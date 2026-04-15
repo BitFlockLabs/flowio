@@ -1,14 +1,15 @@
 [package]
 name = "flowio"
-version = "0.1.0"
+version = "0.1.1-alpha.1"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Single-threaded async runtime built on io_uring with zero-allocation fast paths"
 readme = "README.md"
 keywords = ["async", "io-uring", "runtime", "networking"]
 categories = ["asynchronous", "network-programming"]
 exclude = ["tests/"]
-# repository = "https://github.com/TODO/flowio"
+repository = "https://github.com/BitFlockLabs/flowio"
 
 [dependencies]
 io-uring = "0.7.11"
