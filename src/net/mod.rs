@@ -10,6 +10,10 @@
 //! - TCP / Unix: `readv`, `writev`, `writev_all`, `readv_exact`
 //! - SCTP: `recv_msg_vectored`, `send_msg_vectored`
 //!
+//! Client-side TLS is provided separately by [`tls`], which wraps an existing
+//! connected [`tcp::TcpStream`] with an explicit rustls-driven handshake and
+//! encrypted I/O API.
+//!
 //! UDP remains single-datagram and therefore uses single-buffer sends and
 //! receives only.
 //!
@@ -65,6 +69,7 @@ use std::os::fd::RawFd;
 pub mod sctp;
 pub(crate) mod stream;
 pub mod tcp;
+pub mod tls;
 pub mod udp;
 pub mod unix;
 

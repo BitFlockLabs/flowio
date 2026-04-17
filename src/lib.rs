@@ -1,9 +1,10 @@
 //! A single-threaded async runtime built on Linux `io_uring`.
 //!
 //! `flowio` provides a zero-allocation fast-path runtime with transport
-//! implementations for Unix, TCP, UDP, and one-to-one SCTP sockets.  All I/O
-//! uses a rental buffer pattern — callers pass buffers by value and receive
-//! them back alongside the result on completion.
+//! implementations for Unix, TCP, UDP, and one-to-one SCTP sockets, plus a
+//! client-side rustls TLS wrapper for connected TCP streams. All I/O uses a
+//! rental buffer pattern — callers pass buffers by value and receive them
+//! back alongside the result on completion.
 //!
 //! The public API is organized around three layers:
 //! - [`runtime`] — executor, reactor, timers, and the buffer facility
@@ -22,7 +23,8 @@
 //!
 //! - [`runtime`] — executor, reactor, timer wheel, buffer pools, and task
 //!   management.
-//! - [`net`] — concrete transport types built on the runtime core.
+//! - [`net`] — concrete transport types built on the runtime core, including
+//!   client-side TLS over TCP.
 //! - [`utils`] — intrusive data structures and memory primitives.
 //!
 //! # Example
