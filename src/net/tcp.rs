@@ -5,6 +5,32 @@
 //! rental pattern — the caller-provided buffer is consumed and returned
 //! alongside the result on completion.
 //!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - For repeated outbound connects, prefer [`TcpConnector`]. It reuses stable
+//!   connect-slot state across attempts.
+//! - For steady-state stream I/O, [`TcpStream::read`] / [`TcpStream::write`]
+//!   are the lowest-overhead contiguous APIs when the caller can handle short
+//!   reads and writes.
+//! - Use vectored APIs only when data is already segmented. For one
+//!   contiguous payload, the contiguous APIs stay simpler and usually faster.
+//! - For fixed-shape hot-path buffers, pair TCP with
+//!   [`crate::runtime::buffer::pool::IoBuffPool`].
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use [`TcpStream::connect`] and
+//!   [`TcpStream::connect_timeout`] in repeated outbound loops. Use
+//!   [`TcpConnector`] instead.
+//! - Prefer not to use [`TcpStream::read_exact`] / [`TcpStream::write_all`]
+//!   unless the protocol requires complete-buffer semantics. Use
+//!   [`TcpStream::read`] / [`TcpStream::write`] instead when the caller can
+//!   track progress explicitly.
+//!
+//! The examples below often use `_all` / `_exact` variants because they keep
+//! framing simple in documentation. On the hot path, prefer the partial-I/O
+//! APIs when the caller can handle progress explicitly.
+//!
 //! # Example
 //! ```no_run
 //! use flowio::net::tcp::{TcpConnector, TcpListener};
@@ -152,18 +178,20 @@ use std::time::Duration;
 // AcceptSlot / ConnectSlot
 // ---------------------------------------------------------------------------
 
-struct AcceptSlot
-{
+/// Reusable accept-side submission state kept by [`TcpListener`].
+struct AcceptSlot {
+    /// Completion state for the current or last accept submission.
     state_ptr: *mut CompletionState,
+    /// True while an [`AcceptFuture`] is borrowing this slot.
     in_use: bool,
+    /// Remote address storage filled by the kernel during `accept`.
     addr: libc::sockaddr_storage,
+    /// Length of the returned remote address.
     addrlen: libc::socklen_t,
 }
 
-impl AcceptSlot
-{
-    fn new() -> Self
-    {
+impl AcceptSlot {
+    fn new() -> Self {
         Self {
             state_ptr: std::ptr::null_mut(),
             in_use: false,
@@ -172,20 +200,16 @@ impl AcceptSlot
         }
     }
 
-    fn prepare(&mut self)
-    {
+    fn prepare(&mut self) {
         debug_assert!(!self.in_use, "tcp accept slot already in use");
         self.in_use = true;
         self.addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     }
 
-    fn drop_future(&mut self)
-    {
-        if !self.state_ptr.is_null()
-        {
+    fn drop_future(&mut self) {
+        if !self.state_ptr.is_null() {
             unsafe {
-                if (*self.state_ptr).is_completed() && (*self.state_ptr).result >= 0
-                {
+                if (*self.state_ptr).is_completed() && (*self.state_ptr).result >= 0 {
                     close_fd((*self.state_ptr).result as RawFd);
                 }
                 drop_op_ptr_unchecked(&mut self.state_ptr);
@@ -195,8 +219,7 @@ impl AcceptSlot
         self.in_use = false;
     }
 
-    fn drop_cached_state(&mut self)
-    {
+    fn drop_cached_state(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
         self.in_use = false;
     }
@@ -205,28 +228,22 @@ impl AcceptSlot
         &mut self,
         fd: RawFd,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<(TcpStream, SocketAddr)>>
-    {
-        if !self.state_ptr.is_null()
-        {
+    ) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+        if !self.state_ptr.is_null() {
             let state = unsafe { &*self.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
-                let remote_addr = match socket_addr_from_c(&self.addr, self.addrlen)
-                {
+                let remote_addr = match socket_addr_from_c(&self.addr, self.addrlen) {
                     Ok(addr) => addr,
-                    Err(err) =>
-                    {
+                    Err(err) => {
                         close_fd(result as RawFd);
                         return Poll::Ready(Err(err));
                     }
@@ -235,12 +252,10 @@ impl AcceptSlot
             }
         }
 
-        if self.state_ptr.is_null()
-        {
+        if self.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 self.in_use = false;
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
@@ -256,8 +271,7 @@ impl AcceptSlot
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     self.state_ptr = std::ptr::null_mut();
                     self.in_use = false;
@@ -270,19 +284,22 @@ impl AcceptSlot
     }
 }
 
-struct ConnectSlot
-{
+/// Reusable connect-side submission state kept by [`TcpConnector`].
+struct ConnectSlot {
+    /// Completion state for the current or last connect submission.
     state_ptr: *mut CompletionState,
+    /// True while a [`ConnectFuture`] is borrowing this slot.
     in_use: bool,
+    /// Socket being connected for the current attempt.
     fd: RawFd,
+    /// Prepared remote address for the current attempt.
     addr: libc::sockaddr_storage,
+    /// Length of the prepared remote address.
     addrlen: libc::socklen_t,
 }
 
-impl ConnectSlot
-{
-    fn new() -> Self
-    {
+impl ConnectSlot {
+    fn new() -> Self {
         Self {
             state_ptr: std::ptr::null_mut(),
             in_use: false,
@@ -292,16 +309,13 @@ impl ConnectSlot
         }
     }
 
-    fn prepare(&mut self, addr: SocketAddr) -> io::Result<()>
-    {
+    fn prepare(&mut self, addr: SocketAddr) -> io::Result<()> {
         debug_assert!(!self.in_use, "tcp connect slot already in use");
         self.cleanup_fd();
         self.in_use = true;
-        self.fd = match new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM)
-        {
+        self.fd = match new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM) {
             Ok(fd) => fd,
-            Err(err) =>
-            {
+            Err(err) => {
                 self.in_use = false;
                 return Err(err);
             }
@@ -312,22 +326,18 @@ impl ConnectSlot
         Ok(())
     }
 
-    fn cleanup_fd(&mut self)
-    {
+    fn cleanup_fd(&mut self) {
         close_if_valid(&mut self.fd);
     }
 
-    fn take_stream(&mut self) -> TcpStream
-    {
+    fn take_stream(&mut self) -> TcpStream {
         let fd = self.fd;
         self.fd = -1;
         TcpStream::from_raw_fd(fd)
     }
 
-    fn drop_future(&mut self)
-    {
-        if !self.state_ptr.is_null()
-        {
+    fn drop_future(&mut self) {
+        if !self.state_ptr.is_null() {
             unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
         }
 
@@ -335,27 +345,22 @@ impl ConnectSlot
         self.in_use = false;
     }
 
-    fn drop_cached_state(&mut self)
-    {
+    fn drop_cached_state(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
         self.in_use = false;
     }
 
-    fn poll_connect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<TcpStream>>
-    {
-        if !self.state_ptr.is_null()
-        {
+    fn poll_connect(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<TcpStream>> {
+        if !self.state_ptr.is_null() {
             let state = unsafe { &*self.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
-                if result < 0
-                {
+                if result < 0 {
                     let err = io::Error::from_raw_os_error(-result);
                     self.cleanup_fd();
                     return Poll::Ready(Err(err));
@@ -364,12 +369,10 @@ impl ConnectSlot
             }
         }
 
-        if self.state_ptr.is_null()
-        {
+        if self.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 self.in_use = false;
                 self.cleanup_fd();
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
@@ -384,8 +387,7 @@ impl ConnectSlot
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     self.state_ptr = std::ptr::null_mut();
                     self.in_use = false;
@@ -408,6 +410,9 @@ impl ConnectSlot
 /// Obtained from [`TcpListener::accept`], [`TcpConnector::connect`], or
 /// [`TcpStream::connect`].
 ///
+/// On the steady-state fast path, keep the stream alive and reuse it for many
+/// reads and writes rather than reconnecting repeatedly.
+///
 /// # Example
 /// ```no_run
 /// use flowio::net::tcp::TcpStream;
@@ -424,36 +429,31 @@ impl ConnectSlot
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct TcpStream
-{
+pub struct TcpStream {
+    /// Owned runtime-managed connected socket descriptor.
     fd: RuntimeFd,
 }
 
-impl TcpStream
-{
+impl TcpStream {
     /// Wraps an already-owned connected socket.
-    pub fn from_raw_fd(fd: RawFd) -> Self
-    {
+    pub fn from_raw_fd(fd: RawFd) -> Self {
         Self {
             fd: RuntimeFd::new(fd),
         }
     }
 
     /// Returns the local address of this socket.
-    pub fn local_addr(&self) -> io::Result<SocketAddr>
-    {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
         current_local_addr(self.fd.as_raw_fd())
     }
 
     /// Returns the peer address of this socket.
-    pub fn peer_addr(&self) -> io::Result<SocketAddr>
-    {
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         current_peer_addr(self.fd.as_raw_fd())
     }
 
     /// Enables or disables `TCP_NODELAY` (Nagle's algorithm).
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()>
-    {
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         set_sock_opt(
             self.fd.as_raw_fd(),
             libc::IPPROTO_TCP,
@@ -463,16 +463,14 @@ impl TcpStream
     }
 
     /// Returns the current `TCP_NODELAY` setting.
-    pub fn nodelay(&self) -> io::Result<bool>
-    {
+    pub fn nodelay(&self) -> io::Result<bool> {
         let val: libc::c_int =
             get_sock_opt(self.fd.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY)?;
         Ok(val != 0)
     }
 
     /// Enables or disables `SO_KEEPALIVE`.
-    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()>
-    {
+    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
         set_sock_opt(
             self.fd.as_raw_fd(),
             libc::SOL_SOCKET,
@@ -482,81 +480,85 @@ impl TcpStream
     }
 
     /// Sets the `SO_SNDBUF` socket send buffer size.
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()>
-    {
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
-    pub fn send_buffer_size(&self) -> io::Result<usize>
-    {
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
         super::sock_send_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()>
-    {
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
-    pub fn recv_buffer_size(&self) -> io::Result<usize>
-    {
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
         super::sock_recv_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Shuts down the read, write, or both halves of this connection.
-    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>
-    {
-        let how = match how
-        {
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        let how = match how {
             std::net::Shutdown::Read => libc::SHUT_RD,
             std::net::Shutdown::Write => libc::SHUT_WR,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
         let rc = unsafe { libc::shutdown(self.fd.as_raw_fd(), how) };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
     /// Reads up to `len` bytes into `buffer`.
+    ///
+    /// This is the lowest-overhead contiguous receive API when the caller can
+    /// handle short reads and track framing itself.
     pub fn read<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
         len: usize,
-    ) -> stream::ReadFuture<'_, B, Self>
-    {
+    ) -> stream::ReadFuture<'_, B, Self> {
         stream::ReadFuture::new(self.fd.as_raw_fd(), buffer, len)
     }
 
     /// Writes the initialized portion of `buffer`.
-    pub fn write<B: IoBuffReadOnly>(&mut self, buffer: B) -> stream::WriteFuture<'_, B, Self>
-    {
+    ///
+    /// This is the lowest-overhead contiguous send API when the caller can
+    /// handle short writes itself.
+    pub fn write<B: IoBuffReadOnly>(&mut self, buffer: B) -> stream::WriteFuture<'_, B, Self> {
         stream::WriteFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
     /// Writes the entire buffer, handling partial writes internally.
     ///
-    /// Returns `(Ok(n), buffer)` where `n` equals `buffer.len()` on
-    /// success.
-    pub fn write_all<B: IoBuffReadOnly>(&mut self, buffer: B)
-    -> stream::WriteAllFuture<'_, B, Self>
-    {
+    /// Returns `(Ok(n), buffer)` where `n` equals `buffer.len()` on success.
+    ///
+    /// This is not the lowest-overhead send fast path because it may
+    /// resubmit after partial writes. Prefer [`TcpStream::write`] when the
+    /// caller can handle partial progress.
+    pub fn write_all<B: IoBuffReadOnly>(
+        &mut self,
+        buffer: B,
+    ) -> stream::WriteAllFuture<'_, B, Self> {
         stream::WriteAllFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
     /// Reads exactly `len` bytes, handling partial reads internally.
     ///
     /// Returns `UnexpectedEof` if the peer closes before `len` bytes arrive.
+    ///
+    /// This is not the lowest-overhead receive fast path because it may
+    /// resubmit after partial reads. Prefer [`TcpStream::read`] when the
+    /// caller can handle partial progress.
     pub fn read_exact<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
         len: usize,
-    ) -> stream::ReadExactFuture<'_, B, Self>
-    {
+    ) -> stream::ReadExactFuture<'_, B, Self> {
         stream::ReadExactFuture::new(self.fd.as_raw_fd(), buffer, len)
     }
 
@@ -564,11 +566,13 @@ impl TcpStream
     ///
     /// The chain is consumed and returned alongside the result (rental
     /// pattern).  The total number of bytes read is returned in `Ok`.
+    ///
+    /// Use this when the receive path is already naturally segmented. For a
+    /// single contiguous destination buffer, prefer [`TcpStream::read`].
     pub fn readv<const N: usize>(
         &mut self,
         buffer: IoBuffVecMut<N>,
-    ) -> stream::ReadvFuture<'_, N, Self>
-    {
+    ) -> stream::ReadvFuture<'_, N, Self> {
         stream::ReadvFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
@@ -576,11 +580,13 @@ impl TcpStream
     ///
     /// The chain is consumed and returned alongside the result (rental
     /// pattern).  The total number of bytes written is returned in `Ok`.
+    ///
+    /// Use this when the send path is already naturally segmented. For one
+    /// contiguous payload, prefer [`TcpStream::write`].
     pub fn writev<const N: usize>(
         &mut self,
         buffer: IoBuffVec<N>,
-    ) -> stream::WritevFuture<'_, N, Self>
-    {
+    ) -> stream::WritevFuture<'_, N, Self> {
         stream::WritevFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
@@ -589,11 +595,14 @@ impl TcpStream
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
     /// success.  On error the chain is returned with an unspecified amount
     /// already written.
+    ///
+    /// This is the complete-buffer vectored convenience API, not the
+    /// lowest-overhead vectored send fast path. Prefer [`TcpStream::writev`]
+    /// when the caller can handle partial progress.
     pub fn writev_all<const N: usize>(
         &mut self,
         buffer: IoBuffVec<N>,
-    ) -> stream::WritevAllFuture<'_, N, Self>
-    {
+    ) -> stream::WritevAllFuture<'_, N, Self> {
         stream::WritevAllFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
@@ -601,20 +610,21 @@ impl TcpStream
     ///
     /// Returns `(Ok(len), chain)` on success.  Returns `UnexpectedEof` if
     /// the peer closes before `len` bytes arrive.
+    ///
+    /// This is the complete-buffer vectored convenience API, not the
+    /// lowest-overhead vectored receive fast path. Prefer [`TcpStream::readv`]
+    /// when the caller can handle partial progress.
     pub fn readv_exact<const N: usize>(
         &mut self,
         buffer: IoBuffVecMut<N>,
         len: usize,
-    ) -> stream::ReadvExactFuture<'_, N, Self>
-    {
+    ) -> stream::ReadvExactFuture<'_, N, Self> {
         stream::ReadvExactFuture::new(self.fd.as_raw_fd(), buffer, len)
     }
 }
 
-impl AsRawFd for TcpStream
-{
-    fn as_raw_fd(&self) -> RawFd
-    {
+impl AsRawFd for TcpStream {
+    fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
@@ -623,13 +633,13 @@ impl AsRawFd for TcpStream
 // TcpConnector
 // ---------------------------------------------------------------------------
 
-impl TcpStream
-{
+impl TcpStream {
     /// Convenience method that creates a one-shot connection to the given
     /// address. For repeated connections, use [`TcpConnector`] to reuse the
     /// connector's slot metadata across attempts.
-    pub fn connect(addr: SocketAddr) -> io::Result<OwnedConnectFuture>
-    {
+    ///
+    /// This is not the repeated-connect fast path.
+    pub fn connect(addr: SocketAddr) -> io::Result<OwnedConnectFuture> {
         OwnedConnectFuture::new(addr)
     }
 
@@ -639,11 +649,13 @@ impl TcpStream
     /// provided duration elapses. For repeated outbound connections, prefer
     /// [`TcpConnector::connect_timeout`] so the connector can reuse its slot
     /// metadata across attempts.
+    ///
+    /// This is the convenience timeout API, not the repeated-connect fast
+    /// path.
     pub fn connect_timeout(
         addr: SocketAddr,
         timeout_duration: Duration,
-    ) -> io::Result<OwnedConnectTimeoutFuture>
-    {
+    ) -> io::Result<OwnedConnectTimeoutFuture> {
         Ok(OwnedConnectTimeoutFuture {
             inner: timeout(timeout_duration, Self::connect(addr)?),
         })
@@ -654,6 +666,9 @@ impl TcpStream
 ///
 /// The slot keeps stable socket/address metadata across attempts. Each
 /// individual connect submission still uses the reactor completion-state pool.
+///
+/// This is the best TCP API to use on the repeated outbound connect fast path.
+/// Prefer [`TcpStream::connect`] only for occasional convenience connects.
 ///
 /// # Example
 /// ```no_run
@@ -672,33 +687,31 @@ impl TcpStream
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct TcpConnector
-{
+pub struct TcpConnector {
+    /// Reusable connect state kept across connection attempts.
     connect_slot: ConnectSlot,
 }
 
 /// Equivalent to [`TcpConnector::new()`].
-impl Default for TcpConnector
-{
-    fn default() -> Self
-    {
+impl Default for TcpConnector {
+    fn default() -> Self {
         Self {
             connect_slot: ConnectSlot::new(),
         }
     }
 }
 
-impl TcpConnector
-{
+impl TcpConnector {
     /// Creates a new connector.
-    pub fn new() -> Self
-    {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Starts connecting to the provided remote address.
-    pub fn connect(&mut self, addr: SocketAddr) -> io::Result<ConnectFuture<'_>>
-    {
+    ///
+    /// This is the repeated-connect fast-path API. Prefer
+    /// [`TcpStream::connect`] only for occasional convenience connects.
+    pub fn connect(&mut self, addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
         self.connect_slot.prepare(addr)?;
         Ok(ConnectFuture {
             slot: &mut self.connect_slot,
@@ -708,23 +721,22 @@ impl TcpConnector
     /// Starts connecting to the provided remote address with a deadline.
     ///
     /// Returns `TimedOut` if the connection does not complete before the
-    /// provided duration elapses.
+    /// provided duration elapses. This is the repeated-connect timeout API;
+    /// prefer it over [`TcpStream::connect_timeout`] when the same connector
+    /// is reused across attempts.
     pub fn connect_timeout(
         &mut self,
         addr: SocketAddr,
         timeout_duration: Duration,
-    ) -> io::Result<ConnectTimeoutFuture<'_>>
-    {
+    ) -> io::Result<ConnectTimeoutFuture<'_>> {
         Ok(ConnectTimeoutFuture {
             inner: timeout(timeout_duration, self.connect(addr)?),
         })
     }
 }
 
-impl Drop for TcpConnector
-{
-    fn drop(&mut self)
-    {
+impl Drop for TcpConnector {
+    fn drop(&mut self) {
         self.connect_slot.drop_cached_state();
         self.connect_slot.cleanup_fd();
     }
@@ -754,41 +766,37 @@ impl Drop for TcpConnector
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct TcpListener
-{
+pub struct TcpListener {
+    /// Owned listening socket descriptor.
     fd: RuntimeFd,
+    /// Cached local address assigned after bind/listen.
     local_addr: SocketAddr,
+    /// Reusable accept state kept across accepts.
     accept_slot: AcceptSlot,
 }
 
-impl TcpListener
-{
+impl TcpListener {
     /// Binds a nonblocking listener with `SO_REUSEADDR` and starts listening.
-    pub fn bind(addr: SocketAddr, backlog: i32) -> io::Result<Self>
-    {
+    pub fn bind(addr: SocketAddr, backlog: i32) -> io::Result<Self> {
         Self::bind_inner(addr, backlog, false)
     }
 
     /// Binds a nonblocking listener with both `SO_REUSEADDR` and
     /// `SO_REUSEPORT`, then starts listening.  Useful for multi-process
     /// server patterns where multiple listeners share the same port.
-    pub fn bind_reuse_port(addr: SocketAddr, backlog: i32) -> io::Result<Self>
-    {
+    pub fn bind_reuse_port(addr: SocketAddr, backlog: i32) -> io::Result<Self> {
         Self::bind_inner(addr, backlog, true)
     }
 
-    fn bind_inner(addr: SocketAddr, backlog: i32, reuse_port: bool) -> io::Result<Self>
-    {
+    fn bind_inner(addr: SocketAddr, backlog: i32, reuse_port: bool) -> io::Result<Self> {
         let fd = new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM)?;
 
-        if let Err(err) = set_reuse_addr(fd)
-        {
+        if let Err(err) = set_reuse_addr(fd) {
             close_fd(fd);
             return Err(err);
         }
 
-        if reuse_port && let Err(err) = set_reuse_port(fd)
-        {
+        if reuse_port && let Err(err) = set_reuse_port(fd) {
             close_fd(fd);
             return Err(err);
         }
@@ -801,26 +809,22 @@ impl TcpListener
                 sockaddr_len,
             )
         };
-        if bind_res < 0
-        {
+        if bind_res < 0 {
             let err = io::Error::last_os_error();
             close_fd(fd);
             return Err(err);
         }
 
         let listen_res = unsafe { libc::listen(fd, backlog) };
-        if listen_res < 0
-        {
+        if listen_res < 0 {
             let err = io::Error::last_os_error();
             close_fd(fd);
             return Err(err);
         }
 
-        let local_addr = match current_local_addr(fd)
-        {
+        let local_addr = match current_local_addr(fd) {
             Ok(addr) => addr,
-            Err(err) =>
-            {
+            Err(err) => {
                 close_fd(fd);
                 return Err(err);
             }
@@ -834,14 +838,12 @@ impl TcpListener
     }
 
     /// Returns the local address currently assigned to the listener.
-    pub fn local_addr(&self) -> SocketAddr
-    {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Starts accepting one incoming connection.
-    pub fn accept(&mut self) -> AcceptFuture<'_>
-    {
+    pub fn accept(&mut self) -> AcceptFuture<'_> {
         self.accept_slot.prepare();
         AcceptFuture {
             fd: self.fd.as_raw_fd(),
@@ -850,18 +852,14 @@ impl TcpListener
     }
 }
 
-impl AsRawFd for TcpListener
-{
-    fn as_raw_fd(&self) -> RawFd
-    {
+impl AsRawFd for TcpListener {
+    fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl Drop for TcpListener
-{
-    fn drop(&mut self)
-    {
+impl Drop for TcpListener {
+    fn drop(&mut self) {
         self.accept_slot.drop_cached_state();
     }
 }
@@ -871,27 +869,24 @@ impl Drop for TcpListener
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct AcceptFuture<'a>
-{
+pub struct AcceptFuture<'a> {
+    /// Listening socket descriptor used for the submitted accept request.
     fd: RawFd,
+    /// Borrowed reusable accept slot owned by the listener.
     slot: &'a mut AcceptSlot,
 }
 
-impl Future for AcceptFuture<'_>
-{
+impl Future for AcceptFuture<'_> {
     type Output = io::Result<(TcpStream, SocketAddr)>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         this.slot.poll_accept(this.fd, cx)
     }
 }
 
-impl Drop for AcceptFuture<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for AcceptFuture<'_> {
+    fn drop(&mut self) {
         self.slot.drop_future();
     }
 }
@@ -901,54 +896,45 @@ impl Drop for AcceptFuture<'_>
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct ConnectFuture<'a>
-{
+pub struct ConnectFuture<'a> {
+    /// Borrowed reusable connect slot owned by the connector.
     slot: &'a mut ConnectSlot,
 }
 
-impl Future for ConnectFuture<'_>
-{
+impl Future for ConnectFuture<'_> {
     type Output = io::Result<TcpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         this.slot.poll_connect(cx)
     }
 }
 
-impl Drop for ConnectFuture<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for ConnectFuture<'_> {
+    fn drop(&mut self) {
         self.slot.drop_future();
     }
 }
 
-fn map_connect_timeout(result: Result<io::Result<TcpStream>, Elapsed>) -> io::Result<TcpStream>
-{
-    match result
-    {
+fn map_connect_timeout(result: Result<io::Result<TcpStream>, Elapsed>) -> io::Result<TcpStream> {
+    match result {
         Ok(result) => result,
         Err(_) => Err(io::Error::from(io::ErrorKind::TimedOut)),
     }
 }
 
 /// Connect future with a relative timeout for a reusable [`TcpConnector`].
-pub struct ConnectTimeoutFuture<'a>
-{
+pub struct ConnectTimeoutFuture<'a> {
+    /// Timeout wrapper around the reusable-slot connect future.
     inner: Timeout<ConnectFuture<'a>>,
 }
 
-impl Future for ConnectTimeoutFuture<'_>
-{
+impl Future for ConnectTimeoutFuture<'_> {
     type Output = io::Result<TcpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        match unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
-        {
+        match unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx) {
             Poll::Ready(result) => Poll::Ready(map_connect_timeout(result)),
             Poll::Pending => Poll::Pending,
         }
@@ -963,23 +949,22 @@ impl Future for ConnectTimeoutFuture<'_>
 /// Owns its socket and prepared address so no external [`TcpConnector`] is
 /// needed. Repeated connections should use [`TcpConnector`] to avoid rebuilding
 /// the reusable slot wrapper.
-pub struct OwnedConnectFuture
-{
+pub struct OwnedConnectFuture {
+    /// Completion state for the one-shot connect submission.
     state_ptr: *mut CompletionState,
+    /// Socket owned by this self-contained connect future until success or drop.
     fd: RawFd,
+    /// Prepared remote address for the one-shot connect attempt.
     addr: libc::sockaddr_storage,
+    /// Length of the prepared remote address.
     addrlen: libc::socklen_t,
 }
 
-impl OwnedConnectFuture
-{
-    fn new(addr: SocketAddr) -> io::Result<Self>
-    {
-        let fd = match new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM)
-        {
+impl OwnedConnectFuture {
+    fn new(addr: SocketAddr) -> io::Result<Self> {
+        let fd = match new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM) {
             Ok(fd) => fd,
-            Err(err) =>
-            {
+            Err(err) => {
                 return Err(err);
             }
         };
@@ -992,38 +977,31 @@ impl OwnedConnectFuture
         })
     }
 
-    fn cleanup_fd(&mut self)
-    {
+    fn cleanup_fd(&mut self) {
         close_if_valid(&mut self.fd);
     }
 
-    fn take_stream(&mut self) -> TcpStream
-    {
+    fn take_stream(&mut self) -> TcpStream {
         let fd = self.fd;
         self.fd = -1;
         TcpStream::from_raw_fd(fd)
     }
 }
 
-impl Future for OwnedConnectFuture
-{
+impl Future for OwnedConnectFuture {
     type Output = io::Result<TcpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
-                if result < 0
-                {
+                if result < 0 {
                     let err = io::Error::from_raw_os_error(-result);
                     this.cleanup_fd();
                     return Poll::Ready(Err(err));
@@ -1033,12 +1011,10 @@ impl Future for OwnedConnectFuture
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 this.cleanup_fd();
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
@@ -1052,8 +1028,7 @@ impl Future for OwnedConnectFuture
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     this.cleanup_fd();
@@ -1066,30 +1041,25 @@ impl Future for OwnedConnectFuture
     }
 }
 
-impl Drop for OwnedConnectFuture
-{
-    fn drop(&mut self)
-    {
+impl Drop for OwnedConnectFuture {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
         self.cleanup_fd();
     }
 }
 
 /// Self-contained connect future with a relative timeout.
-pub struct OwnedConnectTimeoutFuture
-{
+pub struct OwnedConnectTimeoutFuture {
+    /// Timeout wrapper around the self-contained one-shot connect future.
     inner: Timeout<OwnedConnectFuture>,
 }
 
-impl Future for OwnedConnectTimeoutFuture
-{
+impl Future for OwnedConnectTimeoutFuture {
     type Output = io::Result<TcpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        match unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
-        {
+        match unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx) {
             Poll::Ready(result) => Poll::Ready(map_connect_timeout(result)),
             Poll::Pending => Poll::Pending,
         }

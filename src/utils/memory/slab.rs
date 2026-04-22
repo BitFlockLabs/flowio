@@ -1,8 +1,9 @@
+//! Slab-page allocator used by the higher-level object pool.
+
 use crate::utils;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlabAllocatorConfigError
-{
+pub enum SlabAllocatorConfigError {
     /// `objs_per_slab` must be greater than zero.
     ObjsPerSlabZero,
     /// Object alignment must be a non-zero power of two.
@@ -11,18 +12,13 @@ pub enum SlabAllocatorConfigError
     SizeOverflow,
 }
 
-impl std::fmt::Display for SlabAllocatorConfigError
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
-    {
-        match self
-        {
-            Self::ObjsPerSlabZero =>
-            {
+impl std::fmt::Display for SlabAllocatorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ObjsPerSlabZero => {
                 f.write_str("SlabAllocator::new_uninit requires objs_per_slab > 0")
             }
-            Self::InvalidObjectAlign =>
-            {
+            Self::InvalidObjectAlign => {
                 f.write_str("SlabAllocator::new_uninit requires power-of-two object alignment")
             }
             Self::SizeOverflow => f.write_str("slab geometry overflowed usize"),
@@ -45,8 +41,7 @@ pub const SLAB_LINK_ALIGN: usize = std::mem::align_of::<utils::list::intrusive::
 /// individual objects are freed, their slots are tracked by the higher-level
 /// pool free list instead.
 #[repr(C)]
-pub struct Slab
-{
+pub struct Slab {
     /// Intrusive link used to chain slabs in a singly-linked list.
     /// This must stay at offset 0 because other code reinterprets a slab as
     /// its link head when chaining pages.
@@ -57,14 +52,11 @@ pub struct Slab
     pub end_ptr: *mut u8,
 }
 
-impl Slab
-{
+impl Slab {
     #[inline(always)]
-    pub fn try_alloc(&mut self, obj_size: usize) -> Option<*mut u8>
-    {
+    pub fn try_alloc(&mut self, obj_size: usize) -> Option<*mut u8> {
         let remaining = self.end_ptr as usize - self.bump_ptr as usize;
-        if remaining < obj_size
-        {
+        if remaining < obj_size {
             return None;
         }
         let ptr = self.bump_ptr;
@@ -76,44 +68,43 @@ impl Slab
 /// The underlying allocator responsible for requesting large chunks (slabs)
 /// of memory from the generic `MemoryProvider` and formatting the slab's
 /// intrusive header.
-pub struct SlabAllocator<'a, P: super::provider::MemoryProvider>
-{
+pub struct SlabAllocator<'a, P: super::provider::MemoryProvider> {
+    /// Raw memory source from which full slab pages are requested.
     provider: &'a mut P,
+    /// Total bytes requested for each slab page, including padding.
     total_slab_size: usize,
+    /// Header size rounded up to the object alignment.
     header_padded_size: usize,
+    /// Alignment required for the slab allocation as a whole.
     slab_align: usize,
 }
 
-impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P>
-{
+impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     pub fn new_uninit(
         provider: &'a mut P,
         obj_size: usize,
         obj_align: usize,
         objs_per_slab: usize,
-    ) -> Result<Self, SlabAllocatorConfigError>
-    {
-        if objs_per_slab == 0
-        {
+    ) -> Result<Self, SlabAllocatorConfigError> {
+        if objs_per_slab == 0 {
             return Err(SlabAllocatorConfigError::ObjsPerSlabZero);
         }
 
         let provider_align = provider.alignment_guarantee();
 
-        // The provider only needs to guarantee the stricter of the two
+        // The slab page must satisfy both the provider's base guarantee and
+        // the requested object alignment.
         let slab_align = std::cmp::max(provider_align, obj_align);
 
-        if !obj_align.is_power_of_two()
-        {
+        if !obj_align.is_power_of_two() {
             return Err(SlabAllocatorConfigError::InvalidObjectAlign);
         }
 
-        // TIGHT HEADER: We only need to pad the header to the OBJECT'S alignment.
-        // Since the Slab starts at a 'slab_align' boundary (which is a multiple of obj_align),
-        // rounding the header to obj_align is sufficient!
+        // The slab page itself starts at `slab_align`, so the header only
+        // needs to be rounded up to the object alignment before payload slots
+        // begin.
         let header_padded_size =
-            crate::utils::size_up(SLAB_HDR_SIZE, obj_align).map_err(|err| match err
-            {
+            crate::utils::size_up(SLAB_HDR_SIZE, obj_align).map_err(|err| match err {
                 utils::SizeUpError::InvalidAlign => SlabAllocatorConfigError::InvalidObjectAlign,
                 utils::SizeUpError::SizeOverflow => SlabAllocatorConfigError::SizeOverflow,
             })?;
@@ -125,8 +116,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P>
             .checked_add(payload_bytes)
             .ok_or(SlabAllocatorConfigError::SizeOverflow)?;
         let total_slab_size =
-            crate::utils::size_up(min_required, slab_align).map_err(|err| match err
-            {
+            crate::utils::size_up(min_required, slab_align).map_err(|err| match err {
                 utils::SizeUpError::InvalidAlign => SlabAllocatorConfigError::InvalidObjectAlign,
                 utils::SizeUpError::SizeOverflow => SlabAllocatorConfigError::SizeOverflow,
             })?;
@@ -139,17 +129,17 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P>
         })
     }
 
-    pub fn init(&mut self)
-    {
+    pub fn init(&mut self) {
         debug_assert!(self.slab_align.is_power_of_two());
 
-        // Tell the provider to use this alignment from now on
+        // Raise the provider's minimum alignment to the slab alignment for all
+        // future slab-page allocations.
         self.provider.init(self.slab_align);
     }
 
-    pub fn provide_slab(&mut self) -> Option<*mut Slab>
-    {
-        // Request memory specifically aligned for this Slab's requirements
+    /// Requests, formats, and returns a fresh slab page.
+    pub fn provide_slab(&mut self) -> Option<*mut Slab> {
+        // Request raw memory already aligned for this slab page.
         let raw_mem = self.provider.request_memory(self.total_slab_size)?;
 
         unsafe {
@@ -167,8 +157,8 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P>
         }
     }
 
-    pub fn get_slab_alignment(&self) -> usize
-    {
+    /// Returns the alignment required for each slab page allocation.
+    pub fn get_slab_alignment(&self) -> usize {
         self.slab_align
     }
 
@@ -177,8 +167,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P>
     /// # Safety
     /// `slab_ptr` must have been allocated by this `SlabAllocator`'s provider
     /// and must not be in use by any live pool objects.
-    pub unsafe fn free_slab(&mut self, slab_ptr: *mut u8)
-    {
+    pub unsafe fn free_slab(&mut self, slab_ptr: *mut u8) {
         unsafe { self.provider.free_memory(slab_ptr, self.total_slab_size) };
     }
 }

@@ -30,6 +30,30 @@
 //! - [`SctpStream::reset_streams`]
 //! - [`SctpStream::add_streams`]
 //!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - For repeated outbound associations, prefer [`SctpConnector`]. It reuses
+//!   stable connect state across attempts.
+//! - If the socket is configured for data-only traffic without notifications
+//!   or `SCTP_RCVINFO`, prefer [`SctpStream::send`] / [`SctpStream::recv`] on
+//!   the hot path. Those are the explicit SCTP fast-path APIs in this module.
+//! - Use vectored SCTP APIs only when payloads are already segmented. For a
+//!   single contiguous message, the contiguous APIs stay simpler and usually
+//!   faster.
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use [`SctpConnector::new`] when the intended workload is
+//!   data-only. Use [`SctpConnector::with_config`] plus
+//!   [`SctpSocketConfig::data`] instead.
+//! - Prefer not to use [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
+//!   when metadata and notifications are not needed. Use
+//!   [`SctpStream::send`] / [`SctpStream::recv`] instead.
+//!
+//! The examples below show message-oriented APIs because they are the most
+//! explicit in documentation. For data-only hot paths, prefer
+//! [`SctpStream::send`] / [`SctpStream::recv`] when their constraints fit.
+//!
 //! # Example
 //! ```no_run
 //! use flowio::net::sctp::{SctpConnector, SctpInitConfig, SctpListener, SctpSendInfo};
@@ -138,9 +162,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+/// Kernel-facing notification-subscription layout used with SCTP socket
+/// options on Linux.
 #[repr(C)]
-struct SctpEventSubscribe
-{
+struct SctpEventSubscribe {
     sctp_data_io_event: u8,
     sctp_association_event: u8,
     sctp_address_event: u8,
@@ -157,10 +182,8 @@ struct SctpEventSubscribe
     sctp_send_failure_event_event: u8,
 }
 
-impl SctpEventSubscribe
-{
-    const fn from_mask(mask: SctpNotificationMask, recv_rcvinfo: bool) -> Self
-    {
+impl SctpEventSubscribe {
+    const fn from_mask(mask: SctpNotificationMask, recv_rcvinfo: bool) -> Self {
         Self {
             sctp_data_io_event: recv_rcvinfo as u8,
             sctp_association_event: mask.association as u8,
@@ -208,8 +231,7 @@ const SCTP_STREAM_RESET_OUTGOING: u16 = 0x02;
 /// This is passed to [`SctpStream::send_msg`] to control stream selection,
 /// PPID, flags, and association-scoped metadata.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SctpSendInfo
-{
+pub struct SctpSendInfo {
     /// SCTP stream number to send on.
     pub stream_id: u16,
     /// Send flags (e.g. `SCTP_UNORDERED`).
@@ -224,8 +246,7 @@ pub struct SctpSendInfo
 
 /// Per-message SCTP receive metadata extracted from `SCTP_RCVINFO`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SctpRecvInfo
-{
+pub struct SctpRecvInfo {
     /// SCTP stream number the message was received on.
     pub stream_id: u16,
     /// Stream Sequence Number.
@@ -259,8 +280,7 @@ pub struct SctpRecvInfo
 /// # let _ = params;
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpPeerAddrParams
-{
+pub struct SctpPeerAddrParams {
     /// Association to target, or `0` for the default association on one-to-one
     /// sockets.
     pub assoc_id: libc::sctp_assoc_t,
@@ -286,8 +306,7 @@ pub struct SctpPeerAddrParams
 
 /// Association-wide retransmission and RTO policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SctpAssocConfig
-{
+pub struct SctpAssocConfig {
     /// Maximum association-level retransmissions before the association is
     /// considered failed.
     pub assoc_max_retrans: Option<u16>,
@@ -304,16 +323,14 @@ pub struct SctpAssocConfig
 /// These flags are used with [`SctpStream::reconfig_supported`] and
 /// [`SctpStream::enable_stream_reset`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpReconfigFlags
-{
+pub struct SctpReconfigFlags {
     /// Association ID (0 for the default association).
     pub assoc_id: libc::sctp_assoc_t,
     /// Bitmask of `RESET_STREAMS`, `RESET_ASSOC`, `CHANGE_ASSOC`.
     pub flags: u32,
 }
 
-impl SctpReconfigFlags
-{
+impl SctpReconfigFlags {
     /// Enables stream reset requests on the association.
     pub const RESET_STREAMS: u32 = SCTP_ENABLE_RESET_STREAM_REQ;
     /// Enables association reset requests on the association.
@@ -322,8 +339,7 @@ impl SctpReconfigFlags
     pub const CHANGE_ASSOC: u32 = SCTP_ENABLE_CHANGE_ASSOC_REQ;
 
     /// Creates an empty association-wide flag block.
-    pub const fn association_default() -> Self
-    {
+    pub const fn association_default() -> Self {
         Self {
             assoc_id: 0,
             flags: 0,
@@ -345,8 +361,7 @@ impl SctpReconfigFlags
 /// # let _ = (request, flags);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SctpResetStreams
-{
+pub struct SctpResetStreams {
     /// Association ID (0 for the default association).
     pub assoc_id: libc::sctp_assoc_t,
     /// Direction flags (incoming, outgoing, or both).
@@ -355,11 +370,9 @@ pub struct SctpResetStreams
     pub streams: Vec<u16>,
 }
 
-impl SctpResetStreams
-{
+impl SctpResetStreams {
     /// Resets the specified incoming streams.
-    pub fn incoming(streams: &[u16]) -> Self
-    {
+    pub fn incoming(streams: &[u16]) -> Self {
         Self {
             assoc_id: 0,
             flags: SCTP_STREAM_RESET_INCOMING,
@@ -368,8 +381,7 @@ impl SctpResetStreams
     }
 
     /// Resets the specified outgoing streams.
-    pub fn outgoing(streams: &[u16]) -> Self
-    {
+    pub fn outgoing(streams: &[u16]) -> Self {
         Self {
             assoc_id: 0,
             flags: SCTP_STREAM_RESET_OUTGOING,
@@ -378,8 +390,7 @@ impl SctpResetStreams
     }
 
     /// Resets the specified incoming and outgoing streams.
-    pub fn bidirectional(streams: &[u16]) -> Self
-    {
+    pub fn bidirectional(streams: &[u16]) -> Self {
         Self {
             assoc_id: 0,
             flags: SCTP_STREAM_RESET_INCOMING | SCTP_STREAM_RESET_OUTGOING,
@@ -390,8 +401,7 @@ impl SctpResetStreams
 
 /// Request parameters for `SCTP_ADD_STREAMS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpAddStreams
-{
+pub struct SctpAddStreams {
     /// Association ID (0 for the default association).
     pub assoc_id: libc::sctp_assoc_t,
     /// Number of inbound streams to add.
@@ -400,11 +410,9 @@ pub struct SctpAddStreams
     pub outbound_streams: u16,
 }
 
-impl SctpAddStreams
-{
+impl SctpAddStreams {
     /// Requests additional inbound and outbound streams for the association.
-    pub const fn new(inbound_streams: u16, outbound_streams: u16) -> Self
-    {
+    pub const fn new(inbound_streams: u16, outbound_streams: u16) -> Self {
         Self {
             assoc_id: 0,
             inbound_streams,
@@ -413,8 +421,7 @@ impl SctpAddStreams
     }
 }
 
-impl SctpPeerAddrParams
-{
+impl SctpPeerAddrParams {
     /// Enables heartbeats for the selected address or association.
     pub const HEARTBEAT_ENABLE: u32 = SPP_HB_ENABLE;
     /// Disables heartbeats for the selected address or association.
@@ -437,8 +444,7 @@ impl SctpPeerAddrParams
     pub const DSCP: u32 = SPP_DSCP;
 
     /// Returns an empty association-wide parameter block.
-    pub const fn association_default() -> Self
-    {
+    pub const fn association_default() -> Self {
         Self {
             assoc_id: 0,
             address: None,
@@ -453,8 +459,7 @@ impl SctpPeerAddrParams
     }
 
     /// Returns a parameter block targeting a specific transport address.
-    pub const fn for_address(address: SocketAddr) -> Self
-    {
+    pub const fn for_address(address: SocketAddr) -> Self {
         Self {
             address: Some(address),
             ..Self::association_default()
@@ -464,8 +469,7 @@ impl SctpPeerAddrParams
 
 /// Read-only per-path SCTP state returned by `SCTP_GET_PEER_ADDR_INFO`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpPeerAddrInfo
-{
+pub struct SctpPeerAddrInfo {
     /// Association ID.
     pub assoc_id: libc::sctp_assoc_t,
     /// Peer transport address.
@@ -482,8 +486,7 @@ pub struct SctpPeerAddrInfo
     pub mtu: u32,
 }
 
-impl SctpPeerAddrInfo
-{
+impl SctpPeerAddrInfo {
     /// Path is inactive and not currently usable.
     pub const INACTIVE: i32 = 0;
     /// Path is still considered usable but is close to failure.
@@ -498,8 +501,7 @@ impl SctpPeerAddrInfo
 
 /// Read-only association status returned by `SCTP_STATUS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpAssocStatus
-{
+pub struct SctpAssocStatus {
     /// Association ID.
     pub assoc_id: libc::sctp_assoc_t,
     /// Association state (see `EMPTY`, `ESTABLISHED`, etc.).
@@ -520,8 +522,7 @@ pub struct SctpAssocStatus
     pub primary_path: SctpPeerAddrInfo,
 }
 
-impl SctpAssocStatus
-{
+impl SctpAssocStatus {
     /// No association is currently attached.
     pub const EMPTY: i32 = 0;
     /// Association is closed.
@@ -544,11 +545,9 @@ impl SctpAssocStatus
 
 /// Decoded SCTP notifications returned by [`SctpStream::recv_msg`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SctpNotification
-{
+pub enum SctpNotification {
     /// Association state change such as up/down/restart.
-    AssocChange
-    {
+    AssocChange {
         /// Kernel-reported association state.
         state: u16,
         /// Error code associated with the state change, if any.
@@ -561,14 +560,12 @@ pub enum SctpNotification
         assoc_id: libc::sctp_assoc_t,
     },
     /// Peer completed an SCTP shutdown sequence.
-    Shutdown
-    {
+    Shutdown {
         /// Association identifier reported by the kernel.
         assoc_id: libc::sctp_assoc_t,
     },
     /// Per-path reachability or state change notification.
-    PeerAddrChange
-    {
+    PeerAddrChange {
         /// Peer transport address whose state changed.
         addr: SocketAddr,
         /// Kernel-reported path state.
@@ -579,16 +576,14 @@ pub enum SctpNotification
         assoc_id: libc::sctp_assoc_t,
     },
     /// Remote peer reported a protocol error.
-    RemoteError
-    {
+    RemoteError {
         /// SCTP error code from the peer.
         error: u16,
         /// Association identifier reported by the kernel.
         assoc_id: libc::sctp_assoc_t,
     },
     /// A send failed and the kernel returned the original send metadata.
-    SendFailed
-    {
+    SendFailed {
         /// Kernel error code for the failed send.
         error: u32,
         /// Original send metadata supplied with the failed message.
@@ -597,16 +592,14 @@ pub enum SctpNotification
         assoc_id: libc::sctp_assoc_t,
     },
     /// Adaptation layer indication notification.
-    Adaptation
-    {
+    Adaptation {
         /// Adaptation indication value from the peer/kernel.
         indication: u32,
         /// Association identifier reported by the kernel.
         assoc_id: libc::sctp_assoc_t,
     },
     /// Partial-delivery state change notification.
-    PartialDelivery
-    {
+    PartialDelivery {
         /// Kernel-reported partial-delivery indication.
         indication: u32,
         /// Association identifier reported by the kernel.
@@ -617,22 +610,19 @@ pub enum SctpNotification
         sequence: u32,
     },
     /// Sender queue became empty for the association.
-    SenderDry
-    {
+    SenderDry {
         /// Association identifier reported by the kernel.
         assoc_id: libc::sctp_assoc_t,
     },
     /// Stream reset completion or state change notification.
-    StreamReset
-    {
+    StreamReset {
         /// Kernel flags for the reset event.
         flags: u16,
         /// Association identifier reported by the kernel.
         assoc_id: libc::sctp_assoc_t,
     },
     /// Association reset notification with TSN restart points.
-    AssocReset
-    {
+    AssocReset {
         /// Kernel flags for the reset event.
         flags: u16,
         /// Association identifier reported by the kernel.
@@ -643,8 +633,7 @@ pub enum SctpNotification
         remote_tsn: u32,
     },
     /// Stream-count change notification.
-    StreamChange
-    {
+    StreamChange {
         /// Kernel flags for the stream-change event.
         flags: u16,
         /// Association identifier reported by the kernel.
@@ -655,8 +644,7 @@ pub enum SctpNotification
         outbound_streams: u16,
     },
     /// Notification kind not decoded by the crate yet.
-    Other
-    {
+    Other {
         /// Raw SCTP notification type.
         kind: u16,
         /// Raw notification flags.
@@ -668,8 +656,7 @@ pub enum SctpNotification
 
 /// Coarse notification category used by transport consumers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SctpNotificationKind
-{
+pub enum SctpNotificationKind {
     /// [`SctpNotification::AssocChange`].
     AssocChange,
     /// [`SctpNotification::Shutdown`].
@@ -696,13 +683,10 @@ pub enum SctpNotificationKind
     Other,
 }
 
-impl SctpNotification
-{
+impl SctpNotification {
     /// Returns the notification kind without exposing payload details.
-    pub const fn kind(&self) -> SctpNotificationKind
-    {
-        match self
-        {
+    pub const fn kind(&self) -> SctpNotificationKind {
+        match self {
             Self::AssocChange { .. } => SctpNotificationKind::AssocChange,
             Self::Shutdown { .. } => SctpNotificationKind::Shutdown,
             Self::PeerAddrChange { .. } => SctpNotificationKind::PeerAddrChange,
@@ -721,8 +705,7 @@ impl SctpNotification
 
 /// Result metadata returned by [`SctpStream::recv_msg`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SctpRecvMeta
-{
+pub enum SctpRecvMeta {
     /// Regular user data was received and the contained metadata came from
     /// `SCTP_RCVINFO`.
     Data(SctpRecvInfo),
@@ -730,55 +713,44 @@ pub enum SctpRecvMeta
     Notification(SctpNotification),
 }
 
-impl SctpRecvMeta
-{
+impl SctpRecvMeta {
     /// Returns `true` when the receive completed with user data.
-    pub const fn is_data(&self) -> bool
-    {
+    pub const fn is_data(&self) -> bool {
         matches!(self, Self::Data(_))
     }
 
     /// Returns `true` when the receive completed with an SCTP notification.
-    pub const fn is_notification(&self) -> bool
-    {
+    pub const fn is_notification(&self) -> bool {
         matches!(self, Self::Notification(_))
     }
 
     /// Returns a shared reference to the receive data metadata, if present.
-    pub const fn data(&self) -> Option<&SctpRecvInfo>
-    {
-        match self
-        {
+    pub const fn data(&self) -> Option<&SctpRecvInfo> {
+        match self {
             Self::Data(info) => Some(info),
             Self::Notification(_) => None,
         }
     }
 
     /// Returns a shared reference to the SCTP notification, if present.
-    pub const fn notification(&self) -> Option<&SctpNotification>
-    {
-        match self
-        {
+    pub const fn notification(&self) -> Option<&SctpNotification> {
+        match self {
             Self::Data(_) => None,
             Self::Notification(notification) => Some(notification),
         }
     }
 
     /// Extracts the receive data metadata, if present.
-    pub const fn into_data(self) -> Option<SctpRecvInfo>
-    {
-        match self
-        {
+    pub const fn into_data(self) -> Option<SctpRecvInfo> {
+        match self {
             Self::Data(info) => Some(info),
             Self::Notification(_) => None,
         }
     }
 
     /// Extracts the SCTP notification, if present.
-    pub const fn into_notification(self) -> Option<SctpNotification>
-    {
-        match self
-        {
+    pub const fn into_notification(self) -> Option<SctpNotification> {
+        match self {
             Self::Data(_) => None,
             Self::Notification(notification) => Some(notification),
         }
@@ -787,8 +759,7 @@ impl SctpRecvMeta
 
 /// Typed SCTP notification subscription policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpNotificationMask
-{
+pub struct SctpNotificationMask {
     /// Association state notifications.
     pub association: bool,
     /// Peer-address/path state notifications.
@@ -815,10 +786,8 @@ pub struct SctpNotificationMask
     pub stream_change: bool,
 }
 
-impl SctpNotificationMask
-{
-    pub const fn none() -> Self
-    {
+impl SctpNotificationMask {
+    pub const fn none() -> Self {
         Self {
             association: false,
             address: false,
@@ -835,8 +804,7 @@ impl SctpNotificationMask
         }
     }
 
-    pub const fn all() -> Self
-    {
+    pub const fn all() -> Self {
         Self {
             association: true,
             address: true,
@@ -855,8 +823,7 @@ impl SctpNotificationMask
 
     /// Notification set matching the crate's current signaling-oriented rich
     /// receive behavior.
-    pub const fn signaling_default() -> Self
-    {
+    pub const fn signaling_default() -> Self {
         Self {
             association: true,
             address: true,
@@ -874,31 +841,26 @@ impl SctpNotificationMask
     }
 }
 
-impl Default for SctpNotificationMask
-{
-    fn default() -> Self
-    {
+impl Default for SctpNotificationMask {
+    fn default() -> Self {
         Self::signaling_default()
     }
 }
 
 #[repr(C, packed(4))]
-struct SctpPrimRaw
-{
+struct SctpPrimRaw {
     assoc_id: libc::sctp_assoc_t,
     addr: libc::sockaddr_storage,
 }
 
 #[repr(C, packed(4))]
-struct SctpSetPeerPrimRaw
-{
+struct SctpSetPeerPrimRaw {
     assoc_id: libc::sctp_assoc_t,
     addr: libc::sockaddr_storage,
 }
 
 #[repr(C, packed(4))]
-struct SctpPaddrParamsRaw
-{
+struct SctpPaddrParamsRaw {
     assoc_id: libc::sctp_assoc_t,
     address: libc::sockaddr_storage,
     heartbeat_interval_ms: u32,
@@ -911,15 +873,13 @@ struct SctpPaddrParamsRaw
 }
 
 #[repr(C)]
-struct SctpAssocValueRaw
-{
+struct SctpAssocValueRaw {
     assoc_id: libc::sctp_assoc_t,
     assoc_value: u32,
 }
 
 #[repr(C, packed(4))]
-struct SctpAssocParamsRaw
-{
+struct SctpAssocParamsRaw {
     assoc_id: libc::sctp_assoc_t,
     assoc_max_retrans: u16,
     peer_destinations: u16,
@@ -928,10 +888,8 @@ struct SctpAssocParamsRaw
     cookie_life_ms: u32,
 }
 
-impl SctpAssocParamsRaw
-{
-    fn get(fd: RawFd) -> io::Result<Self>
-    {
+impl SctpAssocParamsRaw {
+    fn get(fd: RawFd) -> io::Result<Self> {
         let mut raw = Self {
             assoc_id: 0,
             assoc_max_retrans: 0,
@@ -950,12 +908,10 @@ impl SctpAssocParamsRaw
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        if optlen as usize != std::mem::size_of::<Self>()
-        {
+        if optlen as usize != std::mem::size_of::<Self>() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(raw)
@@ -963,18 +919,15 @@ impl SctpAssocParamsRaw
 }
 
 #[repr(C, packed(4))]
-struct SctpRtoInfoRaw
-{
+struct SctpRtoInfoRaw {
     assoc_id: libc::sctp_assoc_t,
     rto_initial_ms: u32,
     rto_max_ms: u32,
     rto_min_ms: u32,
 }
 
-impl SctpRtoInfoRaw
-{
-    fn get(fd: RawFd) -> io::Result<Self>
-    {
+impl SctpRtoInfoRaw {
+    fn get(fd: RawFd) -> io::Result<Self> {
         let mut raw = Self {
             assoc_id: 0,
             rto_initial_ms: 0,
@@ -991,12 +944,10 @@ impl SctpRtoInfoRaw
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        if optlen as usize != std::mem::size_of::<Self>()
-        {
+        if optlen as usize != std::mem::size_of::<Self>() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(raw)
@@ -1004,25 +955,21 @@ impl SctpRtoInfoRaw
 }
 
 #[repr(C)]
-struct SctpResetStreamsHeader
-{
+struct SctpResetStreamsHeader {
     assoc_id: libc::sctp_assoc_t,
     flags: u16,
     number_streams: u16,
 }
 
 #[repr(C)]
-struct SctpAddStreamsRaw
-{
+struct SctpAddStreamsRaw {
     assoc_id: libc::sctp_assoc_t,
     inbound_streams: u16,
     outbound_streams: u16,
 }
 
-impl SctpPaddrParamsRaw
-{
-    fn from_public(params: SctpPeerAddrParams) -> Self
-    {
+impl SctpPaddrParamsRaw {
+    fn from_public(params: SctpPeerAddrParams) -> Self {
         Self {
             assoc_id: params.assoc_id,
             address: option_socket_addr_to_storage(params.address),
@@ -1036,8 +983,7 @@ impl SctpPaddrParamsRaw
         }
     }
 
-    fn to_public(&self) -> io::Result<SctpPeerAddrParams>
-    {
+    fn to_public(&self) -> io::Result<SctpPeerAddrParams> {
         Ok(SctpPeerAddrParams {
             assoc_id: unsafe { std::ptr::addr_of!(self.assoc_id).read_unaligned() },
             address: storage_to_option_socket_addr(unsafe {
@@ -1059,8 +1005,7 @@ impl SctpPaddrParamsRaw
 }
 
 #[repr(C, packed(4))]
-struct SctpPaddrInfoRaw
-{
+struct SctpPaddrInfoRaw {
     assoc_id: libc::sctp_assoc_t,
     address: libc::sockaddr_storage,
     state: i32,
@@ -1070,10 +1015,8 @@ struct SctpPaddrInfoRaw
     mtu: u32,
 }
 
-impl SctpPaddrInfoRaw
-{
-    fn from_address(address: SocketAddr) -> Self
-    {
+impl SctpPaddrInfoRaw {
+    fn from_address(address: SocketAddr) -> Self {
         Self {
             assoc_id: 0,
             address: option_socket_addr_to_storage(Some(address)),
@@ -1085,8 +1028,7 @@ impl SctpPaddrInfoRaw
         }
     }
 
-    fn to_public(&self) -> io::Result<SctpPeerAddrInfo>
-    {
+    fn to_public(&self) -> io::Result<SctpPeerAddrInfo> {
         Ok(SctpPeerAddrInfo {
             assoc_id: unsafe { std::ptr::addr_of!(self.assoc_id).read_unaligned() },
             address: socket_addr_from_c(
@@ -1107,8 +1049,7 @@ impl SctpPaddrInfoRaw
 }
 
 #[repr(C, packed(4))]
-struct SctpStatusRaw
-{
+struct SctpStatusRaw {
     assoc_id: libc::sctp_assoc_t,
     state: i32,
     receiver_window: u32,
@@ -1120,10 +1061,8 @@ struct SctpStatusRaw
     primary_path: SctpPaddrInfoRaw,
 }
 
-impl SctpStatusRaw
-{
-    fn new() -> Self
-    {
+impl SctpStatusRaw {
+    fn new() -> Self {
         Self {
             assoc_id: 0,
             state: 0,
@@ -1145,8 +1084,7 @@ impl SctpStatusRaw
         }
     }
 
-    fn to_public(&self) -> io::Result<SctpAssocStatus>
-    {
+    fn to_public(&self) -> io::Result<SctpAssocStatus> {
         Ok(SctpAssocStatus {
             assoc_id: unsafe { std::ptr::addr_of!(self.assoc_id).read_unaligned() },
             state: unsafe { std::ptr::addr_of!(self.state).read_unaligned() },
@@ -1169,8 +1107,7 @@ impl SctpStatusRaw
 }
 
 #[repr(C, packed(4))]
-struct SctpPaddrParamsRawLegacy
-{
+struct SctpPaddrParamsRawLegacy {
     assoc_id: libc::sctp_assoc_t,
     address: libc::sockaddr_storage,
     heartbeat_interval_ms: u32,
@@ -1180,10 +1117,8 @@ struct SctpPaddrParamsRawLegacy
     flags: u32,
 }
 
-impl SctpPaddrParamsRawLegacy
-{
-    fn from_public(params: SctpPeerAddrParams) -> Self
-    {
+impl SctpPaddrParamsRawLegacy {
+    fn from_public(params: SctpPeerAddrParams) -> Self {
         Self {
             assoc_id: params.assoc_id,
             address: option_socket_addr_to_storage(params.address),
@@ -1195,8 +1130,7 @@ impl SctpPaddrParamsRawLegacy
         }
     }
 
-    fn to_public(&self) -> io::Result<SctpPeerAddrParams>
-    {
+    fn to_public(&self) -> io::Result<SctpPeerAddrParams> {
         Ok(SctpPeerAddrParams {
             assoc_id: unsafe { std::ptr::addr_of!(self.assoc_id).read_unaligned() },
             address: storage_to_option_socket_addr(unsafe {
@@ -1217,18 +1151,20 @@ impl SctpPaddrParamsRawLegacy
     }
 }
 
-struct AcceptSlot
-{
+/// Reusable accept-side submission state kept by [`SctpListener`].
+struct AcceptSlot {
+    /// Completion state for the current or last accept submission.
     state_ptr: *mut CompletionState,
+    /// True while an [`AcceptFuture`] is borrowing this slot.
     in_use: bool,
+    /// Remote address storage filled by the kernel during `accept`.
     addr: libc::sockaddr_storage,
+    /// Length of the returned remote address.
     addrlen: libc::socklen_t,
 }
 
-impl AcceptSlot
-{
-    fn new() -> Self
-    {
+impl AcceptSlot {
+    fn new() -> Self {
         Self {
             state_ptr: std::ptr::null_mut(),
             in_use: false,
@@ -1237,8 +1173,7 @@ impl AcceptSlot
         }
     }
 
-    fn prepare(&mut self)
-    {
+    fn prepare(&mut self) {
         debug_assert!(
             !self.in_use || self.state_ptr.is_null() || unsafe { (*self.state_ptr).is_completed() },
             "runtime sctp accept slot still in flight"
@@ -1252,13 +1187,10 @@ impl AcceptSlot
         self.addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     }
 
-    fn drop_future(&mut self)
-    {
-        if !self.state_ptr.is_null()
-        {
+    fn drop_future(&mut self) {
+        if !self.state_ptr.is_null() {
             unsafe {
-                if (*self.state_ptr).is_completed() && (*self.state_ptr).result >= 0
-                {
+                if (*self.state_ptr).is_completed() && (*self.state_ptr).result >= 0 {
                     close_fd((*self.state_ptr).result as RawFd);
                 }
                 drop_op_ptr_unchecked(&mut self.state_ptr);
@@ -1268,27 +1200,30 @@ impl AcceptSlot
         self.in_use = false;
     }
 
-    fn drop_cached_state(&mut self)
-    {
+    fn drop_cached_state(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
         self.in_use = false;
     }
 }
 
-struct ConnectSlot
-{
+/// Reusable connect-side submission state kept by [`SctpConnector`].
+struct ConnectSlot {
+    /// Completion state for the current or last connect submission.
     state_ptr: *mut CompletionState,
+    /// True while a [`ConnectFuture`] is borrowing this slot.
     in_use: bool,
+    /// Socket being configured and connected for the current attempt.
     fd: RawFd,
+    /// Prepared remote address for the current connect attempt.
     addr: libc::sockaddr_storage,
+    /// Length of the prepared remote address.
     addrlen: libc::socklen_t,
+    /// Socket configuration to apply after association establishment.
     connected_config: SctpSocketConfig,
 }
 
-impl ConnectSlot
-{
-    fn new() -> Self
-    {
+impl ConnectSlot {
+    fn new() -> Self {
         Self {
             state_ptr: std::ptr::null_mut(),
             in_use: false,
@@ -1304,8 +1239,7 @@ impl ConnectSlot
         local_addr: Option<SocketAddr>,
         remote_addr: SocketAddr,
         config: SctpSocketConfig,
-    ) -> io::Result<()>
-    {
+    ) -> io::Result<()> {
         debug_assert!(
             !self.in_use || self.state_ptr.is_null() || unsafe { (*self.state_ptr).is_completed() },
             "runtime sctp connect slot still in flight"
@@ -1317,26 +1251,21 @@ impl ConnectSlot
         );
         self.connected_config = config;
         self.in_use = true;
-        self.fd = match new_sctp_socket(socket_domain(remote_addr), libc::SOCK_STREAM)
-        {
+        self.fd = match new_sctp_socket(socket_domain(remote_addr), libc::SOCK_STREAM) {
             Ok(fd) => fd,
-            Err(err) =>
-            {
+            Err(err) => {
                 self.in_use = false;
                 return Err(err);
             }
         };
-        if let Err(err) = configure_sctp_socket(self.fd, config)
-        {
+        if let Err(err) = configure_sctp_socket(self.fd, config) {
             self.cleanup_fd();
             self.in_use = false;
             return Err(err);
         }
 
-        if let Some(local_addr) = local_addr
-        {
-            if let Err(err) = set_reuse_addr(self.fd)
-            {
+        if let Some(local_addr) = local_addr {
+            if let Err(err) = set_reuse_addr(self.fd) {
                 self.cleanup_fd();
                 self.in_use = false;
                 return Err(err);
@@ -1349,8 +1278,7 @@ impl ConnectSlot
                     sockaddr_len,
                 )
             };
-            if bind_res < 0
-            {
+            if bind_res < 0 {
                 let err = io::Error::last_os_error();
                 self.cleanup_fd();
                 self.in_use = false;
@@ -1364,45 +1292,38 @@ impl ConnectSlot
         Ok(())
     }
 
-    fn cleanup_fd(&mut self)
-    {
+    fn cleanup_fd(&mut self) {
         close_if_valid(&mut self.fd);
     }
 
-    fn take_stream(&mut self, remote_addr: SocketAddr) -> SctpStream
-    {
+    fn take_stream(&mut self, remote_addr: SocketAddr) -> SctpStream {
         let fd = self.fd;
         self.fd = -1;
         SctpStream::from_raw_fd(fd, remote_addr)
     }
 
-    fn drop_future(&mut self)
-    {
+    fn drop_future(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
         self.cleanup_fd();
         self.in_use = false;
     }
 
-    fn drop_cached_state(&mut self)
-    {
+    fn drop_cached_state(&mut self) {
         self.drop_future();
     }
 }
 
 /// One-to-one SCTP listener with a reusable accept slot.
-pub struct SctpListener
-{
+pub struct SctpListener {
     fd: RuntimeFd,
     local_addr: SocketAddr,
     accept_slot: AcceptSlot,
     accepted_config: SctpSocketConfig,
 }
 
-impl SctpListener
-{
+impl SctpListener {
     /// Binds a listener, applies init parameters, enables notifications, and starts listening.
-    pub fn bind(addr: SocketAddr, backlog: i32, initmsg: SctpInitConfig) -> io::Result<Self>
-    {
+    pub fn bind(addr: SocketAddr, backlog: i32, initmsg: SctpInitConfig) -> io::Result<Self> {
         Self::bind_with_config(addr, backlog, SctpSocketConfig::rich(initmsg))
     }
 
@@ -1411,16 +1332,13 @@ impl SctpListener
         addr: SocketAddr,
         backlog: i32,
         config: SctpSocketConfig,
-    ) -> io::Result<Self>
-    {
+    ) -> io::Result<Self> {
         let fd = new_sctp_socket(socket_domain(addr), libc::SOCK_STREAM)?;
-        if let Err(err) = configure_sctp_socket(fd, config)
-        {
+        if let Err(err) = configure_sctp_socket(fd, config) {
             close_fd(fd);
             return Err(err);
         }
-        if let Err(err) = set_reuse_addr(fd)
-        {
+        if let Err(err) = set_reuse_addr(fd) {
             close_fd(fd);
             return Err(err);
         }
@@ -1433,26 +1351,22 @@ impl SctpListener
                 sockaddr_len,
             )
         };
-        if bind_res < 0
-        {
+        if bind_res < 0 {
             let err = io::Error::last_os_error();
             close_fd(fd);
             return Err(err);
         }
 
         let listen_res = unsafe { libc::listen(fd, backlog) };
-        if listen_res < 0
-        {
+        if listen_res < 0 {
             let err = io::Error::last_os_error();
             close_fd(fd);
             return Err(err);
         }
 
-        let local_addr = match current_local_addr(fd)
-        {
+        let local_addr = match current_local_addr(fd) {
             Ok(addr) => addr,
-            Err(err) =>
-            {
+            Err(err) => {
                 close_fd(fd);
                 return Err(err);
             }
@@ -1467,14 +1381,12 @@ impl SctpListener
     }
 
     /// Returns the local address currently assigned to the listener.
-    pub fn local_addr(&self) -> SocketAddr
-    {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Starts accepting one SCTP association.
-    pub fn accept(&mut self) -> AcceptFuture<'_>
-    {
+    pub fn accept(&mut self) -> AcceptFuture<'_> {
         self.accept_slot.prepare();
         AcceptFuture {
             fd: self.fd.as_raw_fd(),
@@ -1484,26 +1396,21 @@ impl SctpListener
     }
 }
 
-impl AsRawFd for SctpListener
-{
-    fn as_raw_fd(&self) -> RawFd
-    {
+impl AsRawFd for SctpListener {
+    fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl Drop for SctpListener
-{
-    fn drop(&mut self)
-    {
+impl Drop for SctpListener {
+    fn drop(&mut self) {
         self.accept_slot.drop_cached_state();
     }
 }
 
 /// Initial SCTP association parameters used by listeners and connectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpInitConfig
-{
+pub struct SctpInitConfig {
     /// Requested outbound stream count during association setup.
     pub outbound_streams: u16,
     /// Requested inbound stream count during association setup.
@@ -1514,10 +1421,8 @@ pub struct SctpInitConfig
     pub max_init_timeout_ms: u16,
 }
 
-impl Default for SctpInitConfig
-{
-    fn default() -> Self
-    {
+impl Default for SctpInitConfig {
+    fn default() -> Self {
         Self {
             outbound_streams: 16,
             inbound_streams: 16,
@@ -1527,16 +1432,13 @@ impl Default for SctpInitConfig
     }
 }
 
-impl SctpInitConfig
-{
+impl SctpInitConfig {
     /// Returns a configuration suitable for Diameter-style one-to-one associations.
-    pub fn diameter_default() -> Self
-    {
+    pub fn diameter_default() -> Self {
         Self::default()
     }
 
-    fn as_raw(self) -> libc::sctp_initmsg
-    {
+    fn as_raw(self) -> libc::sctp_initmsg {
         libc::sctp_initmsg {
             sinit_num_ostreams: self.outbound_streams,
             sinit_max_instreams: self.inbound_streams,
@@ -1547,21 +1449,35 @@ impl SctpInitConfig
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SctpSocketOptions
-{
+struct SctpSocketOptions {
+    /// Notification mask applied while the socket is unconnected or before
+    /// listener-accepted associations are finalized.
     notifications: SctpNotificationMask,
+    /// Whether ancillary `SCTP_RCVINFO` metadata is requested from the kernel.
     recv_rcvinfo: bool,
+    /// Whether `SCTP_NODELAY` is enabled on the socket.
     nodelay: bool,
+    /// Optional default send metadata used by the data fast-path send APIs.
     default_send_info: Option<SctpSendInfo>,
+    /// Optional `SO_SNDBUF` size to apply.
     send_buffer_size: Option<usize>,
+    /// Optional `SO_RCVBUF` size to apply.
     recv_buffer_size: Option<usize>,
 }
 
 /// SCTP socket behavior configuration shared by listeners, connectors, and
-/// fast-path stream operations.
+/// stream operations.
+///
+/// Best fast-path choice:
+/// - Use [`SctpSocketConfig::data`] when the workload is data-only and does
+///   not need notifications or `SCTP_RCVINFO`.
+///
+/// Prefer not to use on the fast path:
+/// - Prefer not to use [`SctpSocketConfig::rich`] / [`SctpSocketConfig::signaling`]
+///   for a data-only path. They enable richer metadata behavior for signaling
+///   workloads rather than the leanest data path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SctpSocketConfig
-{
+pub struct SctpSocketConfig {
     /// Association setup parameters used before the socket connects or starts
     /// listening.
     pub init: SctpInitConfig,
@@ -1584,27 +1500,28 @@ pub struct SctpSocketConfig
     pub default_peer_addr_params: Option<SctpPeerAddrParams>,
 }
 
-impl Default for SctpSocketConfig
-{
-    fn default() -> Self
-    {
+impl Default for SctpSocketConfig {
+    fn default() -> Self {
         Self::rich(SctpInitConfig::default())
     }
 }
 
-impl SctpSocketConfig
-{
+impl SctpSocketConfig {
     /// Rich metadata configuration matching the current `send_msg` / `recv_msg`
     /// defaults.
-    pub fn rich(init: SctpInitConfig) -> Self
-    {
+    ///
+    /// Prefer not to use this on the data fast path; use
+    /// [`SctpSocketConfig::data`] instead when metadata is unnecessary.
+    pub fn rich(init: SctpInitConfig) -> Self {
         Self::signaling(init)
     }
 
     /// Signaling-oriented configuration: rich metadata plus the notification
     /// mask that current SCTP users expect.
-    pub fn signaling(init: SctpInitConfig) -> Self
-    {
+    ///
+    /// This is the better choice for signaling-style SCTP use. Prefer
+    /// [`SctpSocketConfig::data`] instead for the leanest data fast path.
+    pub fn signaling(init: SctpInitConfig) -> Self {
         Self {
             init,
             notifications: SctpNotificationMask::signaling_default(),
@@ -1620,8 +1537,10 @@ impl SctpSocketConfig
 
     /// Data-fast-path configuration intended for [`SctpStream::send`] /
     /// [`SctpStream::recv`].
-    pub fn data(init: SctpInitConfig) -> Self
-    {
+    ///
+    /// This is the best configuration to use when the stream only carries
+    /// application data and does not need ancillary metadata or notifications.
+    pub fn data(init: SctpInitConfig) -> Self {
         Self {
             init,
             notifications: SctpNotificationMask::none(),
@@ -1635,8 +1554,7 @@ impl SctpSocketConfig
         }
     }
 
-    fn socket_options(self) -> SctpSocketOptions
-    {
+    fn socket_options(self) -> SctpSocketOptions {
         SctpSocketOptions {
             notifications: self.notifications,
             recv_rcvinfo: self.recv_rcvinfo,
@@ -1653,24 +1571,35 @@ impl SctpSocketConfig
 /// Each individual connect submission still gets its own `CompletionState`
 /// from the reactor pool; the slot only holds the stable socket/address/init
 /// state needed to build the next future.
-pub struct SctpConnector
-{
+///
+/// This is the best SCTP API to use on the repeated outbound connect fast
+/// path. For data-only associations, pair it with
+/// [`SctpSocketConfig::data`] instead of the richer default config.
+pub struct SctpConnector {
+    /// Reusable connect state kept across association attempts.
     connect_slot: ConnectSlot,
+    /// Socket configuration applied to newly created association sockets.
     config: SctpSocketConfig,
+    /// Optional local address to bind before connecting.
     local_addr: Option<SocketAddr>,
 }
 
-impl SctpConnector
-{
+impl SctpConnector {
     /// Creates a connector with the provided init configuration.
-    pub fn new(init: SctpInitConfig) -> Self
-    {
+    ///
+    /// This uses the richer signaling-oriented socket configuration. Prefer
+    /// [`SctpConnector::with_config`] plus [`SctpSocketConfig::data`] when the
+    /// target workload is the SCTP data fast path.
+    pub fn new(init: SctpInitConfig) -> Self {
         Self::with_config(SctpSocketConfig::rich(init))
     }
 
     /// Creates a connector with the provided SCTP socket configuration.
-    pub fn with_config(config: SctpSocketConfig) -> Self
-    {
+    ///
+    /// This is the best constructor when the caller wants explicit control
+    /// over whether the connector is optimized for signaling metadata or the
+    /// leaner data fast path.
+    pub fn with_config(config: SctpSocketConfig) -> Self {
         Self {
             connect_slot: ConnectSlot::new(),
             config,
@@ -1679,15 +1608,13 @@ impl SctpConnector
     }
 
     /// Pins the connector to a specific local address before connecting.
-    pub fn with_local_addr(mut self, addr: SocketAddr) -> Self
-    {
+    pub fn with_local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
     }
 
     /// Starts connecting to the provided remote SCTP peer.
-    pub fn connect(&mut self, remote_addr: SocketAddr) -> io::Result<ConnectFuture<'_>>
-    {
+    pub fn connect(&mut self, remote_addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
         self.connect_slot
             .prepare(self.local_addr, remote_addr, self.config)?;
         Ok(ConnectFuture {
@@ -1704,34 +1631,39 @@ impl SctpConnector
         &mut self,
         remote_addr: SocketAddr,
         timeout_duration: Duration,
-    ) -> io::Result<ConnectTimeoutFuture<'_>>
-    {
+    ) -> io::Result<ConnectTimeoutFuture<'_>> {
         Ok(ConnectTimeoutFuture {
             inner: timeout(timeout_duration, self.connect(remote_addr)?),
         })
     }
 }
 
-impl Drop for SctpConnector
-{
-    fn drop(&mut self)
-    {
+impl Drop for SctpConnector {
+    fn drop(&mut self) {
         self.connect_slot.drop_cached_state();
     }
 }
 
 /// One-to-one SCTP association with generic buffer support.
-pub struct SctpStream
-{
+///
+/// Best fast-path choice:
+/// - Use [`SctpStream::send`] / [`SctpStream::recv`] when the socket was
+///   configured for data-only traffic and the caller does not need per-message
+///   metadata or notifications.
+///
+/// Prefer not to use on the fast path:
+/// - Prefer not to use [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
+///   or the richer signaling config when the workload is just message data.
+pub struct SctpStream {
+    /// Owned SCTP association socket descriptor.
     fd: RuntimeFd,
+    /// Remote address recorded when the association was accepted or connected.
     remote_addr: SocketAddr,
 }
 
-impl SctpStream
-{
+impl SctpStream {
     /// Wraps an already-owned SCTP socket and records its remote peer.
-    pub fn from_raw_fd(fd: RawFd, remote_addr: SocketAddr) -> Self
-    {
+    pub fn from_raw_fd(fd: RawFd, remote_addr: SocketAddr) -> Self {
         Self {
             fd: RuntimeFd::new(fd),
             remote_addr,
@@ -1739,53 +1671,44 @@ impl SctpStream
     }
 
     /// Returns the local address currently assigned to the association socket.
-    pub fn local_addr(&self) -> io::Result<SocketAddr>
-    {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
         current_local_addr(self.fd.as_raw_fd())
     }
 
     /// Returns the remote address associated with the stream.
-    pub fn peer_addr(&self) -> SocketAddr
-    {
+    pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
     /// Sets the `SO_SNDBUF` socket send buffer size.
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()>
-    {
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
-    pub fn send_buffer_size(&self) -> io::Result<usize>
-    {
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
         super::sock_send_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()>
-    {
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
-    pub fn recv_buffer_size(&self) -> io::Result<usize>
-    {
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
         super::sock_recv_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Shuts down the read, write, or both halves of this association socket.
-    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>
-    {
-        let how = match how
-        {
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        let how = match how {
             std::net::Shutdown::Read => libc::SHUT_RD,
             std::net::Shutdown::Write => libc::SHUT_WR,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
         let rc = unsafe { libc::shutdown(self.fd.as_raw_fd(), how) };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -1795,8 +1718,7 @@ impl SctpStream
     ///
     /// This relies on a Linux SCTP address-enumeration socket option and may
     /// fail on systems with partial SCTP support.
-    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>>
-    {
+    pub fn local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
         get_assoc_addrs(self.fd.as_raw_fd(), SCTP_GET_LOCAL_ADDRS_OPT, 0)
     }
 
@@ -1804,8 +1726,7 @@ impl SctpStream
     ///
     /// This relies on a Linux SCTP address-enumeration socket option and may
     /// fail on systems with partial SCTP support.
-    pub fn peer_addrs(&self) -> io::Result<Vec<SocketAddr>>
-    {
+    pub fn peer_addrs(&self) -> io::Result<Vec<SocketAddr>> {
         get_assoc_addrs(self.fd.as_raw_fd(), SCTP_GET_PEER_ADDRS_OPT, 0)
     }
 
@@ -1813,8 +1734,7 @@ impl SctpStream
     ///
     /// This is capability-dependent and may be unavailable on kernels with
     /// limited SCTP status support.
-    pub fn status(&self) -> io::Result<SctpAssocStatus>
-    {
+    pub fn status(&self) -> io::Result<SctpAssocStatus> {
         let mut raw = SctpStatusRaw::new();
         let mut optlen = std::mem::size_of::<SctpStatusRaw>() as libc::socklen_t;
         let rc = unsafe {
@@ -1826,12 +1746,10 @@ impl SctpStream
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        if optlen as usize != std::mem::size_of::<SctpStatusRaw>()
-        {
+        if optlen as usize != std::mem::size_of::<SctpStatusRaw>() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
 
@@ -1841,8 +1759,7 @@ impl SctpStream
     /// Returns read-only transport information for one peer address.
     ///
     /// This depends on `SCTP_GET_PEER_ADDR_INFO` support in the running kernel.
-    pub fn peer_addr_info(&self, peer_addr: SocketAddr) -> io::Result<SctpPeerAddrInfo>
-    {
+    pub fn peer_addr_info(&self, peer_addr: SocketAddr) -> io::Result<SctpPeerAddrInfo> {
         let mut raw = SctpPaddrInfoRaw::from_address(peer_addr);
         let mut optlen = std::mem::size_of::<SctpPaddrInfoRaw>() as libc::socklen_t;
         let rc = unsafe {
@@ -1854,12 +1771,10 @@ impl SctpStream
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        if optlen as usize != std::mem::size_of::<SctpPaddrInfoRaw>()
-        {
+        if optlen as usize != std::mem::size_of::<SctpPaddrInfoRaw>() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
 
@@ -1870,8 +1785,7 @@ impl SctpStream
     ///
     /// This is derived from [`SctpStream::status`] and has the same capability
     /// requirements.
-    pub fn primary_path_info(&self) -> io::Result<SctpPeerAddrInfo>
-    {
+    pub fn primary_path_info(&self) -> io::Result<SctpPeerAddrInfo> {
         self.status().map(|status| status.primary_path)
     }
 
@@ -1889,8 +1803,7 @@ impl SctpStream
     /// # Ok(())
     /// # }
     /// ```
-    pub fn reconfig_supported(&self) -> io::Result<SctpReconfigFlags>
-    {
+    pub fn reconfig_supported(&self) -> io::Result<SctpReconfigFlags> {
         let mut raw = SctpAssocValueRaw {
             assoc_id: 0,
             assoc_value: 0,
@@ -1905,12 +1818,10 @@ impl SctpStream
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        if optlen as usize != std::mem::size_of::<SctpAssocValueRaw>()
-        {
+        if optlen as usize != std::mem::size_of::<SctpAssocValueRaw>() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
 
@@ -1936,8 +1847,7 @@ impl SctpStream
     /// # Ok(())
     /// # }
     /// ```
-    pub fn enable_stream_reset(&self, flags: SctpReconfigFlags) -> io::Result<()>
-    {
+    pub fn enable_stream_reset(&self, flags: SctpReconfigFlags) -> io::Result<()> {
         let raw = SctpAssocValueRaw {
             assoc_id: flags.assoc_id,
             assoc_value: flags.flags,
@@ -1963,10 +1873,8 @@ impl SctpStream
     /// # Ok(())
     /// # }
     /// ```
-    pub fn reset_streams(&self, request: &SctpResetStreams) -> io::Result<()>
-    {
-        if request.streams.len() > (u16::MAX as usize)
-        {
+    pub fn reset_streams(&self, request: &SctpResetStreams) -> io::Result<()> {
+        if request.streams.len() > (u16::MAX as usize) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
 
@@ -1985,8 +1893,7 @@ impl SctpStream
                 buffer.as_mut_ptr(),
                 header_len,
             );
-            if streams_len != 0
-            {
+            if streams_len != 0 {
                 std::ptr::copy_nonoverlapping(
                     request.streams.as_ptr() as *const u8,
                     buffer.as_mut_ptr().add(header_len),
@@ -2004,8 +1911,7 @@ impl SctpStream
                 total_len as libc::socklen_t,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
 
@@ -2025,8 +1931,7 @@ impl SctpStream
     /// # Ok(())
     /// # }
     /// ```
-    pub fn add_streams(&self, request: SctpAddStreams) -> io::Result<()>
-    {
+    pub fn add_streams(&self, request: SctpAddStreams) -> io::Result<()> {
         let raw = SctpAddStreamsRaw {
             assoc_id: request.assoc_id,
             inbound_streams: request.inbound_streams,
@@ -2041,8 +1946,7 @@ impl SctpStream
     }
 
     /// Reads `SCTP_PEER_ADDR_PARAMS` for the whole association or for one specific path.
-    pub fn peer_addr_params(&self, address: Option<SocketAddr>) -> io::Result<SctpPeerAddrParams>
-    {
+    pub fn peer_addr_params(&self, address: Option<SocketAddr>) -> io::Result<SctpPeerAddrParams> {
         let mut buffer = [0u8; std::mem::size_of::<SctpPaddrParamsRaw>()];
         let request = SctpPaddrParamsRaw::from_public(SctpPeerAddrParams {
             address,
@@ -2065,28 +1969,24 @@ impl SctpStream
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        if optlen as usize == std::mem::size_of::<SctpPaddrParamsRaw>()
-        {
+        if optlen as usize == std::mem::size_of::<SctpPaddrParamsRaw>() {
             let raw =
                 unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRaw) };
             return raw.to_public();
         }
 
-        if optlen as usize == std::mem::size_of::<SctpPaddrParamsRawLegacy>()
-        {
+        if optlen as usize == std::mem::size_of::<SctpPaddrParamsRawLegacy>() {
             let raw = unsafe {
                 std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRawLegacy)
             };
             return raw.to_public();
         }
 
-        if (optlen as usize) < std::mem::size_of::<SctpPaddrParamsRawLegacy>()
-        {
+        if (optlen as usize) < std::mem::size_of::<SctpPaddrParamsRawLegacy>() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
 
@@ -2095,14 +1995,12 @@ impl SctpStream
     }
 
     /// Applies `SCTP_PEER_ADDR_PARAMS` to the whole association or to one specific path.
-    pub fn set_peer_addr_params(&self, params: SctpPeerAddrParams) -> io::Result<()>
-    {
+    pub fn set_peer_addr_params(&self, params: SctpPeerAddrParams) -> io::Result<()> {
         apply_peer_addr_params_raw(self.fd.as_raw_fd(), params)
     }
 
     /// Requests that the local SCTP stack use the provided peer address as primary.
-    pub fn set_primary_addr(&self, peer_addr: SocketAddr) -> io::Result<()>
-    {
+    pub fn set_primary_addr(&self, peer_addr: SocketAddr) -> io::Result<()> {
         let raw = SctpPrimRaw {
             assoc_id: 0,
             addr: option_socket_addr_to_storage(Some(peer_addr)),
@@ -2119,8 +2017,7 @@ impl SctpStream
     ///
     /// Some Linux SCTP deployments reject this with `EPERM`/`EACCES` when dynamic address
     /// reconfiguration is disabled by kernel policy or association capabilities.
-    pub fn set_peer_primary_addr(&self, local_addr: SocketAddr) -> io::Result<()>
-    {
+    pub fn set_peer_primary_addr(&self, local_addr: SocketAddr) -> io::Result<()> {
         let raw = SctpSetPeerPrimRaw {
             assoc_id: 0,
             addr: option_socket_addr_to_storage(Some(local_addr)),
@@ -2134,15 +2031,13 @@ impl SctpStream
     }
 
     /// Returns the remote address associated with the stream.
-    pub fn remote_addr(&self) -> SocketAddr
-    {
+    pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
 
     /// Applies default SCTP send metadata to this socket. This is used by the
     /// fast-path [`SctpStream::send`] API.
-    pub fn set_default_send_info(&self, info: SctpSendInfo) -> io::Result<()>
-    {
+    pub fn set_default_send_info(&self, info: SctpSendInfo) -> io::Result<()> {
         set_sock_opt(
             self.fd.as_raw_fd(),
             libc::IPPROTO_SCTP,
@@ -2152,8 +2047,7 @@ impl SctpStream
     }
 
     /// Applies a typed SCTP notification subscription mask.
-    pub fn set_notification_mask(&self, mask: SctpNotificationMask) -> io::Result<()>
-    {
+    pub fn set_notification_mask(&self, mask: SctpNotificationMask) -> io::Result<()> {
         let recv_rcvinfo: libc::c_int = super::get_sock_opt(
             self.fd.as_raw_fd(),
             libc::IPPROTO_SCTP,
@@ -2163,8 +2057,7 @@ impl SctpStream
     }
 
     /// Applies association-wide retransmission and RTO policy.
-    pub fn apply_assoc_config(&self, config: &SctpAssocConfig) -> io::Result<()>
-    {
+    pub fn apply_assoc_config(&self, config: &SctpAssocConfig) -> io::Result<()> {
         apply_assoc_config_raw(self.fd.as_raw_fd(), *config)
     }
 
@@ -2172,8 +2065,7 @@ impl SctpStream
     ///
     /// `params.address` must be `None`; use [`SctpStream::set_peer_addr_params`]
     /// for path-specific overrides.
-    pub fn set_default_peer_addr_params(&self, params: SctpPeerAddrParams) -> io::Result<()>
-    {
+    pub fn set_default_peer_addr_params(&self, params: SctpPeerAddrParams) -> io::Result<()> {
         apply_default_peer_addr_params(self.fd.as_raw_fd(), params)
     }
 
@@ -2182,14 +2074,11 @@ impl SctpStream
     /// This path is intended for sockets configured without SCTP
     /// notifications and without `SCTP_RCVINFO`. It returns only the received
     /// byte count, matching the common data-only case.
-    pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> DataRecvFuture<'_, B>
-    {
+    pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> DataRecvFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv", len, buffer.writable_len())
-        {
+        let len = match checked_read_len("recv", len, buffer.writable_len()) {
             Ok(len) => len,
-            Err(err) =>
-            {
+            Err(err) => {
                 input_error = Some(err);
                 0
             }
@@ -2207,8 +2096,7 @@ impl SctpStream
     /// Starts one connected data send on the fast path.
     ///
     /// Per-message metadata comes from the socket's default send info, if any.
-    pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> DataSendFuture<'_, B>
-    {
+    pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> DataSendFuture<'_, B> {
         DataSendFuture {
             fd: self.fd.as_raw_fd(),
             state_ptr: std::ptr::null_mut(),
@@ -2218,14 +2106,11 @@ impl SctpStream
     }
 
     /// Starts one message-oriented receive.
-    pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B>
-    {
+    pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv_msg", len, buffer.writable_len())
-        {
+        let len = match checked_read_len("recv_msg", len, buffer.writable_len()) {
             Ok(len) => len,
-            Err(err) =>
-            {
+            Err(err) => {
                 input_error = Some(err);
                 0
             }
@@ -2250,8 +2135,7 @@ impl SctpStream
         &mut self,
         buffer: B,
         info: SctpSendInfo,
-    ) -> SendFuture<'_, B>
-    {
+    ) -> SendFuture<'_, B> {
         SendFuture {
             fd: self.fd.as_raw_fd(),
             state_ptr: std::ptr::null_mut(),
@@ -2274,8 +2158,7 @@ impl SctpStream
     pub fn recv_msg_vectored<const N: usize>(
         &mut self,
         buffer: IoBuffVecMut<N>,
-    ) -> RecvVectoredFuture<'_, N>
-    {
+    ) -> RecvVectoredFuture<'_, N> {
         let mut buffer = buffer;
         let mut iovecs: [MaybeUninit<libc::iovec>; N] =
             unsafe { MaybeUninit::uninit().assume_init() };
@@ -2302,8 +2185,7 @@ impl SctpStream
         &mut self,
         buffer: IoBuffVec<N>,
         info: SctpSendInfo,
-    ) -> SendVectoredFuture<'_, N>
-    {
+    ) -> SendVectoredFuture<'_, N> {
         let mut iovecs: [MaybeUninit<libc::iovec>; N] =
             unsafe { MaybeUninit::uninit().assume_init() };
         let (iov_count, _) = buffer.fill_write_iovecs_and_len(&mut iovecs);
@@ -2321,10 +2203,8 @@ impl SctpStream
     }
 }
 
-impl AsRawFd for SctpStream
-{
-    fn as_raw_fd(&self) -> RawFd
-    {
+impl AsRawFd for SctpStream {
+    fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
@@ -2332,22 +2212,25 @@ impl AsRawFd for SctpStream
 use super::{opt_mut, opt_ref, opt_take};
 
 #[doc(hidden)]
-pub struct DataRecvFuture<'a, B: IoBuffReadWrite>
-{
+pub struct DataRecvFuture<'a, B: IoBuffReadWrite> {
+    /// SCTP association socket descriptor used for this data-only receive.
     fd: RawFd,
+    /// Completion state for the submitted receive operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Maximum bytes requested from the kernel.
     len: u32,
+    /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
+    /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut SctpStream>,
 }
 
-impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B>
-{
+impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
     type Output = (io::Result<usize>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.state_ptr.is_null()
@@ -2357,19 +2240,16 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B>
             return Poll::Ready((Err(err), buffer));
         }
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
 
@@ -2379,12 +2259,10 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B>
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -2399,8 +2277,7 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -2413,56 +2290,50 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadWrite> Drop for DataRecvFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadWrite> Drop for DataRecvFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
 #[doc(hidden)]
-pub struct DataSendFuture<'a, B: IoBuffReadOnly>
-{
+pub struct DataSendFuture<'a, B: IoBuffReadOnly> {
+    /// SCTP association socket descriptor used for this data-only send.
     fd: RawFd,
+    /// Completion state for the submitted send operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
+    /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut SctpStream>,
 }
 
-impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B>
-{
+impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
     type Output = (io::Result<usize>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
                 return Poll::Ready((Ok(result as usize), buffer));
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -2478,8 +2349,7 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -2492,36 +2362,42 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadOnly> Drop for DataSendFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadOnly> Drop for DataSendFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
 #[doc(hidden)]
-pub struct RecvFuture<'a, B: IoBuffReadWrite>
-{
+pub struct RecvFuture<'a, B: IoBuffReadWrite> {
+    /// SCTP association socket descriptor used for this recvmsg path.
     fd: RawFd,
+    /// Completion state for the submitted receive operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Maximum message bytes requested from the kernel.
     len: u32,
+    /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
+    /// Single-entry iovec describing the caller buffer to `recvmsg`.
     iovec: MaybeUninit<libc::iovec>,
+    /// Peer address scratch returned by the kernel when available.
     addr: MaybeUninit<libc::sockaddr_storage>,
+    /// Length of the returned peer address.
     addrlen: libc::socklen_t,
+    /// Control-message scratch used for `SCTP_RCVINFO`.
     control: [u8; cmsg_space(std::mem::size_of::<libc::sctp_rcvinfo>())],
+    /// Message header wrapping the address, data, and control scratch.
     msghdr: MaybeUninit<libc::msghdr>,
+    /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut SctpStream>,
 }
 
-impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
-{
+impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
     type Output = (io::Result<(usize, SctpRecvMeta)>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.state_ptr.is_null()
@@ -2531,18 +2407,15 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
             return Poll::Ready((Err(err), buffer));
         }
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
-                if result < 0
-                {
+                if result < 0 {
                     let buffer = unsafe { opt_take(&mut this.buffer) };
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
@@ -2556,12 +2429,9 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
                     let ptr = opt_mut(&mut this.buffer).as_mut_ptr();
                     std::slice::from_raw_parts(ptr, actual)
                 };
-                let meta = if (msg.msg_flags & libc::MSG_NOTIFICATION) != 0
-                {
+                let meta = if (msg.msg_flags & libc::MSG_NOTIFICATION) != 0 {
                     parse_notification(data_slice)
-                }
-                else
-                {
+                } else {
                     parse_rcvinfo(&this.control[..], msg.msg_controllen).map(SctpRecvMeta::Data)
                 };
 
@@ -2570,20 +2440,17 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
                     buffer.set_written_len(actual);
                 }
 
-                return match meta
-                {
+                return match meta {
                     Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
                     Err(err) => Poll::Ready((Err(err), buffer)),
                 };
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -2612,8 +2479,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -2626,60 +2492,58 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
 #[doc(hidden)]
-pub struct SendFuture<'a, B: IoBuffReadOnly>
-{
+pub struct SendFuture<'a, B: IoBuffReadOnly> {
+    /// SCTP association socket descriptor used for this sendmsg path.
     fd: RawFd,
+    /// Completion state for the submitted send operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
+    /// Single-entry iovec describing the caller buffer to `sendmsg`.
     iovec: MaybeUninit<libc::iovec>,
+    /// Control-message scratch used to carry `SCTP_SNDINFO`.
     control: [u8; cmsg_space(std::mem::size_of::<libc::sctp_sndinfo>())],
+    /// Message header wrapping the data and ancillary send metadata.
     msghdr: MaybeUninit<libc::msghdr>,
+    /// Public send metadata translated into the kernel ABI layout.
     sndinfo: libc::sctp_sndinfo,
+    /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut SctpStream>,
 }
 
-impl<B: IoBuffReadOnly> Future for SendFuture<'_, B>
-{
+impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
     type Output = (io::Result<usize>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
                 return Poll::Ready((Ok(result as usize), buffer));
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -2710,8 +2574,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -2724,10 +2587,8 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
@@ -2737,63 +2598,61 @@ impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B>
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct RecvVectoredFuture<'a, const N: usize>
-{
+pub struct RecvVectoredFuture<'a, const N: usize> {
+    /// SCTP association socket descriptor used for this vectored recvmsg path.
     fd: RawFd,
+    /// Completion state for the submitted receive operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned vectored receive chain returned on completion.
     buffer: Option<IoBuffVecMut<N>>,
+    /// Kernel-facing iovec scratch materialized from the receive chain.
     iovecs: [MaybeUninit<libc::iovec>; N],
+    /// Number of initialized entries inside `iovecs`.
     iov_count: usize,
+    /// Peer address scratch returned by the kernel when available.
     addr: MaybeUninit<libc::sockaddr_storage>,
+    /// Length of the returned peer address.
     addrlen: libc::socklen_t,
+    /// Control-message scratch used for `SCTP_RCVINFO`.
     control: [u8; cmsg_space(std::mem::size_of::<libc::sctp_rcvinfo>())],
+    /// Message header wrapping the address, iovecs, and control scratch.
     msghdr: MaybeUninit<libc::msghdr>,
+    /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut SctpStream>,
 }
 
-impl<const N: usize> Future for RecvVectoredFuture<'_, N>
-{
+impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
     type Output = (io::Result<(usize, SctpRecvMeta)>, IoBuffVecMut<N>);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
-                if result < 0
-                {
+                if result < 0 {
                     let buffer = unsafe { opt_take(&mut this.buffer) };
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
 
                 let actual = result as usize;
                 let msg = unsafe { this.msghdr.assume_init_ref() };
-                let data_slice = if this.iov_count == 0
-                {
+                let data_slice = if this.iov_count == 0 {
                     &[]
-                }
-                else
-                {
+                } else {
                     let first_iov = unsafe { &*(this.iovecs.as_ptr() as *const libc::iovec) };
                     let safe_len = std::cmp::min(actual, first_iov.iov_len);
                     unsafe { std::slice::from_raw_parts(first_iov.iov_base as *const u8, safe_len) }
                 };
 
-                let meta = if (msg.msg_flags & libc::MSG_NOTIFICATION) != 0
-                {
+                let meta = if (msg.msg_flags & libc::MSG_NOTIFICATION) != 0 {
                     parse_notification(data_slice)
-                }
-                else
-                {
+                } else {
                     parse_rcvinfo(&this.control[..], msg.msg_controllen).map(SctpRecvMeta::Data)
                 };
 
@@ -2802,26 +2661,22 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N>
                     buffer.distribute_written(actual);
                 }
 
-                return match meta
-                {
+                return match meta {
                     Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
                     Err(err) => Poll::Ready((Err(err), buffer)),
                 };
             }
         }
 
-        if this.iov_count == 0
-        {
+        if this.iov_count == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(io::Error::from(io::ErrorKind::InvalidInput)), buffer));
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -2844,8 +2699,7 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -2858,10 +2712,8 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N>
     }
 }
 
-impl<const N: usize> Drop for RecvVectoredFuture<'_, N>
-{
-    fn drop(&mut self)
-    {
+impl<const N: usize> Drop for RecvVectoredFuture<'_, N> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
@@ -2871,58 +2723,58 @@ impl<const N: usize> Drop for RecvVectoredFuture<'_, N>
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct SendVectoredFuture<'a, const N: usize>
-{
+pub struct SendVectoredFuture<'a, const N: usize> {
+    /// SCTP association socket descriptor used for this vectored sendmsg path.
     fd: RawFd,
+    /// Completion state for the submitted send operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned vectored send chain returned on completion.
     buffer: Option<IoBuffVec<N>>,
+    /// Kernel-facing iovec scratch materialized from the send chain.
     iovecs: [MaybeUninit<libc::iovec>; N],
+    /// Number of initialized entries inside `iovecs`.
     iov_count: usize,
+    /// Control-message scratch used to carry `SCTP_SNDINFO`.
     control: [u8; cmsg_space(std::mem::size_of::<libc::sctp_sndinfo>())],
+    /// Message header wrapping the iovecs and ancillary send metadata.
     msghdr: MaybeUninit<libc::msghdr>,
+    /// Public send metadata translated into the kernel ABI layout.
     sndinfo: libc::sctp_sndinfo,
+    /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut SctpStream>,
 }
 
-impl<const N: usize> Future for SendVectoredFuture<'_, N>
-{
+impl<const N: usize> Future for SendVectoredFuture<'_, N> {
     type Output = (io::Result<usize>, IoBuffVec<N>);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
                 return Poll::Ready((Ok(result as usize), buffer));
             }
         }
 
-        if this.iov_count == 0
-        {
+        if this.iov_count == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Ok(0), buffer));
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -2946,8 +2798,7 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -2960,51 +2811,44 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N>
     }
 }
 
-impl<const N: usize> Drop for SendVectoredFuture<'_, N>
-{
-    fn drop(&mut self)
-    {
+impl<const N: usize> Drop for SendVectoredFuture<'_, N> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
 #[doc(hidden)]
-pub struct AcceptFuture<'a>
-{
+pub struct AcceptFuture<'a> {
+    /// Listening socket descriptor used for the accept submission.
     fd: RawFd,
+    /// Borrowed reusable accept slot owned by the listener.
     slot: &'a mut AcceptSlot,
+    /// Socket configuration to apply to the accepted association after accept.
     accepted_config: SctpSocketConfig,
 }
 
-impl Future for AcceptFuture<'_>
-{
+impl Future for AcceptFuture<'_> {
     type Output = io::Result<(SctpStream, SocketAddr)>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.slot.state_ptr.is_null()
-        {
+        if !this.slot.state_ptr.is_null() {
             let state = unsafe { &*this.slot.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.slot.state_ptr) };
                 this.slot.state_ptr = std::ptr::null_mut();
                 this.slot.in_use = false;
 
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
 
                 let fd = result as RawFd;
-                return match socket_addr_from_c(&this.slot.addr, this.slot.addrlen)
-                {
-                    Ok(remote_addr) =>
-                    {
+                return match socket_addr_from_c(&this.slot.addr, this.slot.addrlen) {
+                    Ok(remote_addr) => {
                         if let Err(err) =
                             apply_sctp_connected_socket_config(fd, this.accepted_config)
                         {
@@ -3013,8 +2857,7 @@ impl Future for AcceptFuture<'_>
                         }
                         Poll::Ready(Ok((SctpStream::from_raw_fd(fd, remote_addr), remote_addr)))
                     }
-                    Err(err) =>
-                    {
+                    Err(err) => {
                         close_fd(fd);
                         Poll::Ready(Err(err))
                     }
@@ -3022,12 +2865,10 @@ impl Future for AcceptFuture<'_>
             }
         }
 
-        if this.slot.state_ptr.is_null()
-        {
+        if this.slot.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 this.slot.in_use = false;
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
@@ -3044,8 +2885,7 @@ impl Future for AcceptFuture<'_>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.slot.state_ptr = std::ptr::null_mut();
                     this.slot.in_use = false;
@@ -3058,42 +2898,36 @@ impl Future for AcceptFuture<'_>
     }
 }
 
-impl Drop for AcceptFuture<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for AcceptFuture<'_> {
+    fn drop(&mut self) {
         self.slot.drop_future();
     }
 }
 
 #[doc(hidden)]
-pub struct ConnectFuture<'a>
-{
+pub struct ConnectFuture<'a> {
+    /// Borrowed reusable connect slot owned by the connector.
     slot: &'a mut ConnectSlot,
+    /// Remote address recorded into the resulting public stream on success.
     remote_addr: SocketAddr,
 }
 
-impl Future for ConnectFuture<'_>
-{
+impl Future for ConnectFuture<'_> {
     type Output = io::Result<SctpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.slot.state_ptr.is_null()
-        {
+        if !this.slot.state_ptr.is_null() {
             let state = unsafe { &*this.slot.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.slot.state_ptr) };
                 this.slot.state_ptr = std::ptr::null_mut();
                 this.slot.in_use = false;
 
-                if result < 0
-                {
+                if result < 0 {
                     let err = io::Error::from_raw_os_error(-result);
                     this.slot.cleanup_fd();
                     return Poll::Ready(Err(err));
@@ -3109,12 +2943,10 @@ impl Future for ConnectFuture<'_>
             }
         }
 
-        if this.slot.state_ptr.is_null()
-        {
+        if this.slot.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 this.slot.in_use = false;
                 this.slot.cleanup_fd();
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
@@ -3130,8 +2962,7 @@ impl Future for ConnectFuture<'_>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.slot.state_ptr = std::ptr::null_mut();
                     this.slot.in_use = false;
@@ -3145,19 +2976,15 @@ impl Future for ConnectFuture<'_>
     }
 }
 
-impl Drop for ConnectFuture<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for ConnectFuture<'_> {
+    fn drop(&mut self) {
         self.slot.drop_future();
     }
 }
 
 #[doc(hidden)]
-pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()>
-{
-    fn dummy_fd() -> io::Result<RawFd>
-    {
+pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()> {
+    fn dummy_fd() -> io::Result<RawFd> {
         let mut fds = [-1; 2];
         let rc = unsafe {
             libc::socketpair(
@@ -3167,19 +2994,16 @@ pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()>
                 fds.as_mut_ptr(),
             )
         };
-        if rc != 0
-        {
+        if rc != 0 {
             return Err(io::Error::last_os_error());
         }
         close_fd(fds[1]);
         Ok(fds[0])
     }
 
-    fn fd_closed(fd: RawFd) -> io::Result<bool>
-    {
+    fn fd_closed(fd: RawFd) -> io::Result<bool> {
         let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if rc == -1
-        {
+        if rc == -1 {
             return Ok(io::Error::last_os_error().raw_os_error() == Some(libc::EBADF));
         }
         Ok(false)
@@ -3200,22 +3024,18 @@ pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()>
 
     slot.drop_future();
 
-    if !slot.state_ptr.is_null() || slot.in_use
-    {
+    if !slot.state_ptr.is_null() || slot.in_use {
         return Err(io::Error::from(io::ErrorKind::Other));
     }
-    if !fd_closed(fd)?
-    {
+    if !fd_closed(fd)? {
         return Err(io::Error::from(io::ErrorKind::Other));
     }
     Ok(())
 }
 
 #[doc(hidden)]
-pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()>
-{
-    fn dummy_fd() -> io::Result<RawFd>
-    {
+pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()> {
+    fn dummy_fd() -> io::Result<RawFd> {
         let mut fds = [-1; 2];
         let rc = unsafe {
             libc::socketpair(
@@ -3225,19 +3045,16 @@ pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()>
                 fds.as_mut_ptr(),
             )
         };
-        if rc != 0
-        {
+        if rc != 0 {
             return Err(io::Error::last_os_error());
         }
         close_fd(fds[1]);
         Ok(fds[0])
     }
 
-    fn fd_closed(fd: RawFd) -> io::Result<bool>
-    {
+    fn fd_closed(fd: RawFd) -> io::Result<bool> {
         let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if rc == -1
-        {
+        if rc == -1 {
             return Ok(io::Error::last_os_error().raw_os_error() == Some(libc::EBADF));
         }
         Ok(false)
@@ -3250,49 +3067,41 @@ pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()>
 
     slot.drop_future();
 
-    if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1
-    {
+    if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 {
         return Err(io::Error::from(io::ErrorKind::Other));
     }
-    if !fd_closed(fd)?
-    {
+    if !fd_closed(fd)? {
         return Err(io::Error::from(io::ErrorKind::Other));
     }
     Ok(())
 }
 
-fn map_connect_timeout(result: Result<io::Result<SctpStream>, Elapsed>) -> io::Result<SctpStream>
-{
-    match result
-    {
+fn map_connect_timeout(result: Result<io::Result<SctpStream>, Elapsed>) -> io::Result<SctpStream> {
+    match result {
         Ok(result) => result,
         Err(_) => Err(io::Error::from(io::ErrorKind::TimedOut)),
     }
 }
 
 /// Connect future with a relative timeout for a reusable [`SctpConnector`].
-pub struct ConnectTimeoutFuture<'a>
-{
+pub struct ConnectTimeoutFuture<'a> {
+    /// Timeout wrapper around the reusable-slot connect future.
     inner: Timeout<ConnectFuture<'a>>,
 }
 
-impl Future for ConnectTimeoutFuture<'_>
-{
+impl Future for ConnectTimeoutFuture<'_> {
     type Output = io::Result<SctpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        match unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
-        {
+        match unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx) {
             Poll::Ready(result) => Poll::Ready(map_connect_timeout(result)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-fn new_sctp_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<RawFd>
-{
+fn new_sctp_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<RawFd> {
     let fd = unsafe {
         libc::socket(
             domain,
@@ -3300,16 +3109,14 @@ fn new_sctp_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<RawFd>
             libc::IPPROTO_SCTP,
         )
     };
-    if fd < 0
-    {
+    if fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
     Ok(fd)
 }
 
-fn raw_sndinfo_from_public(info: SctpSendInfo) -> libc::sctp_sndinfo
-{
+fn raw_sndinfo_from_public(info: SctpSendInfo) -> libc::sctp_sndinfo {
     libc::sctp_sndinfo {
         snd_sid: info.stream_id,
         snd_flags: info.flags,
@@ -3319,15 +3126,13 @@ fn raw_sndinfo_from_public(info: SctpSendInfo) -> libc::sctp_sndinfo
     }
 }
 
-fn set_sctp_events(fd: RawFd, mask: SctpNotificationMask, recv_rcvinfo: bool) -> io::Result<()>
-{
+fn set_sctp_events(fd: RawFd, mask: SctpNotificationMask, recv_rcvinfo: bool) -> io::Result<()> {
     let events = SctpEventSubscribe::from_mask(mask, recv_rcvinfo);
     set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_EVENTS, &events)?;
     Ok(())
 }
 
-fn apply_sctp_socket_options(fd: RawFd, options: SctpSocketOptions) -> io::Result<()>
-{
+fn apply_sctp_socket_options(fd: RawFd, options: SctpSocketOptions) -> io::Result<()> {
     set_sctp_events(fd, options.notifications, options.recv_rcvinfo)?;
 
     let recv_rcvinfo: libc::c_int = if options.recv_rcvinfo { 1 } else { 0 };
@@ -3341,18 +3146,15 @@ fn apply_sctp_socket_options(fd: RawFd, options: SctpSocketOptions) -> io::Resul
     let nodelay: libc::c_int = if options.nodelay { 1 } else { 0 };
     set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_NODELAY, &nodelay)?;
 
-    if let Some(size) = options.send_buffer_size
-    {
+    if let Some(size) = options.send_buffer_size {
         super::set_sock_send_buffer_size(fd, size)?;
     }
 
-    if let Some(size) = options.recv_buffer_size
-    {
+    if let Some(size) = options.recv_buffer_size {
         super::set_sock_recv_buffer_size(fd, size)?;
     }
 
-    if let Some(info) = options.default_send_info
-    {
+    if let Some(info) = options.default_send_info {
         set_sock_opt(
             fd,
             libc::IPPROTO_SCTP,
@@ -3364,10 +3166,8 @@ fn apply_sctp_socket_options(fd: RawFd, options: SctpSocketOptions) -> io::Resul
     Ok(())
 }
 
-fn apply_assoc_config_raw(fd: RawFd, config: SctpAssocConfig) -> io::Result<()>
-{
-    if let Some(assoc_max_retrans) = config.assoc_max_retrans
-    {
+fn apply_assoc_config_raw(fd: RawFd, config: SctpAssocConfig) -> io::Result<()> {
+    if let Some(assoc_max_retrans) = config.assoc_max_retrans {
         let mut raw = SctpAssocParamsRaw::get(fd)?;
         raw.assoc_max_retrans = assoc_max_retrans;
         set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_ASSOCINFO, &raw)?;
@@ -3376,16 +3176,13 @@ fn apply_assoc_config_raw(fd: RawFd, config: SctpAssocConfig) -> io::Result<()>
     if config.rto_initial_ms.is_some() || config.rto_max_ms.is_some() || config.rto_min_ms.is_some()
     {
         let mut raw = SctpRtoInfoRaw::get(fd)?;
-        if let Some(rto_initial_ms) = config.rto_initial_ms
-        {
+        if let Some(rto_initial_ms) = config.rto_initial_ms {
             raw.rto_initial_ms = rto_initial_ms;
         }
-        if let Some(rto_max_ms) = config.rto_max_ms
-        {
+        if let Some(rto_max_ms) = config.rto_max_ms {
             raw.rto_max_ms = rto_max_ms;
         }
-        if let Some(rto_min_ms) = config.rto_min_ms
-        {
+        if let Some(rto_min_ms) = config.rto_min_ms {
             raw.rto_min_ms = rto_min_ms;
         }
         set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_RTOINFO, &raw)?;
@@ -3394,47 +3191,38 @@ fn apply_assoc_config_raw(fd: RawFd, config: SctpAssocConfig) -> io::Result<()>
     Ok(())
 }
 
-fn apply_peer_addr_params_raw(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()>
-{
+fn apply_peer_addr_params_raw(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()> {
     if params.ipv6_flow_label != 0
         || params.dscp != 0
         || (params.flags & (SPP_IPV6_FLOWLABEL | SPP_DSCP)) != 0
     {
         let raw = SctpPaddrParamsRaw::from_public(params);
         set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_PEER_ADDR_PARAMS, &raw)
-    }
-    else
-    {
+    } else {
         let raw = SctpPaddrParamsRawLegacy::from_public(params);
         set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_PEER_ADDR_PARAMS, &raw)
     }
 }
 
-fn apply_default_peer_addr_params(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()>
-{
-    if params.address.is_some()
-    {
+fn apply_default_peer_addr_params(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()> {
+    if params.address.is_some() {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     apply_peer_addr_params_raw(fd, params)
 }
 
-fn apply_sctp_connected_socket_config(fd: RawFd, config: SctpSocketConfig) -> io::Result<()>
-{
+fn apply_sctp_connected_socket_config(fd: RawFd, config: SctpSocketConfig) -> io::Result<()> {
     apply_sctp_socket_options(fd, config.socket_options())?;
-    if let Some(assoc) = config.assoc
-    {
+    if let Some(assoc) = config.assoc {
         apply_assoc_config_raw(fd, assoc)?;
     }
-    if let Some(params) = config.default_peer_addr_params
-    {
+    if let Some(params) = config.default_peer_addr_params {
         apply_default_peer_addr_params(fd, params)?;
     }
     Ok(())
 }
 
-fn configure_sctp_socket(fd: RawFd, config: SctpSocketConfig) -> io::Result<()>
-{
+fn configure_sctp_socket(fd: RawFd, config: SctpSocketConfig) -> io::Result<()> {
     set_sock_opt(
         fd,
         libc::IPPROTO_SCTP,
@@ -3445,8 +3233,7 @@ fn configure_sctp_socket(fd: RawFd, config: SctpSocketConfig) -> io::Result<()>
 }
 
 #[repr(C)]
-struct SctpGetAddrsHeader
-{
+struct SctpGetAddrsHeader {
     assoc_id: libc::sctp_assoc_t,
     addr_num: u32,
 }
@@ -3455,13 +3242,11 @@ fn get_assoc_addrs(
     fd: RawFd,
     optname: libc::c_int,
     assoc_id: libc::sctp_assoc_t,
-) -> io::Result<Vec<SocketAddr>>
-{
+) -> io::Result<Vec<SocketAddr>> {
     const INITIAL_CAPACITY: usize = 8;
 
     let mut capacity = INITIAL_CAPACITY;
-    loop
-    {
+    loop {
         let header_len = std::mem::size_of::<SctpGetAddrsHeader>();
         let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
         let total_len = header_len + capacity * storage_len;
@@ -3485,21 +3270,18 @@ fn get_assoc_addrs(
                 &mut optlen,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        if (optlen as usize) < header_len
-        {
+        if (optlen as usize) < header_len {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
 
         let header =
             unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpGetAddrsHeader) };
         let addr_count = header.addr_num as usize;
-        if addr_count > capacity
-        {
+        if addr_count > capacity {
             capacity = addr_count;
             continue;
         }
@@ -3511,37 +3293,31 @@ fn get_assoc_addrs(
     }
 }
 
-fn option_socket_addr_to_storage(addr: Option<SocketAddr>) -> libc::sockaddr_storage
-{
-    match addr
-    {
+fn option_socket_addr_to_storage(addr: Option<SocketAddr>) -> libc::sockaddr_storage {
+    match addr {
         Some(addr) => socket_addr_to_c(addr).0,
-        None =>
-        unsafe { std::mem::zeroed() },
+        None => unsafe { std::mem::zeroed() },
     }
 }
 
-fn sockaddr_len_for_storage(storage: libc::sockaddr_storage) -> io::Result<libc::socklen_t>
-{
+fn sockaddr_len_for_storage(storage: libc::sockaddr_storage) -> io::Result<libc::socklen_t> {
     let family = unsafe {
         *(&storage as *const libc::sockaddr_storage as *const libc::sa_family_t) as libc::c_int
     };
-    match family
-    {
+    match family {
         libc::AF_INET => Ok(std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t),
         libc::AF_INET6 => Ok(std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t),
         _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
     }
 }
 
-fn storage_to_option_socket_addr(storage: libc::sockaddr_storage)
--> io::Result<Option<SocketAddr>>
-{
+fn storage_to_option_socket_addr(
+    storage: libc::sockaddr_storage,
+) -> io::Result<Option<SocketAddr>> {
     let family = unsafe {
         *(&storage as *const libc::sockaddr_storage as *const libc::sa_family_t) as libc::c_int
     };
-    match family
-    {
+    match family {
         0 => Ok(None),
         libc::AF_INET => socket_addr_from_c(
             &storage,
@@ -3561,11 +3337,9 @@ fn parse_assoc_addrs(
     payload: &[u8],
     addr_count: usize,
     storage_len: usize,
-) -> io::Result<Vec<SocketAddr>>
-{
+) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(addr_count);
-    if parse_assoc_addrs_inner(payload, addr_count, storage_len, &mut addrs)
-    {
+    if parse_assoc_addrs_inner(payload, addr_count, storage_len, &mut addrs) {
         return Ok(addrs);
     }
 
@@ -3577,36 +3351,29 @@ fn parse_assoc_addrs_inner(
     remaining: usize,
     storage_len: usize,
     addrs: &mut Vec<SocketAddr>,
-) -> bool
-{
-    if remaining == 0
-    {
+) -> bool {
+    if remaining == 0 {
         return payload.is_empty();
     }
 
-    if payload.len() < std::mem::size_of::<libc::sa_family_t>()
-    {
+    if payload.len() < std::mem::size_of::<libc::sa_family_t>() {
         return false;
     }
 
     let family = libc::sa_family_t::from_ne_bytes([payload[0], payload[1]]) as libc::c_int;
-    for candidate in assoc_addr_candidates(family, storage_len)
-    {
-        if payload.len() < candidate.entry_len
-        {
+    for candidate in assoc_addr_candidates(family, storage_len) {
+        if payload.len() < candidate.entry_len {
             continue;
         }
 
-        if let Ok(addr) = parse_assoc_addr_entry(&payload[..candidate.addr_len], family)
-        {
+        if let Ok(addr) = parse_assoc_addr_entry(&payload[..candidate.addr_len], family) {
             addrs.push(addr);
             if parse_assoc_addrs_inner(
                 &payload[candidate.entry_len..],
                 remaining - 1,
                 storage_len,
                 addrs,
-            )
-            {
+            ) {
                 return true;
             }
             let _ = addrs.pop();
@@ -3617,14 +3384,12 @@ fn parse_assoc_addrs_inner(
 }
 
 #[derive(Clone, Copy)]
-struct AssocAddrCandidate
-{
+struct AssocAddrCandidate {
     entry_len: usize,
     addr_len: usize,
 }
 
-fn assoc_addr_candidates(family: libc::c_int, storage_len: usize) -> &'static [AssocAddrCandidate]
-{
+fn assoc_addr_candidates(family: libc::c_int, storage_len: usize) -> &'static [AssocAddrCandidate] {
     const IPV4_DENSE: usize = std::mem::size_of::<libc::sockaddr_in>();
     const IPV4_COMPACT: usize = 8;
     const IPV6_DENSE: usize = std::mem::size_of::<libc::sockaddr_in6>();
@@ -3669,27 +3434,18 @@ fn assoc_addr_candidates(family: libc::c_int, storage_len: usize) -> &'static [A
         },
     ];
 
-    match family
-    {
-        libc::AF_INET =>
-        {
-            if storage_len == std::mem::size_of::<libc::sockaddr_storage>()
-            {
+    match family {
+        libc::AF_INET => {
+            if storage_len == std::mem::size_of::<libc::sockaddr_storage>() {
                 &IPV4_PADDED
-            }
-            else
-            {
+            } else {
                 &IPV4_BASE
             }
         }
-        libc::AF_INET6 =>
-        {
-            if storage_len == std::mem::size_of::<libc::sockaddr_storage>()
-            {
+        libc::AF_INET6 => {
+            if storage_len == std::mem::size_of::<libc::sockaddr_storage>() {
                 &IPV6_PADDED
-            }
-            else
-            {
+            } else {
                 &IPV6_BASE
             }
         }
@@ -3697,27 +3453,19 @@ fn assoc_addr_candidates(family: libc::c_int, storage_len: usize) -> &'static [A
     }
 }
 
-fn parse_assoc_addr_entry(bytes: &[u8], family: libc::c_int) -> io::Result<SocketAddr>
-{
-    match family
-    {
-        libc::AF_INET =>
-        {
-            if bytes.len() >= 8
-            {
+fn parse_assoc_addr_entry(bytes: &[u8], family: libc::c_int) -> io::Result<SocketAddr> {
+    match family {
+        libc::AF_INET => {
+            if bytes.len() >= 8 {
                 let port = u16::from_be_bytes([bytes[2], bytes[3]]);
                 let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
                 Ok(SocketAddr::from((ip, port)))
-            }
-            else
-            {
+            } else {
                 Err(io::Error::from(io::ErrorKind::InvalidData))
             }
         }
-        libc::AF_INET6 =>
-        {
-            if bytes.len() < std::mem::size_of::<libc::sockaddr_in6>()
-            {
+        libc::AF_INET6 => {
+            if bytes.len() < std::mem::size_of::<libc::sockaddr_in6>() {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
 
@@ -3737,19 +3485,16 @@ fn parse_assoc_addr_entry(bytes: &[u8], family: libc::c_int) -> io::Result<Socke
     }
 }
 
-const fn cmsg_align(len: usize) -> usize
-{
+const fn cmsg_align(len: usize) -> usize {
     let align = std::mem::size_of::<usize>();
     (len + align - 1) & !(align - 1)
 }
 
-const fn cmsg_space(data_len: usize) -> usize
-{
+const fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
 
-fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo)
-{
+fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
     let hdr = unsafe { &mut *(control.as_mut_ptr() as *mut libc::cmsghdr) };
     hdr.cmsg_level = libc::IPPROTO_SCTP;
     hdr.cmsg_type = libc::SCTP_SNDINFO;
@@ -3766,23 +3511,19 @@ fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo)
     }
 }
 
-fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo>
-{
+fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo> {
     let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    if controllen < hdr_len
-    {
+    if controllen < hdr_len {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
     let hdr = unsafe { &*(control.as_ptr() as *const libc::cmsghdr) };
-    if hdr.cmsg_level != libc::IPPROTO_SCTP || hdr.cmsg_type != libc::SCTP_RCVINFO
-    {
+    if hdr.cmsg_level != libc::IPPROTO_SCTP || hdr.cmsg_type != libc::SCTP_RCVINFO {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
     let needed = cmsg_align(hdr_len) + std::mem::size_of::<libc::sctp_rcvinfo>();
-    if controllen < needed
-    {
+    if controllen < needed {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
@@ -3800,10 +3541,8 @@ fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo>
     })
 }
 
-fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
-{
-    if buffer.len() < 8
-    {
+fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
+    if buffer.len() < 8 {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
@@ -3811,12 +3550,9 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
     let sn_flags = u16::from_ne_bytes([buffer[2], buffer[3]]);
     let sn_length = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
 
-    let notification = match sn_type as libc::c_int
-    {
-        x if x == local_sctp_assoc_change() =>
-        {
-            if buffer.len() < 20
-            {
+    let notification = match sn_type as libc::c_int {
+        x if x == local_sctp_assoc_change() => {
+            if buffer.len() < 20 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::AssocChange {
@@ -3827,12 +3563,10 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 assoc_id: i32::from_ne_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]),
             }
         }
-        x if x == local_sctp_peer_addr_change() =>
-        {
+        x if x == local_sctp_peer_addr_change() => {
             let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
             let min_len = 8 + storage_len + 12;
-            if buffer.len() < min_len
-            {
+            if buffer.len() < min_len {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
 
@@ -3871,10 +3605,8 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 ]),
             }
         }
-        x if x == local_sctp_remote_error() =>
-        {
-            if buffer.len() < 14
-            {
+        x if x == local_sctp_remote_error() => {
+            if buffer.len() < 14 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::RemoteError {
@@ -3882,20 +3614,16 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 assoc_id: i32::from_ne_bytes([buffer[10], buffer[11], buffer[12], buffer[13]]),
             }
         }
-        x if x == local_sctp_shutdown_event() =>
-        {
-            if buffer.len() < 12
-            {
+        x if x == local_sctp_shutdown_event() => {
+            if buffer.len() < 12 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::Shutdown {
                 assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
             }
         }
-        x if x == local_sctp_adaptation_indication() =>
-        {
-            if buffer.len() < 16
-            {
+        x if x == local_sctp_adaptation_indication() => {
+            if buffer.len() < 16 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::Adaptation {
@@ -3903,10 +3631,8 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 assoc_id: i32::from_ne_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
             }
         }
-        x if x == local_sctp_partial_delivery_event() =>
-        {
-            if buffer.len() < 24
-            {
+        x if x == local_sctp_partial_delivery_event() => {
+            if buffer.len() < 24 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::PartialDelivery {
@@ -3916,20 +3642,16 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 sequence: u32::from_ne_bytes([buffer[20], buffer[21], buffer[22], buffer[23]]),
             }
         }
-        x if x == local_sctp_sender_dry_event() =>
-        {
-            if buffer.len() < 12
-            {
+        x if x == local_sctp_sender_dry_event() => {
+            if buffer.len() < 12 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::SenderDry {
                 assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
             }
         }
-        x if x == local_sctp_stream_reset_event() =>
-        {
-            if buffer.len() < 12
-            {
+        x if x == local_sctp_stream_reset_event() => {
+            if buffer.len() < 12 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::StreamReset {
@@ -3937,10 +3659,8 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
             }
         }
-        x if x == local_sctp_assoc_reset_event() =>
-        {
-            if buffer.len() < 20
-            {
+        x if x == local_sctp_assoc_reset_event() => {
+            if buffer.len() < 20 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::AssocReset {
@@ -3950,10 +3670,8 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 remote_tsn: u32::from_ne_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]),
             }
         }
-        x if x == local_sctp_stream_change_event() =>
-        {
-            if buffer.len() < 16
-            {
+        x if x == local_sctp_stream_change_event() => {
+            if buffer.len() < 16 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::StreamChange {
@@ -3963,12 +3681,10 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
                 outbound_streams: u16::from_ne_bytes([buffer[14], buffer[15]]),
             }
         }
-        x if x == local_sctp_send_failed_event() =>
-        {
+        x if x == local_sctp_send_failed_event() => {
             let sndinfo_len = std::mem::size_of::<libc::sctp_sndinfo>();
             let min_len = 12 + sndinfo_len + 4;
-            if buffer.len() < min_len
-            {
+            if buffer.len() < min_len {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             let error = u32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
@@ -4002,134 +3718,110 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
     Ok(SctpRecvMeta::Notification(notification))
 }
 
-const fn local_sctp_assoc_change() -> libc::c_int
-{
+const fn local_sctp_assoc_change() -> libc::c_int {
     local_sctp_notification_type(1)
 }
 
-const fn local_sctp_peer_addr_change() -> libc::c_int
-{
+const fn local_sctp_peer_addr_change() -> libc::c_int {
     local_sctp_notification_type(2)
 }
 
-const fn local_sctp_remote_error() -> libc::c_int
-{
+const fn local_sctp_remote_error() -> libc::c_int {
     local_sctp_notification_type(4)
 }
 
-const fn local_sctp_shutdown_event() -> libc::c_int
-{
+const fn local_sctp_shutdown_event() -> libc::c_int {
     local_sctp_notification_type(5)
 }
 
-const fn local_sctp_partial_delivery_event() -> libc::c_int
-{
+const fn local_sctp_partial_delivery_event() -> libc::c_int {
     local_sctp_notification_type(6)
 }
 
-const fn local_sctp_adaptation_indication() -> libc::c_int
-{
+const fn local_sctp_adaptation_indication() -> libc::c_int {
     local_sctp_notification_type(7)
 }
 
-const fn local_sctp_sender_dry_event() -> libc::c_int
-{
+const fn local_sctp_sender_dry_event() -> libc::c_int {
     local_sctp_notification_type(9)
 }
 
-const fn local_sctp_stream_reset_event() -> libc::c_int
-{
+const fn local_sctp_stream_reset_event() -> libc::c_int {
     local_sctp_notification_type(10)
 }
 
-const fn local_sctp_assoc_reset_event() -> libc::c_int
-{
+const fn local_sctp_assoc_reset_event() -> libc::c_int {
     local_sctp_notification_type(11)
 }
 
-const fn local_sctp_stream_change_event() -> libc::c_int
-{
+const fn local_sctp_stream_change_event() -> libc::c_int {
     local_sctp_notification_type(12)
 }
 
-const fn local_sctp_send_failed_event() -> libc::c_int
-{
+const fn local_sctp_send_failed_event() -> libc::c_int {
     local_sctp_notification_type(13)
 }
 
-const fn local_sctp_notification_type(index: libc::c_int) -> libc::c_int
-{
+const fn local_sctp_notification_type(index: libc::c_int) -> libc::c_int {
     (1 << 15) | index
 }
 
 #[doc(hidden)]
-pub fn test_parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta>
-{
+pub fn test_parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
     parse_notification(buffer)
 }
 
 #[doc(hidden)]
-pub const fn test_assoc_change_type() -> libc::c_int
-{
+pub const fn test_assoc_change_type() -> libc::c_int {
     local_sctp_assoc_change()
 }
 
 #[doc(hidden)]
-pub const fn test_adaptation_indication_type() -> libc::c_int
-{
+pub const fn test_adaptation_indication_type() -> libc::c_int {
     local_sctp_adaptation_indication()
 }
 
 #[doc(hidden)]
-pub const fn test_peer_addr_change_type() -> libc::c_int
-{
+pub const fn test_peer_addr_change_type() -> libc::c_int {
     local_sctp_peer_addr_change()
 }
 
 #[doc(hidden)]
-pub const fn test_remote_error_type() -> libc::c_int
-{
+pub const fn test_remote_error_type() -> libc::c_int {
     local_sctp_remote_error()
 }
 
 #[doc(hidden)]
-pub const fn test_shutdown_event_type() -> libc::c_int
-{
+pub const fn test_shutdown_event_type() -> libc::c_int {
     local_sctp_shutdown_event()
 }
 
 #[doc(hidden)]
-pub const fn test_partial_delivery_event_type() -> libc::c_int
-{
+pub const fn test_partial_delivery_event_type() -> libc::c_int {
     local_sctp_partial_delivery_event()
 }
 
 #[doc(hidden)]
-pub const fn test_sender_dry_event_type() -> libc::c_int
-{
+pub const fn test_sender_dry_event_type() -> libc::c_int {
     local_sctp_sender_dry_event()
 }
 
 #[doc(hidden)]
-pub const fn test_stream_reset_event_type() -> libc::c_int
-{
+pub const fn test_stream_reset_event_type() -> libc::c_int {
     local_sctp_stream_reset_event()
 }
 
 #[doc(hidden)]
-pub const fn test_assoc_reset_event_type() -> libc::c_int
-{
+pub const fn test_assoc_reset_event_type() -> libc::c_int {
     local_sctp_assoc_reset_event()
 }
 
 #[doc(hidden)]
-pub const fn test_stream_change_event_type() -> libc::c_int
-{
+pub const fn test_stream_change_event_type() -> libc::c_int {
     local_sctp_stream_change_event()
 }
 
 #[doc(hidden)]
-pub const fn test_send_failed_event_type() -> libc::c_int
-{
+pub const fn test_send_failed_event_type() -> libc::c_int {
     local_sctp_send_failed_event()
 }

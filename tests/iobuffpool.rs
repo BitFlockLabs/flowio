@@ -9,8 +9,7 @@ macro_rules! seg {
     };
 }
 
-fn new_pool(config: IoBuffPoolConfig) -> IoBuffPool
-{
+fn new_pool(config: IoBuffPoolConfig) -> IoBuffPool {
     IoBuffPool::new(config).expect("pool config invalid")
 }
 
@@ -19,8 +18,7 @@ fn new_pool(config: IoBuffPoolConfig) -> IoBuffPool
 // ============================================================================
 
 #[test]
-fn pool_alloc_basic()
-{
+fn pool_alloc_basic() {
     println!("--- Pool alloc basic ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 16,
@@ -49,8 +47,7 @@ fn pool_alloc_basic()
 }
 
 #[test]
-fn pool_new_zero_objs_per_slab_returns_error()
-{
+fn pool_new_zero_objs_per_slab_returns_error() {
     let result = IoBuffPool::new(IoBuffPoolConfig {
         headroom: 0,
         payload: 64,
@@ -64,8 +61,7 @@ fn pool_new_zero_objs_per_slab_returns_error()
 }
 
 #[test]
-fn pool_new_layout_overflow_returns_error()
-{
+fn pool_new_layout_overflow_returns_error() {
     let result = IoBuffPool::new(IoBuffPoolConfig {
         headroom: usize::MAX,
         payload: 1,
@@ -77,8 +73,7 @@ fn pool_new_layout_overflow_returns_error()
 }
 
 #[test]
-fn pool_alloc_before_init_returns_error()
-{
+fn pool_alloc_before_init_returns_error() {
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
         payload: 64,
@@ -90,8 +85,7 @@ fn pool_alloc_before_init_returns_error()
 }
 
 #[test]
-fn pool_alloc_write_read()
-{
+fn pool_alloc_write_read() {
     println!("--- Pool alloc + write + read ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 8,
@@ -118,8 +112,7 @@ fn pool_alloc_write_read()
 // ============================================================================
 
 #[test]
-fn pool_reuse_after_drop()
-{
+fn pool_reuse_after_drop() {
     println!("--- Pool reuse after drop ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -141,8 +134,7 @@ fn pool_reuse_after_drop()
 }
 
 #[test]
-fn pool_reuse_resets_state()
-{
+fn pool_reuse_resets_state() {
     println!("--- Pool reuse resets buffer state ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 8,
@@ -181,8 +173,7 @@ fn pool_reuse_resets_state()
 // ============================================================================
 
 #[test]
-fn pool_multiple_cycles()
-{
+fn pool_multiple_cycles() {
     println!("--- Pool 1000 alloc/drop cycles ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -192,8 +183,7 @@ fn pool_multiple_cycles()
     });
     pool.init();
 
-    for i in 0..1000
-    {
+    for i in 0..1000 {
         let mut buf = pool.alloc().unwrap();
         buf.payload_append(format!("cycle-{i}").as_bytes()).unwrap();
         assert_eq!(&buf.payload_bytes()[..6], b"cycle-");
@@ -203,8 +193,7 @@ fn pool_multiple_cycles()
 }
 
 #[test]
-fn pool_concurrent_buffers()
-{
+fn pool_concurrent_buffers() {
     println!("--- Pool multiple buffers alive at once ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -215,16 +204,14 @@ fn pool_concurrent_buffers()
     pool.init();
 
     let mut buffers = Vec::new();
-    for i in 0..20
-    {
+    for i in 0..20 {
         let mut buf = pool.alloc().unwrap();
         buf.payload_append(format!("buf-{i}").as_bytes()).unwrap();
         buffers.push(buf);
     }
 
     println!("  {} buffers alive simultaneously", buffers.len());
-    for (i, buf) in buffers.iter().enumerate()
-    {
+    for (i, buf) in buffers.iter().enumerate() {
         let expected = format!("buf-{i}");
         assert_eq!(buf.payload_bytes(), expected.as_bytes());
     }
@@ -234,8 +221,7 @@ fn pool_concurrent_buffers()
     println!("  All dropped, pool should have 20 free slots");
 
     // Re-allocate — should reuse
-    for _ in 0..20
-    {
+    for _ in 0..20 {
         let buf = pool.alloc().unwrap();
         assert!(buf.is_empty());
         drop(buf);
@@ -248,8 +234,7 @@ fn pool_concurrent_buffers()
 // ============================================================================
 
 #[test]
-fn pool_grows_across_slabs()
-{
+fn pool_grows_across_slabs() {
     println!("--- Pool slab growth ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -260,8 +245,7 @@ fn pool_grows_across_slabs()
     pool.init();
 
     let mut ptrs = Vec::new();
-    for i in 0..20
-    {
+    for i in 0..20 {
         let buf = pool.alloc().unwrap();
         ptrs.push(IoBuffReadOnly::as_ptr(&buf));
         println!("  alloc #{}: ptr={:?}", i, ptrs.last().unwrap());
@@ -287,8 +271,7 @@ fn pool_grows_across_slabs()
 // ============================================================================
 
 #[test]
-fn pool_freeze_clone_return()
-{
+fn pool_freeze_clone_return() {
     println!("--- Pool: alloc → freeze → clone → drop all → reuse ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -333,8 +316,7 @@ fn pool_freeze_clone_return()
 // ============================================================================
 
 #[test]
-fn pool_flat_buffers()
-{
+fn pool_flat_buffers() {
     println!("--- Pool flat (0 headroom, 0 tailroom) ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -360,8 +342,7 @@ fn pool_flat_buffers()
 // ============================================================================
 
 #[test]
-fn pool_single_obj_per_slab()
-{
+fn pool_single_obj_per_slab() {
     println!("--- Pool: 1 object per slab ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -371,8 +352,7 @@ fn pool_single_obj_per_slab()
     });
     pool.init();
 
-    for i in 0..10
-    {
+    for i in 0..10 {
         let mut buf = pool.alloc().unwrap();
         buf.payload_append(format!("s{i}").as_bytes()).unwrap();
         drop(buf);
@@ -385,8 +365,7 @@ fn pool_single_obj_per_slab()
 // ============================================================================
 
 #[test]
-fn pool_drop_cleans_up()
-{
+fn pool_drop_cleans_up() {
     println!("--- Pool drop releases all slab pages ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -397,8 +376,7 @@ fn pool_drop_cleans_up()
     pool.init();
 
     // Allocate and drop many buffers to create multiple slabs.
-    for _ in 0..100
-    {
+    for _ in 0..100 {
         let buf = pool.alloc().unwrap();
         drop(buf);
     }
@@ -414,8 +392,7 @@ fn pool_drop_cleans_up()
 // ============================================================================
 
 #[test]
-fn pool_full_protocol_pattern()
-{
+fn pool_full_protocol_pattern() {
     println!("--- Pool: full protocol frame (headroom + payload + tailroom) ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 16,
@@ -470,8 +447,7 @@ fn pool_full_protocol_pattern()
 // ============================================================================
 
 #[test]
-fn pool_with_vec_chain()
-{
+fn pool_with_vec_chain() {
     use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 
     println!("--- Pool + Vec chain integration ---");
@@ -540,8 +516,7 @@ fn pool_with_vec_chain()
 // ============================================================================
 
 #[test]
-fn pool_simulated_readv()
-{
+fn pool_simulated_readv() {
     use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 
     println!("--- Pool: simulated readv (kernel fills multiple buffers) ---");
@@ -580,8 +555,7 @@ fn pool_simulated_readv()
 // ============================================================================
 
 #[test]
-fn pool_buffer_survives_pool_drop()
-{
+fn pool_buffer_survives_pool_drop() {
     println!("--- Pool buffer survives pool drop ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 4,
@@ -605,8 +579,7 @@ fn pool_buffer_survives_pool_drop()
 }
 
 #[test]
-fn pool_frozen_clone_survives_pool_drop()
-{
+fn pool_frozen_clone_survives_pool_drop() {
     println!("--- Pool frozen clone survives pool drop ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
@@ -635,8 +608,7 @@ fn pool_frozen_clone_survives_pool_drop()
 }
 
 #[test]
-fn pool_move_with_live_buffer_is_safe()
-{
+fn pool_move_with_live_buffer_is_safe() {
     println!("--- Moving outer pool handle with live buffer ---");
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,

@@ -9,13 +9,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-fn new_executor() -> Executor
-{
+fn new_executor() -> Executor {
     Executor::new().expect("failed to construct runtime executor")
 }
 
-fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Executor
-{
+fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Executor {
     Executor::new_with_config(ExecutorConfig {
         reactor: ReactorConfig { ring_entries: 64 },
         process_quota,
@@ -25,8 +23,7 @@ fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Execu
 }
 
 #[test]
-fn runtime_executor_constructs_with_custom_config()
-{
+fn runtime_executor_constructs_with_custom_config() {
     let executor = new_executor_with(16, None);
     assert_eq!(executor.process_quota, 16);
     assert_eq!(executor.cpu_affinity, None);
@@ -34,8 +31,7 @@ fn runtime_executor_constructs_with_custom_config()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn runtime_executor_preserves_cpu_affinity_config()
-{
+fn runtime_executor_preserves_cpu_affinity_config() {
     let current_cpu = unsafe { libc::sched_getcpu() };
     assert!(current_cpu >= 0, "sched_getcpu failed");
 
@@ -45,8 +41,7 @@ fn runtime_executor_preserves_cpu_affinity_config()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn runtime_executor_runs_with_cpu_affinity()
-{
+fn runtime_executor_runs_with_cpu_affinity() {
     let current_cpu = unsafe { libc::sched_getcpu() };
     assert!(current_cpu >= 0, "sched_getcpu failed");
 
@@ -65,8 +60,7 @@ fn runtime_executor_runs_with_cpu_affinity()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn runtime_executor_keeps_cpu_affinity_across_spawned_work()
-{
+fn runtime_executor_keeps_cpu_affinity_across_spawned_work() {
     let current_cpu = unsafe { libc::sched_getcpu() };
     assert!(current_cpu >= 0, "sched_getcpu failed");
 
@@ -91,8 +85,7 @@ fn runtime_executor_keeps_cpu_affinity_across_spawned_work()
 }
 
 #[test]
-fn runtime_layout_probe()
-{
+fn runtime_layout_probe() {
     println!(
         "layout CompletionState size={} align={}",
         std::mem::size_of::<CompletionState>(),
@@ -110,8 +103,7 @@ fn runtime_layout_probe()
 }
 
 #[test]
-fn runtime_executor_runs_immediate_task()
-{
+fn runtime_executor_runs_immediate_task() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(false));
     let completed_flag = completed.clone();
@@ -126,8 +118,7 @@ fn runtime_executor_runs_immediate_task()
 }
 
 #[test]
-fn runtime_executor_runs_nop_future()
-{
+fn runtime_executor_runs_nop_future() {
     let mut executor = new_executor();
 
     executor
@@ -152,8 +143,7 @@ fn runtime_executor_runs_nop_future()
 }
 
 #[test]
-fn runtime_executor_runs_spawned_task_and_drains()
-{
+fn runtime_executor_runs_spawned_task_and_drains() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(0usize));
     let spawned_completed = completed.clone();
@@ -174,8 +164,7 @@ fn runtime_executor_runs_spawned_task_and_drains()
 }
 
 #[test]
-fn runtime_sleep_completes()
-{
+fn runtime_sleep_completes() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(false));
     let completed_flag = completed.clone();
@@ -191,8 +180,7 @@ fn runtime_sleep_completes()
 }
 
 #[test]
-fn runtime_sleep_ordering()
-{
+fn runtime_sleep_ordering() {
     let mut executor = new_executor();
     let order = Rc::new(RefCell::new(Vec::new()));
     let order_first = order.clone();
@@ -220,8 +208,7 @@ fn runtime_sleep_ordering()
 }
 
 #[test]
-fn runtime_sleep_ordering_across_cascade_boundary()
-{
+fn runtime_sleep_ordering_across_cascade_boundary() {
     let mut executor = new_executor_with(1, None);
     let order = Rc::new(RefCell::new(Vec::new()));
     let order_a = order.clone();
@@ -260,8 +247,7 @@ fn runtime_sleep_ordering_across_cascade_boundary()
 }
 
 #[test]
-fn runtime_sleep_uses_fresh_tick_after_idle_gap()
-{
+fn runtime_sleep_uses_fresh_tick_after_idle_gap() {
     let mut executor = new_executor();
     let observed = Rc::new(Cell::new(Duration::ZERO));
     let observed_flag = observed.clone();
@@ -283,8 +269,7 @@ fn runtime_sleep_uses_fresh_tick_after_idle_gap()
 }
 
 #[test]
-fn runtime_sleep_until_uses_fresh_tick_after_idle_gap()
-{
+fn runtime_sleep_until_uses_fresh_tick_after_idle_gap() {
     let mut executor = new_executor();
     let observed = Rc::new(Cell::new(Duration::ZERO));
     let observed_flag = observed.clone();
@@ -307,8 +292,7 @@ fn runtime_sleep_until_uses_fresh_tick_after_idle_gap()
 }
 
 #[test]
-fn runtime_sleep_can_be_cancelled_by_drop()
-{
+fn runtime_sleep_can_be_cancelled_by_drop() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(false));
     let completed_flag = completed.clone();
@@ -328,8 +312,7 @@ fn runtime_sleep_can_be_cancelled_by_drop()
 }
 
 #[test]
-fn runtime_timeout_completes_before_deadline()
-{
+fn runtime_timeout_completes_before_deadline() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(false));
     let completed_flag = completed.clone();
@@ -352,8 +335,7 @@ fn runtime_timeout_completes_before_deadline()
 }
 
 #[test]
-fn runtime_timeout_expires()
-{
+fn runtime_timeout_expires() {
     let mut executor = new_executor();
     let timed_out = Rc::new(Cell::new(false));
     let timed_out_flag = timed_out.clone();
@@ -374,8 +356,7 @@ fn runtime_timeout_expires()
 }
 
 #[test]
-fn runtime_timeout_at_completes()
-{
+fn runtime_timeout_at_completes() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(false));
     let completed_flag = completed.clone();
@@ -399,8 +380,7 @@ fn runtime_timeout_at_completes()
 }
 
 #[test]
-fn runtime_nop_slot_can_be_reused()
-{
+fn runtime_nop_slot_can_be_reused() {
     let mut executor = new_executor();
 
     executor
@@ -420,8 +400,7 @@ fn runtime_nop_slot_can_be_reused()
 /// Validates that the pointer-based TLS context correctly cycles owner_task
 /// across interleaved task polls.
 #[test]
-fn runtime_concurrent_io_tasks()
-{
+fn runtime_concurrent_io_tasks() {
     let mut executor = new_executor();
     let num_pairs = 4;
     let rounds = 50;
@@ -431,15 +410,13 @@ fn runtime_concurrent_io_tasks()
 
     executor
         .run(async move {
-            for _ in 0..num_pairs
-            {
+            for _ in 0..num_pairs {
                 let done = completed_flag.clone();
                 let (mut pinger, mut ponger) = UnixStream::pair().expect("socketpair failed");
 
                 // Spawn ponger.
                 Executor::spawn(async move {
-                    for _ in 0..rounds
-                    {
+                    for _ in 0..rounds {
                         let buf = vec![0u8; msg_size];
                         let (res, buf) = ponger.read_exact(buf, msg_size).await;
                         res.expect("ponger read failed");
@@ -452,8 +429,7 @@ fn runtime_concurrent_io_tasks()
                 // Spawn pinger.
                 Executor::spawn(async move {
                     let mut data = vec![0xAAu8; msg_size];
-                    for _ in 0..rounds
-                    {
+                    for _ in 0..rounds {
                         let (res, buf) = pinger.write_all(data).await;
                         res.expect("pinger write failed");
                         data = buf;
@@ -478,8 +454,7 @@ fn runtime_concurrent_io_tasks()
 
 /// JoinHandle returns the spawned task's result when awaited.
 #[test]
-fn runtime_join_handle_returns_value()
-{
+fn runtime_join_handle_returns_value() {
     let mut executor = new_executor();
 
     executor
@@ -493,8 +468,7 @@ fn runtime_join_handle_returns_value()
 
 /// JoinHandle works with non-trivial return types.
 #[test]
-fn runtime_join_handle_returns_string()
-{
+fn runtime_join_handle_returns_string() {
     let mut executor = new_executor();
 
     executor
@@ -509,8 +483,7 @@ fn runtime_join_handle_returns_string()
 
 /// Dropping a JoinHandle without awaiting detaches the task — it still runs.
 #[test]
-fn runtime_join_handle_detach_on_drop()
-{
+fn runtime_join_handle_detach_on_drop() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(false));
     let completed_flag = completed.clone();
@@ -530,8 +503,7 @@ fn runtime_join_handle_detach_on_drop()
 
 /// Multiple JoinHandles can be awaited concurrently.
 #[test]
-fn runtime_join_handle_multiple_concurrent()
-{
+fn runtime_join_handle_multiple_concurrent() {
     let mut executor = new_executor();
 
     executor
@@ -551,8 +523,7 @@ fn runtime_join_handle_multiple_concurrent()
 
 /// JoinHandle works with async tasks that perform I/O before returning.
 #[test]
-fn runtime_join_handle_with_io()
-{
+fn runtime_join_handle_with_io() {
     let mut executor = new_executor();
 
     executor
@@ -585,8 +556,7 @@ fn runtime_join_handle_with_io()
 
 /// JoinHandle::is_finished() reports completion status without consuming.
 #[test]
-fn runtime_join_handle_is_finished()
-{
+fn runtime_join_handle_is_finished() {
     let mut executor = new_executor();
 
     executor
@@ -608,8 +578,7 @@ fn runtime_join_handle_is_finished()
 /// Dropping an I/O future while an SQE is in-flight triggers ASYNC_CANCEL
 /// and safely frees the CompletionState when the CQE arrives.
 #[test]
-fn runtime_cancel_in_flight_read_on_drop()
-{
+fn runtime_cancel_in_flight_read_on_drop() {
     let mut executor = new_executor();
 
     executor
@@ -638,8 +607,7 @@ fn runtime_cancel_in_flight_read_on_drop()
 
 /// Dropping a single write future mid-flight cancels the operation cleanly.
 #[test]
-fn runtime_cancel_in_flight_write_on_drop()
-{
+fn runtime_cancel_in_flight_write_on_drop() {
     let mut executor = new_executor();
 
     executor
@@ -648,8 +616,7 @@ fn runtime_cancel_in_flight_write_on_drop()
 
             // Fill the socket buffer so the next single write blocks.
             // Write in a loop until we get backpressure, then timeout on the blocking write.
-            loop
-            {
+            loop {
                 let buf = vec![0xAAu8; 65536];
                 let result = timeout(Duration::from_millis(5), async {
                     let (res, _buf) = left.write(buf).await;
@@ -657,8 +624,7 @@ fn runtime_cancel_in_flight_write_on_drop()
                 })
                 .await;
 
-                if result.is_err()
-                {
+                if result.is_err() {
                     // Timed out — the write future was dropped while in-flight.
                     break;
                 }
@@ -674,8 +640,7 @@ fn runtime_cancel_in_flight_write_on_drop()
 
 /// Multiple concurrent futures can be cancelled independently.
 #[test]
-fn runtime_cancel_multiple_concurrent()
-{
+fn runtime_cancel_multiple_concurrent() {
     let mut executor = new_executor();
 
     executor
@@ -715,8 +680,7 @@ fn runtime_cancel_multiple_concurrent()
 /// Uses a spawned reader that drains slowly so write_all makes partial
 /// progress then blocks.
 #[test]
-fn runtime_cancel_write_all_mid_flight()
-{
+fn runtime_cancel_write_all_mid_flight() {
     let mut executor = new_executor();
 
     executor
@@ -761,8 +725,7 @@ fn runtime_cancel_write_all_mid_flight()
 /// Dropping a read_exact future mid-flight after partial progress cancels the
 /// outstanding SQE and reclaims the CompletionState exactly once.
 #[test]
-fn runtime_cancel_read_exact_mid_flight()
-{
+fn runtime_cancel_read_exact_mid_flight() {
     let mut executor = new_executor();
 
     executor
@@ -798,8 +761,7 @@ fn runtime_cancel_read_exact_mid_flight()
 
 /// `Nop::default()` produces a working future identical to `Nop::new()`.
 #[test]
-fn runtime_nop_default_trait()
-{
+fn runtime_nop_default_trait() {
     let mut executor = new_executor();
 
     executor
@@ -812,8 +774,7 @@ fn runtime_nop_default_trait()
 
 /// `NopSlot::default()` produces a reusable slot identical to `NopSlot::new()`.
 #[test]
-fn runtime_nop_slot_default_trait()
-{
+fn runtime_nop_slot_default_trait() {
     let mut executor = new_executor();
 
     executor

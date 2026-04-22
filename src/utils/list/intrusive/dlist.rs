@@ -1,3 +1,6 @@
+//! Circular intrusive doubly linked list used by ready queues and timer
+//! buckets.
+
 use std::marker::PhantomData;
 use std::ptr;
 
@@ -23,19 +26,16 @@ macro_rules! debug_assert_list_inited {
 
 /// The intrusive hook that must be embedded within your struct.
 #[repr(C)]
-pub struct Link
-{
+pub struct Link {
     /// Next link in the circular list.
     pub next: *mut Link,
     /// Previous link in the circular list.
     pub prev: *mut Link,
 }
 
-impl Link
-{
+impl Link {
     /// Creates a Link in a detached state (pointers are null).
-    pub const fn new_unlinked() -> Self
-    {
+    pub const fn new_unlinked() -> Self {
         Self {
             next: ptr::null_mut(),
             prev: ptr::null_mut(),
@@ -43,36 +43,31 @@ impl Link
     }
 
     #[inline(always)]
-    pub fn is_unlinked(&self) -> bool
-    {
+    pub fn is_unlinked(&self) -> bool {
         self.next.is_null() && self.prev.is_null()
     }
 }
 
 /// A circular intrusive doubly linked list.
-pub struct DList<T>
-{
+pub struct DList<T> {
     /// Sentinel head node anchoring the circular list.
     head: Link,
+    /// Carries the container type without storing values directly.
     _marker: PhantomData<T>,
 }
 
-impl<T> DList<T>
-{
+impl<T> DList<T> {
     /// Creates a new list instance.
-    /// Note: You MUST call .init() after this if the list is moved to its final location.
-    pub const fn new_uninit() -> Self
-    {
+    /// Call [`DList::init`] after moving it to its final memory location.
+    pub const fn new_uninit() -> Self {
         Self {
             head: Link::new_unlinked(),
             _marker: PhantomData,
         }
     }
 
-    /// Linux-style INIT_LIST_HEAD.
-    /// Anchors the circular pointers to the current memory address of the list.
-    pub fn init(&mut self)
-    {
+    /// Initializes the sentinel so the list points to itself.
+    pub fn init(&mut self) {
         let head_ptr = &mut self.head as *mut Link;
         unsafe {
             (*head_ptr).next = head_ptr;
@@ -80,21 +75,22 @@ impl<T> DList<T>
         }
     }
 
-    /// Returns true if the sentinel points to itself or if the list is uninitialized (null pointers).
+    /// Returns `true` when the list has no payload nodes.
+    ///
+    /// In debug builds, callers are still expected to initialize the list
+    /// before use.
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         let head_ptr = &self.head as *const Link;
         self.head.next.is_null() || std::ptr::eq(self.head.next, head_ptr)
     }
 
-    /// Internal helper: Connects a new node between two known nodes.
+    /// Internal helper that links `new_link` between two adjacent nodes.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure `new_link`, `prev`, and `next` are valid pointers.
-    unsafe fn __list_add(&mut self, new_link: *mut Link, prev: *mut Link, next: *mut Link)
-    {
+    unsafe fn __list_add(&mut self, new_link: *mut Link, prev: *mut Link, next: *mut Link) {
         debug_assert_list_inited!(self);
         unsafe {
             (*next).prev = new_link;
@@ -104,14 +100,13 @@ impl<T> DList<T>
         }
     }
 
-    /// Adds an element to the end of the list
+    /// Adds an element to the back of the list.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
     /// to a `Link` that is currently unlinked (unless unchecked).
-    pub unsafe fn push_back(&mut self, node_link: *mut Link)
-    {
+    pub unsafe fn push_back(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -126,15 +121,14 @@ impl<T> DList<T>
         }
     }
 
-    /// Adds an element to the end of the list without checking whether it is
+    /// Adds an element to the back of the list without checking whether it is
     /// already linked. Callers must guarantee queue membership independently.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is valid, non-null, and not
     /// currently linked into any list.
-    pub unsafe fn push_back_unchecked(&mut self, node_link: *mut Link)
-    {
+    pub unsafe fn push_back_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -147,14 +141,13 @@ impl<T> DList<T>
         }
     }
 
-    /// Adds an element to the front of the list
+    /// Adds an element to the front of the list.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
     /// to a `Link` that is currently unlinked (unless unchecked).
-    pub unsafe fn push_front(&mut self, node_link: *mut Link)
-    {
+    pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -169,16 +162,17 @@ impl<T> DList<T>
         }
     }
 
-    /// Adds an element to the front of the list without checking if it was previously unlinked.
-    /// This is an optimization for memory pools where nodes are known to be detached
-    /// without explicitly nullifying their pointers.
+    /// Adds an element to the front of the list without checking its detached
+    /// state first.
+    ///
+    /// This is used in internal fast paths where queue membership is already
+    /// tracked by surrounding state.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
     /// to a `Link` that is currently unlinked (unless unchecked).
-    pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link)
-    {
+    pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -193,13 +187,11 @@ impl<T> DList<T>
 
     /// Appends all nodes from `other` to the back of `self` in O(1).
     #[inline(always)]
-    pub fn append_back(&mut self, other: &mut Self)
-    {
+    pub fn append_back(&mut self, other: &mut Self) {
         debug_assert_list_inited!(self);
         debug_assert_list_inited!(other);
 
-        if other.is_empty()
-        {
+        if other.is_empty() {
             return;
         }
 
@@ -221,24 +213,21 @@ impl<T> DList<T>
         }
     }
 
-    /// Removes a specific node from the list
+    /// Removes a specific node from the list.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid pointer to a `Link`
     /// that is currently part of this specific list.
-    pub unsafe fn remove(&mut self, node_link: *mut Link)
-    {
-        if node_link.is_null()
-        {
+    pub unsafe fn remove(&mut self, node_link: *mut Link) {
+        if node_link.is_null() {
             return;
         }
 
         debug_assert_list_inited!(self);
 
         let head_ptr = &self.head as *const Link as *mut Link;
-        if node_link == head_ptr
-        {
+        if node_link == head_ptr {
             return;
         }
 
@@ -251,9 +240,8 @@ impl<T> DList<T>
             let next = (*node_link).next;
             let prev = (*node_link).prev;
 
-            // Do nothing if the node is already unlinked
-            if next.is_null() || prev.is_null()
-            {
+            // Treat already-detached nodes as a no-op on the unchecked path.
+            if next.is_null() || prev.is_null() {
                 return;
             }
 
@@ -266,14 +254,12 @@ impl<T> DList<T>
         }
     }
 
-    /// Peeks at the first element
+    /// Returns the first element without unlinking it.
     #[inline(always)]
-    pub fn front(&self, offset: usize) -> Option<*mut T>
-    {
+    pub fn front(&self, offset: usize) -> Option<*mut T> {
         debug_assert_list_inited!(self);
 
-        if self.is_empty()
-        {
+        if self.is_empty() {
             return None;
         }
         unsafe {
@@ -287,18 +273,16 @@ impl<T> DList<T>
         }
     }
 
-    /// Removes and returns the first element
+    /// Removes and returns the first element.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
     /// distance from the start of the container `T` to the `Link` field.
-    pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T>
-    {
+    pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T> {
         debug_assert_list_inited!(self);
 
-        if self.is_empty()
-        {
+        if self.is_empty() {
             return None;
         }
 
@@ -320,8 +304,7 @@ impl<T> DList<T>
     }
 
     /// Returns a forward-walking iterator
-    pub fn cursor_mut(&mut self) -> CursorMut<'_, T>
-    {
+    pub fn cursor_mut(&mut self) -> CursorMut<'_, T> {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -333,8 +316,7 @@ impl<T> DList<T>
     }
 
     /// Returns a backward-walking iterator.
-    pub fn cursor_back_mut(&mut self) -> CursorBackMut<'_, T>
-    {
+    pub fn cursor_back_mut(&mut self) -> CursorBackMut<'_, T> {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -352,13 +334,11 @@ impl<T> DList<T>
     /// # Safety
     ///
     /// The caller must ensure that `other` is a valid, initialized list.
-    pub unsafe fn splice_back(&mut self, other: &mut DList<T>)
-    {
+    pub unsafe fn splice_back(&mut self, other: &mut DList<T>) {
         debug_assert_list_inited!(self);
         debug_assert_list_inited!(other);
 
-        if other.is_empty()
-        {
+        if other.is_empty() {
             return;
         }
 
@@ -384,25 +364,24 @@ impl<T> DList<T>
     }
 }
 
-/// Forward Iterator
-pub struct CursorMut<'a, T>
-{
+/// Mutable forward cursor over a [`DList`].
+pub struct CursorMut<'a, T> {
+    /// Link that will be yielded on the next cursor step.
     current: *mut Link,
+    /// Sentinel head used to detect the end of the circular list.
     head: *mut Link,
+    /// Borrowed list that this cursor can also mutate via removals.
     list: &'a mut DList<T>,
 }
 
-impl<'a, T> CursorMut<'a, T>
-{
+impl<'a, T> CursorMut<'a, T> {
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
     /// distance from the start of the container `T` to the `Link` field.
-    pub unsafe fn next_with_offset(&mut self, offset: usize) -> Option<(*mut T, *mut Link)>
-    {
-        if self.current == self.head
-        {
+    pub unsafe fn next_with_offset(&mut self, offset: usize) -> Option<(*mut T, *mut Link)> {
+        if self.current == self.head {
             return None;
         }
 
@@ -424,33 +403,31 @@ impl<'a, T> CursorMut<'a, T>
     ///
     /// The caller must ensure that `node_link` is a valid pointer to a `Link`
     /// that is currently part of this specific list.
-    pub unsafe fn remove_link(&mut self, link: *mut Link)
-    {
+    pub unsafe fn remove_link(&mut self, link: *mut Link) {
         unsafe {
             self.list.remove(link);
         }
     }
 }
 
-/// Backward Iterator
-pub struct CursorBackMut<'a, T>
-{
+/// Mutable backward cursor over a [`DList`].
+pub struct CursorBackMut<'a, T> {
+    /// Link that will be yielded on the next backward cursor step.
     current: *mut Link,
+    /// Sentinel head used to detect the end of the circular list.
     head: *mut Link,
+    /// Borrowed list that this cursor can also mutate via removals.
     _list: &'a mut DList<T>,
 }
 
-impl<'a, T> CursorBackMut<'a, T>
-{
+impl<'a, T> CursorBackMut<'a, T> {
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
     /// distance from the start of the container `T` to the `Link` field.
-    pub unsafe fn prev_with_offset(&mut self, offset: usize) -> Option<(*mut T, *mut Link)>
-    {
-        if self.current == self.head
-        {
+    pub unsafe fn prev_with_offset(&mut self, offset: usize) -> Option<(*mut T, *mut Link)> {
+        if self.current == self.head {
             return None;
         }
 
@@ -473,8 +450,7 @@ impl<'a, T> CursorBackMut<'a, T>
     ///
     /// The caller must ensure that `node_link` is a valid pointer to a `Link`
     /// that is currently part of this specific list.
-    pub unsafe fn remove_link(&mut self, link: *mut Link)
-    {
+    pub unsafe fn remove_link(&mut self, link: *mut Link) {
         unsafe {
             self._list.remove(link);
         }

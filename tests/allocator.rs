@@ -2,17 +2,14 @@ use flowio::utils::memory::pool::*;
 use std::mem::MaybeUninit;
 
 // verbose memory provider
-struct VerboseProvider
-{
+struct VerboseProvider {
     buffer: Vec<u8>,
     offset: usize,
     alignment: usize,
 }
 
-impl VerboseProvider
-{
-    fn new(size: usize, align: usize) -> Self
-    {
+impl VerboseProvider {
+    fn new(size: usize, align: usize) -> Self {
         Self {
             buffer: vec![0u8; size],
             offset: 0,
@@ -21,10 +18,8 @@ impl VerboseProvider
     }
 }
 
-impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider
-{
-    fn init(&mut self, required_align: usize)
-    {
+impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider {
+    fn init(&mut self, required_align: usize) {
         // Escalation: The provider adapts to the stricter requirement
         self.alignment = core::cmp::max(self.alignment, required_align);
         self.offset = 0;
@@ -34,20 +29,17 @@ impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider
         );
     }
 
-    fn alignment_guarantee(&self) -> usize
-    {
+    fn alignment_guarantee(&self) -> usize {
         self.alignment
     }
 
-    fn request_memory(&mut self, size: usize) -> Option<*mut u8>
-    {
+    fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
         let base = self.buffer.as_mut_ptr() as usize;
         let current = base + self.offset;
         let aligned = (current + self.alignment - 1) & !(self.alignment - 1);
         let padding = aligned - current;
 
-        if self.offset + padding + size > self.buffer.len()
-        {
+        if self.offset + padding + size > self.buffer.len() {
             println!(
                 "  [Actual] Provider: Failed to allocate {} bytes (OOM)",
                 size
@@ -64,8 +56,7 @@ impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider
         Some(ptr)
     }
 
-    unsafe fn free_memory(&mut self, _ptr: *mut u8, size: usize)
-    {
+    unsafe fn free_memory(&mut self, _ptr: *mut u8, size: usize) {
         println!(
             "  [Actual] Provider: Freeing {} bytes (noop in bump allocator)",
             size
@@ -74,37 +65,30 @@ impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider
 }
 
 // 32 bytes test object
-struct Task
-{
+struct Task {
     id: u32,
 }
-impl InPlaceInit for Task
-{
+impl InPlaceInit for Task {
     type Args = u32;
-    fn init_at(slot: &mut MaybeUninit<Self>, id: Self::Args)
-    {
+    fn init_at(slot: &mut MaybeUninit<Self>, id: Self::Args) {
         slot.write(Task { id });
     }
 }
 
 // 64 bytes test object
 #[repr(C, align(64))]
-struct HardwareTask
-{
+struct HardwareTask {
     id: u32,
 }
-impl InPlaceInit for HardwareTask
-{
+impl InPlaceInit for HardwareTask {
     type Args = u32;
-    fn init_at(slot: &mut MaybeUninit<Self>, id: Self::Args)
-    {
+    fn init_at(slot: &mut MaybeUninit<Self>, id: Self::Args) {
         slot.write(HardwareTask { id });
     }
 }
 
 #[test]
-fn test_verbose_pool_logic()
-{
+fn test_verbose_pool_logic() {
     println!("\n=== TEST CASE: Lifecycle & Alignment Verification ===");
 
     // Setup
@@ -158,10 +142,8 @@ fn test_verbose_pool_logic()
         let mut count = 0;
         // We know from math ~254 objects fit in a 4KB slab.
         // We loop until a new request is seen in the logs.
-        for i in 0..300
-        {
-            if pool.alloc(i).is_none()
-            {
+        for i in 0..300 {
+            if pool.alloc(i).is_none() {
                 println!("  [Actual] Pool reached OOM at {} objects", count);
                 break;
             }
@@ -174,8 +156,7 @@ fn test_verbose_pool_logic()
 }
 
 #[test]
-fn test_strict_alignment_64()
-{
+fn test_strict_alignment_64() {
     println!("\n=== TEST CASE: Strict 64-Byte Hardware Alignment ===");
 
     let mut provider = VerboseProvider::new(4096, 64);
@@ -202,23 +183,19 @@ fn test_strict_alignment_64()
 }
 
 #[test]
-fn test_alignment_conflict_resolution()
-{
+fn test_alignment_conflict_resolution() {
     println!("\n=== TEST CASE: Alignment Conflict (Obj 64, Provider 8) ===");
 
     // Provider only guarantees 8-byte alignment
     let mut provider = VerboseProvider::new(8192, 8);
 
     #[repr(align(64))]
-    struct BigAlign
-    {
+    struct BigAlign {
         _inner: u64,
     }
-    impl InPlaceInit for BigAlign
-    {
+    impl InPlaceInit for BigAlign {
         type Args = ();
-        fn init_at(slot: &mut MaybeUninit<Self>, _: ())
-        {
+        fn init_at(slot: &mut MaybeUninit<Self>, _: ()) {
             slot.write(BigAlign { _inner: 0 });
         }
     }

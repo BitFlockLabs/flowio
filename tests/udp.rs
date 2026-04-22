@@ -6,8 +6,7 @@ use flowio::runtime::executor::Executor;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 
 #[test]
-fn runtime_udp_ping_pong()
-{
+fn runtime_udp_ping_pong() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -48,8 +47,7 @@ fn runtime_udp_ping_pong()
 }
 
 #[test]
-fn runtime_udp_send_to_recv_from_ping_pong()
-{
+fn runtime_udp_send_to_recv_from_ping_pong() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -91,8 +89,7 @@ fn runtime_udp_send_to_recv_from_ping_pong()
 }
 
 #[test]
-fn runtime_udp_recv_rejects_oversize_iobuff()
-{
+fn runtime_udp_recv_rejects_oversize_iobuff() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -116,8 +113,7 @@ fn runtime_udp_recv_rejects_oversize_iobuff()
 
 /// UdpSocket peer_addr and socket options.
 #[test]
-fn runtime_udp_socket_options()
-{
+fn runtime_udp_socket_options() {
     let mut socket =
         UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("failed to bind");
 
@@ -154,8 +150,7 @@ fn runtime_udp_socket_options()
 
 /// Connected UDP ping-pong using IoBuffMut for receive and IoBuffMut for send.
 #[test]
-fn runtime_udp_ping_pong_iobuff()
-{
+fn runtime_udp_ping_pong_iobuff() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -199,8 +194,7 @@ fn runtime_udp_ping_pong_iobuff()
 
 /// Unconnected send_to / recv_from using IoBuffMut and IoBuff.
 #[test]
-fn runtime_udp_send_to_recv_from_iobuff()
-{
+fn runtime_udp_send_to_recv_from_iobuff() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))

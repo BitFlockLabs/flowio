@@ -3,15 +3,13 @@ use std::mem::offset_of;
 use std::ptr;
 
 #[repr(C)]
-pub struct Task
-{
+pub struct Task {
     pub id: u32,
     pub link: utils::list::intrusive::dlist::Link,
 }
 
 #[test]
-fn test_verbose_pointer_audit()
-{
+fn test_verbose_pointer_audit() {
     let offset = offset_of!(Task, link);
 
     // 1. Initialize List in a stable location
@@ -31,8 +29,7 @@ fn test_verbose_pointer_audit()
 
     unsafe {
         println!("\n--- PHASE 1: SEQUENTIAL INSERTION (FIFO) ---");
-        for task in slab.iter_mut()
-        {
+        for task in slab.iter_mut() {
             let link_addr = &task.link as *const _ as usize;
             list.push_back(&mut task.link);
             println!(
@@ -43,8 +40,7 @@ fn test_verbose_pointer_audit()
 
         println!("\n--- PHASE 2: FORWARD WALK (Verification) ---");
         let mut cur = list.cursor_mut();
-        while let Some((task, link_ptr)) = cur.next_with_offset(offset)
-        {
+        while let Some((task, link_ptr)) = cur.next_with_offset(offset) {
             let link = &*link_ptr;
             println!(
                 "VISIT: ID {:<2} | Self: 0x{:x} | Prev: 0x{:x} | Next: 0x{:x}",
@@ -58,16 +54,14 @@ fn test_verbose_pointer_audit()
         println!("\n--- PHASE 3: SELECTIVE DELETION (Head, Mid, Tail) ---");
         // Remove 0 (Current Head), 5 (Middle), 9 (Current Tail)
         let targets = [0, 5, 9];
-        for &idx in &targets
-        {
+        for &idx in &targets {
             println!("REMOVING ID: {}", idx);
             list.remove(&mut slab[idx].link);
         }
 
         println!("\n--- PHASE 4: BACKWARD WALK (Post-Deletion) ---");
         let mut bcur = list.cursor_back_mut();
-        while let Some((task, link_ptr)) = bcur.prev_with_offset(offset)
-        {
+        while let Some((task, link_ptr)) = bcur.prev_with_offset(offset) {
             println!(
                 "BACK-VISIT: ID {:<2} | Link: 0x{:x}",
                 (*task).id,
@@ -77,10 +71,8 @@ fn test_verbose_pointer_audit()
 
         println!("\n--- PHASE 5: INTERLEAVED POP & RE-INSERT ---");
         // Pop 2 from front, push 1 new one to front
-        for _ in 0..2
-        {
-            if let Some(t) = list.pop_front(offset)
-            {
+        for _ in 0..2 {
+            if let Some(t) = list.pop_front(offset) {
                 println!("POP-FRONT: ID {}", (*t).id);
             }
         }
@@ -91,8 +83,7 @@ fn test_verbose_pointer_audit()
 
         println!("\n--- FINAL LIST STATE ---");
         let mut cur = list.cursor_mut();
-        while let Some((task, _)) = cur.next_with_offset(offset)
-        {
+        while let Some((task, _)) = cur.next_with_offset(offset) {
             print!("{} <-> ", (*task).id);
         }
         println!("SENTINEL");
@@ -102,8 +93,7 @@ fn test_verbose_pointer_audit()
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "broken list")]
-fn test_broken_list_detection()
-{
+fn test_broken_list_detection() {
     let mut list = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
     list.init();
 
@@ -132,8 +122,7 @@ fn test_broken_list_detection()
 }
 
 #[test]
-fn test_verbose_splice_logic()
-{
+fn test_verbose_splice_logic() {
     let offset = std::mem::offset_of!(Task, link);
 
     // Setup two lists
@@ -153,12 +142,10 @@ fn test_verbose_splice_logic()
     unsafe {
         // Initial state
         println!("\n[PHASE 1] Initializing Queues");
-        for task in tasks.iter_mut().take(3)
-        {
+        for task in tasks.iter_mut().take(3) {
             running_queue.push_back(&mut task.link);
         }
-        for task in tasks.iter_mut().take(6).skip(3)
-        {
+        for task in tasks.iter_mut().take(6).skip(3) {
             ready_queue.push_back(&mut task.link);
         }
 
@@ -175,16 +162,14 @@ fn test_verbose_splice_logic()
         print_list_verbose(&mut running_queue, offset);
 
         println!("Ready Queue (Post-Splice):");
-        if ready_queue.is_empty()
-        {
+        if ready_queue.is_empty() {
             println!("  (List is empty as expected)");
         }
 
         // Verify IDs are in order 0, 1, 2, 3, 4, 5
         let mut cur = running_queue.cursor_mut();
         let mut expected_id = 0;
-        while let Some((task, _)) = cur.next_with_offset(offset)
-        {
+        while let Some((task, _)) = cur.next_with_offset(offset) {
             assert_eq!((*task).id, expected_id);
             expected_id += 1;
         }
@@ -195,52 +180,44 @@ fn test_verbose_splice_logic()
 }
 
 /// Helper for verbose printing
-unsafe fn print_list_verbose<T>(list: &mut utils::list::intrusive::dlist::DList<T>, offset: usize)
-{
+unsafe fn print_list_verbose<T>(list: &mut utils::list::intrusive::dlist::DList<T>, offset: usize) {
     let mut cur = list.cursor_mut();
     let mut found = false;
-    while let Some((task, link)) = unsafe { cur.next_with_offset(offset) }
-    {
+    while let Some((task, link)) = unsafe { cur.next_with_offset(offset) } {
         unsafe {
             let t = &*task as *const _ as *mut Task;
             println!("  ID: {} | LinkAddr: {:p}", (*t).id, link);
             found = true;
         }
     }
-    if !found
-    {
+    if !found {
         println!("  <Empty>");
     }
 }
 
 #[repr(C)]
-struct Node
-{
+struct Node {
     value: u32,
     link: utils::list::intrusive::dlist::Link,
 }
 
-fn new_node(value: u32) -> Node
-{
+fn new_node(value: u32) -> Node {
     Node {
         value,
         link: utils::list::intrusive::dlist::Link::new_unlinked(),
     }
 }
 
-fn link_offset() -> usize
-{
+fn link_offset() -> usize {
     offset_of!(Node, link)
 }
 
-fn link_ptr(n: &mut Node) -> *mut utils::list::intrusive::dlist::Link
-{
+fn link_ptr(n: &mut Node) -> *mut utils::list::intrusive::dlist::Link {
     &mut n.link as *mut utils::list::intrusive::dlist::Link
 }
 
 #[test]
-fn empty_uninit_then_init_verbose()
-{
+fn empty_uninit_then_init_verbose() {
     let off = link_offset();
     eprintln!("\n== empty_uninit_then_init_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -262,8 +239,7 @@ fn empty_uninit_then_init_verbose()
 }
 
 #[test]
-fn front_peek_does_not_remove_verbose()
-{
+fn front_peek_does_not_remove_verbose() {
     let off = link_offset();
     eprintln!("\n== front_peek_does_not_remove_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -300,8 +276,7 @@ fn front_peek_does_not_remove_verbose()
 }
 
 #[test]
-fn push_back_order_then_pop_front_verbose()
-{
+fn push_back_order_then_pop_front_verbose() {
     let off = link_offset();
     eprintln!("\n== push_back_order_then_pop_front_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -364,8 +339,7 @@ fn push_back_order_then_pop_front_verbose()
 }
 
 #[test]
-fn push_front_order_then_pop_front_verbose()
-{
+fn push_front_order_then_pop_front_verbose() {
     let off = link_offset();
     eprintln!("\n== push_front_order_then_pop_front_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -411,8 +385,7 @@ fn push_front_order_then_pop_front_verbose()
 }
 
 #[test]
-fn mixed_pushes_expected_order_verbose()
-{
+fn mixed_pushes_expected_order_verbose() {
     let off = link_offset();
     eprintln!("\n== mixed_pushes_expected_order_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -454,8 +427,7 @@ fn mixed_pushes_expected_order_verbose()
 }
 
 #[test]
-fn remove_arbitrary_middle_verbose()
-{
+fn remove_arbitrary_middle_verbose() {
     let off = link_offset();
     eprintln!("\n== remove_arbitrary_middle_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -494,8 +466,7 @@ fn remove_arbitrary_middle_verbose()
 }
 
 #[test]
-fn remove_head_and_tail_verbose()
-{
+fn remove_head_and_tail_verbose() {
     let off = link_offset();
     eprintln!("\n== remove_head_and_tail_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -536,8 +507,7 @@ fn remove_head_and_tail_verbose()
 }
 
 #[test]
-fn reuse_node_after_removal_verbose()
-{
+fn reuse_node_after_removal_verbose() {
     let off = link_offset();
     eprintln!("\n== reuse_node_after_removal_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -573,8 +543,7 @@ fn reuse_node_after_removal_verbose()
 }
 
 #[test]
-fn cursor_forward_remove_evens_verbose()
-{
+fn cursor_forward_remove_evens_verbose() {
     let off = link_offset();
     eprintln!("\n== cursor_forward_remove_evens_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -594,8 +563,7 @@ fn cursor_forward_remove_evens_verbose()
 
     unsafe {
         eprintln!("push_back 1..6");
-        for n in &mut nodes
-        {
+        for n in &mut nodes {
             let p = link_ptr(n);
             let v = n.value;
             eprintln!("  push {} link={:p}", v, p);
@@ -604,12 +572,10 @@ fn cursor_forward_remove_evens_verbose()
 
         eprintln!("iterate forward and remove evens");
         let mut cur = list.cursor_mut();
-        while let Some((tptr, lptr)) = cur.next_with_offset(off)
-        {
+        while let Some((tptr, lptr)) = cur.next_with_offset(off) {
             let v = (*tptr).value;
             eprintln!("  visit {} link={:p}", v, lptr);
-            if v % 2 == 0
-            {
+            if v % 2 == 0 {
                 eprintln!("    REMOVE {}", v);
                 cur.remove_link(lptr);
                 eprintln!("    removed link is_unlinked={}", (*lptr).is_unlinked());
@@ -633,8 +599,7 @@ fn cursor_forward_remove_evens_verbose()
 }
 
 #[test]
-fn cursor_backward_remove_odds_verbose()
-{
+fn cursor_backward_remove_odds_verbose() {
     let off = link_offset();
     eprintln!("\n== cursor_backward_remove_odds_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -653,8 +618,7 @@ fn cursor_backward_remove_odds_verbose()
 
     unsafe {
         eprintln!("push_back 1..5");
-        for n in &mut nodes
-        {
+        for n in &mut nodes {
             let p = link_ptr(n);
             let v = n.value;
             eprintln!("  push {} link={:p}", v, p);
@@ -663,12 +627,10 @@ fn cursor_backward_remove_odds_verbose()
 
         eprintln!("iterate backward and remove odds");
         let mut cur = list.cursor_back_mut();
-        while let Some((tptr, lptr)) = cur.prev_with_offset(off)
-        {
+        while let Some((tptr, lptr)) = cur.prev_with_offset(off) {
             let v = (*tptr).value;
             eprintln!("  visit {} link={:p}", v, lptr);
-            if v % 2 == 1
-            {
+            if v % 2 == 1 {
                 eprintln!("    REMOVE {}", v);
                 cur.remove_link(lptr);
                 eprintln!("    removed link is_unlinked={}", (*lptr).is_unlinked());
@@ -690,8 +652,7 @@ fn cursor_backward_remove_odds_verbose()
 }
 
 #[test]
-fn remove_null_is_noop_verbose()
-{
+fn remove_null_is_noop_verbose() {
     let off = link_offset();
     eprintln!("\n== remove_null_is_noop_verbose ==");
     eprintln!("offset(link) = {off}");
@@ -725,14 +686,12 @@ fn remove_null_is_noop_verbose()
 
 // Debug-only tests: rely on debug_assert! panics.
 #[cfg(debug_assertions)]
-mod debug_only
-{
+mod debug_only {
     use super::*;
 
     #[test]
     #[should_panic(expected = "double insert")]
-    fn double_insert_panics_verbose()
-    {
+    fn double_insert_panics_verbose() {
         eprintln!("\n== double_insert_panics_verbose ==");
 
         let mut list: utils::list::intrusive::dlist::DList<Node> =
@@ -754,8 +713,7 @@ mod debug_only
 
     #[test]
     #[should_panic(expected = "List not initialized")]
-    fn uninitialized_list_panics_on_push_verbose()
-    {
+    fn uninitialized_list_panics_on_push_verbose() {
         eprintln!("\n== uninitialized_list_panics_on_push_verbose ==");
 
         let mut list: utils::list::intrusive::dlist::DList<Node> =
@@ -776,8 +734,7 @@ mod debug_only
 
     #[test]
     #[should_panic(expected = "remove on unlinked node")]
-    fn remove_unlinked_panics_verbose()
-    {
+    fn remove_unlinked_panics_verbose() {
         eprintln!("\n== remove_unlinked_panics_verbose ==");
 
         let mut list: utils::list::intrusive::dlist::DList<Node> =

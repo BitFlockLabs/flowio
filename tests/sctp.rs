@@ -17,8 +17,7 @@ use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::timeout;
 use std::time::Duration;
 
-fn sctp_unsupported(err: &std::io::Error) -> bool
-{
+fn sctp_unsupported(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
         Some(libc::EPROTONOSUPPORT)
@@ -29,8 +28,7 @@ fn sctp_unsupported(err: &std::io::Error) -> bool
     )
 }
 
-fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -> Vec<u8>
-{
+fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     buf[0..2].copy_from_slice(&(notification_type as u16).to_ne_bytes());
     buf[2..4].copy_from_slice(&flags.to_ne_bytes());
@@ -38,8 +36,7 @@ fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -
     buf
 }
 
-fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage
-{
+fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
@@ -59,20 +56,17 @@ fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage
 }
 
 #[test]
-fn sctp_accept_slot_drop_future_closes_completed_fd()
-{
+fn sctp_accept_slot_drop_future_closes_completed_fd() {
     test_accept_slot_drop_future_closes_completed_fd().unwrap();
 }
 
 #[test]
-fn sctp_connect_slot_drop_future_closes_socket_fd()
-{
+fn sctp_connect_slot_drop_future_closes_socket_fd() {
     test_connect_slot_drop_future_closes_socket_fd().unwrap();
 }
 
 #[test]
-fn parse_assoc_change_notification()
-{
+fn parse_assoc_change_notification() {
     let mut buf = vec![0u8; 20];
     buf[0..2].copy_from_slice(&(test_assoc_change_type() as u16).to_ne_bytes());
     buf[2..4].copy_from_slice(&0u16.to_ne_bytes());
@@ -97,8 +91,7 @@ fn parse_assoc_change_notification()
 }
 
 #[test]
-fn parse_adaptation_notification()
-{
+fn parse_adaptation_notification() {
     let mut buf = vec![0u8; 16];
     buf[0..2].copy_from_slice(&(test_adaptation_indication_type() as u16).to_ne_bytes());
     buf[2..4].copy_from_slice(&0u16.to_ne_bytes());
@@ -117,8 +110,7 @@ fn parse_adaptation_notification()
 }
 
 #[test]
-fn parse_send_failed_event_notification()
-{
+fn parse_send_failed_event_notification() {
     let sndinfo_len = std::mem::size_of::<libc::sctp_sndinfo>();
     let mut buf = vec![0u8; 12 + sndinfo_len + 4];
     buf[0..2].copy_from_slice(&(test_send_failed_event_type() as u16).to_ne_bytes());
@@ -157,8 +149,7 @@ fn parse_send_failed_event_notification()
 }
 
 #[test]
-fn parse_peer_addr_change_notification()
-{
+fn parse_peer_addr_change_notification() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
@@ -189,8 +180,7 @@ fn parse_peer_addr_change_notification()
 }
 
 #[test]
-fn parse_remote_error_and_shutdown_notifications()
-{
+fn parse_remote_error_and_shutdown_notifications() {
     let mut remote_error = notification_buffer(test_remote_error_type(), 0, 14);
     remote_error[8..10].copy_from_slice(&0x1122u16.to_be_bytes());
     remote_error[10..14].copy_from_slice(&12i32.to_ne_bytes());
@@ -221,8 +211,7 @@ fn parse_remote_error_and_shutdown_notifications()
 }
 
 #[test]
-fn parse_partial_delivery_and_reset_notifications()
-{
+fn parse_partial_delivery_and_reset_notifications() {
     let mut partial_delivery = notification_buffer(test_partial_delivery_event_type(), 0, 24);
     partial_delivery[8..12].copy_from_slice(&7u32.to_ne_bytes());
     partial_delivery[12..16].copy_from_slice(&15i32.to_ne_bytes());
@@ -282,8 +271,7 @@ fn parse_partial_delivery_and_reset_notifications()
 }
 
 #[test]
-fn parse_unknown_notification_falls_back_to_other()
-{
+fn parse_unknown_notification_falls_back_to_other() {
     let parsed =
         test_parse_notification(&notification_buffer(0x9001, 0x0007, 8)).expect("other parse");
     assert_eq!(
@@ -297,8 +285,7 @@ fn parse_unknown_notification_falls_back_to_other()
 }
 
 #[test]
-fn notification_helpers()
-{
+fn notification_helpers() {
     let notification = SctpNotification::Shutdown { assoc_id: 7 };
     assert_eq!(notification.kind(), SctpNotificationKind::Shutdown);
 
@@ -326,8 +313,7 @@ fn notification_helpers()
 }
 
 #[test]
-fn notification_mask_all_and_none_round_trip()
-{
+fn notification_mask_all_and_none_round_trip() {
     let all = SctpNotificationMask::all();
     assert!(all.association);
     assert!(all.address);
@@ -358,8 +344,7 @@ fn notification_mask_all_and_none_round_trip()
 }
 
 #[test]
-fn notification_mask_defaults()
-{
+fn notification_mask_defaults() {
     assert_eq!(
         SctpNotificationMask::default(),
         SctpNotificationMask::signaling_default()
@@ -369,21 +354,17 @@ fn notification_mask_defaults()
 }
 
 #[test]
-fn runtime_sctp_ping_pong()
-{
+fn runtime_sctp_ping_pong() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
     assert_eq!(init, SctpInitConfig::default());
 
     let mut listener =
-        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init)
-        {
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
             Ok(listener) => listener,
-            Err(err) =>
-            {
-                if sctp_unsupported(&err)
-                {
+            Err(err) => {
+                if sctp_unsupported(&err) {
                     eprintln!("skipping runtime_sctp_ping_pong: SCTP unsupported ({err})");
                     return;
                 }
@@ -408,24 +389,19 @@ fn runtime_sctp_ping_pong()
 
                 // Skip notifications until we get a data message.
                 let mut current_buf = srv_buf;
-                let (recv_len, meta, recv_buf) = loop
-                {
+                let (recv_len, meta, recv_buf) = loop {
                     let recv_res = stream.recv_msg(current_buf, msg_size).await;
                     let (recv_len, meta) = recv_res.0.expect("server recv failed");
-                    match meta
-                    {
+                    match meta {
                         SctpRecvMeta::Notification(_) => current_buf = recv_res.1,
-                        SctpRecvMeta::Data(info) =>
-                        {
+                        SctpRecvMeta::Data(info) => {
                             break (recv_len, SctpRecvMeta::Data(info), recv_res.1);
                         }
                     }
                 };
                 assert_eq!(recv_len, 4);
-                match meta
-                {
-                    SctpRecvMeta::Data(info) =>
-                    {
+                match meta {
+                    SctpRecvMeta::Data(info) => {
                         assert_eq!(info.stream_id, 1);
                         assert_eq!(info.ppid, 0x0102_0304);
                     }
@@ -519,8 +495,7 @@ fn runtime_sctp_ping_pong()
                 .expect("set_primary_addr failed");
 
             // set_peer_primary_addr may fail with EPERM/EACCES/EOPNOTSUPP depending on kernel.
-            if let Err(err) = stream.set_peer_primary_addr(client_local_addr)
-            {
+            if let Err(err) = stream.set_peer_primary_addr(client_local_addr) {
                 let raw = err.raw_os_error();
                 assert!(
                     matches!(
@@ -539,8 +514,7 @@ fn runtime_sctp_ping_pong()
                 flags: SctpReconfigFlags::RESET_STREAMS | SctpReconfigFlags::CHANGE_ASSOC,
             });
             // Stream reconfiguration may not be supported on all kernels.
-            if let Err(err) = enable_res
-            {
+            if let Err(err) = enable_res {
                 let raw = err.raw_os_error();
                 assert!(
                     matches!(
@@ -553,11 +527,8 @@ fn runtime_sctp_ping_pong()
                     ),
                     "enable_stream_reset failed unexpectedly: {err}"
                 );
-            }
-            else
-            {
-                if let Err(err) = stream.reset_streams(&SctpResetStreams::outgoing(&[1]))
-                {
+            } else {
+                if let Err(err) = stream.reset_streams(&SctpResetStreams::outgoing(&[1])) {
                     let raw = err.raw_os_error();
                     assert!(
                         matches!(
@@ -572,8 +543,7 @@ fn runtime_sctp_ping_pong()
                     );
                 }
 
-                if let Err(err) = stream.add_streams(SctpAddStreams::new(1, 1))
-                {
+                if let Err(err) = stream.add_streams(SctpAddStreams::new(1, 1)) {
                     let raw = err.raw_os_error();
                     assert!(
                         matches!(
@@ -605,25 +575,20 @@ fn runtime_sctp_ping_pong()
 
             // Skip notifications until we get data back.
             let mut current_buf = cli_recv;
-            let (recv_len, meta, recv_buf) = loop
-            {
+            let (recv_len, meta, recv_buf) = loop {
                 let recv_res = stream.recv_msg(current_buf, msg_size).await;
                 let (recv_len, meta) = recv_res.0.expect("client recv failed");
-                match meta
-                {
+                match meta {
                     SctpRecvMeta::Notification(_) => current_buf = recv_res.1,
-                    SctpRecvMeta::Data(info) =>
-                    {
+                    SctpRecvMeta::Data(info) => {
                         break (recv_len, SctpRecvMeta::Data(info), recv_res.1);
                     }
                 }
             };
             assert_eq!(recv_len, 4);
             assert_eq!(&recv_buf[..recv_len], b"ping");
-            match meta
-            {
-                SctpRecvMeta::Data(info) =>
-                {
+            match meta {
+                SctpRecvMeta::Data(info) => {
                     assert_eq!(info.stream_id, 1);
                     assert_eq!(info.ppid, 0x0102_0304);
                 }
@@ -638,8 +603,7 @@ fn runtime_sctp_ping_pong()
 }
 
 #[test]
-fn runtime_sctp_default_peer_addr_params_rejects_specific_address()
-{
+fn runtime_sctp_default_peer_addr_params_rejects_specific_address() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
@@ -647,13 +611,10 @@ fn runtime_sctp_default_peer_addr_params_rejects_specific_address()
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         128,
         init,
-    )
-    {
+    ) {
         Ok(listener) => listener,
-        Err(err) =>
-        {
-            if sctp_unsupported(&err)
-            {
+        Err(err) => {
+            if sctp_unsupported(&err) {
                 eprintln!(
                     "skipping runtime_sctp_default_peer_addr_params_rejects_specific_address: SCTP unsupported ({err})"
                 );
@@ -689,8 +650,7 @@ fn runtime_sctp_default_peer_addr_params_rejects_specific_address()
 }
 
 #[test]
-fn runtime_sctp_fast_send_recv()
-{
+fn runtime_sctp_fast_send_recv() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
@@ -707,13 +667,10 @@ fn runtime_sctp_fast_send_recv()
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         128,
         socket_config,
-    )
-    {
+    ) {
         Ok(listener) => listener,
-        Err(err) =>
-        {
-            if sctp_unsupported(&err)
-            {
+        Err(err) => {
+            if sctp_unsupported(&err) {
                 eprintln!("skipping runtime_sctp_fast_send_recv: SCTP unsupported ({err})");
                 return;
             }
@@ -761,8 +718,7 @@ fn runtime_sctp_fast_send_recv()
 }
 
 #[test]
-fn runtime_sctp_multistream_long_lived()
-{
+fn runtime_sctp_multistream_long_lived() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig {
@@ -771,13 +727,10 @@ fn runtime_sctp_multistream_long_lived()
         ..SctpInitConfig::diameter_default()
     };
     let mut listener =
-        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init)
-        {
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
             Ok(listener) => listener,
-            Err(err) =>
-            {
-                if sctp_unsupported(&err)
-                {
+            Err(err) => {
+                if sctp_unsupported(&err) {
                     eprintln!(
                         "skipping runtime_sctp_multistream_long_lived: SCTP unsupported ({err})"
                     );
@@ -800,18 +753,15 @@ fn runtime_sctp_multistream_long_lived()
                 let (mut stream, _remote) = listener.accept().await.expect("accept failed");
 
                 let mut current_buf = vec![0u8; msg_size];
-                for round in 0..rounds
-                {
+                for round in 0..rounds {
                     let expected_stream = (round % stream_count) as u16;
                     let expected_ppid = 0x0102_0304u32 + round as u32;
                     let expected_payload = format!("ping-{round:02}-stream-{expected_stream}");
 
-                    let (recv_len, info, recv_buf) = loop
-                    {
+                    let (recv_len, info, recv_buf) = loop {
                         let recv_res = stream.recv_msg(current_buf, msg_size).await;
                         let (recv_len, meta) = recv_res.0.expect("server recv failed");
-                        match meta
-                        {
+                        match meta {
                             SctpRecvMeta::Notification(_) => current_buf = recv_res.1,
                             SctpRecvMeta::Data(info) => break (recv_len, info, recv_res.1),
                         }
@@ -850,8 +800,7 @@ fn runtime_sctp_multistream_long_lived()
                 .expect("connect failed");
 
             let mut current_buf = vec![0u8; msg_size];
-            for round in 0..rounds
-            {
+            for round in 0..rounds {
                 let stream_id = (round % stream_count) as u16;
                 let ppid = 0x0102_0304u32 + round as u32;
                 let payload = format!("ping-{round:02}-stream-{stream_id}").into_bytes();
@@ -870,12 +819,10 @@ fn runtime_sctp_multistream_long_lived()
                     .await;
                 assert_eq!(send_res.expect("client send failed"), payload.len());
 
-                let (recv_len, info, recv_buf) = loop
-                {
+                let (recv_len, info, recv_buf) = loop {
                     let recv_res = stream.recv_msg(current_buf, msg_size).await;
                     let (recv_len, meta) = recv_res.0.expect("client recv failed");
-                    match meta
-                    {
+                    match meta {
                         SctpRecvMeta::Notification(_) => current_buf = recv_res.1,
                         SctpRecvMeta::Data(info) => break (recv_len, info, recv_res.1),
                     }
@@ -891,8 +838,7 @@ fn runtime_sctp_multistream_long_lived()
 }
 
 #[test]
-fn runtime_sctp_shutdown_write_peer_observes_terminal_state()
-{
+fn runtime_sctp_shutdown_write_peer_observes_terminal_state() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
@@ -900,13 +846,10 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state()
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         128,
         init,
-    )
-    {
+    ) {
         Ok(listener) => listener,
-        Err(err) =>
-        {
-            if sctp_unsupported(&err)
-            {
+        Err(err) => {
+            if sctp_unsupported(&err) {
                 eprintln!(
                     "skipping runtime_sctp_shutdown_write_peer_observes_terminal_state: SCTP unsupported ({err})"
                 );
@@ -929,8 +872,7 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state()
                 let mut saw_shutdown_notification = false;
                 let mut saw_eof = false;
 
-                while !(saw_data && (saw_shutdown_notification || saw_eof))
-                {
+                while !(saw_data && (saw_shutdown_notification || saw_eof)) {
                     let recv_res =
                         timeout(Duration::from_secs(1), stream.recv_msg(current_buf, 256))
                             .await
@@ -938,31 +880,25 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state()
                     let (recv_len, meta) = recv_res.0.expect("server recv failed");
                     current_buf = recv_res.1;
 
-                    match meta
-                    {
-                        SctpRecvMeta::Notification(SctpNotification::Shutdown { .. }) =>
-                        {
+                    match meta {
+                        SctpRecvMeta::Notification(SctpNotification::Shutdown { .. }) => {
                             saw_shutdown_notification = true;
                         }
-                        SctpRecvMeta::Notification(_) =>
-                        {}
-                        SctpRecvMeta::Data(info) =>
-                        {
+                        SctpRecvMeta::Notification(_) => {}
+                        SctpRecvMeta::Data(info) => {
                             assert!(!saw_data, "unexpected extra data after shutdown");
                             assert_eq!(recv_len, 4);
                             assert_eq!(&current_buf[..recv_len], b"ping");
                             assert_eq!(info.stream_id, 1);
                             assert_eq!(info.ppid, 0x0102_0304);
                             saw_data = true;
-                            if recv_len == 0
-                            {
+                            if recv_len == 0 {
                                 saw_eof = true;
                             }
                         }
                     }
 
-                    if recv_len == 0
-                    {
+                    if recv_len == 0 {
                         saw_eof = true;
                     }
                 }
@@ -1006,19 +942,15 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state()
 }
 
 #[test]
-fn runtime_sctp_connect_timeout_success()
-{
+fn runtime_sctp_connect_timeout_success() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
     let mut listener =
-        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init)
-        {
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
             Ok(listener) => listener,
-            Err(err) =>
-            {
-                if sctp_unsupported(&err)
-                {
+            Err(err) => {
+                if sctp_unsupported(&err) {
                     eprintln!(
                         "skipping runtime_sctp_connect_timeout_success: SCTP unsupported ({err})"
                     );
@@ -1050,18 +982,14 @@ fn runtime_sctp_connect_timeout_success()
 }
 
 #[test]
-fn runtime_sctp_connect_timeout_propagates_connect_error()
-{
+fn runtime_sctp_connect_timeout_propagates_connect_error() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
-    let listener = match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init)
-    {
+    let listener = match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
         Ok(listener) => listener,
-        Err(err) =>
-        {
-            if sctp_unsupported(&err)
-            {
+        Err(err) => {
+            if sctp_unsupported(&err) {
                 eprintln!(
                     "skipping runtime_sctp_connect_timeout_propagates_connect_error: SCTP unsupported ({err})"
                 );
@@ -1082,8 +1010,7 @@ fn runtime_sctp_connect_timeout_propagates_connect_error()
                 .connect_timeout(addr, Duration::from_secs(1))
                 .expect("connect_timeout init failed")
                 .await;
-            let err = match result
-            {
+            let err = match result {
                 Ok(_) => panic!("connect_timeout should propagate connect failure"),
                 Err(err) => err,
             };
@@ -1098,19 +1025,15 @@ fn runtime_sctp_connect_timeout_propagates_connect_error()
 
 /// SCTP ping-pong using IoBuffMut for send/recv instead of Vec<u8>.
 #[test]
-fn runtime_sctp_ping_pong_iobuff()
-{
+fn runtime_sctp_ping_pong_iobuff() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
     let mut listener =
-        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init)
-        {
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
             Ok(listener) => listener,
-            Err(err) =>
-            {
-                if sctp_unsupported(&err)
-                {
+            Err(err) => {
+                if sctp_unsupported(&err) {
                     eprintln!("skipping runtime_sctp_ping_pong_iobuff: SCTP unsupported ({err})");
                     return;
                 }
@@ -1133,30 +1056,24 @@ fn runtime_sctp_ping_pong_iobuff()
                 // past already-written payload, so without reset the next recv
                 // would write at the wrong offset.
                 let mut current_buf = IoBuffMut::new(0, msg_size, 0);
-                let (recv_len, meta, recv_buf) = loop
-                {
+                let (recv_len, meta, recv_buf) = loop {
                     let recv_res = stream.recv_msg(current_buf, msg_size).await;
                     let (recv_len, meta) = recv_res.0.expect("server recv failed");
-                    match meta
-                    {
-                        SctpRecvMeta::Notification(_) =>
-                        {
+                    match meta {
+                        SctpRecvMeta::Notification(_) => {
                             let mut buf = recv_res.1;
                             buf.reset();
                             current_buf = buf;
                         }
-                        SctpRecvMeta::Data(info) =>
-                        {
+                        SctpRecvMeta::Data(info) => {
                             break (recv_len, SctpRecvMeta::Data(info), recv_res.1);
                         }
                     }
                 };
                 assert_eq!(recv_len, 4);
                 assert_eq!(recv_buf.payload_bytes()[..recv_len], *b"ping");
-                match meta
-                {
-                    SctpRecvMeta::Data(info) =>
-                    {
+                match meta {
+                    SctpRecvMeta::Data(info) => {
                         assert_eq!(info.stream_id, 1);
                         assert_eq!(info.ppid, 0x0102_0304);
                     }
@@ -1205,30 +1122,24 @@ fn runtime_sctp_ping_pong_iobuff()
 
             // Receive with IoBuffMut, skip notifications.
             let mut current_buf = IoBuffMut::new(0, msg_size, 0);
-            let (recv_len, meta, recv_buf) = loop
-            {
+            let (recv_len, meta, recv_buf) = loop {
                 let recv_res = stream.recv_msg(current_buf, msg_size).await;
                 let (recv_len, meta) = recv_res.0.expect("client recv failed");
-                match meta
-                {
-                    SctpRecvMeta::Notification(_) =>
-                    {
+                match meta {
+                    SctpRecvMeta::Notification(_) => {
                         let mut buf = recv_res.1;
                         buf.reset();
                         current_buf = buf;
                     }
-                    SctpRecvMeta::Data(info) =>
-                    {
+                    SctpRecvMeta::Data(info) => {
                         break (recv_len, SctpRecvMeta::Data(info), recv_res.1);
                     }
                 }
             };
             assert_eq!(recv_len, 4);
             assert_eq!(recv_buf.payload_bytes()[..recv_len], *b"ping");
-            match meta
-            {
-                SctpRecvMeta::Data(info) =>
-                {
+            match meta {
+                SctpRecvMeta::Data(info) => {
                     assert_eq!(info.stream_id, 1);
                     assert_eq!(info.ppid, 0x0102_0304);
                 }
@@ -1239,8 +1150,7 @@ fn runtime_sctp_ping_pong_iobuff()
 }
 
 #[test]
-fn runtime_sctp_recv_msg_rejects_oversize_iobuff()
-{
+fn runtime_sctp_recv_msg_rejects_oversize_iobuff() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
@@ -1248,13 +1158,10 @@ fn runtime_sctp_recv_msg_rejects_oversize_iobuff()
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         128,
         init,
-    )
-    {
+    ) {
         Ok(listener) => listener,
-        Err(err) =>
-        {
-            if sctp_unsupported(&err)
-            {
+        Err(err) => {
+            if sctp_unsupported(&err) {
                 eprintln!(
                     "skipping runtime_sctp_recv_msg_rejects_oversize_iobuff: SCTP unsupported ({err})"
                 );
@@ -1297,19 +1204,15 @@ fn runtime_sctp_recv_msg_rejects_oversize_iobuff()
 
 /// SCTP ping-pong using vectored send/recv with IoBuffVecMut.
 #[test]
-fn runtime_sctp_ping_pong_vectored()
-{
+fn runtime_sctp_ping_pong_vectored() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
     let mut listener =
-        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init)
-        {
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
             Ok(listener) => listener,
-            Err(err) =>
-            {
-                if sctp_unsupported(&err)
-                {
+            Err(err) => {
+                if sctp_unsupported(&err) {
                     eprintln!("skipping runtime_sctp_ping_pong_vectored: SCTP unsupported ({err})");
                     return;
                 }
@@ -1328,15 +1231,12 @@ fn runtime_sctp_ping_pong_vectored()
 
                 // Receive with single-buffer recv_msg, skip notifications.
                 let mut current_buf = vec![0u8; 256];
-                let (recv_len, _meta, _recv_buf) = loop
-                {
+                let (recv_len, _meta, _recv_buf) = loop {
                     let recv_res = stream.recv_msg(current_buf, 256).await;
                     let (recv_len, meta) = recv_res.0.expect("server recv failed");
-                    match meta
-                    {
+                    match meta {
                         SctpRecvMeta::Notification(_) => current_buf = recv_res.1,
-                        SctpRecvMeta::Data(info) =>
-                        {
+                        SctpRecvMeta::Data(info) => {
                             break (recv_len, SctpRecvMeta::Data(info), recv_res.1);
                         }
                     }
@@ -1409,30 +1309,24 @@ fn runtime_sctp_ping_pong_vectored()
             recv_chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
             recv_chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
 
-            let (recv_len, meta, _recv_chain) = loop
-            {
+            let (recv_len, meta, _recv_chain) = loop {
                 let recv_res = stream.recv_msg_vectored(recv_chain).await;
                 let (recv_len, meta) = recv_res.0.expect("client recv_msg_vectored failed");
-                match meta
-                {
-                    SctpRecvMeta::Notification(_) =>
-                    {
+                match meta {
+                    SctpRecvMeta::Notification(_) => {
                         // Rebuild chain for retry (old one consumed by rental).
                         recv_chain = IoBuffVecMut::<2>::new();
                         recv_chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
                         recv_chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
                     }
-                    SctpRecvMeta::Data(info) =>
-                    {
+                    SctpRecvMeta::Data(info) => {
                         break (recv_len, SctpRecvMeta::Data(info), recv_res.1);
                     }
                 }
             };
             assert_eq!(recv_len, 8);
-            match meta
-            {
-                SctpRecvMeta::Data(info) =>
-                {
+            match meta {
+                SctpRecvMeta::Data(info) => {
                     assert_eq!(info.stream_id, 1);
                     assert_eq!(info.ppid, 0x0102_0304);
                 }

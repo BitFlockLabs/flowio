@@ -1,21 +1,19 @@
+//! Slab-backed object pool with intrusive free-list reuse.
+
 use crate::utils;
 use std::mem::MaybeUninit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PoolConfigError
-{
+pub enum PoolConfigError {
     /// `objs_per_slab` must be greater than zero.
     ObjsPerSlabZero,
     /// Pool slot geometry overflowed addressable memory.
     SizeOverflow,
 }
 
-impl std::fmt::Display for PoolConfigError
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
-    {
-        match self
-        {
+impl std::fmt::Display for PoolConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             Self::ObjsPerSlabZero => f.write_str("Pool::new_uninit requires objs_per_slab > 0"),
             Self::SizeOverflow => f.write_str("pool slot geometry overflowed usize"),
         }
@@ -25,19 +23,16 @@ impl std::fmt::Display for PoolConfigError
 impl std::error::Error for PoolConfigError {}
 
 /// Initializes an object directly inside pre-allocated memory.
-pub trait InPlaceInit: Sized
-{
+pub trait InPlaceInit: Sized {
     type Args;
     /// Writes a fully initialized value into `slot`.
     fn init_at(slot: &mut MaybeUninit<Self>, args: Self::Args);
 }
 
-impl<const N: usize> InPlaceInit for [u8; N]
-{
+impl<const N: usize> InPlaceInit for [u8; N] {
     type Args = ();
 
-    fn init_at(slot: &mut MaybeUninit<Self>, _args: Self::Args)
-    {
+    fn init_at(slot: &mut MaybeUninit<Self>, _args: Self::Args) {
         // Zero-fill byte arrays so newly allocated buffers start in a defined state.
         unsafe {
             std::ptr::write_bytes(slot.as_mut_ptr() as *mut u8, 0, N);
@@ -48,14 +43,13 @@ impl<const N: usize> InPlaceInit for [u8; N]
 /// A memory pool that manages objects of type `T`.
 ///
 /// It allocates large chunks of memory (slabs) from the `MemoryProvider`
-/// and chunks them into slots. Freed slots are kept in an intrusive single-linked list
-/// (`free_list`) for zero-allocation reuse.
+/// and splits them into fixed-size slots. Freed slots are kept in an
+/// intrusive singly linked free list for zero-allocation reuse.
 ///
 /// Slab pages are tracked via a singly-linked list through each Slab header's
 /// `link.next` pointer.  This avoids the DList sentinel's self-referential
 /// pointers, making the pool safe to move after initialization.
-pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider>
-{
+pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider> {
     /// Slab allocator responsible for requesting and formatting new pages.
     slab_factory: super::slab::SlabAllocator<'a, P>,
     /// Free-list of returned object slots ready for reuse.
@@ -69,12 +63,11 @@ pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider>
     obj_size: usize,
 }
 
-impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P>
-{
-    pub fn new_uninit(provider: &'a mut P, objs_per_slab: usize) -> Result<Self, PoolConfigError>
-    {
-        if objs_per_slab == 0
-        {
+impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
+    /// Creates an uninitialized pool. Call [`Pool::init`] after moving the
+    /// pool to its final memory location.
+    pub fn new_uninit(provider: &'a mut P, objs_per_slab: usize) -> Result<Self, PoolConfigError> {
+        if objs_per_slab == 0 {
             return Err(PoolConfigError::ObjsPerSlabZero);
         }
 
@@ -84,18 +77,16 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P>
         let obj_size =
             crate::utils::size_up(base_size, align).map_err(|_| PoolConfigError::SizeOverflow)?;
 
-        // Factory creates geometry based purely on the provider's inherent alignment
+        // Slab geometry is fixed up front and then reused across all slab
+        // allocations from this pool.
         let slab_factory =
             super::slab::SlabAllocator::new_uninit(provider, obj_size, align, objs_per_slab)
-                .map_err(|err| match err
-                {
-                    super::slab::SlabAllocatorConfigError::ObjsPerSlabZero =>
-                    {
+                .map_err(|err| match err {
+                    super::slab::SlabAllocatorConfigError::ObjsPerSlabZero => {
                         PoolConfigError::ObjsPerSlabZero
                     }
                     super::slab::SlabAllocatorConfigError::InvalidObjectAlign
-                    | super::slab::SlabAllocatorConfigError::SizeOverflow =>
-                    {
+                    | super::slab::SlabAllocatorConfigError::SizeOverflow => {
                         PoolConfigError::SizeOverflow
                     }
                 })?;
@@ -109,8 +100,8 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P>
         })
     }
 
-    pub fn init(&mut self)
-    {
+    /// Initializes the slab allocator and intrusive free list.
+    pub fn init(&mut self) {
         self.slab_factory.init();
         self.free_list.init();
     }
@@ -119,27 +110,20 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P>
     ///
     /// The caller must ensure the memory provider is valid and that
     /// the `InPlaceInit::init_at` implementation does not panic.
-    pub unsafe fn alloc(&mut self, args: T::Args) -> Option<*mut T>
-    {
-        let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front(0) }
-        {
+    pub unsafe fn alloc(&mut self, args: T::Args) -> Option<*mut T> {
+        let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front(0) } {
             link_ptr
-        }
-        else
-        {
-            // B. Try Current Slab
-            let mut ptr = if !self.current_slab.is_null()
-            {
+        } else {
+            // First try to bump-allocate from the current slab page.
+            let mut ptr = if !self.current_slab.is_null() {
                 unsafe { (*self.current_slab).try_alloc(self.obj_size) }
-            }
-            else
-            {
+            } else {
                 None
             };
 
-            // C. Request New Slab
-            if ptr.is_none()
-            {
+            // If the current page is exhausted, request a new slab page and
+            // make it the current bump-allocation source.
+            if ptr.is_none() {
                 let slab_ptr = self.slab_factory.provide_slab()?;
                 // Link new slab into the singly-linked page list.
                 unsafe {
@@ -166,10 +150,8 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P>
     ///
     /// The caller must ensure that `obj` is a valid pointer to a dynamically
     /// allocated object originally provided by this pool.
-    pub unsafe fn free(&mut self, obj: *mut T)
-    {
-        if obj.is_null()
-        {
+    pub unsafe fn free(&mut self, obj: *mut T) {
+        if obj.is_null() {
             return;
         }
 
@@ -182,14 +164,12 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P>
     }
 }
 
-impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T, P>
-{
-    fn drop(&mut self)
-    {
-        // Walk the singly-linked slab page list and free each page.
+impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T, P> {
+    fn drop(&mut self) {
+        // Walk the singly linked slab-page chain and return each page to the
+        // backing memory provider.
         let mut current = self.slab_page_head;
-        while !current.is_null()
-        {
+        while !current.is_null() {
             let next = unsafe { (*current).link.next as *mut super::slab::Slab };
             let slab_ptr = current as *mut u8;
             unsafe { self.slab_factory.free_slab(slab_ptr) };

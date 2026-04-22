@@ -1,52 +1,52 @@
 mod common;
 
-use common::TestIoBuffMut as IoBuffMut;
+use common::{TestIoBuffMut as IoBuffMut, make_payload_chain, make_read_chain, run_test};
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
-use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-#[test]
-fn runtime_tcp_ping_pong()
-{
-    let mut executor = Executor::new().expect("failed to construct runtime executor");
-
-    let mut listener =
-        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
-    let addr = listener.local_addr();
-
-    let peer = std::thread::spawn(move || {
+fn spawn_std_tcp_peer(
+    addr: SocketAddr,
+    expected_recv: Vec<u8>,
+    response: Vec<u8>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
         use std::io::{Read, Write};
 
         let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
-        let mut buf = [0u8; 4];
+        let mut buf = vec![0u8; expected_recv.len()];
         stream.read_exact(&mut buf).expect("std read failed");
-        assert_eq!(&buf, b"ping");
-        stream.write_all(b"pong").expect("std write failed");
+        assert_eq!(buf, expected_recv, "std peer received unexpected payload");
+        stream.write_all(&response).expect("std write failed");
+    })
+}
+
+#[test]
+fn runtime_tcp_ping_pong() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+    let peer = spawn_std_tcp_peer(addr, b"ping".to_vec(), b"pong".to_vec());
+
+    run_test(async move {
+        let (mut stream, _addr) = listener.accept().await.expect("accept failed");
+
+        let (res, _buf) = stream.write(b"ping".to_vec()).await;
+        assert_eq!(res.expect("write failed"), 4);
+
+        let recv = vec![0u8; 4];
+        let (res, buf) = stream.read(recv, 4).await;
+        assert_eq!(res.expect("read failed"), 4);
+        assert_eq!(&buf[..4], b"pong");
     });
-
-    executor
-        .run(async move {
-            let (mut stream, _addr) = listener.accept().await.expect("accept failed");
-
-            let (res, _buf) = stream.write(b"ping".to_vec()).await;
-            assert_eq!(res.expect("write failed"), 4);
-
-            let recv = vec![0u8; 4];
-            let (res, buf) = stream.read(recv, 4).await;
-            assert_eq!(res.expect("read failed"), 4);
-            assert_eq!(&buf[..4], b"pong");
-        })
-        .expect("executor run failed");
 
     peer.join().expect("peer panicked");
 }
 
 #[test]
-fn runtime_tcp_connect_ping_pong()
-{
+fn runtime_tcp_connect_ping_pong() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -87,83 +87,54 @@ fn runtime_tcp_connect_ping_pong()
 }
 
 #[test]
-fn runtime_tcp_write_all_read_exact()
-{
-    let mut executor = Executor::new().expect("failed to construct runtime executor");
-
+fn runtime_tcp_write_all_read_exact() {
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
+    let peer = spawn_std_tcp_peer(addr, b"ping".to_vec(), b"pong".to_vec());
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
+    run_test(async move {
+        let (mut stream, _addr) = listener.accept().await.expect("accept failed");
 
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf).expect("std read failed");
-        assert_eq!(&buf, b"ping");
-        stream.write_all(b"pong").expect("std write failed");
+        let send = b"ping".to_vec();
+        let (res, _buf) = stream.write_all(send).await;
+        assert_eq!(res.expect("write_all failed"), 4);
+
+        let recv = vec![0u8; 4];
+        let (res, buf) = stream.read_exact(recv, 4).await;
+        assert_eq!(res.expect("read_exact failed"), 4);
+        assert_eq!(&buf[..], b"pong");
     });
-
-    executor
-        .run(async move {
-            let (mut stream, _addr) = listener.accept().await.expect("accept failed");
-
-            let send = b"ping".to_vec();
-            let (res, _buf) = stream.write_all(send).await;
-            assert_eq!(res.expect("write_all failed"), 4);
-
-            let recv = vec![0u8; 4];
-            let (res, buf) = stream.read_exact(recv, 4).await;
-            assert_eq!(res.expect("read_exact failed"), 4);
-            assert_eq!(&buf[..], b"pong");
-        })
-        .expect("executor run failed");
 
     peer.join().expect("peer panicked");
 }
 
 #[test]
-fn runtime_tcp_write_all_read_exact_large_payload()
-{
+fn runtime_tcp_write_all_read_exact_large_payload() {
     let msg_size = 256 * 1024; // 256KB
-    let mut executor = Executor::new().expect("failed to construct runtime executor");
-
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
+    let peer = spawn_std_tcp_peer(addr, vec![0xABu8; msg_size], vec![0xABu8; msg_size]);
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
+    run_test(async move {
+        let (mut stream, _addr) = listener.accept().await.expect("accept failed");
 
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
-        let mut buf = vec![0u8; msg_size];
-        stream.read_exact(&mut buf).expect("std read failed");
-        assert!(buf.iter().all(|&b| b == 0xAB), "data mismatch");
-        stream.write_all(&buf).expect("std write failed");
+        let send = vec![0xABu8; msg_size];
+        let (res, _buf) = stream.write_all(send).await;
+        assert_eq!(res.expect("write_all failed"), msg_size);
+
+        let recv = vec![0u8; msg_size];
+        let (res, buf) = stream.read_exact(recv, msg_size).await;
+        assert_eq!(res.expect("read_exact failed"), msg_size);
+        assert!(buf.iter().all(|&b| b == 0xAB), "data mismatch on read");
     });
-
-    executor
-        .run(async move {
-            let (mut stream, _addr) = listener.accept().await.expect("accept failed");
-
-            let send = vec![0xABu8; msg_size];
-            let (res, _buf) = stream.write_all(send).await;
-            assert_eq!(res.expect("write_all failed"), msg_size);
-
-            let recv = vec![0u8; msg_size];
-            let (res, buf) = stream.read_exact(recv, msg_size).await;
-            assert_eq!(res.expect("read_exact failed"), msg_size);
-            assert!(buf.iter().all(|&b| b == 0xAB), "data mismatch on read");
-        })
-        .expect("executor run failed");
 
     peer.join().expect("peer panicked");
 }
 
 #[test]
-fn runtime_tcp_read_exact_eof()
-{
+fn runtime_tcp_read_exact_eof() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -195,8 +166,7 @@ fn runtime_tcp_read_exact_eof()
 
 /// TcpStream::connect() convenience creates a connection without a TcpConnector.
 #[test]
-fn runtime_tcp_stream_connect()
-{
+fn runtime_tcp_stream_connect() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -234,8 +204,7 @@ fn runtime_tcp_stream_connect()
 }
 
 #[test]
-fn runtime_tcp_stream_connect_timeout_success()
-{
+fn runtime_tcp_stream_connect_timeout_success() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -260,8 +229,7 @@ fn runtime_tcp_stream_connect_timeout_success()
 }
 
 #[test]
-fn runtime_tcp_connector_connect_timeout_success()
-{
+fn runtime_tcp_connector_connect_timeout_success() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -288,8 +256,7 @@ fn runtime_tcp_connector_connect_timeout_success()
 }
 
 #[test]
-fn runtime_tcp_stream_connect_timeout_propagates_connect_error()
-{
+fn runtime_tcp_stream_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -302,8 +269,7 @@ fn runtime_tcp_stream_connect_timeout_propagates_connect_error()
             let result = TcpStream::connect_timeout(addr, Duration::from_secs(1))
                 .expect("connect_timeout init failed")
                 .await;
-            let err = match result
-            {
+            let err = match result {
                 Ok(_) => panic!("connect_timeout should propagate connect failure"),
                 Err(err) => err,
             };
@@ -313,8 +279,7 @@ fn runtime_tcp_stream_connect_timeout_propagates_connect_error()
 }
 
 #[test]
-fn runtime_tcp_connector_connect_timeout_propagates_connect_error()
-{
+fn runtime_tcp_connector_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -329,8 +294,7 @@ fn runtime_tcp_connector_connect_timeout_propagates_connect_error()
                 .connect_timeout(addr, Duration::from_secs(1))
                 .expect("connect_timeout init failed")
                 .await;
-            let err = match result
-            {
+            let err = match result {
                 Ok(_) => panic!("connect_timeout should propagate connect failure"),
                 Err(err) => err,
             };
@@ -341,8 +305,7 @@ fn runtime_tcp_connector_connect_timeout_propagates_connect_error()
 
 /// TcpStream address queries and socket options.
 #[test]
-fn runtime_tcp_socket_options()
-{
+fn runtime_tcp_socket_options() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -393,8 +356,7 @@ fn runtime_tcp_socket_options()
 
 /// TcpListener::bind_reuse_port sets SO_REUSEPORT.
 #[test]
-fn runtime_tcp_listener_reuse_port()
-{
+fn runtime_tcp_listener_reuse_port() {
     let listener = TcpListener::bind_reuse_port(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128)
         .expect("bind_reuse_port failed");
 
@@ -404,8 +366,7 @@ fn runtime_tcp_listener_reuse_port()
 
 /// `TcpConnector::default()` produces a working connector identical to `TcpConnector::new()`.
 #[test]
-fn runtime_tcp_connector_default_trait()
-{
+fn runtime_tcp_connector_default_trait() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -437,8 +398,7 @@ fn runtime_tcp_connector_default_trait()
 
 /// Ping-pong using IoBuffMut for receive and IoBuff (frozen) for send.
 #[test]
-fn runtime_tcp_ping_pong_iobuff()
-{
+fn runtime_tcp_ping_pong_iobuff() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -476,8 +436,7 @@ fn runtime_tcp_ping_pong_iobuff()
 
 /// write_all with frozen IoBuff, read_exact with IoBuffMut.
 #[test]
-fn runtime_tcp_write_all_read_exact_iobuff()
-{
+fn runtime_tcp_write_all_read_exact_iobuff() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -516,8 +475,7 @@ fn runtime_tcp_write_all_read_exact_iobuff()
 
 /// IoBuffMut with headroom — prepend a protocol header before sending.
 #[test]
-fn runtime_tcp_iobuff_headroom()
-{
+fn runtime_tcp_iobuff_headroom() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -552,8 +510,7 @@ fn runtime_tcp_iobuff_headroom()
 
 /// Pool-allocated buffers through TCP transport.
 #[test]
-fn runtime_tcp_pool_buffers()
-{
+fn runtime_tcp_pool_buffers() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -600,8 +557,7 @@ fn runtime_tcp_pool_buffers()
 
 /// Large payload with IoBuffMut — forces partial kernel transfers.
 #[test]
-fn runtime_tcp_write_all_read_exact_large_iobuff()
-{
+fn runtime_tcp_write_all_read_exact_large_iobuff() {
     let msg_size = 256 * 1024;
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
@@ -647,8 +603,7 @@ fn runtime_tcp_write_all_read_exact_large_iobuff()
 
 /// writev 3 segments to a std peer, readv the echo back.
 #[test]
-fn runtime_tcp_writev_readv()
-{
+fn runtime_tcp_writev_readv() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -669,27 +624,12 @@ fn runtime_tcp_writev_readv()
         .run(async move {
             let (mut stream, _addr) = listener.accept().await.expect("accept failed");
 
-            // writev 3 segments.
-            let mut seg1 = IoBuffMut::new(0, 16, 0);
-            seg1.payload_append(b"hello").unwrap();
-            let mut seg2 = IoBuffMut::new(0, 16, 0);
-            seg2.payload_append(b" ").unwrap();
-            let mut seg3 = IoBuffMut::new(0, 16, 0);
-            seg3.payload_append(b"world").unwrap();
-
-            let mut write_chain = IoBuffVecMut::<3>::new();
-            write_chain.push(seg1).unwrap();
-            write_chain.push(seg2).unwrap();
-            write_chain.push(seg3).unwrap();
-            let frozen = write_chain.freeze();
+            let frozen = make_payload_chain([&b"hello"[..], &b" "[..], &b"world"[..]]);
 
             let (res, _chain) = stream.writev(frozen).await;
             assert_eq!(res.expect("writev failed"), 11);
 
-            // readv 2 segments.
-            let mut read_chain = IoBuffVecMut::<2>::new();
-            read_chain.push(IoBuffMut::new(0, 6, 0)).unwrap();
-            read_chain.push(IoBuffMut::new(0, 5, 0)).unwrap();
+            let read_chain = make_read_chain([6, 5]);
 
             let (res, chain) = stream.readv(read_chain).await;
             assert_eq!(res.expect("readv failed"), 11);

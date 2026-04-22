@@ -22,6 +22,28 @@
 //! therefore intentionally thread-local today. Cross-thread transfer is
 //! deferred to a later design.
 //!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - For fixed-shape steady-state transport I/O, prefer
+//!   [`super::pool::IoBuffPool`] plus [`IoBuffMut`]. That is the intended
+//!   zero-allocation buffer fast path after warmup.
+//! - Freeze into [`IoBuff`] when data should be reused or fanned out to
+//!   multiple send paths without copying.
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use [`IoBuffMut::new`] for fixed-shape steady-state
+//!   buffers. It is the convenience API for heap-backed buffers and is a good
+//!   choice for setup code, tests, and variable-size workloads instead.
+//! - Prefer not to replace the primary send/receive buffer with [`IoBuffView`]
+//!   when the structured headroom/payload/tailroom layout still matters. Use
+//!   [`IoBuffView`] for parsing and slicing convenience; keep the original
+//!   [`IoBuff`] or [`IoBuffMut`] for transport reuse and later mutation.
+//!
+//! The examples below often use [`IoBuffMut::new`] because it keeps the code
+//! short. On the fixed-shape hot path, prefer pool-backed allocation from
+//! [`super::pool::IoBuffPool`].
+//!
 //! # Provided trait implementations
 //!
 //! | Type | [`IoBuffReadOnly`] | [`IoBuffReadWrite`] |
@@ -44,8 +66,7 @@ use std::ptr::NonNull;
 /// Error codes returned by buffer operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum IoBuffError
-{
+pub enum IoBuffError {
     /// Heap-backed buffer layout overflowed addressable memory.
     LayoutOverflow,
     /// Headroom region does not have enough space for the prepend.
@@ -79,22 +100,18 @@ fn resolve_slice_bounds(
     range: impl RangeBounds<usize>,
     len: usize,
     _context: &str,
-) -> Result<(usize, usize), IoBuffError>
-{
-    let start = match range.start_bound()
-    {
+) -> Result<(usize, usize), IoBuffError> {
+    let start = match range.start_bound() {
         std::ops::Bound::Included(&s) => s,
         std::ops::Bound::Excluded(&s) => s + 1,
         std::ops::Bound::Unbounded => 0,
     };
-    let end = match range.end_bound()
-    {
+    let end = match range.end_bound() {
         std::ops::Bound::Included(&e) => e + 1,
         std::ops::Bound::Excluded(&e) => e,
         std::ops::Bound::Unbounded => len,
     };
-    if start > end || end > len
-    {
+    if start > end || end > len {
         return Err(IoBuffError::SliceOutOfBounds);
     }
 
@@ -116,8 +133,7 @@ fn resolve_slice_bounds(
 /// bytes for the entire lifetime of the buffer value.  The pointer must not
 /// be invalidated by moves of the buffer value (i.e. the backing storage must
 /// be heap- or pool-allocated, not inline).
-pub unsafe trait IoBuffReadOnly: Unpin + 'static
-{
+pub unsafe trait IoBuffReadOnly: Unpin + 'static {
     /// Returns a raw pointer to the start of the readable data (the full
     /// active window: headroom written + payload + tailroom written).
     fn as_ptr(&self) -> *const u8;
@@ -126,8 +142,7 @@ pub unsafe trait IoBuffReadOnly: Unpin + 'static
     fn len(&self) -> usize;
 
     /// Returns `true` if the active window contains no readable bytes.
-    fn is_empty(&self) -> bool
-    {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -143,8 +158,7 @@ pub unsafe trait IoBuffReadOnly: Unpin + 'static
 /// `as_mut_ptr()` must return a pointer that remains valid and writable for
 /// at least `writable_len()` bytes for the entire lifetime of the buffer
 /// value.  The pointer must not be invalidated by moves of the buffer value.
-pub unsafe trait IoBuffReadWrite: Unpin + 'static
-{
+pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     /// Returns a raw pointer to the start of the unwritten payload region
     /// (where the next kernel write will land).
     fn as_mut_ptr(&mut self) -> *mut u8;
@@ -179,8 +193,7 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static
 /// tailroom_capacity` bytes.  The data region (headroom + payload + tailroom)
 /// starts immediately after the header fields in memory.
 #[repr(C)]
-pub(crate) struct IoBuffHeader
-{
+pub(crate) struct IoBuffHeader {
     /// Non-atomic reference count for single-threaded sharing.
     /// Incremented by `IoBuff::clone()`, decremented by drop.
     /// When it reaches zero, the backing allocation is freed (heap) or
@@ -208,28 +221,24 @@ pub(crate) struct IoBuffHeader
     // follows immediately after this header in memory.
 }
 
-impl IoBuffHeader
-{
+impl IoBuffHeader {
     /// Returns the total size of the trailing data region
     /// (headroom + payload + tailroom).
     #[inline(always)]
-    fn total_capacity(&self) -> usize
-    {
+    fn total_capacity(&self) -> usize {
         self.headroom_capacity + self.payload_capacity + self.tailroom_capacity
     }
 
     /// Returns a pointer to the first byte of the trailing data region
     /// (the start of the headroom area).
     #[inline(always)]
-    pub(crate) fn headroom_ptr(&self) -> *mut u8
-    {
+    pub(crate) fn headroom_ptr(&self) -> *mut u8 {
         // SAFETY: the allocation includes total_capacity() bytes after
         // this header.
         unsafe { (self as *const Self as *mut u8).add(std::mem::size_of::<Self>()) }
     }
 
-    fn try_layout(total_data_capacity: usize) -> Result<std::alloc::Layout, IoBuffError>
-    {
+    fn try_layout(total_data_capacity: usize) -> Result<std::alloc::Layout, IoBuffError> {
         let total_size = std::mem::size_of::<Self>()
             .checked_add(total_data_capacity)
             .ok_or(IoBuffError::LayoutOverflow)?;
@@ -238,8 +247,7 @@ impl IoBuffHeader
             .map_err(|_| IoBuffError::LayoutOverflow)
     }
 
-    fn layout(total_data_capacity: usize) -> std::alloc::Layout
-    {
+    fn layout(total_data_capacity: usize) -> std::alloc::Layout {
         // Internal callers only use this after successful checked geometry
         // construction; keep the infallible form for deallocation paths.
         let result = Self::try_layout(total_data_capacity);
@@ -252,8 +260,7 @@ impl IoBuffHeader
         headroom: usize,
         payload: usize,
         tailroom: usize,
-    ) -> Result<NonNull<Self>, IoBuffError>
-    {
+    ) -> Result<NonNull<Self>, IoBuffError> {
         let total = headroom
             .checked_add(payload)
             .and_then(|sum| sum.checked_add(tailroom))
@@ -272,15 +279,13 @@ impl IoBuffHeader
     }
 
     #[inline(always)]
-    fn retain(&self)
-    {
+    fn retain(&self) {
         self.refcount.set(self.refcount.get() + 1);
     }
 
     /// Decrements refcount and returns true if this was the last reference.
     #[inline(always)]
-    fn release(&self) -> bool
-    {
+    fn release(&self) -> bool {
         let prev = self.refcount.get();
         debug_assert!(prev > 0, "IoBuffHeader refcount underflow");
         self.refcount.set(prev - 1);
@@ -288,8 +293,7 @@ impl IoBuffHeader
     }
 
     #[inline(always)]
-    fn ref_count(&self) -> usize
-    {
+    fn ref_count(&self) -> usize {
         self.refcount.get()
     }
 
@@ -297,19 +301,15 @@ impl IoBuffHeader
     ///
     /// # Safety
     /// Must only be called once, when refcount reaches zero.
-    unsafe fn dealloc(ptr: NonNull<Self>)
-    {
+    unsafe fn dealloc(ptr: NonNull<Self>) {
         let header = unsafe { ptr.as_ref() };
         let pool = header.pool;
-        if pool.is_null()
-        {
+        if pool.is_null() {
             // Heap-allocated: free via global allocator.
             let total = header.total_capacity();
             let layout = Self::layout(total);
             unsafe { std::alloc::dealloc(ptr.as_ptr() as *mut u8, layout) };
-        }
-        else
-        {
+        } else {
             // Pool-allocated: return to pool's free list.
             unsafe { IoBuffPoolInner::release_buffer(pool, ptr.as_ptr() as *mut u8) };
         }
@@ -328,10 +328,15 @@ impl IoBuffHeader
 /// Every buffer has three regions: headroom (for prepending protocol headers),
 /// payload (the main writable region), and tailroom (for appending trailers).
 ///
-/// Created via [`IoBuffMut::new`] (heap).
+/// Created via [`IoBuffMut::new`] (heap) or returned by
+/// [`super::pool::IoBuffPool::alloc`] (fast-path pool-backed reuse).
+///
+/// For fixed-shape steady-state workloads, the pool-backed path is preferred.
+/// [`IoBuffMut::new`] is the simpler alternative when shapes vary or when the
+/// allocation cost is not on the hot path.
 ///
 /// # Example
-/// ```no_run
+/// ```
 /// use flowio::runtime::buffer::IoBuffMut;
 ///
 /// // Simple buffer: no headroom/tailroom, 4096 bytes payload.
@@ -346,8 +351,7 @@ impl IoBuffHeader
 /// framed.headroom_prepend(b"HDR:").unwrap();
 /// assert_eq!(framed.bytes(), b"HDR:payload");
 /// ```
-pub struct IoBuffMut
-{
+pub struct IoBuffMut {
     /// Pointer to the backing `IoBuffHeader` + data allocation (heap or pool).
     /// The header is followed by a contiguous byte array of
     /// `headroom + payload + tailroom` bytes.
@@ -367,8 +371,7 @@ pub struct IoBuffMut
     pub(crate) tailroom_len: usize,
 }
 
-impl IoBuffMut
-{
+impl IoBuffMut {
     /// Creates a new heap-allocated mutable buffer with the given region sizes.
     ///
     /// - `headroom` — reserved bytes before the payload for prepending headers.
@@ -377,8 +380,7 @@ impl IoBuffMut
     ///
     /// The buffer starts with offset positioned at the beginning of the payload
     /// region and len = 0.
-    pub fn new(headroom: usize, payload: usize, tailroom: usize) -> Result<Self, IoBuffError>
-    {
+    pub fn new(headroom: usize, payload: usize, tailroom: usize) -> Result<Self, IoBuffError> {
         let header = IoBuffHeader::heap_alloc(headroom, payload, tailroom)?;
         Ok(Self {
             header,
@@ -391,8 +393,7 @@ impl IoBuffMut
     /// Returns the number of headroom bytes that are part of the active
     /// window.  After `advance()` consumes headroom bytes, this decreases.
     #[inline(always)]
-    fn headroom_len(&self) -> usize
-    {
+    fn headroom_len(&self) -> usize {
         let hdr_cap = unsafe { self.header.as_ref().headroom_capacity };
         hdr_cap.saturating_sub(self.offset)
     }
@@ -400,8 +401,7 @@ impl IoBuffMut
     /// Returns the total number of active bytes (headroom written + payload
     /// written + tailroom written).
     #[inline(always)]
-    fn active_len(&self) -> usize
-    {
+    fn active_len(&self) -> usize {
         self.headroom_len() + self.payload_len + self.tailroom_len
     }
 
@@ -411,15 +411,13 @@ impl IoBuffMut
 
     /// Returns the original headroom region size configured at allocation.
     #[inline(always)]
-    pub fn headroom_capacity(&self) -> usize
-    {
+    pub fn headroom_capacity(&self) -> usize {
         unsafe { self.header.as_ref().headroom_capacity }
     }
 
     /// Returns the number of headroom bytes still available for prepending.
     #[inline(always)]
-    pub fn headroom_remaining(&self) -> usize
-    {
+    pub fn headroom_remaining(&self) -> usize {
         self.offset
     }
 
@@ -427,10 +425,8 @@ impl IoBuffMut
     /// window.  The offset moves backward, expanding the active window.
     ///
     /// Returns an error if the headroom does not have enough space.
-    pub fn headroom_prepend(&mut self, data: &[u8]) -> Result<(), IoBuffError>
-    {
-        if data.len() > self.headroom_remaining()
-        {
+    pub fn headroom_prepend(&mut self, data: &[u8]) -> Result<(), IoBuffError> {
+        if data.len() > self.headroom_remaining() {
             return Err(IoBuffError::HeadroomFull);
         }
         self.offset -= data.len();
@@ -448,15 +444,13 @@ impl IoBuffMut
     /// Returns the current payload region capacity.  This may be larger than
     /// the original if `payload_extend_from_tailroom()` was called.
     #[inline(always)]
-    pub fn payload_capacity(&self) -> usize
-    {
+    pub fn payload_capacity(&self) -> usize {
         unsafe { self.header.as_ref().payload_capacity }
     }
 
     /// Returns the number of bytes written to the payload region.
     #[inline(always)]
-    pub fn payload_len(&self) -> usize
-    {
+    pub fn payload_len(&self) -> usize {
         self.payload_len
     }
 
@@ -466,10 +460,8 @@ impl IoBuffMut
     /// the active window contiguous. In that state this returns `0`, even if
     /// the backing payload capacity has spare physical space.
     #[inline(always)]
-    pub fn payload_remaining(&self) -> usize
-    {
-        if self.tailroom_len != 0
-        {
+    pub fn payload_remaining(&self) -> usize {
+        if self.tailroom_len != 0 {
             return 0;
         }
         self.payload_capacity() - self.payload_len
@@ -477,15 +469,13 @@ impl IoBuffMut
 
     /// Returns `true` if no bytes have been written to the payload region.
     #[inline(always)]
-    pub fn payload_is_empty(&self) -> bool
-    {
+    pub fn payload_is_empty(&self) -> bool {
         self.payload_len == 0
     }
 
     /// Returns the written payload as a read-only byte slice.
     #[inline(always)]
-    pub fn payload_bytes(&self) -> &[u8]
-    {
+    pub fn payload_bytes(&self) -> &[u8] {
         let hdr = unsafe { self.header.as_ref() };
         unsafe {
             let ptr = hdr.headroom_ptr().add(hdr.headroom_capacity);
@@ -495,8 +485,7 @@ impl IoBuffMut
 
     /// Returns the written payload as a mutable byte slice.
     #[inline(always)]
-    pub fn payload_bytes_mut(&mut self) -> &mut [u8]
-    {
+    pub fn payload_bytes_mut(&mut self) -> &mut [u8] {
         let hdr = unsafe { self.header.as_ref() };
         unsafe {
             let ptr = hdr.headroom_ptr().add(hdr.headroom_capacity);
@@ -520,8 +509,7 @@ impl IoBuffMut
     /// assert_eq!(buf.payload_bytes(), b"hello");
     /// ```
     #[inline(always)]
-    pub fn payload_unwritten_mut(&mut self) -> &mut [u8]
-    {
+    pub fn payload_unwritten_mut(&mut self) -> &mut [u8] {
         let hdr = unsafe { self.header.as_ref() };
         unsafe {
             let ptr = hdr
@@ -536,14 +524,11 @@ impl IoBuffMut
     /// Returns an error if the payload does not have enough remaining space,
     /// or if tailroom data has already been written (because the tailroom
     /// sits immediately after the payload to keep the active window contiguous).
-    pub fn payload_append(&mut self, data: &[u8]) -> Result<(), IoBuffError>
-    {
-        if self.tailroom_len != 0 && !data.is_empty()
-        {
+    pub fn payload_append(&mut self, data: &[u8]) -> Result<(), IoBuffError> {
+        if self.tailroom_len != 0 && !data.is_empty() {
             return Err(IoBuffError::PayloadSealed);
         }
-        if data.len() > self.payload_remaining()
-        {
+        if data.len() > self.payload_remaining() {
             return Err(IoBuffError::PayloadFull);
         }
         let hdr = unsafe { self.header.as_ref() };
@@ -567,14 +552,11 @@ impl IoBuffMut
     /// Returns an error if `new_len` exceeds the payload capacity, or if
     /// tailroom data has already been written and the requested length would
     /// change the payload size.
-    pub fn payload_set_len(&mut self, new_len: usize) -> Result<(), IoBuffError>
-    {
-        if self.tailroom_len != 0 && new_len != self.payload_len
-        {
+    pub fn payload_set_len(&mut self, new_len: usize) -> Result<(), IoBuffError> {
+        if self.tailroom_len != 0 && new_len != self.payload_len {
             return Err(IoBuffError::PayloadSealed);
         }
-        if new_len > self.payload_capacity()
-        {
+        if new_len > self.payload_capacity() {
             return Err(IoBuffError::PayloadFull);
         }
         self.payload_len = new_len;
@@ -586,11 +568,9 @@ impl IoBuffMut
     /// logically discarded (tailroom_len is reset to 0).
     ///
     /// Returns an error if `amount` exceeds the current tailroom capacity.
-    pub fn payload_extend_from_tailroom(&mut self, amount: usize) -> Result<(), IoBuffError>
-    {
+    pub fn payload_extend_from_tailroom(&mut self, amount: usize) -> Result<(), IoBuffError> {
         let hdr = unsafe { self.header.as_mut() };
-        if amount > hdr.tailroom_capacity
-        {
+        if amount > hdr.tailroom_capacity {
             return Err(IoBuffError::TailroomInsufficient);
         }
         hdr.payload_capacity += amount;
@@ -605,15 +585,13 @@ impl IoBuffMut
 
     /// Returns the current tailroom region capacity.
     #[inline(always)]
-    pub fn tailroom_capacity(&self) -> usize
-    {
+    pub fn tailroom_capacity(&self) -> usize {
         unsafe { self.header.as_ref().tailroom_capacity }
     }
 
     /// Returns the number of tailroom bytes still available for appending.
     #[inline(always)]
-    pub fn tailroom_remaining(&self) -> usize
-    {
+    pub fn tailroom_remaining(&self) -> usize {
         self.tailroom_capacity() - self.tailroom_len
     }
 
@@ -622,10 +600,8 @@ impl IoBuffMut
     /// forming a single active window with any prepended headroom.
     ///
     /// Returns an error if the tailroom does not have enough space.
-    pub fn tailroom_append(&mut self, data: &[u8]) -> Result<(), IoBuffError>
-    {
-        if data.len() > self.tailroom_remaining()
-        {
+    pub fn tailroom_append(&mut self, data: &[u8]) -> Result<(), IoBuffError> {
+        if data.len() > self.tailroom_remaining() {
             return Err(IoBuffError::TailroomFull);
         }
         let hdr = unsafe { self.header.as_ref() };
@@ -650,8 +626,7 @@ impl IoBuffMut
     /// written payload, and any tailroom written via `tailroom_append()`.
     /// This is the data that gets sent over the wire.
     #[inline(always)]
-    pub fn bytes(&self) -> &[u8]
-    {
+    pub fn bytes(&self) -> &[u8] {
         unsafe {
             let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
             std::slice::from_raw_parts(ptr, self.active_len())
@@ -660,8 +635,7 @@ impl IoBuffMut
 
     /// Returns the full active window as a mutable byte slice.
     #[inline(always)]
-    pub fn bytes_mut(&mut self) -> &mut [u8]
-    {
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
             let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
             std::slice::from_raw_parts_mut(ptr, self.active_len())
@@ -671,15 +645,13 @@ impl IoBuffMut
     /// Returns the total number of active bytes (headroom written + payload
     /// written + tailroom written).
     #[inline(always)]
-    pub fn len(&self) -> usize
-    {
+    pub fn len(&self) -> usize {
         self.active_len()
     }
 
     /// Returns `true` if the active window contains no bytes.
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.active_len() == 0
     }
 
@@ -707,10 +679,8 @@ impl IoBuffMut
     /// # Errors
     /// Returns [`IoBuffError::AdvanceOutOfBounds`] if `count` exceeds the
     /// active window length.
-    pub fn advance(&mut self, count: usize) -> Result<(), IoBuffError>
-    {
-        if count > self.active_len()
-        {
+    pub fn advance(&mut self, count: usize) -> Result<(), IoBuffError> {
+        if count > self.active_len() {
             return Err(IoBuffError::AdvanceOutOfBounds);
         }
         // Consume the active window in structural order: headroom, payload,
@@ -741,8 +711,7 @@ impl IoBuffMut
     /// Resets the buffer to its initial state: offset = headroom_capacity,
     /// payload_len = 0, tailroom_len = 0.  All written data (headroom,
     /// payload, tailroom) is logically discarded.
-    pub fn reset(&mut self)
-    {
+    pub fn reset(&mut self) {
         let headroom = unsafe { self.header.as_ref().headroom_capacity };
         self.offset = headroom;
         self.payload_len = 0;
@@ -755,8 +724,7 @@ impl IoBuffMut
 
     /// Freezes this buffer, consuming it and returning an immutable [`IoBuff`].
     /// The backing storage is shared; no data is copied.
-    pub fn freeze(self) -> IoBuff
-    {
+    pub fn freeze(self) -> IoBuff {
         let buf = IoBuff {
             header: self.header,
             offset: self.offset,
@@ -768,52 +736,41 @@ impl IoBuffMut
     }
 }
 
-impl Drop for IoBuffMut
-{
-    fn drop(&mut self)
-    {
+impl Drop for IoBuffMut {
+    fn drop(&mut self) {
         let hdr = unsafe { self.header.as_ref() };
-        if hdr.release()
-        {
+        if hdr.release() {
             unsafe { IoBuffHeader::dealloc(self.header) };
         }
     }
 }
 
-impl AsRef<[u8]> for IoBuffMut
-{
+impl AsRef<[u8]> for IoBuffMut {
     #[inline(always)]
-    fn as_ref(&self) -> &[u8]
-    {
+    fn as_ref(&self) -> &[u8] {
         self.bytes()
     }
 }
 
-impl AsMut<[u8]> for IoBuffMut
-{
+impl AsMut<[u8]> for IoBuffMut {
     #[inline(always)]
-    fn as_mut(&mut self) -> &mut [u8]
-    {
+    fn as_mut(&mut self) -> &mut [u8] {
         self.bytes_mut()
     }
 }
 
-impl std::ops::Deref for IoBuffMut
-{
+impl std::ops::Deref for IoBuffMut {
     type Target = [u8];
 
     #[inline(always)]
-    fn deref(&self) -> &[u8]
-    {
+    fn deref(&self) -> &[u8] {
         self.bytes()
     }
 }
 
-impl std::ops::DerefMut for IoBuffMut
-{
+impl std::ops::DerefMut for IoBuffMut {
     #[inline(always)]
-    fn deref_mut(&mut self) -> &mut [u8]
-    {
+    fn deref_mut(&mut self) -> &mut [u8] {
         self.bytes_mut()
     }
 }
@@ -832,8 +789,12 @@ impl std::ops::DerefMut for IoBuffMut
 ///
 /// Created by calling [`IoBuffMut::freeze`] on a mutable buffer.
 ///
+/// This is the right send-path representation when the same bytes need to be
+/// reused or fanned out. It is not the receive fast path; use [`IoBuffMut`]
+/// there.
+///
 /// # Example
-/// ```no_run
+/// ```
 /// use flowio::runtime::buffer::IoBuffMut;
 ///
 /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
@@ -845,23 +806,22 @@ impl std::ops::DerefMut for IoBuffMut
 /// assert_eq!(clone1.bytes(), b"shared data");
 /// assert_eq!(clone2.bytes(), b"shared data");
 /// ```
-pub struct IoBuff
-{
+pub struct IoBuff {
     /// Pointer to the shared `IoBuffHeader` + data allocation.  Multiple
     /// `IoBuff` handles can point to the same header (reference-counted).
     header: NonNull<IoBuffHeader>,
-    /// Byte index into the data region where the active window starts.
+    /// Byte index into the backing data region where the active window starts.
+    /// This preserves any prepended headroom bytes exactly as they existed
+    /// when the mutable buffer was frozen.
     offset: usize,
-    /// Number of bytes in the payload region.
+    /// Number of active payload bytes preserved from the mutable source.
     payload_len: usize,
-    /// Number of bytes in the tailroom region.
+    /// Number of active trailer bytes preserved after the payload.
     tailroom_len: usize,
 }
 
-impl std::fmt::Debug for IoBuff
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
-    {
+impl std::fmt::Debug for IoBuff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IoBuff")
             .field("len", &self.len())
             .field("bytes", &self.bytes())
@@ -869,48 +829,41 @@ impl std::fmt::Debug for IoBuff
     }
 }
 
-impl IoBuff
-{
+impl IoBuff {
     /// Returns the number of headroom bytes in the active window.
     #[inline(always)]
-    pub fn headroom_len(&self) -> usize
-    {
+    pub fn headroom_len(&self) -> usize {
         let hdr_cap = unsafe { self.header.as_ref().headroom_capacity };
         hdr_cap.saturating_sub(self.offset)
     }
 
     /// Returns the number of payload bytes in the active window.
     #[inline(always)]
-    pub fn payload_len(&self) -> usize
-    {
+    pub fn payload_len(&self) -> usize {
         self.payload_len
     }
 
     /// Returns the number of tailroom bytes in the active window.
     #[inline(always)]
-    pub fn tailroom_len(&self) -> usize
-    {
+    pub fn tailroom_len(&self) -> usize {
         self.tailroom_len
     }
 
     /// Returns the total number of bytes in the active window.
     #[inline(always)]
-    pub fn len(&self) -> usize
-    {
+    pub fn len(&self) -> usize {
         self.headroom_len() + self.payload_len + self.tailroom_len
     }
 
     /// Returns `true` if the active window contains no bytes.
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns the full active window as a read-only byte slice.
     #[inline(always)]
-    pub fn bytes(&self) -> &[u8]
-    {
+    pub fn bytes(&self) -> &[u8] {
         unsafe {
             let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
             std::slice::from_raw_parts(ptr, self.len())
@@ -919,8 +872,7 @@ impl IoBuff
 
     /// Returns the written payload as a read-only slice.
     #[inline(always)]
-    pub fn payload_bytes(&self) -> &[u8]
-    {
+    pub fn payload_bytes(&self) -> &[u8] {
         let hdr = unsafe { self.header.as_ref() };
         unsafe {
             let ptr = hdr.headroom_ptr().add(hdr.headroom_capacity);
@@ -941,8 +893,7 @@ impl IoBuff
     /// let hello = frozen.slice(0..5).unwrap();
     /// assert_eq!(hello.bytes(), b"Hello");
     /// ```
-    pub fn slice(&self, range: impl RangeBounds<usize>) -> Result<IoBuffView, IoBuffError>
-    {
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Result<IoBuffView, IoBuffError> {
         let (start, end) = resolve_slice_bounds(range, self.len(), "IoBuff")?;
         unsafe { self.header.as_ref().retain() };
         Ok(IoBuffView {
@@ -968,11 +919,9 @@ impl IoBuff
     /// let mut unfrozen = frozen.try_mut().unwrap();
     /// unfrozen.payload_append(b"!").unwrap();
     /// ```
-    pub fn try_mut(self) -> Result<IoBuffMut, IoBuff>
-    {
+    pub fn try_mut(self) -> Result<IoBuffMut, IoBuff> {
         let hdr = unsafe { self.header.as_ref() };
-        if hdr.ref_count() != 1
-        {
+        if hdr.ref_count() != 1 {
             return Err(self);
         }
         let buf = IoBuffMut {
@@ -987,8 +936,7 @@ impl IoBuff
 
     /// Returns the reference count of the backing storage.
     #[inline(always)]
-    pub(crate) fn ref_count(&self) -> usize
-    {
+    pub(crate) fn ref_count(&self) -> usize {
         unsafe { self.header.as_ref().ref_count() }
     }
 
@@ -1009,31 +957,25 @@ impl IoBuff
     /// let exclusive = frozen.make_mut().unwrap();
     /// assert_eq!(exclusive.bytes(), b"original");
     /// ```
-    pub fn make_mut(self) -> Result<IoBuffMut, IoBuffError>
-    {
-        match self.try_mut()
-        {
+    pub fn make_mut(self) -> Result<IoBuffMut, IoBuffError> {
+        match self.try_mut() {
             Ok(buf) => Ok(buf),
-            Err(frozen) =>
-            {
+            Err(frozen) => {
                 let hdr = unsafe { frozen.header.as_ref() };
                 let mut new = IoBuffMut::new(
                     hdr.headroom_capacity,
                     hdr.payload_capacity,
                     hdr.tailroom_capacity,
                 )?;
-                if frozen.headroom_len() > 0
-                {
+                if frozen.headroom_len() > 0 {
                     let head_len = frozen.headroom_len();
                     new.headroom_prepend(&frozen.bytes()[..head_len])?;
                 }
-                if frozen.payload_len > 0
-                {
+                if frozen.payload_len > 0 {
                     let head_len = frozen.headroom_len();
                     new.payload_append(&frozen.bytes()[head_len..head_len + frozen.payload_len])?;
                 }
-                if frozen.tailroom_len > 0
-                {
+                if frozen.tailroom_len > 0 {
                     let tail_start = frozen.headroom_len() + frozen.payload_len;
                     new.tailroom_append(&frozen.bytes()[tail_start..])?;
                 }
@@ -1043,10 +985,8 @@ impl IoBuff
     }
 }
 
-impl Clone for IoBuff
-{
-    fn clone(&self) -> Self
-    {
+impl Clone for IoBuff {
+    fn clone(&self) -> Self {
         unsafe { self.header.as_ref().retain() };
         IoBuff {
             header: self.header,
@@ -1057,34 +997,27 @@ impl Clone for IoBuff
     }
 }
 
-impl Drop for IoBuff
-{
-    fn drop(&mut self)
-    {
+impl Drop for IoBuff {
+    fn drop(&mut self) {
         let hdr = unsafe { self.header.as_ref() };
-        if hdr.release()
-        {
+        if hdr.release() {
             unsafe { IoBuffHeader::dealloc(self.header) };
         }
     }
 }
 
-impl AsRef<[u8]> for IoBuff
-{
+impl AsRef<[u8]> for IoBuff {
     #[inline(always)]
-    fn as_ref(&self) -> &[u8]
-    {
+    fn as_ref(&self) -> &[u8] {
         self.bytes()
     }
 }
 
-impl std::ops::Deref for IoBuff
-{
+impl std::ops::Deref for IoBuff {
     type Target = [u8];
 
     #[inline(always)]
-    fn deref(&self) -> &[u8]
-    {
+    fn deref(&self) -> &[u8] {
         self.bytes()
     }
 }
@@ -1095,8 +1028,12 @@ impl std::ops::Deref for IoBuff
 /// structure. It is a raw byte subview and is therefore not zero-copy
 /// reversible back into [`IoBuffMut`].
 ///
+/// This is primarily a parsing helper. For steady-state transport I/O, keep
+/// the original [`IoBuff`] or [`IoBuffMut`] unless you specifically need a
+/// sliced read-only byte view.
+///
 /// # Example
-/// ```no_run
+/// ```
 /// use flowio::runtime::buffer::IoBuffMut;
 ///
 /// let mut buf = IoBuffMut::new(2, 16, 2).unwrap();
@@ -1112,17 +1049,17 @@ impl std::ops::Deref for IoBuff
 /// assert_eq!(copied.headroom_capacity(), 0);
 /// assert_eq!(copied.tailroom_capacity(), 0);
 /// ```
-pub struct IoBuffView
-{
+pub struct IoBuffView {
+    /// Shared backing allocation referenced by this byte-range view.
     header: NonNull<IoBuffHeader>,
+    /// Byte offset of the view start within the shared data region.
     offset: usize,
+    /// Length of the visible byte range.
     len: usize,
 }
 
-impl std::fmt::Debug for IoBuffView
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
-    {
+impl std::fmt::Debug for IoBuffView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IoBuffView")
             .field("len", &self.len)
             .field("bytes", &self.bytes())
@@ -1130,31 +1067,26 @@ impl std::fmt::Debug for IoBuffView
     }
 }
 
-impl IoBuffView
-{
+impl IoBuffView {
     #[inline(always)]
-    pub fn len(&self) -> usize
-    {
+    pub fn len(&self) -> usize {
         self.len
     }
 
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline(always)]
-    pub fn bytes(&self) -> &[u8]
-    {
+    pub fn bytes(&self) -> &[u8] {
         unsafe {
             let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
             std::slice::from_raw_parts(ptr, self.len)
         }
     }
 
-    pub fn slice(&self, range: impl RangeBounds<usize>) -> Result<IoBuffView, IoBuffError>
-    {
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Result<IoBuffView, IoBuffError> {
         let (start, end) = resolve_slice_bounds(range, self.len, "IoBuffView")?;
         unsafe { self.header.as_ref().retain() };
         Ok(IoBuffView {
@@ -1165,18 +1097,15 @@ impl IoBuffView
     }
 
     /// Copies the viewed bytes into a new tight payload-only mutable buffer.
-    pub fn make_mut(&self) -> Result<IoBuffMut, IoBuffError>
-    {
+    pub fn make_mut(&self) -> Result<IoBuffMut, IoBuffError> {
         let mut new = IoBuffMut::new(0, self.len, 0)?;
         new.payload_append(self.bytes())?;
         Ok(new)
     }
 }
 
-impl Clone for IoBuffView
-{
-    fn clone(&self) -> Self
-    {
+impl Clone for IoBuffView {
+    fn clone(&self) -> Self {
         unsafe { self.header.as_ref().retain() };
         IoBuffView {
             header: self.header,
@@ -1186,34 +1115,27 @@ impl Clone for IoBuffView
     }
 }
 
-impl Drop for IoBuffView
-{
-    fn drop(&mut self)
-    {
+impl Drop for IoBuffView {
+    fn drop(&mut self) {
         let hdr = unsafe { self.header.as_ref() };
-        if hdr.release()
-        {
+        if hdr.release() {
             unsafe { IoBuffHeader::dealloc(self.header) };
         }
     }
 }
 
-impl AsRef<[u8]> for IoBuffView
-{
+impl AsRef<[u8]> for IoBuffView {
     #[inline(always)]
-    fn as_ref(&self) -> &[u8]
-    {
+    fn as_ref(&self) -> &[u8] {
         self.bytes()
     }
 }
 
-impl std::ops::Deref for IoBuffView
-{
+impl std::ops::Deref for IoBuffView {
     type Target = [u8];
 
     #[inline(always)]
-    fn deref(&self) -> &[u8]
-    {
+    fn deref(&self) -> &[u8] {
         self.bytes()
     }
 }
@@ -1225,17 +1147,14 @@ impl std::ops::Deref for IoBuffView
 // --- IoBuff (frozen, read-only) ---
 
 // SAFETY: IoBuff's backing storage is heap/pool-allocated and pointer-stable.
-unsafe impl IoBuffReadOnly for IoBuff
-{
+unsafe impl IoBuffReadOnly for IoBuff {
     #[inline(always)]
-    fn as_ptr(&self) -> *const u8
-    {
+    fn as_ptr(&self) -> *const u8 {
         unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
     }
 
     #[inline(always)]
-    fn len(&self) -> usize
-    {
+    fn len(&self) -> usize {
         self.len()
     }
 }
@@ -1243,17 +1162,14 @@ unsafe impl IoBuffReadOnly for IoBuff
 // --- IoBuffView (read-only byte subview) ---
 
 // SAFETY: IoBuffView's backing storage is heap/pool-allocated and pointer-stable.
-unsafe impl IoBuffReadOnly for IoBuffView
-{
+unsafe impl IoBuffReadOnly for IoBuffView {
     #[inline(always)]
-    fn as_ptr(&self) -> *const u8
-    {
+    fn as_ptr(&self) -> *const u8 {
         unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
     }
 
     #[inline(always)]
-    fn len(&self) -> usize
-    {
+    fn len(&self) -> usize {
         self.len
     }
 }
@@ -1261,27 +1177,22 @@ unsafe impl IoBuffReadOnly for IoBuffView
 // --- IoBuffMut (mutable, exclusive) ---
 
 // SAFETY: IoBuffMut's backing storage is heap/pool-allocated and pointer-stable.
-unsafe impl IoBuffReadOnly for IoBuffMut
-{
+unsafe impl IoBuffReadOnly for IoBuffMut {
     #[inline(always)]
-    fn as_ptr(&self) -> *const u8
-    {
+    fn as_ptr(&self) -> *const u8 {
         unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
     }
 
     #[inline(always)]
-    fn len(&self) -> usize
-    {
+    fn len(&self) -> usize {
         self.active_len()
     }
 }
 
 // SAFETY: IoBuffMut has exclusive ownership — mutable pointer is valid.
-unsafe impl IoBuffReadWrite for IoBuffMut
-{
+unsafe impl IoBuffReadWrite for IoBuffMut {
     #[inline(always)]
-    fn as_mut_ptr(&mut self) -> *mut u8
-    {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
         let hdr = unsafe { self.header.as_ref() };
         unsafe {
             hdr.headroom_ptr()
@@ -1290,14 +1201,12 @@ unsafe impl IoBuffReadWrite for IoBuffMut
     }
 
     #[inline(always)]
-    fn writable_len(&self) -> usize
-    {
+    fn writable_len(&self) -> usize {
         self.payload_remaining()
     }
 
     #[inline(always)]
-    unsafe fn set_written_len(&mut self, len: usize)
-    {
+    unsafe fn set_written_len(&mut self, len: usize) {
         debug_assert!(
             len <= self.payload_capacity(),
             "set_written_len({}) exceeds payload capacity {}",
@@ -1319,39 +1228,32 @@ unsafe impl IoBuffReadWrite for IoBuffMut
 // --- Vec<u8> ---
 
 // SAFETY: Vec's heap buffer does not move when the Vec value is moved.
-unsafe impl IoBuffReadOnly for Vec<u8>
-{
+unsafe impl IoBuffReadOnly for Vec<u8> {
     #[inline(always)]
-    fn as_ptr(&self) -> *const u8
-    {
+    fn as_ptr(&self) -> *const u8 {
         Vec::as_ptr(self)
     }
 
     #[inline(always)]
-    fn len(&self) -> usize
-    {
+    fn len(&self) -> usize {
         Vec::len(self)
     }
 }
 
 // SAFETY: Same heap stability.
-unsafe impl IoBuffReadWrite for Vec<u8>
-{
+unsafe impl IoBuffReadWrite for Vec<u8> {
     #[inline(always)]
-    fn as_mut_ptr(&mut self) -> *mut u8
-    {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
         Vec::as_mut_ptr(self)
     }
 
     #[inline(always)]
-    fn writable_len(&self) -> usize
-    {
+    fn writable_len(&self) -> usize {
         Vec::capacity(self)
     }
 
     #[inline(always)]
-    unsafe fn set_written_len(&mut self, len: usize)
-    {
+    unsafe fn set_written_len(&mut self, len: usize) {
         // SAFETY: caller guarantees the first `len` bytes are written.
         unsafe { self.set_len(len) };
     }
@@ -1360,39 +1262,32 @@ unsafe impl IoBuffReadWrite for Vec<u8>
 // --- Box<[u8]> ---
 
 // SAFETY: Box heap allocation does not move when the Box value is moved.
-unsafe impl IoBuffReadOnly for Box<[u8]>
-{
+unsafe impl IoBuffReadOnly for Box<[u8]> {
     #[inline(always)]
-    fn as_ptr(&self) -> *const u8
-    {
+    fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
     }
 
     #[inline(always)]
-    fn len(&self) -> usize
-    {
+    fn len(&self) -> usize {
         <[u8]>::len(self)
     }
 }
 
 // SAFETY: Same heap stability.
-unsafe impl IoBuffReadWrite for Box<[u8]>
-{
+unsafe impl IoBuffReadWrite for Box<[u8]> {
     #[inline(always)]
-    fn as_mut_ptr(&mut self) -> *mut u8
-    {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
         <[u8]>::as_mut_ptr(self)
     }
 
     #[inline(always)]
-    fn writable_len(&self) -> usize
-    {
+    fn writable_len(&self) -> usize {
         <[u8]>::len(self)
     }
 
     #[inline(always)]
-    unsafe fn set_written_len(&mut self, _len: usize)
-    {
+    unsafe fn set_written_len(&mut self, _len: usize) {
         // Box<[u8]> has no internal length to update.
     }
 }
@@ -1400,17 +1295,14 @@ unsafe impl IoBuffReadWrite for Box<[u8]>
 // --- &'static [u8] (read-only, useful for sending constant data) ---
 
 // SAFETY: A static reference is valid for the entire program lifetime.
-unsafe impl IoBuffReadOnly for &'static [u8]
-{
+unsafe impl IoBuffReadOnly for &'static [u8] {
     #[inline(always)]
-    fn as_ptr(&self) -> *const u8
-    {
+    fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
     }
 
     #[inline(always)]
-    fn len(&self) -> usize
-    {
+    fn len(&self) -> usize {
         <[u8]>::len(self)
     }
 }

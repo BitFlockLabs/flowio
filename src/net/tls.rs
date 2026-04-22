@@ -16,9 +16,33 @@
 //! buffering stays explicit and caller-controlled instead of silently relying
 //! on crate defaults.
 //!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - Keep one [`TlsClientStream`] alive for the lifetime of the connection.
+//!   Build it once around an already-connected [`TcpStream`], then drive
+//!   [`TlsClientStream::handshake`] exactly once before application I/O.
+//! - Reuse a caller-owned [`Arc<rustls::ClientConfig>`] across connections.
+//! - After the handshake, prefer [`TlsClientStream::read`] /
+//!   [`TlsClientStream::write`] when the caller can handle partial plaintext
+//!   progress. Those are the lowest-overhead TLS data APIs in this module.
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use [`TlsClientStream::read_exact`] /
+//!   [`TlsClientStream::write_all`] unless complete-buffer semantics are
+//!   required. Use [`TlsClientStream::read`] / [`TlsClientStream::write`]
+//!   instead when the caller can track progress explicitly.
+//! - Prefer not to put DNS resolution or TCP connection establishment inside
+//!   the steady-state TLS data path. The wrapper expects an already-connected
+//!   transport.
+//!
+//! The example below uses `write_all` / `read_exact` because it makes the
+//! framing obvious. On the hot path, prefer `write` / `read` when the caller
+//! can handle partial plaintext progress explicitly.
+//!
 //! # Example
 //! ```no_run
-//! use flowio::net::tcp::TcpStream;
+//! use flowio::net::tcp::TcpConnector;
 //! use flowio::net::tls::{TlsClientOptions, TlsClientStream};
 //! use flowio::runtime::executor::Executor;
 //! use rustls::pki_types::ServerName;
@@ -40,8 +64,10 @@
 //! };
 //!
 //! let mut executor = Executor::new()?;
+//! let mut connector = TcpConnector::new();
 //! executor.run(async move {
-//!     let tcp = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)))
+//!     let tcp = connector
+//!         .connect(SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)))
 //!         .unwrap()
 //!         .await
 //!         .unwrap();
@@ -69,6 +95,11 @@ use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use rustls::ClientConfig;
 use rustls::client::ClientConnection;
 use rustls::pki_types::ServerName;
+use rustls::pki_types::alg_id::{
+    ECDSA_SHA256, ECDSA_SHA384, ECDSA_SHA512, ED448, ED25519, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384,
+    RSA_PKCS1_SHA512, RSA_PSS_SHA256, RSA_PSS_SHA384, RSA_PSS_SHA512,
+};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::future::Future;
 use std::io::{self, Cursor, Read, Write};
 use std::os::fd::AsRawFd;
@@ -80,14 +111,18 @@ use std::task::{Context, Poll};
 type PendingTlsRead = stream::ReadFuture<'static, Vec<u8>, TlsTransportMarker>;
 type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMarker>;
 
+/// Marker type used when the shared stream futures are driving raw TLS record
+/// I/O for the wrapper instead of borrowing a public transport object.
 struct TlsTransportMarker;
 
 #[inline]
+/// Maps rustls protocol errors into I/O-facing invalid-data failures.
 fn tls_protocol_error(err: rustls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
 }
 
 #[inline]
+/// Builds an internal-invariant error for unexpected wrapper state.
 fn tls_internal_error(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
@@ -102,6 +137,10 @@ fn tls_internal_error(message: &'static str) -> io::Error {
 /// the initial capacity used when collecting TLS records emitted by rustls
 /// before writing them to the socket; the buffer may still grow if rustls
 /// emits more than the initial capacity in one flush cycle.
+///
+/// For steady-state use, pick values once per connection profile and reuse
+/// them. Recomputing or reallocating these choices per operation is not the
+/// intended fast path.
 ///
 /// # Example
 /// ```
@@ -139,6 +178,16 @@ pub struct TlsClientOptions {
 /// It does not add another plaintext staging layer beyond what rustls itself
 /// requires internally.
 ///
+/// Best fast-path choice:
+/// - Use one long-lived stream per connection, call [`TlsClientStream::handshake`]
+///   once, then prefer [`TlsClientStream::read`] / [`TlsClientStream::write`]
+///   for steady-state plaintext I/O.
+///
+/// Prefer not to use on the fast path:
+/// - Prefer not to call [`TlsClientStream::read_exact`] /
+///   [`TlsClientStream::write_all`] unless the protocol truly requires
+///   complete-buffer semantics.
+///
 /// # Cancellation semantics
 /// Dropping a `handshake`, `read`, `write`, `flush`, or `shutdown` future does
 /// not discard already-started raw transport work. Any in-flight TLS record
@@ -146,16 +195,135 @@ pub struct TlsClientOptions {
 /// the next TLS operation. This keeps TLS record handling correct without
 /// introducing background threads or a broader transport abstraction.
 pub struct TlsClientStream {
+    /// Underlying connected TCP transport owned by this TLS wrapper.
     stream: TcpStream,
+    /// rustls client connection holding TLS protocol state and plaintext
+    /// buffers.
     connection: ClientConnection,
+    /// Capacity used when creating new raw TLS receive buffers.
     transport_read_buffer_size: usize,
+    /// Initial capacity used when collecting rustls-emitted TLS records.
     transport_write_buffer_size: usize,
+    /// Reusable ciphertext receive buffer currently owned by the stream.
     read_tls_buffer: Option<Vec<u8>>,
+    /// Reusable ciphertext send buffer currently owned by the stream.
     write_tls_buffer: Option<Vec<u8>>,
+    /// In-flight raw transport read, if a TLS record read has already been
+    /// submitted.
     pending_read_tls: Option<PendingTlsRead>,
+    /// In-flight raw transport write, if emitted TLS records are still being
+    /// flushed.
     pending_write_tls: Option<PendingTlsWrite>,
+    /// True after rustls has started TLS-level close-notify shutdown.
     write_shutdown: bool,
+    /// True after the underlying TCP stream has been shutdown for writes.
     transport_write_shutdown: bool,
+}
+
+/// Derives RFC 5929 `tls-server-end-point` channel-binding bytes from an
+/// end-entity certificate DER blob.
+///
+/// Returns `None` when the certificate uses a signature algorithm that does
+/// not define a usable digest for `tls-server-end-point`, such as Ed25519 or
+/// Ed448, or when the certificate DER is malformed.
+pub fn tls_server_end_point(certificate_der: &[u8]) -> Option<Vec<u8>> {
+    let signature_algorithm = extract_certificate_signature_algorithm(certificate_der)?;
+
+    if signature_algorithm == ED25519.as_ref() || signature_algorithm == ED448.as_ref() {
+        return None;
+    }
+
+    if signature_algorithm == RSA_PKCS1_SHA256.as_ref()
+        || signature_algorithm == ECDSA_SHA256.as_ref()
+        || signature_algorithm == RSA_PSS_SHA256.as_ref()
+    {
+        return Some(Sha256::digest(certificate_der).to_vec());
+    }
+
+    if signature_algorithm == RSA_PKCS1_SHA384.as_ref()
+        || signature_algorithm == ECDSA_SHA384.as_ref()
+        || signature_algorithm == RSA_PSS_SHA384.as_ref()
+    {
+        return Some(Sha384::digest(certificate_der).to_vec());
+    }
+
+    if signature_algorithm == RSA_PKCS1_SHA512.as_ref()
+        || signature_algorithm == ECDSA_SHA512.as_ref()
+        || signature_algorithm == RSA_PSS_SHA512.as_ref()
+    {
+        return Some(Sha512::digest(certificate_der).to_vec());
+    }
+
+    None
+}
+
+/// Extracts the certificate signature-algorithm identifier from the outer
+/// certificate sequence.
+fn extract_certificate_signature_algorithm(certificate_der: &[u8]) -> Option<&[u8]> {
+    let (tag, header_len, body_len) = read_tlv(certificate_der, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+
+    let body_start = header_len;
+    let body_end = body_start.checked_add(body_len)?;
+    if body_end != certificate_der.len() {
+        return None;
+    }
+
+    let (_, first_header_len, first_body_len) = read_tlv(certificate_der, body_start)?;
+    let first_end = body_start
+        .checked_add(first_header_len)?
+        .checked_add(first_body_len)?;
+    let (second_tag, second_header_len, second_body_len) = read_tlv(certificate_der, first_end)?;
+    if second_tag != 0x30 {
+        return None;
+    }
+
+    let second_body_start = first_end.checked_add(second_header_len)?;
+    let second_end = first_end
+        .checked_add(second_header_len)?
+        .checked_add(second_body_len)?;
+    certificate_der.get(second_body_start..second_end)
+}
+
+/// Reads one DER tag-length-value header and returns its tag, header length,
+/// and body length.
+fn read_tlv(bytes: &[u8], offset: usize) -> Option<(u8, usize, usize)> {
+    let tag = *bytes.get(offset)?;
+    let first_len = *bytes.get(offset + 1)?;
+
+    if first_len & 0x80 == 0 {
+        let body_len = first_len as usize;
+        let header_len = 2usize;
+        let end = offset.checked_add(header_len)?.checked_add(body_len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        return Some((tag, header_len, body_len));
+    }
+
+    let len_octets = (first_len & 0x7f) as usize;
+    if len_octets == 0 || len_octets > std::mem::size_of::<usize>() {
+        return None;
+    }
+
+    let mut body_len = 0usize;
+    let len_start = offset.checked_add(2)?;
+    let len_end = len_start.checked_add(len_octets)?;
+    let len_bytes = bytes.get(len_start..len_end)?;
+
+    for &octet in len_bytes {
+        body_len = body_len.checked_shl(8)? | octet as usize;
+    }
+
+    let header_len = 2usize.checked_add(len_octets)?;
+    let end = offset.checked_add(header_len)?.checked_add(body_len)?;
+    if end > bytes.len() {
+        return None;
+    }
+
+    Some((tag, header_len, body_len))
 }
 
 impl TlsClientStream {
@@ -164,6 +332,9 @@ impl TlsClientStream {
     /// This allocates the wrapper's reusable ciphertext scratch buffers up
     /// front using the capacities provided in [`TlsClientOptions`].
     ///
+    /// This is connection-setup work. The intended fast path is to construct
+    /// the wrapper once per connection and reuse it for the session lifetime.
+    ///
     /// # Errors
     /// Returns `InvalidInput` if either transport scratch buffer size is zero.
     /// Returns `InvalidData` if rustls rejects the supplied config or server
@@ -171,7 +342,7 @@ impl TlsClientStream {
     ///
     /// # Example
     /// ```no_run
-    /// use flowio::net::tcp::TcpStream;
+    /// use flowio::net::tcp::TcpConnector;
     /// use flowio::net::tls::{TlsClientOptions, TlsClientStream};
     /// use flowio::runtime::executor::Executor;
     /// use rustls::pki_types::ServerName;
@@ -184,7 +355,6 @@ impl TlsClientStream {
     ///         .with_root_certificates(RootCertStore::empty())
     ///         .with_no_client_auth(),
     /// );
-    /// let tcp = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)))?;
     /// let options = TlsClientOptions {
     ///     rustls_buffer_limit: Some(16 * 1024),
     ///     transport_read_buffer_size: 16 * 1024,
@@ -192,8 +362,10 @@ impl TlsClientStream {
     /// };
     ///
     /// let mut executor = Executor::new()?;
+    /// let mut connector = TcpConnector::new();
     /// executor.run(async move {
-    ///     let tcp = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)))
+    ///     let tcp = connector
+    ///         .connect(SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)))
     ///         .unwrap()
     ///         .await
     ///         .unwrap();
@@ -248,6 +420,8 @@ impl TlsClientStream {
     ///
     /// The handshake is not performed implicitly by `read`, `write`, or
     /// `flush`. Callers must drive it explicitly before application I/O.
+    ///
+    /// This is a connection-setup API, not a steady-state data-path API.
     pub fn handshake(&mut self) -> TlsHandshakeFuture<'_> {
         TlsHandshakeFuture { stream: self }
     }
@@ -255,6 +429,9 @@ impl TlsClientStream {
     /// Reads up to `len` decrypted plaintext bytes into `buffer`.
     ///
     /// Returns `NotConnected` if the TLS handshake has not completed yet.
+    ///
+    /// This is the lowest-overhead TLS read API when the caller can handle
+    /// short plaintext reads.
     pub fn read<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> TlsReadFuture<'_, B> {
         TlsReadFuture::new(self, buffer, len)
     }
@@ -263,6 +440,10 @@ impl TlsClientStream {
     ///
     /// Returns `UnexpectedEof` if the TLS session reaches EOF before `len`
     /// plaintext bytes become available.
+    ///
+    /// This is the complete-buffer convenience API, not the lowest-overhead
+    /// TLS read fast path. Prefer [`TlsClientStream::read`] when the caller
+    /// can handle partial progress.
     pub fn read_exact<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
@@ -277,6 +458,9 @@ impl TlsClientStream {
     /// The returned count may be short if rustls accepts only part of the
     /// supplied plaintext, for example because of the configured rustls buffer
     /// limit. Use [`Self::write_all`] when the full buffer must be accepted.
+    ///
+    /// This is the lowest-overhead TLS write API when the caller can handle
+    /// short plaintext writes.
     pub fn write<B: IoBuffReadOnly>(&mut self, buffer: B) -> TlsWriteFuture<'_, B> {
         TlsWriteFuture::new(self, buffer)
     }
@@ -285,6 +469,10 @@ impl TlsClientStream {
     ///
     /// Returns `NotConnected` if called before handshake completion and
     /// `BrokenPipe` if the TLS write side has already been shut down.
+    ///
+    /// This is the complete-buffer convenience API, not the lowest-overhead
+    /// TLS write fast path. Prefer [`TlsClientStream::write`] when the caller
+    /// can handle partial progress.
     pub fn write_all<B: IoBuffReadOnly>(&mut self, buffer: B) -> TlsWriteAllFuture<'_, B> {
         TlsWriteAllFuture::new(self, buffer)
     }
@@ -294,6 +482,9 @@ impl TlsClientStream {
     ///
     /// This does not advance the TLS handshake by itself beyond draining
     /// already-generated outbound records.
+    ///
+    /// This is primarily a control-path API for callers that need an explicit
+    /// flush boundary.
     pub fn flush(&mut self) -> TlsFlushFuture<'_> {
         TlsFlushFuture { stream: self }
     }
@@ -302,6 +493,7 @@ impl TlsClientStream {
     ///
     /// After this completes, further plaintext writes return `BrokenPipe`.
     /// The read side remains available until the peer closes its direction.
+    /// This is a shutdown-path API rather than a steady-state fast-path API.
     pub fn shutdown(&mut self) -> TlsShutdownFuture<'_> {
         TlsShutdownFuture { stream: self }
     }
@@ -310,6 +502,8 @@ impl TlsClientStream {
     ///
     /// This is sufficient for a later `tls-server-end-point` channel-binding
     /// implementation in a protocol-specific consumer such as PostgreSQL.
+    /// Accessing this once after the handshake is the intended usage; it is
+    /// not part of the steady-state I/O fast path.
     pub fn peer_end_entity_certificate_der(&self) -> Option<&[u8]> {
         self.connection
             .peer_certificates()
@@ -344,6 +538,8 @@ impl TlsClientStream {
             .unwrap_or_else(|| Vec::with_capacity(self.transport_read_buffer_size))
     }
 
+    // Returns a read scratch buffer to the stream after clearing any bytes
+    // that were filled by the last transport read attempt.
     fn restore_read_tls_buffer(&mut self, mut buffer: Vec<u8>) {
         buffer.clear();
         if self.read_tls_buffer.is_none() {
@@ -357,6 +553,8 @@ impl TlsClientStream {
             .unwrap_or_else(|| Vec::with_capacity(self.transport_write_buffer_size))
     }
 
+    // Returns a write scratch buffer to the stream after clearing any emitted
+    // TLS records from the previous flush cycle.
     fn restore_write_tls_buffer(&mut self, mut buffer: Vec<u8>) {
         buffer.clear();
         if self.write_tls_buffer.is_none() {
@@ -525,6 +723,7 @@ impl Drop for TlsClientStream {
 /// Explicit TLS handshake future.
 #[doc(hidden)]
 pub struct TlsHandshakeFuture<'a> {
+    /// TLS stream whose handshake state is being driven.
     stream: &'a mut TlsClientStream,
 }
 
@@ -567,9 +766,13 @@ impl Future for TlsHandshakeFuture<'_> {
 /// TLS plaintext read future.
 #[doc(hidden)]
 pub struct TlsReadFuture<'a, B: IoBuffReadWrite> {
+    /// TLS stream providing decrypted plaintext.
     stream: &'a mut TlsClientStream,
+    /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Maximum plaintext bytes requested from the TLS reader.
     target: usize,
+    /// Deferred validation error returned before any TLS work starts.
     input_error: Option<io::Error>,
 }
 
@@ -636,11 +839,17 @@ impl<B: IoBuffReadWrite> Future for TlsReadFuture<'_, B> {
 /// TLS plaintext read-exact future.
 #[doc(hidden)]
 pub struct TlsReadExactFuture<'a, B: IoBuffReadWrite> {
+    /// TLS stream providing decrypted plaintext.
     stream: &'a mut TlsClientStream,
+    /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Stable base pointer captured once for incremental exact reads.
     base_ptr: *mut u8,
+    /// Total plaintext bytes required before completion.
     target: usize,
+    /// Plaintext bytes already written into the caller buffer.
     filled: usize,
+    /// Deferred validation error returned before any TLS work starts.
     input_error: Option<io::Error>,
 }
 
@@ -726,8 +935,11 @@ impl<B: IoBuffReadWrite> Future for TlsReadExactFuture<'_, B> {
 /// TLS plaintext write future.
 #[doc(hidden)]
 pub struct TlsWriteFuture<'a, B: IoBuffReadOnly> {
+    /// TLS stream that will accept plaintext and flush resulting records.
     stream: &'a mut TlsClientStream,
+    /// Caller-owned plaintext buffer returned on completion.
     buffer: Option<B>,
+    /// Amount of plaintext accepted by rustls once the first write occurs.
     written: Option<usize>,
 }
 
@@ -805,10 +1017,15 @@ impl<B: IoBuffReadOnly> Future for TlsWriteFuture<'_, B> {
 /// TLS plaintext write-all future.
 #[doc(hidden)]
 pub struct TlsWriteAllFuture<'a, B: IoBuffReadOnly> {
+    /// TLS stream that will accept plaintext and flush resulting records.
     stream: &'a mut TlsClientStream,
+    /// Caller-owned plaintext buffer returned on completion.
     buffer: Option<B>,
+    /// Stable base pointer captured once for incremental plaintext writes.
     base_ptr: *const u8,
+    /// Total plaintext byte count that must be accepted by rustls.
     total: usize,
+    /// Plaintext bytes already accepted by rustls.
     offset: usize,
 }
 
@@ -886,6 +1103,7 @@ impl<B: IoBuffReadOnly> Future for TlsWriteAllFuture<'_, B> {
 /// Flush future for pending TLS records.
 #[doc(hidden)]
 pub struct TlsFlushFuture<'a> {
+    /// TLS stream whose queued outbound records are being drained.
     stream: &'a mut TlsClientStream,
 }
 
@@ -901,6 +1119,7 @@ impl Future for TlsFlushFuture<'_> {
 /// Shutdown future for the TLS write side.
 #[doc(hidden)]
 pub struct TlsShutdownFuture<'a> {
+    /// TLS stream whose write side is being closed.
     stream: &'a mut TlsClientStream,
 }
 

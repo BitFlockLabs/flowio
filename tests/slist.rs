@@ -1,33 +1,28 @@
 use flowio::utils;
 
 #[repr(C)]
-struct Node
-{
+struct Node {
     pub value: u64,
     pub link: utils::list::intrusive::slist::Link,
 }
 
 #[repr(C)]
-struct WeirdOffsetNode
-{
+struct WeirdOffsetNode {
     pub _padding: [u8; 17],
     pub link: utils::list::intrusive::slist::Link,
     pub value: u64,
 }
 
-const fn node_offset() -> usize
-{
+const fn node_offset() -> usize {
     std::mem::offset_of!(Node, link)
 }
 
-const fn weird_offset() -> usize
-{
+const fn weird_offset() -> usize {
     std::mem::offset_of!(WeirdOffsetNode, link)
 }
 
 #[test]
-fn test_empty_list()
-{
+fn test_empty_list() {
     let mut list: utils::list::intrusive::slist::SList<Node> =
         utils::list::intrusive::slist::SList::new();
     assert!(list.is_empty(), "Newly created list should be empty");
@@ -41,8 +36,7 @@ fn test_empty_list()
 }
 
 #[test]
-fn test_push_pop_lifo()
-{
+fn test_push_pop_lifo() {
     let mut list: utils::list::intrusive::slist::SList<Node> =
         utils::list::intrusive::slist::SList::new_uninit();
 
@@ -91,8 +85,7 @@ fn test_push_pop_lifo()
 }
 
 #[test]
-fn test_push_front_unchecked_edge_case()
-{
+fn test_push_front_unchecked_edge_case() {
     let mut list: utils::list::intrusive::slist::SList<Node> =
         utils::list::intrusive::slist::SList::new();
 
@@ -123,8 +116,7 @@ fn test_push_front_unchecked_edge_case()
 }
 
 #[test]
-fn test_weird_offset()
-{
+fn test_weird_offset() {
     let mut list: utils::list::intrusive::slist::SList<WeirdOffsetNode> =
         utils::list::intrusive::slist::SList::new();
 
@@ -142,8 +134,7 @@ fn test_weird_offset()
 }
 
 #[test]
-fn test_node_reuse()
-{
+fn test_node_reuse() {
     let mut list: utils::list::intrusive::slist::SList<Node> =
         utils::list::intrusive::slist::SList::new();
     let mut n1 = Node {
@@ -163,14 +154,12 @@ fn test_node_reuse()
 }
 
 #[cfg(debug_assertions)]
-mod debug_only
-{
+mod debug_only {
     use super::*;
 
     #[test]
     #[should_panic(expected = "slist double insert")]
-    fn test_double_insert_panics()
-    {
+    fn test_double_insert_panics() {
         let mut list: utils::list::intrusive::slist::SList<Node> =
             utils::list::intrusive::slist::SList::new();
         let mut n1 = Node {
@@ -192,8 +181,7 @@ mod debug_only
 
     #[test]
     #[should_panic(expected = "attempted to push head onto itself")]
-    fn test_push_head_onto_itself_panics()
-    {
+    fn test_push_head_onto_itself_panics() {
         let mut list: utils::list::intrusive::slist::SList<Node> =
             utils::list::intrusive::slist::SList::new();
         let mut n1 = Node {
@@ -210,8 +198,7 @@ mod debug_only
 
     #[test]
     #[should_panic(expected = "singly linked list cycle detected")]
-    fn test_cycle_detection_panics()
-    {
+    fn test_cycle_detection_panics() {
         let mut list: utils::list::intrusive::slist::SList<Node> =
             utils::list::intrusive::slist::SList::new();
         let mut n1 = Node {

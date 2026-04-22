@@ -5,6 +5,20 @@
 //! completion.  Any type implementing [`IoBuffReadOnly`] / [`IoBuffReadWrite`] can be used
 //! (`Vec<u8>`, `Box<[u8]>`, etc.).
 //!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - If the peer is stable, call [`UdpSocket::connect`] once and then use
+//!   [`UdpSocket::send`] / [`UdpSocket::recv`]. That is the fixed-peer UDP
+//!   fast path in this crate.
+//! - For fixed-shape datagram buffers on the hot path, prefer
+//!   [`crate::runtime::buffer::pool::IoBuffPool`] plus
+//!   [`crate::runtime::buffer::IoBuffMut`].
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use [`UdpSocket::send_to`] / [`UdpSocket::recv_from`] when
+//!   the peer is stable. Use connected UDP `send` / `recv` instead.
+//!
 //! [`IoBuffReadOnly`]: crate::runtime::buffer::IoBuffReadOnly
 //! [`IoBuffReadWrite`]: crate::runtime::buffer::IoBuffReadWrite
 //!
@@ -77,6 +91,11 @@ use std::task::{Context, Poll};
 
 /// Datagram socket with generic buffer support.
 ///
+/// On the fast path, keep the socket open and connected to a default peer if
+/// that peer is stable. Prefer not to rebuild sockets or use `send_to` /
+/// `recv_from` in that case; connected `send` / `recv` is the intended
+/// fixed-peer fast path.
+///
 /// # Example
 /// ```no_run
 /// use flowio::net::udp::UdpSocket;
@@ -92,22 +111,21 @@ use std::task::{Context, Poll};
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct UdpSocket
-{
+pub struct UdpSocket {
+    /// Owned datagram socket descriptor.
     fd: RuntimeFd,
+    /// Cached local address assigned after bind.
     local_addr: SocketAddr,
+    /// Connected default peer used by `send`/`recv`, if any.
     peer_addr: Option<SocketAddr>,
 }
 
-impl UdpSocket
-{
+impl UdpSocket {
     /// Binds a UDP socket to the requested local address.
-    pub fn bind(addr: SocketAddr) -> io::Result<Self>
-    {
+    pub fn bind(addr: SocketAddr) -> io::Result<Self> {
         let fd = new_nonblocking_socket(socket_domain(addr), libc::SOCK_DGRAM)?;
 
-        if let Err(err) = set_reuse_addr(fd)
-        {
+        if let Err(err) = set_reuse_addr(fd) {
             close_fd(fd);
             return Err(err);
         }
@@ -120,18 +138,15 @@ impl UdpSocket
                 sockaddr_len,
             )
         };
-        if bind_res < 0
-        {
+        if bind_res < 0 {
             let err = io::Error::last_os_error();
             close_fd(fd);
             return Err(err);
         }
 
-        let local_addr = match current_local_addr(fd)
-        {
+        let local_addr = match current_local_addr(fd) {
             Ok(addr) => addr,
-            Err(err) =>
-            {
+            Err(err) => {
                 close_fd(fd);
                 return Err(err);
             }
@@ -145,20 +160,20 @@ impl UdpSocket
     }
 
     /// Returns the local address currently assigned to the socket.
-    pub fn local_addr(&self) -> SocketAddr
-    {
+    pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Returns the connected peer address, or `None` if not connected.
-    pub fn peer_addr(&self) -> Option<SocketAddr>
-    {
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
     }
 
     /// Connects the socket to a default peer for `send` and `recv`.
-    pub fn connect(&mut self, addr: SocketAddr) -> io::Result<()>
-    {
+    ///
+    /// For fixed-peer UDP traffic, this is the preferred fast-path setup
+    /// because it enables the lower-overhead connected send/recv APIs.
+    pub fn connect(&mut self, addr: SocketAddr) -> io::Result<()> {
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
         let rc = unsafe {
             libc::connect(
@@ -167,8 +182,7 @@ impl UdpSocket
                 sockaddr_len,
             )
         };
-        if rc < 0
-        {
+        if rc < 0 {
             return Err(io::Error::last_os_error());
         }
         self.peer_addr = Some(addr);
@@ -177,32 +191,27 @@ impl UdpSocket
     }
 
     /// Sets the `SO_SNDBUF` socket send buffer size.
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()>
-    {
+    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
-    pub fn send_buffer_size(&self) -> io::Result<usize>
-    {
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
         super::sock_send_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()>
-    {
+    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
-    pub fn recv_buffer_size(&self) -> io::Result<usize>
-    {
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
         super::sock_recv_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Enables or disables `SO_BROADCAST`.
-    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()>
-    {
+    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         set_sock_opt(
             self.fd.as_raw_fd(),
             libc::SOL_SOCKET,
@@ -212,22 +221,20 @@ impl UdpSocket
     }
 
     /// Returns the current `SO_BROADCAST` setting.
-    pub fn broadcast(&self) -> io::Result<bool>
-    {
+    pub fn broadcast(&self) -> io::Result<bool> {
         let val: libc::c_int =
             get_sock_opt(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BROADCAST)?;
         Ok(val != 0)
     }
 
     /// Starts one connected receive into the provided buffer.
-    pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B>
-    {
+    ///
+    /// This is the preferred receive API on the fixed-peer UDP fast path.
+    pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv", len, buffer.writable_len())
-        {
+        let len = match checked_read_len("recv", len, buffer.writable_len()) {
             Ok(len) => len,
-            Err(err) =>
-            {
+            Err(err) => {
                 input_error = Some(err);
                 0
             }
@@ -243,8 +250,9 @@ impl UdpSocket
     }
 
     /// Starts one connected send from the provided buffer.
-    pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B>
-    {
+    ///
+    /// This is the preferred send API on the fixed-peer UDP fast path.
+    pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B> {
         SendFuture {
             fd: self.fd.as_raw_fd(),
             state_ptr: std::ptr::null_mut(),
@@ -254,15 +262,18 @@ impl UdpSocket
     }
 
     /// Starts one unconnected receive and also returns the sending peer.
-    pub fn recv_from<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize)
-    -> RecvFromFuture<'_, B>
-    {
+    ///
+    /// Use this instead of [`UdpSocket::recv`] when peer addresses vary per
+    /// datagram or when the sender address is needed by the caller.
+    pub fn recv_from<B: IoBuffReadWrite>(
+        &mut self,
+        buffer: B,
+        len: usize,
+    ) -> RecvFromFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv_from", len, buffer.writable_len())
-        {
+        let len = match checked_read_len("recv_from", len, buffer.writable_len()) {
             Ok(len) => len,
-            Err(err) =>
-            {
+            Err(err) => {
                 input_error = Some(err);
                 0
             }
@@ -282,9 +293,14 @@ impl UdpSocket
     }
 
     /// Starts one unconnected send to the provided destination.
-    pub fn send_to<B: IoBuffReadOnly>(&mut self, buffer: B, addr: SocketAddr)
-    -> SendToFuture<'_, B>
-    {
+    ///
+    /// Use this instead of [`UdpSocket::send`] when the destination varies per
+    /// datagram.
+    pub fn send_to<B: IoBuffReadOnly>(
+        &mut self,
+        buffer: B,
+        addr: SocketAddr,
+    ) -> SendToFuture<'_, B> {
         let (storage, addrlen) = socket_addr_to_c(addr);
         SendToFuture {
             fd: self.fd.as_raw_fd(),
@@ -299,10 +315,8 @@ impl UdpSocket
     }
 }
 
-impl AsRawFd for UdpSocket
-{
-    fn as_raw_fd(&self) -> RawFd
-    {
+impl AsRawFd for UdpSocket {
+    fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
@@ -316,22 +330,25 @@ use super::{opt_mut, opt_ref, opt_take};
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct RecvFuture<'a, B: IoBuffReadWrite>
-{
+pub struct RecvFuture<'a, B: IoBuffReadWrite> {
+    /// Connected socket descriptor used for this receive.
     fd: RawFd,
+    /// Completion state for the submitted receive operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Maximum datagram bytes requested from the kernel.
     len: u32,
+    /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
+    /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
 
-impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
-{
+impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
     type Output = (io::Result<usize>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.state_ptr.is_null()
@@ -341,19 +358,16 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
             return Poll::Ready((Err(err), buffer));
         }
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
                 let actual = result as usize;
@@ -362,12 +376,10 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -382,8 +394,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -396,10 +407,8 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
@@ -409,47 +418,43 @@ impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B>
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct SendFuture<'a, B: IoBuffReadOnly>
-{
+pub struct SendFuture<'a, B: IoBuffReadOnly> {
+    /// Connected socket descriptor used for this send.
     fd: RawFd,
+    /// Completion state for the submitted send operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
+    /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
 
-impl<B: IoBuffReadOnly> Future for SendFuture<'_, B>
-{
+impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
     type Output = (io::Result<usize>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
                 return Poll::Ready((Ok(result as usize), buffer));
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -465,8 +470,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -479,10 +483,8 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
@@ -492,26 +494,33 @@ impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B>
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct RecvFromFuture<'a, B: IoBuffReadWrite>
-{
+pub struct RecvFromFuture<'a, B: IoBuffReadWrite> {
+    /// Unconnected socket descriptor used for this receive.
     fd: RawFd,
+    /// Completion state for the submitted recvmsg operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Maximum datagram bytes requested from the kernel.
     len: u32,
+    /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
+    /// Storage for the sender address returned by the kernel.
     addr: MaybeUninit<libc::sockaddr_storage>,
+    /// Length of the returned sender address.
     addrlen: libc::socklen_t,
+    /// Single-entry iovec describing the caller buffer to `recvmsg`.
     iovec: MaybeUninit<libc::iovec>,
+    /// Message header wrapping the address and iovec scratch for `recvmsg`.
     msghdr: MaybeUninit<libc::msghdr>,
+    /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
 
-impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B>
-{
+impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
     type Output = (io::Result<(usize, SocketAddr)>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.state_ptr.is_null()
@@ -521,19 +530,16 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B>
             return Poll::Ready((Err(err), buffer));
         }
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
 
@@ -543,8 +549,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B>
                 let msg = unsafe { this.msghdr.assume_init_ref() };
                 let addr = match unsafe {
                     socket_addr_from_c(this.addr.assume_init_ref(), msg.msg_namelen)
-                }
-                {
+                } {
                     Ok(addr) => addr,
                     Err(err) => return Poll::Ready((Err(err), buffer)),
                 };
@@ -552,12 +557,10 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B>
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -587,8 +590,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -601,10 +603,8 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadWrite> Drop for RecvFromFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadWrite> Drop for RecvFromFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
@@ -614,51 +614,51 @@ impl<B: IoBuffReadWrite> Drop for RecvFromFuture<'_, B>
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub struct SendToFuture<'a, B: IoBuffReadOnly>
-{
+pub struct SendToFuture<'a, B: IoBuffReadOnly> {
+    /// Unconnected socket descriptor used for this send.
     fd: RawFd,
+    /// Completion state for the submitted sendmsg operation.
     state_ptr: *mut CompletionState,
+    /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
+    /// Prepared destination address for this datagram.
     addr: libc::sockaddr_storage,
+    /// Length of the prepared destination address.
     addrlen: libc::socklen_t,
+    /// Single-entry iovec describing the caller buffer to `sendmsg`.
     iovec: MaybeUninit<libc::iovec>,
+    /// Message header wrapping the destination address and iovec scratch.
     msghdr: MaybeUninit<libc::msghdr>,
+    /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
 
-impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B>
-{
+impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
     type Output = (io::Result<usize>, B);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null()
-        {
+        if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
-            if state.is_completed()
-            {
+            if state.is_completed() {
                 let result = state.result;
                 let pctx = unsafe { poll_ctx_from_waker(cx) };
                 unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                if result < 0
-                {
+                if result < 0 {
                     return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
                 }
                 return Poll::Ready((Ok(result as usize), buffer));
             }
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
@@ -689,8 +689,7 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B>
                 .user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     let buffer = opt_take(&mut this.buffer);
@@ -703,10 +702,8 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B>
     }
 }
 
-impl<B: IoBuffReadOnly> Drop for SendToFuture<'_, B>
-{
-    fn drop(&mut self)
-    {
+impl<B: IoBuffReadOnly> Drop for SendToFuture<'_, B> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }

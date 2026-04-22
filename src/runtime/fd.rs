@@ -9,51 +9,43 @@ use crate::runtime::executor::try_submit_detached_close;
 use std::os::fd::{AsRawFd, RawFd};
 
 /// Thin owner for a descriptor managed by the runtime.
-pub(crate) struct RuntimeFd
-{
+pub(crate) struct RuntimeFd {
+    /// Raw descriptor value, or `INVALID` after ownership has been moved out.
     fd: RawFd,
 }
 
-impl RuntimeFd
-{
+impl RuntimeFd {
     const INVALID: RawFd = -1;
 
     #[inline(always)]
-    pub const fn new(fd: RawFd) -> Self
-    {
+    pub const fn new(fd: RawFd) -> Self {
         Self { fd }
     }
 
     #[inline(always)]
-    pub fn take_raw_fd(&mut self) -> RawFd
-    {
+    /// Moves the raw descriptor out and leaves this wrapper empty.
+    pub fn take_raw_fd(&mut self) -> RawFd {
         let fd = self.fd;
         self.fd = Self::INVALID;
         fd
     }
 }
 
-impl AsRawFd for RuntimeFd
-{
+impl AsRawFd for RuntimeFd {
     #[inline(always)]
-    fn as_raw_fd(&self) -> RawFd
-    {
+    fn as_raw_fd(&self) -> RawFd {
         self.fd
     }
 }
 
-impl Drop for RuntimeFd
-{
-    fn drop(&mut self)
-    {
+impl Drop for RuntimeFd {
+    fn drop(&mut self) {
         let fd = self.take_raw_fd();
-        if fd < 0
-        {
+        if fd < 0 {
             return;
         }
 
-        if !try_submit_detached_close(fd)
-        {
+        if !try_submit_detached_close(fd) {
             unsafe {
                 libc::close(fd);
             }

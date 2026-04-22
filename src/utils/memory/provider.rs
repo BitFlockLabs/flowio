@@ -1,10 +1,11 @@
+//! Pluggable raw-memory providers used by slab- and pool-backed allocators.
+
 /// Raw memory source used by the slab/pool allocators.
 ///
 /// This keeps allocator policy separate from the global heap so callers can
 /// substitute hugepages, mmap-backed regions, NUMA-aware allocators, or other
 /// custom memory sources.
-pub trait MemoryProvider
-{
+pub trait MemoryProvider {
     /// Raises the minimum alignment that future allocations must satisfy.
     fn init(&mut self, required_align: usize);
 
@@ -23,52 +24,43 @@ pub trait MemoryProvider
 }
 
 /// Heap-backed [`MemoryProvider`] using the global allocator.
-pub struct BasicMemoryProvider
-{
+pub struct BasicMemoryProvider {
+    /// Minimum alignment guaranteed for future allocations from this provider.
     alignment: usize,
 }
 
-impl BasicMemoryProvider
-{
-    pub fn new() -> Self
-    {
+impl BasicMemoryProvider {
+    /// Creates a provider aligned at least to machine word size.
+    pub fn new() -> Self {
         Self {
             alignment: std::mem::align_of::<usize>(),
         }
     }
 }
 
-impl Default for BasicMemoryProvider
-{
-    fn default() -> Self
-    {
+impl Default for BasicMemoryProvider {
+    fn default() -> Self {
         Self::new()
     }
 }
 
-impl MemoryProvider for BasicMemoryProvider
-{
-    fn init(&mut self, required_align: usize)
-    {
+impl MemoryProvider for BasicMemoryProvider {
+    fn init(&mut self, required_align: usize) {
         self.alignment = std::cmp::max(self.alignment, required_align);
     }
 
-    fn alignment_guarantee(&self) -> usize
-    {
+    fn alignment_guarantee(&self) -> usize {
         self.alignment
     }
 
-    fn request_memory(&mut self, size: usize) -> Option<*mut u8>
-    {
+    fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
         let layout = std::alloc::Layout::from_size_align(size, self.alignment).ok()?;
         let ptr = unsafe { std::alloc::alloc(layout) };
         if ptr.is_null() { None } else { Some(ptr) }
     }
 
-    unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize)
-    {
-        if let Ok(layout) = std::alloc::Layout::from_size_align(size, self.alignment)
-        {
+    unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize) {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(size, self.alignment) {
             unsafe { std::alloc::dealloc(ptr, layout) };
         }
     }

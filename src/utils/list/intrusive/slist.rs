@@ -1,3 +1,5 @@
+//! Minimal intrusive singly linked list used by free lists and slab chains.
+
 use std::marker::PhantomData;
 use std::ptr;
 
@@ -8,12 +10,10 @@ macro_rules! debug_assert_slist_sanity {
         let mut fast = ($list).head;
         let mut count = 0;
         // Floyd's cycle-finding algorithm (tortoise and hare)
-        while !fast.is_null() && count < 1000
-        {
+        while !fast.is_null() && count < 1000 {
             unsafe {
                 fast = (*fast).next;
-                if fast.is_null()
-                {
+                if fast.is_null() {
                     break;
                 }
                 fast = (*fast).next;
@@ -35,63 +35,59 @@ macro_rules! debug_assert_slist_sanity {
 }
 
 #[repr(C)]
-pub struct Link
-{
+/// Intrusive hook embedded in containers stored inside an [`SList`].
+pub struct Link {
     /// Pointer to the next link in the list, or null when detached / at tail.
     pub next: *mut Link,
 }
 
-impl Link
-{
-    pub const fn new_unlinked() -> Self
-    {
+impl Link {
+    pub const fn new_unlinked() -> Self {
         Self {
             next: ptr::null_mut(),
         }
     }
 
     #[inline(always)]
-    pub fn is_unlinked(&self) -> bool
-    {
+    pub fn is_unlinked(&self) -> bool {
         self.next.is_null()
     }
 }
 
-pub struct SList<T>
-{
+/// Minimal intrusive singly linked list used by free lists and slab chains.
+pub struct SList<T> {
     /// First link in the list, or null when empty.
     head: *mut Link,
+    /// Carries the container type without storing values directly.
     _marker: PhantomData<T>,
 }
 
-impl<T> Default for SList<T>
-{
-    fn default() -> Self
-    {
+impl<T> Default for SList<T> {
+    fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> SList<T>
-{
-    pub const fn new() -> Self
-    {
+impl<T> SList<T> {
+    /// Creates an empty list in a state that is safe to move.
+    pub const fn new() -> Self {
         Self {
             head: ptr::null_mut(),
             _marker: PhantomData,
         }
     }
 
-    pub const fn new_uninit() -> Self
-    {
+    /// Alias for [`SList::new`], kept for symmetry with other intrusive
+    /// structures that require a later `init`.
+    pub const fn new_uninit() -> Self {
         Self::new()
     }
 
+    /// No-op initialization hook; singly linked lists are immediately usable.
     pub fn init(&mut self) {}
 
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.head.is_null()
     }
 
@@ -99,9 +95,8 @@ impl<T> SList<T>
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a `Link` that is currently unlinked (unless unchecked).
-    pub unsafe fn push_front(&mut self, node_link: *mut Link)
-    {
+    /// to a detached `Link`.
+    pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
         debug_assert!(!node_link.is_null());
         debug_assert!(unsafe { (*node_link).is_unlinked() }, "slist double insert");
@@ -116,9 +111,8 @@ impl<T> SList<T>
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a `Link` that is currently unlinked (unless unchecked).
-    pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link)
-    {
+    /// to a detached `Link`.
+    pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
         debug_assert!(!node_link.is_null());
         debug_assert!(node_link != self.head, "attempted to push head onto itself");
@@ -134,11 +128,9 @@ impl<T> SList<T>
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
     /// distance from the start of the container `T` to the `Link` field.
-    pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T>
-    {
+    pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T> {
         debug_assert_slist_sanity!(self);
-        if self.is_empty()
-        {
+        if self.is_empty() {
             return None;
         }
         unsafe {

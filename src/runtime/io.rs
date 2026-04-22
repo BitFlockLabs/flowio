@@ -1,5 +1,21 @@
 //! Minimal runtime-owned operations used to bootstrap the executor.
 //!
+//! These APIs are primarily useful for runtime tests, benchmarks, and executor
+//! plumbing. They are not the normal transport fast path for applications.
+//!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choice:
+//! - Prefer [`NopSlot`] over repeatedly constructing [`Nop`] when issuing many
+//!   `NOP` operations in a benchmark or internal control loop, because the
+//!   slot object can be reused across calls.
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use these APIs for real network or IPC work. Use transport
+//!   I/O under [`crate::net`] instead.
+//! - Prefer not to repeatedly construct one-shot [`Nop`] values in tight
+//!   loops. Use [`NopSlot`] instead.
+//!
 //! # Example
 //! ```no_run
 //! use flowio::runtime::executor::Executor;
@@ -21,19 +37,17 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 #[inline(always)]
+/// Completes and frees a finished `NOP` submission if one is ready.
 fn complete_nop_op(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
-) -> Option<io::Result<i32>>
-{
-    if state_ptr.is_null()
-    {
+) -> Option<io::Result<i32>> {
+    if state_ptr.is_null() {
         return None;
     }
 
     let state = unsafe { &**state_ptr };
-    if !state.is_completed()
-    {
+    if !state.is_completed() {
         return None;
     }
 
@@ -42,22 +56,20 @@ fn complete_nop_op(
     unsafe { (*pctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
 
-    Some(
-        if result < 0
-        {
-            Err(io::Error::from_raw_os_error(-result))
-        }
-        else
-        {
-            Ok(result)
-        },
-    )
+    Some(if result < 0 {
+        Err(io::Error::from_raw_os_error(-result))
+    } else {
+        Ok(result)
+    })
 }
 
 /// Reusable slot metadata for a `NOP` operation.
 ///
 /// The slot itself is reused across calls, while each submitted `NOP` still
 /// gets a fresh `CompletionState` from the reactor pool.
+///
+/// This is the lower-overhead `NOP` API when many `NOP`s are issued over
+/// time. The one-shot [`Nop`] type is the simpler, non-reused alternative.
 ///
 /// # Example
 /// ```no_run
@@ -76,17 +88,16 @@ fn complete_nop_op(
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct NopSlot
-{
+pub struct NopSlot {
+    /// Completion slot for the currently armed `NOP`, if any.
     state_ptr: *mut CompletionState,
+    /// True while a borrowed [`NopFuture`] exists for this slot.
     in_use: bool,
 }
 
 /// Equivalent to [`NopSlot::new()`].
-impl Default for NopSlot
-{
-    fn default() -> Self
-    {
+impl Default for NopSlot {
+    fn default() -> Self {
         Self {
             state_ptr: std::ptr::null_mut(),
             in_use: false,
@@ -94,19 +105,15 @@ impl Default for NopSlot
     }
 }
 
-impl NopSlot
-{
+impl NopSlot {
     /// Creates an empty `NOP` slot.
-    pub fn new() -> Self
-    {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Returns a future that submits one `IORING_OP_NOP` through this slot.
-    pub fn nop(&mut self) -> io::Result<NopFuture<'_>>
-    {
-        if self.in_use
-        {
+    pub fn nop(&mut self) -> io::Result<NopFuture<'_>> {
+        if self.in_use {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
 
@@ -125,6 +132,9 @@ impl NopSlot
 
 /// One-shot `IORING_OP_NOP` future with its own submitted operation state.
 ///
+/// This is the convenience `NOP` API. For repeated `NOP` submissions, prefer
+/// [`NopSlot`] so the slot metadata itself can be reused.
+///
 /// # Example
 /// ```no_run
 /// use flowio::runtime::executor::Executor;
@@ -136,50 +146,41 @@ impl NopSlot
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub struct Nop
-{
+pub struct Nop {
+    /// Completion slot for this one-shot `NOP` submission.
     state_ptr: *mut CompletionState,
 }
 
 /// Equivalent to [`Nop::new()`].
-impl Default for Nop
-{
-    fn default() -> Self
-    {
+impl Default for Nop {
+    fn default() -> Self {
         Self {
             state_ptr: std::ptr::null_mut(),
         }
     }
 }
 
-impl Nop
-{
+impl Nop {
     /// Creates a new one-shot `NOP` future.
-    pub fn new() -> Self
-    {
+    pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Future for Nop
-{
+impl Future for Nop {
     type Output = io::Result<i32>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some(result) = complete_nop_op(cx, &mut this.state_ptr)
-        {
+        if let Some(result) = complete_nop_op(cx, &mut this.state_ptr) {
             return Poll::Ready(result);
         }
 
-        if this.state_ptr.is_null()
-        {
+        if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
             this.state_ptr = state_ptr;
@@ -189,8 +190,7 @@ impl Future for Nop
             let sqe = opcode::Nop::new().build().user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready(Err(e));
@@ -204,31 +204,26 @@ impl Future for Nop
 
 /// Borrowed `NOP` future backed by a reusable [`NopSlot`].
 #[doc(hidden)]
-pub struct NopFuture<'a>
-{
+pub struct NopFuture<'a> {
+    /// Reusable slot borrowed for the lifetime of this future.
     slot: &'a mut NopSlot,
 }
 
-impl Future for NopFuture<'_>
-{
+impl Future for NopFuture<'_> {
     type Output = io::Result<i32>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
-    {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some(result) = complete_nop_op(cx, &mut this.slot.state_ptr)
-        {
+        if let Some(result) = complete_nop_op(cx, &mut this.slot.state_ptr) {
             this.slot.in_use = false;
             return Poll::Ready(result);
         }
 
-        if this.slot.state_ptr.is_null()
-        {
+        if this.slot.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null()
-            {
+            if state_ptr.is_null() {
                 this.slot.in_use = false;
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
             }
@@ -239,8 +234,7 @@ impl Future for NopFuture<'_>
             let sqe = opcode::Nop::new().build().user_data(state_ptr as u64);
 
             unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe)
-                {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     (*pctx.reactor()).free_op(state_ptr);
                     this.slot.state_ptr = std::ptr::null_mut();
                     this.slot.in_use = false;
@@ -253,18 +247,14 @@ impl Future for NopFuture<'_>
     }
 }
 
-impl Drop for Nop
-{
-    fn drop(&mut self)
-    {
+impl Drop for Nop {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
-impl Drop for NopFuture<'_>
-{
-    fn drop(&mut self)
-    {
+impl Drop for NopFuture<'_> {
+    fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.slot.state_ptr) };
         self.slot.in_use = false;
     }

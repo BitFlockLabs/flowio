@@ -12,8 +12,23 @@
 //! are materialized into caller- or future-owned scratch storage at I/O
 //! submission time instead of being cached inside the chain.
 //!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - Use these chain types when a protocol is already naturally segmented and
+//!   that segmentation is worth preserving.
+//! - Keep `N` small and fixed to the segment count you actually need; the
+//!   chain stores handles inline and is designed for small, explicit segment
+//!   counts rather than dynamic heap-managed vectors.
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to build a vectored chain for a single contiguous payload.
+//!   Use [`IoBuffMut`] / [`IoBuff`] or another contiguous
+//!   [`IoBuffReadWrite`] / [`IoBuffReadOnly`] buffer instead because that path
+//!   is simpler and usually faster.
+//!
 //! # Example
-//! ```no_run
+//! ```
 //! use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
 //! use flowio::runtime::buffer::IoBuffMut;
 //!
@@ -53,8 +68,11 @@ use std::mem::MaybeUninit;
 ///
 /// `N` is the maximum number of buffer segments, determined at compile time.
 /// All segment-handle storage is inline and heap-free.
-pub struct IoBuffVecMut<const N: usize>
-{
+///
+/// This is the right receive-side container when the transport API is
+/// vectored and the application already wants multiple destination segments.
+/// For one contiguous read buffer, [`IoBuffMut`] is the fast-path alternative.
+pub struct IoBuffVecMut<const N: usize> {
     /// Inline array of buffer segment handles. Only indices `0..count`
     /// are initialized.
     buffers: [MaybeUninit<IoBuffMut>; N],
@@ -62,27 +80,21 @@ pub struct IoBuffVecMut<const N: usize>
     count: usize,
 }
 
-impl<const N: usize> Default for IoBuffVecMut<N>
-{
-    fn default() -> Self
-    {
+impl<const N: usize> Default for IoBuffVecMut<N> {
+    fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> From<[IoBuffMut; N]> for IoBuffVecMut<N>
-{
-    fn from(buffers: [IoBuffMut; N]) -> Self
-    {
+impl<const N: usize> From<[IoBuffMut; N]> for IoBuffVecMut<N> {
+    fn from(buffers: [IoBuffMut; N]) -> Self {
         Self::from_array(buffers)
     }
 }
 
-impl<const N: usize> IoBuffVecMut<N>
-{
+impl<const N: usize> IoBuffVecMut<N> {
     /// Creates an empty vectored buffer chain.
-    pub fn new() -> Self
-    {
+    pub fn new() -> Self {
         Self {
             buffers: unsafe { MaybeUninit::uninit().assume_init() },
             count: 0,
@@ -90,11 +102,9 @@ impl<const N: usize> IoBuffVecMut<N>
     }
 
     /// Creates a fully-initialized chain from an array of mutable segments.
-    pub fn from_array(buffers: [IoBuffMut; N]) -> Self
-    {
+    pub fn from_array(buffers: [IoBuffMut; N]) -> Self {
         let mut out = Self::new();
-        for (i, buf) in buffers.into_iter().enumerate()
-        {
+        for (i, buf) in buffers.into_iter().enumerate() {
             out.buffers[i] = MaybeUninit::new(buf);
         }
         out.count = N;
@@ -103,25 +113,21 @@ impl<const N: usize> IoBuffVecMut<N>
 
     /// Returns the number of segments currently in the chain.
     #[inline(always)]
-    pub fn segments(&self) -> usize
-    {
+    pub fn segments(&self) -> usize {
         self.count
     }
 
     /// Returns the maximum number of segments this chain can hold.
     #[inline(always)]
-    pub fn capacity(&self) -> usize
-    {
+    pub fn capacity(&self) -> usize {
         N
     }
 
     /// Adds a buffer segment to the chain. Takes ownership of the buffer.
     ///
     /// Returns `IoBuffError::ChainFull` if the chain is at capacity.
-    pub fn push(&mut self, buf: IoBuffMut) -> Result<(), IoBuffError>
-    {
-        if self.count >= N
-        {
+    pub fn push(&mut self, buf: IoBuffMut) -> Result<(), IoBuffError> {
+        if self.count >= N {
             return Err(IoBuffError::ChainFull);
         }
 
@@ -132,10 +138,8 @@ impl<const N: usize> IoBuffVecMut<N>
 
     /// Returns a reference to the buffer segment at the given index.
     #[inline(always)]
-    pub fn get(&self, index: usize) -> Result<&IoBuffMut, IoBuffError>
-    {
-        if index >= self.count
-        {
+    pub fn get(&self, index: usize) -> Result<&IoBuffMut, IoBuffError> {
+        if index >= self.count {
             return Err(IoBuffError::IndexOutOfBounds);
         }
         Ok(unsafe { self.buffers[index].assume_init_ref() })
@@ -143,10 +147,8 @@ impl<const N: usize> IoBuffVecMut<N>
 
     /// Returns a mutable reference to the buffer segment at the given index.
     #[inline(always)]
-    pub fn get_mut(&mut self, index: usize) -> Result<&mut IoBuffMut, IoBuffError>
-    {
-        if index >= self.count
-        {
+    pub fn get_mut(&mut self, index: usize) -> Result<&mut IoBuffMut, IoBuffError> {
+        if index >= self.count {
             return Err(IoBuffError::IndexOutOfBounds);
         }
         Ok(unsafe { self.buffers[index].assume_init_mut() })
@@ -154,11 +156,9 @@ impl<const N: usize> IoBuffVecMut<N>
 
     /// Returns the total number of active bytes across all segments.
     #[inline(always)]
-    pub fn len(&self) -> usize
-    {
+    pub fn len(&self) -> usize {
         let mut total = 0;
-        for i in 0..self.count
-        {
+        for i in 0..self.count {
             total += unsafe { self.buffers[i].assume_init_ref() }.len();
         }
         total
@@ -166,18 +166,15 @@ impl<const N: usize> IoBuffVecMut<N>
 
     /// Returns `true` if the chain has no segments or all segments are empty.
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.count == 0 || self.len() == 0
     }
 
     /// Returns the total writable capacity across all segments.
     #[inline(always)]
-    pub fn writable_len(&self) -> usize
-    {
+    pub fn writable_len(&self) -> usize {
         let mut total = 0;
-        for i in 0..self.count
-        {
+        for i in 0..self.count {
             total += unsafe { self.buffers[i].assume_init_ref() }.payload_remaining();
         }
         total
@@ -189,11 +186,9 @@ impl<const N: usize> IoBuffVecMut<N>
     pub(crate) fn fill_read_iovecs_and_writable_len(
         &mut self,
         dst: &mut [MaybeUninit<libc::iovec>; N],
-    ) -> (usize, usize)
-    {
+    ) -> (usize, usize) {
         let mut total = 0;
-        for (i, slot) in dst.iter_mut().enumerate().take(self.count)
-        {
+        for (i, slot) in dst.iter_mut().enumerate().take(self.count) {
             let buf = unsafe { self.buffers[i].assume_init_mut() };
             let len = buf.writable_len();
             slot.write(libc::iovec {
@@ -211,18 +206,15 @@ impl<const N: usize> IoBuffVecMut<N>
     /// # Safety
     /// The caller must guarantee that the first `total_bytes` bytes across
     /// the materialized iovec array have been initialized by the kernel.
-    pub unsafe fn distribute_written(&mut self, total_bytes: usize)
-    {
+    pub unsafe fn distribute_written(&mut self, total_bytes: usize) {
         let mut remaining = total_bytes;
-        for i in 0..self.count
-        {
+        for i in 0..self.count {
             let buf = unsafe { self.buffers[i].assume_init_mut() };
             let cap = buf.payload_remaining();
             let written = if remaining >= cap { cap } else { remaining };
             buf.payload_len += written;
             remaining -= written;
-            if remaining == 0
-            {
+            if remaining == 0 {
                 break;
             }
         }
@@ -236,14 +228,12 @@ impl<const N: usize> IoBuffVecMut<N>
 
     /// Freezes all buffer segments and returns an [`IoBuffVec`].
     /// Zero-copy.
-    pub fn freeze(mut self) -> IoBuffVec<N>
-    {
+    pub fn freeze(mut self) -> IoBuffVec<N> {
         let mut frozen_buffers: [MaybeUninit<IoBuff>; N] =
             unsafe { MaybeUninit::uninit().assume_init() };
         let count = self.count;
 
-        for (i, slot) in frozen_buffers.iter_mut().enumerate().take(count)
-        {
+        for (i, slot) in frozen_buffers.iter_mut().enumerate().take(count) {
             let buf = unsafe { self.buffers[i].assume_init_read() };
             *slot = MaybeUninit::new(buf.freeze());
         }
@@ -257,12 +247,9 @@ impl<const N: usize> IoBuffVecMut<N>
     }
 }
 
-impl<const N: usize> Drop for IoBuffVecMut<N>
-{
-    fn drop(&mut self)
-    {
-        for i in 0..self.count
-        {
+impl<const N: usize> Drop for IoBuffVecMut<N> {
+    fn drop(&mut self) {
+        for i in 0..self.count {
             unsafe { self.buffers[i].assume_init_drop() };
         }
     }
@@ -278,33 +265,33 @@ impl<const N: usize> Drop for IoBuffVecMut<N>
 /// and cloning the chain clones each segment zero-copy. Like
 /// [`IoBuffVecMut`], it stores only segment handles; `iovec` scratch belongs
 /// to the calling I/O operation.
-pub struct IoBuffVec<const N: usize>
-{
+///
+/// This is the right send-side container when bytes are already segmented. For
+/// one contiguous payload, a single [`IoBuff`] or [`IoBuffMut`] is the simpler
+/// fast-path alternative.
+pub struct IoBuffVec<const N: usize> {
+    /// Inline array of frozen segment handles. Only indices `0..count` are
+    /// initialized.
     buffers: [MaybeUninit<IoBuff>; N],
+    /// Number of initialized frozen segments currently stored in the chain.
     count: usize,
 }
 
-impl<const N: usize> Default for IoBuffVec<N>
-{
-    fn default() -> Self
-    {
+impl<const N: usize> Default for IoBuffVec<N> {
+    fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> From<[IoBuff; N]> for IoBuffVec<N>
-{
-    fn from(buffers: [IoBuff; N]) -> Self
-    {
+impl<const N: usize> From<[IoBuff; N]> for IoBuffVec<N> {
+    fn from(buffers: [IoBuff; N]) -> Self {
         Self::from_array(buffers)
     }
 }
 
-impl<const N: usize> IoBuffVec<N>
-{
+impl<const N: usize> IoBuffVec<N> {
     /// Creates an empty frozen vectored buffer chain.
-    pub fn new() -> Self
-    {
+    pub fn new() -> Self {
         Self {
             buffers: unsafe { MaybeUninit::uninit().assume_init() },
             count: 0,
@@ -312,11 +299,9 @@ impl<const N: usize> IoBuffVec<N>
     }
 
     /// Creates a fully-initialized chain from an array of frozen segments.
-    pub fn from_array(buffers: [IoBuff; N]) -> Self
-    {
+    pub fn from_array(buffers: [IoBuff; N]) -> Self {
         let mut out = Self::new();
-        for (i, buf) in buffers.into_iter().enumerate()
-        {
+        for (i, buf) in buffers.into_iter().enumerate() {
             out.buffers[i] = MaybeUninit::new(buf);
         }
         out.count = N;
@@ -325,25 +310,21 @@ impl<const N: usize> IoBuffVec<N>
 
     /// Returns the number of segments in the chain.
     #[inline(always)]
-    pub fn segments(&self) -> usize
-    {
+    pub fn segments(&self) -> usize {
         self.count
     }
 
     /// Returns the maximum number of segments this chain can hold.
     #[inline(always)]
-    pub fn capacity(&self) -> usize
-    {
+    pub fn capacity(&self) -> usize {
         N
     }
 
     /// Returns the total number of readable bytes across all segments.
     #[inline(always)]
-    pub fn len(&self) -> usize
-    {
+    pub fn len(&self) -> usize {
         let mut total = 0;
-        for i in 0..self.count
-        {
+        for i in 0..self.count {
             total += unsafe { self.buffers[i].assume_init_ref() }.len();
         }
         total
@@ -351,17 +332,14 @@ impl<const N: usize> IoBuffVec<N>
 
     /// Returns `true` if the chain has no segments or all segments are empty.
     #[inline(always)]
-    pub fn is_empty(&self) -> bool
-    {
+    pub fn is_empty(&self) -> bool {
         self.count == 0 || self.len() == 0
     }
 
     /// Returns a reference to the frozen buffer segment at the given index.
     #[inline(always)]
-    pub fn get(&self, index: usize) -> Result<&IoBuff, IoBuffError>
-    {
-        if index >= self.count
-        {
+    pub fn get(&self, index: usize) -> Result<&IoBuff, IoBuffError> {
+        if index >= self.count {
             return Err(IoBuffError::IndexOutOfBounds);
         }
         Ok(unsafe { self.buffers[index].assume_init_ref() })
@@ -370,10 +348,8 @@ impl<const N: usize> IoBuffVec<N>
     /// Adds a frozen buffer segment to the chain. Takes ownership of the buffer.
     ///
     /// Returns `IoBuffError::ChainFull` if the chain is at capacity.
-    pub fn push(&mut self, buf: IoBuff) -> Result<(), IoBuffError>
-    {
-        if self.count >= N
-        {
+    pub fn push(&mut self, buf: IoBuff) -> Result<(), IoBuffError> {
+        if self.count >= N {
             return Err(IoBuffError::ChainFull);
         }
 
@@ -383,8 +359,7 @@ impl<const N: usize> IoBuffVec<N>
     }
 
     /// Returns an iterator over the frozen buffer segments.
-    pub fn iter(&self) -> impl Iterator<Item = &IoBuff>
-    {
+    pub fn iter(&self) -> impl Iterator<Item = &IoBuff> {
         (0..self.count).map(move |i| unsafe { self.buffers[i].assume_init_ref() })
     }
 
@@ -394,11 +369,9 @@ impl<const N: usize> IoBuffVec<N>
     pub(crate) fn fill_write_iovecs_and_len(
         &self,
         dst: &mut [MaybeUninit<libc::iovec>; N],
-    ) -> (usize, usize)
-    {
+    ) -> (usize, usize) {
         let mut total = 0;
-        for (i, slot) in dst.iter_mut().enumerate().take(self.count)
-        {
+        for (i, slot) in dst.iter_mut().enumerate().take(self.count) {
             let buf = unsafe { self.buffers[i].assume_init_ref() };
             let len = buf.len();
             slot.write(libc::iovec {
@@ -415,13 +388,10 @@ impl<const N: usize> IoBuffVec<N>
     /// Succeeds only if every segment has a reference count of 1.
     /// Returns `Err((IoBuffError::SharedBuffer, self))` with `self` intact
     /// if any segment is shared.
-    pub fn try_mut_all(mut self) -> Result<IoBuffVecMut<N>, (IoBuffError, Self)>
-    {
-        for i in 0..self.count
-        {
+    pub fn try_mut_all(mut self) -> Result<IoBuffVecMut<N>, (IoBuffError, Self)> {
+        for i in 0..self.count {
             let buf = unsafe { self.buffers[i].assume_init_ref() };
-            if buf.ref_count() > 1
-            {
+            if buf.ref_count() > 1 {
                 return Err((IoBuffError::SharedBuffer, self));
             }
         }
@@ -430,8 +400,7 @@ impl<const N: usize> IoBuffVec<N>
             unsafe { MaybeUninit::uninit().assume_init() };
         let count = self.count;
 
-        for (i, slot) in mut_buffers.iter_mut().enumerate().take(count)
-        {
+        for (i, slot) in mut_buffers.iter_mut().enumerate().take(count) {
             let frozen = unsafe { self.buffers[i].assume_init_read() };
             let mutable = unsafe { frozen.try_mut().unwrap_unchecked() };
             *slot = MaybeUninit::new(mutable);
@@ -446,14 +415,11 @@ impl<const N: usize> IoBuffVec<N>
     }
 }
 
-impl<const N: usize> Clone for IoBuffVec<N>
-{
-    fn clone(&self) -> Self
-    {
+impl<const N: usize> Clone for IoBuffVec<N> {
+    fn clone(&self) -> Self {
         let mut buffers: [MaybeUninit<IoBuff>; N] = unsafe { MaybeUninit::uninit().assume_init() };
 
-        for (i, slot) in buffers.iter_mut().enumerate().take(self.count)
-        {
+        for (i, slot) in buffers.iter_mut().enumerate().take(self.count) {
             *slot = MaybeUninit::new(unsafe { self.buffers[i].assume_init_ref() }.clone());
         }
 
@@ -464,12 +430,9 @@ impl<const N: usize> Clone for IoBuffVec<N>
     }
 }
 
-impl<const N: usize> Drop for IoBuffVec<N>
-{
-    fn drop(&mut self)
-    {
-        for i in 0..self.count
-        {
+impl<const N: usize> Drop for IoBuffVec<N> {
+    fn drop(&mut self) {
+        for i in 0..self.count {
             unsafe { self.buffers[i].assume_init_drop() };
         }
     }

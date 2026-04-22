@@ -14,8 +14,42 @@
 //! connected [`tcp::TcpStream`] with an explicit rustls-driven handshake and
 //! encrypted I/O API.
 //!
+//! Hostname resolution is provided by [`resolver`], which offers a small
+//! FlowIO-native DNS helper for turning host names into `SocketAddr` values
+//! before connecting transports such as TCP or SCTP.
+//!
 //! UDP remains single-datagram and therefore uses single-buffer sends and
 //! receives only.
+//!
+//! # Fast-Path Guidance
+//!
+//! Best fast-path choices:
+//! - For repeated outbound connections, prefer reusable connector types such
+//!   as [`tcp::TcpConnector`] and [`sctp::SctpConnector`] because they keep
+//!   stable connector state across attempts.
+//! - On stream transports, `read` / `write` and `readv` / `writev` are the
+//!   lowest-overhead I/O APIs when the caller can handle partial progress.
+//! - For fixed-peer UDP, prefer [`udp::UdpSocket::connect`] plus `send` /
+//!   `recv` because that avoids per-datagram destination handling.
+//! - Use vectored APIs only when payloads are already segmented. For one
+//!   contiguous payload, the contiguous APIs are the simpler fast-path
+//!   alternative.
+//!
+//! Prefer not to use on the fast path:
+//! - Prefer not to use the one-shot connect helpers in repeated outbound
+//!   loops. Use [`tcp::TcpConnector`] or [`sctp::SctpConnector`] instead.
+//! - Prefer not to use `_exact` / `_all` variants unless complete-buffer
+//!   semantics are required. Use partial-I/O APIs instead when the caller can
+//!   track progress explicitly.
+//! - Prefer not to use `send_to` / `recv_from` when the peer is stable. Use
+//!   connected UDP `send` / `recv` instead.
+//! - Prefer not to resolve names in the steady-state data path. [`resolver`]
+//!   is a setup-path helper; resolve once and reuse the resulting
+//!   `SocketAddr` values.
+//!
+//! The examples below often use `_all` / `_exact` variants because they make
+//! protocol framing obvious in docs. On the hot path, prefer partial-I/O APIs
+//! when the caller can manage progress explicitly.
 //!
 //! [`IoBuffReadOnly`]: crate::runtime::buffer::IoBuffReadOnly
 //! [`IoBuffReadWrite`]: crate::runtime::buffer::IoBuffReadWrite
@@ -66,6 +100,7 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 
+pub mod resolver;
 pub mod sctp;
 pub(crate) mod stream;
 pub mod tcp;
@@ -74,16 +109,16 @@ pub mod udp;
 pub mod unix;
 
 // ---------------------------------------------------------------------------
-// Shared option helpers — avoid expect()/unwrap() in fast-path code.
-// All I/O futures store buffers in Option<B> and consume them exactly once.
-// These helpers replace expect()/unwrap() with debug_assert + unwrap_unchecked.
+// Shared option helpers for rental-pattern futures.
+// All I/O futures store buffers in `Option<B>` so they can move the buffer out
+// exactly once on completion or error. These helpers preserve that invariant
+// without carrying `expect()` branches in the hot path.
 // ---------------------------------------------------------------------------
 
 /// # Safety
 /// The caller must guarantee the option is `Some`.
 #[inline(always)]
-pub(crate) unsafe fn opt_take<T>(opt: &mut Option<T>) -> T
-{
+pub(crate) unsafe fn opt_take<T>(opt: &mut Option<T>) -> T {
     debug_assert!(opt.is_some(), "buffer option was None (internal invariant)");
     unsafe { opt.take().unwrap_unchecked() }
 }
@@ -91,8 +126,7 @@ pub(crate) unsafe fn opt_take<T>(opt: &mut Option<T>) -> T
 /// # Safety
 /// The caller must guarantee the option is `Some`.
 #[inline(always)]
-pub(crate) unsafe fn opt_ref<T>(opt: &Option<T>) -> &T
-{
+pub(crate) unsafe fn opt_ref<T>(opt: &Option<T>) -> &T {
     debug_assert!(opt.is_some(), "buffer option was None (internal invariant)");
     unsafe { opt.as_ref().unwrap_unchecked() }
 }
@@ -100,40 +134,34 @@ pub(crate) unsafe fn opt_ref<T>(opt: &Option<T>) -> &T
 /// # Safety
 /// The caller must guarantee the option is `Some`.
 #[inline(always)]
-pub(crate) unsafe fn opt_mut<T>(opt: &mut Option<T>) -> &mut T
-{
+pub(crate) unsafe fn opt_mut<T>(opt: &mut Option<T>) -> &mut T {
     debug_assert!(opt.is_some(), "buffer option was None (internal invariant)");
     unsafe { opt.as_mut().unwrap_unchecked() }
 }
 
-pub(crate) fn checked_read_len(_op: &str, requested: usize, writable: usize) -> io::Result<u32>
-{
-    if requested > writable
-    {
+/// Validates a caller-supplied read length against the writable capacity that
+/// the buffer actually exposes to the kernel.
+pub(crate) fn checked_read_len(_op: &str, requested: usize, writable: usize) -> io::Result<u32> {
+    if requested > writable {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
-    if requested > u32::MAX as usize
-    {
+    if requested > u32::MAX as usize {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
 
     Ok(requested as u32)
 }
 
-fn socket_domain(addr: SocketAddr) -> libc::c_int
-{
-    match addr
-    {
+fn socket_domain(addr: SocketAddr) -> libc::c_int {
+    match addr {
         SocketAddr::V4(_) => libc::AF_INET,
         SocketAddr::V6(_) => libc::AF_INET6,
     }
 }
 
-fn new_nonblocking_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<RawFd>
-{
+fn new_nonblocking_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<RawFd> {
     let fd = unsafe { libc::socket(domain, kind | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0
-    {
+    if fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -141,45 +169,37 @@ fn new_nonblocking_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<
 }
 
 #[inline(always)]
-fn close_fd(fd: RawFd)
-{
+fn close_fd(fd: RawFd) {
     unsafe {
         libc::close(fd);
     }
 }
 
 #[inline(always)]
-fn close_if_valid(fd: &mut RawFd)
-{
-    if *fd >= 0
-    {
+fn close_if_valid(fd: &mut RawFd) {
+    if *fd >= 0 {
         close_fd(*fd);
         *fd = -1;
     }
 }
 
-fn set_reuse_addr(fd: RawFd) -> io::Result<()>
-{
+fn set_reuse_addr(fd: RawFd) -> io::Result<()> {
     set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32)
 }
 
-fn socket_addr_to_c(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t)
-{
+fn socket_addr_to_c(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len;
 
-    match addr
-    {
-        SocketAddr::V4(v4) =>
-        {
+    match addr {
+        SocketAddr::V4(v4) => {
             let sockaddr_in = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
             sockaddr_in.sin_family = libc::AF_INET as libc::sa_family_t;
             sockaddr_in.sin_port = v4.port().to_be();
             sockaddr_in.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
             len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
         }
-        SocketAddr::V6(v6) =>
-        {
+        SocketAddr::V6(v6) => {
             let sockaddr_in6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
             sockaddr_in6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sockaddr_in6.sin6_port = v6.port().to_be();
@@ -196,8 +216,7 @@ fn socket_addr_to_c(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
 fn socket_addr_from_c(
     storage: &libc::sockaddr_storage,
     len: libc::socklen_t,
-) -> io::Result<SocketAddr>
-{
+) -> io::Result<SocketAddr> {
     let family = storage.ss_family as libc::c_int;
 
     if family == libc::AF_INET && len >= std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
@@ -225,51 +244,44 @@ fn socket_addr_from_c(
     Err(io::Error::from(io::ErrorKind::InvalidData))
 }
 
-fn current_local_addr(fd: RawFd) -> io::Result<SocketAddr>
-{
+fn current_local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
     let rc =
         unsafe { libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
-    if rc < 0
-    {
+    if rc < 0 {
         return Err(io::Error::last_os_error());
     }
 
     socket_addr_from_c(&storage, len)
 }
 
-fn current_peer_addr(fd: RawFd) -> io::Result<SocketAddr>
-{
+fn current_peer_addr(fd: RawFd) -> io::Result<SocketAddr> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
     let rc =
         unsafe { libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
-    if rc < 0
-    {
+    if rc < 0 {
         return Err(io::Error::last_os_error());
     }
 
     socket_addr_from_c(&storage, len)
 }
 
-fn set_reuse_port(fd: RawFd) -> io::Result<()>
-{
+fn set_reuse_port(fd: RawFd) -> io::Result<()> {
     set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)
 }
 
 // Shared socket buffer option helpers used by TcpStream, UnixStream, and UdpSocket.
 
-fn sock_send_buffer_size(fd: RawFd) -> io::Result<usize>
-{
+fn sock_send_buffer_size(fd: RawFd) -> io::Result<usize> {
     let val: libc::c_int = get_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF)?;
     Ok(val as usize)
 }
 
-fn set_sock_send_buffer_size(fd: RawFd, size: usize) -> io::Result<()>
-{
+fn set_sock_send_buffer_size(fd: RawFd, size: usize) -> io::Result<()> {
     set_sock_opt(
         fd,
         libc::SOL_SOCKET,
@@ -278,14 +290,12 @@ fn set_sock_send_buffer_size(fd: RawFd, size: usize) -> io::Result<()>
     )
 }
 
-fn sock_recv_buffer_size(fd: RawFd) -> io::Result<usize>
-{
+fn sock_recv_buffer_size(fd: RawFd) -> io::Result<usize> {
     let val: libc::c_int = get_sock_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)?;
     Ok(val as usize)
 }
 
-fn set_sock_recv_buffer_size(fd: RawFd, size: usize) -> io::Result<()>
-{
+fn set_sock_recv_buffer_size(fd: RawFd, size: usize) -> io::Result<()> {
     set_sock_opt(
         fd,
         libc::SOL_SOCKET,
@@ -294,8 +304,7 @@ fn set_sock_recv_buffer_size(fd: RawFd, size: usize) -> io::Result<()>
     )
 }
 
-fn set_sock_opt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()>
-{
+fn set_sock_opt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {
     let rc = unsafe {
         libc::setsockopt(
             fd,
@@ -305,15 +314,13 @@ fn set_sock_opt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) 
             std::mem::size_of::<T>() as libc::socklen_t,
         )
     };
-    if rc < 0
-    {
+    if rc < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<T>
-{
+fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<T> {
     let mut value = T::default();
     let mut len = std::mem::size_of::<T>() as libc::socklen_t;
     let rc = unsafe {
@@ -325,8 +332,7 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
             &mut len,
         )
     };
-    if rc < 0
-    {
+    if rc < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(value)

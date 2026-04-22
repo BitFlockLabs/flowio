@@ -11,7 +11,7 @@ use std::time::Duration;
 /// Default `io_uring` ring size used by the runtime.
 pub const DEFAULT_RING_ENTRIES: u32 = 256;
 
-/// Objects per slab for the CompletionState pool.
+/// Completion-state records allocated per slab in the internal op pool.
 const OP_POOL_OBJS_PER_SLAB: usize = 256;
 
 /// User-facing `io_uring` configuration embedded inside [`crate::runtime::executor::ExecutorConfig`].
@@ -26,16 +26,13 @@ const OP_POOL_OBJS_PER_SLAB: usize = 256;
 /// # let _ = config;
 /// ```
 #[derive(Clone, Copy)]
-pub struct ReactorConfig
-{
+pub struct ReactorConfig {
     /// Number of entries requested for the io_uring submission/completion ring.
     pub ring_entries: u32,
 }
 
-impl Default for ReactorConfig
-{
-    fn default() -> Self
-    {
+impl Default for ReactorConfig {
+    fn default() -> Self {
         Self {
             ring_entries: DEFAULT_RING_ENTRIES,
         }
@@ -43,24 +40,22 @@ impl Default for ReactorConfig
 }
 
 #[doc(hidden)]
-pub(crate) struct Reactor
-{
+pub(crate) struct Reactor {
     /// Owned io_uring instance used for submission and completion handling.
     pub(crate) ring: IoUring,
-    /// True when SQEs have been queued in userspace but not flushed to the kernel yet.
+    /// True when SQEs have been queued in userspace but not flushed to the
+    /// kernel yet.
     pending: bool,
     /// Pool of reusable completion-state records for in-flight operations.
     op_pool: ManuallyDrop<Pool<'static, CompletionState, BasicMemoryProvider>>,
     /// Stable memory provider backing `op_pool`.
     _op_pool_provider: Box<BasicMemoryProvider>,
-    /// Set once the internal op pool has been initialized.
+    /// Set after `op_pool.init()` so drop knows whether the pool is live.
     initialized: bool,
 }
 
-impl Reactor
-{
-    pub fn new_with_config(config: ReactorConfig) -> io::Result<Self>
-    {
+impl Reactor {
+    pub fn new_with_config(config: ReactorConfig) -> io::Result<Self> {
         let mut provider = Box::new(BasicMemoryProvider::new());
         let provider_ptr = &mut *provider as *mut BasicMemoryProvider;
         let op_pool = ManuallyDrop::new(
@@ -77,23 +72,20 @@ impl Reactor
         })
     }
 
-    pub fn init(&mut self)
-    {
+    pub fn init(&mut self) {
         self.op_pool.init();
         self.initialized = true;
     }
 
     /// Allocate a fresh `CompletionState` for one SQE submission.
     #[inline(always)]
-    pub fn alloc_op(&mut self) -> *mut CompletionState
-    {
+    pub fn alloc_op(&mut self) -> *mut CompletionState {
         unsafe { self.op_pool.alloc(()).unwrap_or(std::ptr::null_mut()) }
     }
 
     /// Return a retired `CompletionState` to the pool.
     #[inline(always)]
-    pub fn free_op(&mut self, ptr: *mut CompletionState)
-    {
+    pub fn free_op(&mut self, ptr: *mut CompletionState) {
         debug_assert!(!ptr.is_null(), "reactor free_op called with null pointer");
         unsafe { self.op_pool.free(ptr) };
     }
@@ -101,8 +93,7 @@ impl Reactor
     /// Mark an in-flight operation as orphaned and submit `ASYNC_CANCEL`.
     /// The `CompletionState` remains owned by the reactor until the CQE path
     /// reclaims it.
-    pub fn cancel_op(&mut self, ptr: *mut CompletionState)
-    {
+    pub fn cancel_op(&mut self, ptr: *mut CompletionState) {
         unsafe { (*ptr).set_orphaned() };
         unsafe { (*ptr).clear_waiter() };
 
@@ -118,19 +109,16 @@ impl Reactor
     /// Push an SQE into the submission queue without flushing to the kernel.
     /// The executor calls [`flush_sqes`] after each task-poll batch.
     #[inline(always)]
-    pub fn submit_sqe(&mut self, sqe: io_uring::squeue::Entry) -> io::Result<()>
-    {
+    pub fn submit_sqe(&mut self, sqe: io_uring::squeue::Entry) -> io::Result<()> {
         let mut sq = self.ring.submission();
-        if sq.is_full()
-        {
+        if sq.is_full() {
             drop(sq);
             self.ring.submit()?;
             self.pending = false;
             sq = self.ring.submission();
         }
         unsafe {
-            if sq.push(&sqe).is_err()
-            {
+            if sq.push(&sqe).is_err() {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
         }
@@ -140,50 +128,42 @@ impl Reactor
     }
 
     #[inline(always)]
-    pub fn flush_sqes(&mut self) -> io::Result<()>
-    {
-        if self.pending
-        {
+    /// Flushes any queued SQEs to the kernel submission queue.
+    pub fn flush_sqes(&mut self) -> io::Result<()> {
+        if self.pending {
             self.ring.submit()?;
             self.pending = false;
         }
         Ok(())
     }
 
-    pub fn wait_for_events(&mut self, timeout: Option<Duration>) -> io::Result<()>
-    {
+    /// Waits until at least one completion is available or the optional
+    /// timeout expires.
+    pub fn wait_for_events(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.pending = false;
-        if let Some(timeout) = timeout
-        {
-            let timeout = if timeout.is_zero()
-            {
+        if let Some(timeout) = timeout {
+            let timeout = if timeout.is_zero() {
                 Duration::from_nanos(1)
-            }
-            else
-            {
+            } else {
                 timeout
             };
             let timespec = types::Timespec::from(timeout);
             let args = types::SubmitArgs::new().timespec(&timespec);
-            match self.ring.submitter().submit_with_args(1, &args)
-            {
-                Ok(_) =>
-                {}
-                Err(err) if err.raw_os_error() == Some(libc::ETIME) =>
-                {}
-                Err(err) =>
-                {
+            match self.ring.submitter().submit_with_args(1, &args) {
+                Ok(_) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ETIME) => {}
+                Err(err) => {
                     return Err(err);
                 }
             }
-        }
-        else
-        {
+        } else {
             self.ring.submit_and_wait(1)?;
         }
         Ok(())
     }
 
+    /// Drains completed CQEs, updates `CompletionState`, and wakes waiting
+    /// tasks as needed.
     pub fn poll_io(
         &mut self,
         max_completions: usize,
@@ -191,21 +171,17 @@ impl Reactor
         ready_queue: *mut crate::utils::list::intrusive::dlist::DList<
             crate::runtime::task::TaskHeader,
         >,
-    ) -> io::Result<usize>
-    {
+    ) -> io::Result<usize> {
         let mut cq = self.ring.completion();
         cq.sync();
 
         let mut seen = 0usize;
-        for cqe in &mut cq
-        {
-            if seen >= max_completions
-            {
+        for cqe in &mut cq {
+            if seen >= max_completions {
                 break;
             }
             let user_data = cqe.user_data();
-            if user_data == 0
-            {
+            if user_data == 0 {
                 // Cancel SQE completion — silently skip.
                 seen += 1;
                 continue;
@@ -217,8 +193,7 @@ impl Reactor
                 (*state).cqe_flags = cqe.flags();
                 (*state).set_completed();
 
-                if (*runtime_state).inflight_ops > 0
-                {
+                if (*runtime_state).inflight_ops > 0 {
                     (*runtime_state).inflight_ops -= 1;
                 }
                 #[cfg(debug_assertions)]
@@ -226,17 +201,13 @@ impl Reactor
                     (*runtime_state).stats.cqe_completions += 1;
                 }
 
-                if (*state).is_orphaned() || (*state).is_detached()
-                {
+                if (*state).is_orphaned() || (*state).is_detached() {
                     // Cancelled/abandoned or detached op — free the pool slot,
                     // no task wake.
                     self.op_pool.free(state);
-                }
-                else
-                {
+                } else {
                     let waiter = (*state).take_waiter();
-                    if !waiter.is_null()
-                    {
+                    if !waiter.is_null() {
                         #[cfg(debug_assertions)]
                         {
                             (*runtime_state).stats.waiter_wakes += 1;
@@ -256,12 +227,9 @@ impl Reactor
     }
 }
 
-impl Drop for Reactor
-{
-    fn drop(&mut self)
-    {
-        if self.initialized
-        {
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        if self.initialized {
             unsafe { ManuallyDrop::drop(&mut self.op_pool) };
         }
     }

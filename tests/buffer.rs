@@ -6,8 +6,7 @@ use flowio::runtime::buffer::{
 };
 use static_assertions::assert_not_impl_any;
 
-fn expect_view(view: Result<IoBuffView, IoBuffError>) -> IoBuffView
-{
+fn expect_view(view: Result<IoBuffView, IoBuffError>) -> IoBuffView {
     view.expect("valid IoBuff slice in test")
 }
 
@@ -16,8 +15,7 @@ fn expect_view(view: Result<IoBuffView, IoBuffError>) -> IoBuffView
 // ============================================================================
 
 #[test]
-fn buffer_mut_new_flat()
-{
+fn buffer_mut_new_flat() {
     println!("--- Creating flat buffer (0 headroom, 64 payload, 0 tailroom) ---");
     let buf = IoBuffMut::new(0, 64, 0);
     println!("  headroom_capacity: {}", buf.headroom_capacity());
@@ -38,8 +36,7 @@ fn buffer_mut_new_flat()
 }
 
 #[test]
-fn buffer_mut_new_with_all_regions()
-{
+fn buffer_mut_new_with_all_regions() {
     println!("--- Creating buffer (32 headroom, 4096 payload, 64 tailroom) ---");
     let buf = IoBuffMut::new(32, 4096, 64);
     println!("  headroom_capacity:  {}", buf.headroom_capacity());
@@ -59,15 +56,13 @@ fn buffer_mut_new_with_all_regions()
 }
 
 #[test]
-fn buffer_mut_new_layout_overflow_returns_error()
-{
+fn buffer_mut_new_layout_overflow_returns_error() {
     let result = RealIoBuffMut::new(usize::MAX, 1, 0);
     assert!(matches!(result, Err(IoBuffError::LayoutOverflow)));
 }
 
 #[test]
-fn buffer_mut_payload_append()
-{
+fn buffer_mut_payload_append() {
     println!("--- Payload append ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
 
@@ -97,8 +92,7 @@ fn buffer_mut_payload_append()
 }
 
 #[test]
-fn buffer_mut_payload_append_overflow_returns_error()
-{
+fn buffer_mut_payload_append_overflow_returns_error() {
     println!("--- Payload append overflow ---");
     let mut buf = IoBuffMut::new(0, 4, 0);
 
@@ -117,8 +111,7 @@ fn buffer_mut_payload_append_overflow_returns_error()
 }
 
 #[test]
-fn buffer_mut_payload_set_len()
-{
+fn buffer_mut_payload_set_len() {
     println!("--- Payload set_len (absolute) ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
 
@@ -149,8 +142,7 @@ fn buffer_mut_payload_set_len()
 }
 
 #[test]
-fn buffer_mut_payload_set_len_overflow_returns_error()
-{
+fn buffer_mut_payload_set_len_overflow_returns_error() {
     println!("--- Payload set_len overflow ---");
     let mut buf = IoBuffMut::new(0, 8, 0);
     let result = buf.payload_set_len(9);
@@ -163,8 +155,7 @@ fn buffer_mut_payload_set_len_overflow_returns_error()
 // ============================================================================
 
 #[test]
-fn buffer_mut_headroom_prepend()
-{
+fn buffer_mut_headroom_prepend() {
     println!("--- Headroom prepend ---");
     let mut buf = IoBuffMut::new(16, 64, 0);
 
@@ -185,8 +176,7 @@ fn buffer_mut_headroom_prepend()
 }
 
 #[test]
-fn buffer_mut_headroom_prepend_multiple()
-{
+fn buffer_mut_headroom_prepend_multiple() {
     println!("--- Multiple headroom prepends ---");
     let mut buf = IoBuffMut::new(32, 64, 0);
 
@@ -202,8 +192,7 @@ fn buffer_mut_headroom_prepend_multiple()
 }
 
 #[test]
-fn buffer_mut_headroom_prepend_overflow_returns_error()
-{
+fn buffer_mut_headroom_prepend_overflow_returns_error() {
     println!("--- Headroom prepend overflow ---");
     let mut buf = IoBuffMut::new(4, 64, 0);
 
@@ -219,8 +208,7 @@ fn buffer_mut_headroom_prepend_overflow_returns_error()
 }
 
 #[test]
-fn buffer_mut_headroom_prepend_on_zero_headroom_returns_error()
-{
+fn buffer_mut_headroom_prepend_on_zero_headroom_returns_error() {
     println!("--- Prepend on zero headroom ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     let result = buf.headroom_prepend(b"x");
@@ -233,8 +221,7 @@ fn buffer_mut_headroom_prepend_on_zero_headroom_returns_error()
 // ============================================================================
 
 #[test]
-fn buffer_mut_tailroom_append()
-{
+fn buffer_mut_tailroom_append() {
     println!("--- Tailroom append ---");
     let mut buf = IoBuffMut::new(0, 64, 16);
 
@@ -248,8 +235,7 @@ fn buffer_mut_tailroom_append()
 }
 
 #[test]
-fn buffer_mut_tailroom_append_overflow_returns_error()
-{
+fn buffer_mut_tailroom_append_overflow_returns_error() {
     println!("--- Tailroom append overflow ---");
     let mut buf = IoBuffMut::new(0, 64, 2);
 
@@ -260,8 +246,7 @@ fn buffer_mut_tailroom_append_overflow_returns_error()
 }
 
 #[test]
-fn buffer_mut_tailroom_append_on_zero_tailroom_returns_error()
-{
+fn buffer_mut_tailroom_append_on_zero_tailroom_returns_error() {
     println!("--- Append on zero tailroom ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     let result = buf.tailroom_append(b"x");
@@ -270,8 +255,7 @@ fn buffer_mut_tailroom_append_on_zero_tailroom_returns_error()
 }
 
 #[test]
-fn buffer_mut_tailroom_seals_payload_growth()
-{
+fn buffer_mut_tailroom_seals_payload_growth() {
     println!("--- Tailroom seals payload growth ---");
     let mut buf = IoBuffMut::new(0, 8, 4);
 
@@ -305,8 +289,7 @@ fn buffer_mut_tailroom_seals_payload_growth()
 // ============================================================================
 
 #[test]
-fn buffer_mut_full_protocol_frame()
-{
+fn buffer_mut_full_protocol_frame() {
     println!("--- Full protocol frame: headroom + payload + tailroom ---");
     let mut buf = IoBuffMut::new(8, 256, 4);
 
@@ -338,8 +321,7 @@ fn buffer_mut_full_protocol_frame()
 // ============================================================================
 
 #[test]
-fn buffer_mut_payload_extend_from_tailroom()
-{
+fn buffer_mut_payload_extend_from_tailroom() {
     println!("--- Extend payload from tailroom ---");
     let mut buf = IoBuffMut::new(0, 16, 32);
     println!(
@@ -363,8 +345,7 @@ fn buffer_mut_payload_extend_from_tailroom()
 }
 
 #[test]
-fn buffer_mut_payload_extend_from_tailroom_overflow_returns_error()
-{
+fn buffer_mut_payload_extend_from_tailroom_overflow_returns_error() {
     println!("--- Extend payload from tailroom overflow ---");
     let mut buf = IoBuffMut::new(0, 16, 8);
     let result = buf.payload_extend_from_tailroom(9);
@@ -373,8 +354,7 @@ fn buffer_mut_payload_extend_from_tailroom_overflow_returns_error()
 }
 
 #[test]
-fn buffer_mut_payload_extend_from_tailroom_discards_tailroom_data()
-{
+fn buffer_mut_payload_extend_from_tailroom_discards_tailroom_data() {
     println!("--- Extend from tailroom discards tailroom data ---");
     let mut buf = IoBuffMut::new(0, 16, 16);
 
@@ -395,8 +375,7 @@ fn buffer_mut_payload_extend_from_tailroom_discards_tailroom_data()
 // ============================================================================
 
 #[test]
-fn buffer_mut_advance_payload()
-{
+fn buffer_mut_advance_payload() {
     println!("--- Advance through payload ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"HEADER:PAYLOAD").unwrap();
@@ -417,8 +396,7 @@ fn buffer_mut_advance_payload()
 }
 
 #[test]
-fn buffer_mut_advance_through_headroom_into_payload()
-{
+fn buffer_mut_advance_through_headroom_into_payload() {
     println!("--- Advance through headroom into payload ---");
     let mut buf = IoBuffMut::new(8, 64, 0);
     buf.payload_append(b"data").unwrap();
@@ -442,8 +420,7 @@ fn buffer_mut_advance_through_headroom_into_payload()
 }
 
 #[test]
-fn buffer_mut_advance_overflow_returns_error()
-{
+fn buffer_mut_advance_overflow_returns_error() {
     println!("--- Advance overflow ---");
     let mut buf = IoBuffMut::new(0, 8, 0);
     buf.payload_append(b"tiny").unwrap();
@@ -455,8 +432,7 @@ fn buffer_mut_advance_overflow_returns_error()
 }
 
 #[test]
-fn buffer_mut_advance_into_tailroom()
-{
+fn buffer_mut_advance_into_tailroom() {
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"DATA").unwrap();
     buf.headroom_prepend(b"H:").unwrap();
@@ -469,8 +445,7 @@ fn buffer_mut_advance_into_tailroom()
 }
 
 #[test]
-fn buffer_mut_advance_entire_active_window_with_tailroom()
-{
+fn buffer_mut_advance_entire_active_window_with_tailroom() {
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"DATA").unwrap();
     buf.headroom_prepend(b"H:").unwrap();
@@ -485,8 +460,7 @@ fn buffer_mut_advance_entire_active_window_with_tailroom()
 }
 
 #[test]
-fn buffer_mut_advance_overflow_with_tailroom_leaves_state_unchanged()
-{
+fn buffer_mut_advance_overflow_with_tailroom_leaves_state_unchanged() {
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"DATA").unwrap();
     buf.headroom_prepend(b"H:").unwrap();
@@ -505,8 +479,7 @@ fn buffer_mut_advance_overflow_with_tailroom_leaves_state_unchanged()
 // ============================================================================
 
 #[test]
-fn buffer_mut_reset()
-{
+fn buffer_mut_reset() {
     println!("--- Reset ---");
     let mut buf = IoBuffMut::new(16, 64, 8);
     buf.payload_append(b"data").unwrap();
@@ -533,8 +506,7 @@ fn buffer_mut_reset()
 // ============================================================================
 
 #[test]
-fn buffer_mut_payload_bytes_mut_modify_in_place()
-{
+fn buffer_mut_payload_bytes_mut_modify_in_place() {
     println!("--- Modify payload in place ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"hello").unwrap();
@@ -550,8 +522,7 @@ fn buffer_mut_payload_bytes_mut_modify_in_place()
 // ============================================================================
 
 #[test]
-fn buffer_mut_deref_returns_full_window()
-{
+fn buffer_mut_deref_returns_full_window() {
     println!("--- Deref returns full active window ---");
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"mid").unwrap();
@@ -571,8 +542,7 @@ fn buffer_mut_deref_returns_full_window()
 // ============================================================================
 
 #[test]
-fn buffer_freeze_zero_copy()
-{
+fn buffer_freeze_zero_copy() {
     println!("--- Freeze (zero-copy) ---");
     let mut buf = IoBuffMut::new(4, 64, 0);
     buf.payload_append(b"frozen_data").unwrap();
@@ -603,8 +573,7 @@ fn buffer_freeze_zero_copy()
 // ============================================================================
 
 #[test]
-fn buffer_frozen_clone_shares_data()
-{
+fn buffer_frozen_clone_shares_data() {
     println!("--- Frozen clone shares backing storage ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"shared").unwrap();
@@ -629,8 +598,7 @@ fn buffer_frozen_clone_shares_data()
 // ============================================================================
 
 #[test]
-fn buffer_frozen_slice()
-{
+fn buffer_frozen_slice() {
     println!("--- Frozen slice ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"Hello, World!").unwrap();
@@ -648,8 +616,7 @@ fn buffer_frozen_slice()
 }
 
 #[test]
-fn buffer_frozen_slice_returns_view()
-{
+fn buffer_frozen_slice_returns_view() {
     let mut buf = IoBuffMut::new(0, 16, 0);
     buf.payload_append(b"abcdef").unwrap();
     let frozen = buf.freeze();
@@ -658,8 +625,7 @@ fn buffer_frozen_slice_returns_view()
 }
 
 #[test]
-fn buffer_frozen_slice_full_range()
-{
+fn buffer_frozen_slice_full_range() {
     println!("--- Frozen slice full range ---");
     let mut buf = IoBuffMut::new(0, 16, 0);
     buf.payload_append(b"all").unwrap();
@@ -676,8 +642,7 @@ fn buffer_frozen_slice_full_range()
 }
 
 #[test]
-fn buffer_frozen_slice_out_of_bounds_returns_error()
-{
+fn buffer_frozen_slice_out_of_bounds_returns_error() {
     println!("--- Frozen slice out of bounds ---");
     let mut buf = IoBuffMut::new(0, 8, 0);
     buf.payload_append(b"abc").unwrap();
@@ -689,8 +654,7 @@ fn buffer_frozen_slice_out_of_bounds_returns_error()
 }
 
 #[test]
-fn buffer_frozen_slice_empty()
-{
+fn buffer_frozen_slice_empty() {
     println!("--- Frozen slice empty range ---");
     let mut buf = IoBuffMut::new(0, 8, 0);
     buf.payload_append(b"abc").unwrap();
@@ -706,8 +670,7 @@ fn buffer_frozen_slice_empty()
 // ============================================================================
 
 #[test]
-fn buffer_frozen_try_mut_sole_owner()
-{
+fn buffer_frozen_try_mut_sole_owner() {
     println!("--- try_mut on sole owner (zero-copy) ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"exclusive").unwrap();
@@ -736,8 +699,7 @@ fn buffer_frozen_try_mut_sole_owner()
 }
 
 #[test]
-fn buffer_frozen_try_mut_sole_owner_with_headroom_and_tailroom()
-{
+fn buffer_frozen_try_mut_sole_owner_with_headroom_and_tailroom() {
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"payload").unwrap();
     buf.headroom_prepend(b"H:").unwrap();
@@ -753,8 +715,7 @@ fn buffer_frozen_try_mut_sole_owner_with_headroom_and_tailroom()
 }
 
 #[test]
-fn buffer_frozen_try_mut_shared_fails()
-{
+fn buffer_frozen_try_mut_shared_fails() {
     println!("--- try_mut on shared buffer fails ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"shared").unwrap();
@@ -767,8 +728,7 @@ fn buffer_frozen_try_mut_shared_fails()
 }
 
 #[test]
-fn buffer_frozen_make_mut_copies_when_shared()
-{
+fn buffer_frozen_make_mut_copies_when_shared() {
     println!("--- make_mut copies when shared ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"original").unwrap();
@@ -798,8 +758,7 @@ fn buffer_frozen_make_mut_copies_when_shared()
 }
 
 #[test]
-fn buffer_frozen_make_mut_preserves_shape()
-{
+fn buffer_frozen_make_mut_preserves_shape() {
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"payload").unwrap();
     buf.headroom_prepend(b"H:").unwrap();
@@ -815,8 +774,7 @@ fn buffer_frozen_make_mut_preserves_shape()
 }
 
 #[test]
-fn buffer_view_make_mut_is_tight_payload_only()
-{
+fn buffer_view_make_mut_is_tight_payload_only() {
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"payload").unwrap();
     buf.headroom_prepend(b"H:").unwrap();
@@ -836,8 +794,7 @@ fn buffer_view_make_mut_is_tight_payload_only()
 // ============================================================================
 
 #[test]
-fn buffer_trait_read_only_on_iobuff_mut()
-{
+fn buffer_trait_read_only_on_iobuff_mut() {
     println!("--- IoBuffReadOnly on IoBuffMut ---");
     let mut buf = IoBuffMut::new(4, 64, 4);
     buf.payload_append(b"payload").unwrap();
@@ -852,8 +809,7 @@ fn buffer_trait_read_only_on_iobuff_mut()
 }
 
 #[test]
-fn buffer_trait_read_write_on_iobuff_mut()
-{
+fn buffer_trait_read_write_on_iobuff_mut() {
     println!("--- IoBuffReadWrite on IoBuffMut ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
 
@@ -879,8 +835,7 @@ fn buffer_trait_read_write_on_iobuff_mut()
 }
 
 #[test]
-fn buffer_trait_read_only_on_iobuff()
-{
+fn buffer_trait_read_only_on_iobuff() {
     println!("--- IoBuffReadOnly on IoBuff ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"frozen").unwrap();
@@ -898,8 +853,7 @@ fn buffer_trait_read_only_on_iobuff()
 // ============================================================================
 
 #[test]
-fn buffer_mut_zero_capacity_all_regions()
-{
+fn buffer_mut_zero_capacity_all_regions() {
     println!("--- Zero capacity in all regions ---");
     let buf = IoBuffMut::new(0, 0, 0);
     assert_eq!(buf.len(), 0);
@@ -910,8 +864,7 @@ fn buffer_mut_zero_capacity_all_regions()
 }
 
 #[test]
-fn buffer_mut_zero_payload_with_headroom_tailroom()
-{
+fn buffer_mut_zero_payload_with_headroom_tailroom() {
     println!("--- Zero payload but non-zero headroom/tailroom ---");
     let mut buf = IoBuffMut::new(8, 0, 8);
     assert_eq!(buf.payload_remaining(), 0);
@@ -927,8 +880,7 @@ fn buffer_mut_zero_payload_with_headroom_tailroom()
 }
 
 #[test]
-fn buffer_mut_large_buffer()
-{
+fn buffer_mut_large_buffer() {
     println!("--- Large buffer (1MB payload) ---");
     let mut buf = IoBuffMut::new(0, 1024 * 1024, 0);
     let data = vec![0xABu8; 1024 * 1024];
@@ -940,8 +892,7 @@ fn buffer_mut_large_buffer()
 }
 
 #[test]
-fn buffer_mut_advance_entire_active_window()
-{
+fn buffer_mut_advance_entire_active_window() {
     println!("--- Advance entire active window ---");
     let mut buf = IoBuffMut::new(4, 64, 0);
     buf.payload_append(b"data").unwrap();
@@ -955,8 +906,7 @@ fn buffer_mut_advance_entire_active_window()
 }
 
 #[test]
-fn buffer_mut_payload_append_exact_fit()
-{
+fn buffer_mut_payload_append_exact_fit() {
     println!("--- Payload append exact fit ---");
     let mut buf = IoBuffMut::new(0, 5, 0);
     buf.payload_append(b"exact").unwrap();
@@ -967,8 +917,7 @@ fn buffer_mut_payload_append_exact_fit()
 }
 
 #[test]
-fn buffer_frozen_drop_all_clones()
-{
+fn buffer_frozen_drop_all_clones() {
     println!("--- Drop all frozen clones (refcount reaches 0) ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"data").unwrap();
@@ -986,8 +935,7 @@ fn buffer_frozen_drop_all_clones()
 }
 
 #[test]
-fn buffer_mut_payload_unwritten_mut_partial_fill()
-{
+fn buffer_mut_payload_unwritten_mut_partial_fill() {
     println!("--- Partial fill via payload_unwritten_mut ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
 
@@ -1005,8 +953,7 @@ fn buffer_mut_payload_unwritten_mut_partial_fill()
 }
 
 #[test]
-fn buffer_frozen_empty_buffer()
-{
+fn buffer_frozen_empty_buffer() {
     println!("--- Freeze empty buffer ---");
     let buf = IoBuffMut::new(8, 64, 8);
     let frozen = buf.freeze();
@@ -1017,8 +964,7 @@ fn buffer_frozen_empty_buffer()
 }
 
 #[test]
-fn buffer_mut_headroom_prepend_then_advance_restores()
-{
+fn buffer_mut_headroom_prepend_then_advance_restores() {
     println!("--- Prepend then advance (undo prepend) ---");
     let mut buf = IoBuffMut::new(8, 64, 0);
     buf.payload_append(b"data").unwrap();
@@ -1039,8 +985,7 @@ fn buffer_mut_headroom_prepend_then_advance_restores()
 // ============================================================================
 
 #[test]
-fn trait_vec_u8_read_only()
-{
+fn trait_vec_u8_read_only() {
     println!("--- IoBuffReadOnly for Vec<u8> ---");
     let v = vec![1u8, 2, 3, 4, 5];
     let ptr = IoBuffReadOnly::as_ptr(&v);
@@ -1052,8 +997,7 @@ fn trait_vec_u8_read_only()
 }
 
 #[test]
-fn trait_vec_u8_read_write()
-{
+fn trait_vec_u8_read_write() {
     println!("--- IoBuffReadWrite for Vec<u8> ---");
     let mut v = Vec::with_capacity(64);
     let ptr = IoBuffReadWrite::as_mut_ptr(&mut v);
@@ -1071,8 +1015,7 @@ fn trait_vec_u8_read_write()
 }
 
 #[test]
-fn trait_box_slice_read_only()
-{
+fn trait_box_slice_read_only() {
     println!("--- IoBuffReadOnly for Box<[u8]> ---");
     let b: Box<[u8]> = vec![10u8, 20, 30].into_boxed_slice();
     let ptr = IoBuffReadOnly::as_ptr(&b);
@@ -1084,8 +1027,7 @@ fn trait_box_slice_read_only()
 }
 
 #[test]
-fn trait_static_slice_read_only()
-{
+fn trait_static_slice_read_only() {
     println!("--- IoBuffReadOnly for &'static [u8] ---");
     let s: &'static [u8] = b"static data";
     let ptr = IoBuffReadOnly::as_ptr(&s);
@@ -1101,8 +1043,7 @@ fn trait_static_slice_read_only()
 // ============================================================================
 
 #[test]
-fn buffer_types_are_not_send()
-{
+fn buffer_types_are_not_send() {
     assert_not_impl_any!(RealIoBuffMut: Send);
     assert_not_impl_any!(flowio::runtime::buffer::IoBuff: Send);
 }
@@ -1112,8 +1053,7 @@ fn buffer_types_are_not_send()
 // ============================================================================
 
 #[test]
-fn buffer_mut_simulated_kernel_read()
-{
+fn buffer_mut_simulated_kernel_read() {
     println!("--- Simulated kernel read via IoBuffReadWrite trait ---");
     let mut buf = IoBuffMut::new(0, 4096, 0);
 
@@ -1145,8 +1085,7 @@ fn buffer_mut_simulated_kernel_read()
 }
 
 #[test]
-fn buffer_mut_simulated_kernel_read_with_headroom()
-{
+fn buffer_mut_simulated_kernel_read_with_headroom() {
     println!("--- Simulated kernel read + headroom prepend ---");
     let mut buf = IoBuffMut::new(16, 4096, 0);
 
@@ -1171,8 +1110,7 @@ fn buffer_mut_simulated_kernel_read_with_headroom()
 // ============================================================================
 
 #[test]
-fn buffer_mut_reset_after_advance()
-{
+fn buffer_mut_reset_after_advance() {
     println!("--- Reset after advance ---");
     let mut buf = IoBuffMut::new(8, 64, 4);
     buf.payload_append(b"data").unwrap();
@@ -1204,8 +1142,7 @@ fn buffer_mut_reset_after_advance()
 // ============================================================================
 
 #[test]
-fn buffer_frozen_slice_of_slice()
-{
+fn buffer_frozen_slice_of_slice() {
     println!("--- Slice of a slice ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"ABCDEFGHIJ").unwrap();
@@ -1227,8 +1164,7 @@ fn buffer_frozen_slice_of_slice()
 }
 
 #[test]
-fn buffer_frozen_many_clones_and_slices()
-{
+fn buffer_frozen_many_clones_and_slices() {
     println!("--- Many clones and slices ---");
     let mut buf = IoBuffMut::new(0, 128, 0);
     buf.payload_append(b"the quick brown fox jumps over the lazy dog")
@@ -1237,11 +1173,9 @@ fn buffer_frozen_many_clones_and_slices()
 
     let mut handles = Vec::new();
     let mut views = Vec::new();
-    for i in 0..10
-    {
+    for i in 0..10 {
         handles.push(frozen.clone());
-        if i < frozen.len()
-        {
+        if i < frozen.len() {
             views.push(expect_view(frozen.slice(i..frozen.len())));
         }
     }

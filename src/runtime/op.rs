@@ -1,3 +1,6 @@
+//! Per-submission completion state shared between io_uring CQE handling and
+//! the runtime's concrete futures.
+
 use crate::runtime::task::TaskHeader;
 use crate::utils::memory::pool::InPlaceInit;
 use std::mem::MaybeUninit;
@@ -12,8 +15,7 @@ use std::mem::MaybeUninit;
 /// with an in-flight state marks it orphaned and leaves reclamation to the
 /// CQE path.
 #[doc(hidden)]
-pub struct CompletionState
-{
+pub struct CompletionState {
     /// CQE result value, stored exactly as returned by the kernel.
     pub result: i32,
     /// CQE flags copied from the completion entry.
@@ -24,65 +26,58 @@ pub struct CompletionState
     pub waiter: *mut TaskHeader,
 }
 
-impl CompletionState
-{
+impl CompletionState {
+    /// CQE has been observed and its result fields are valid.
     pub const FLAG_COMPLETED: u32 = 1 << 0;
+    /// Owning future was dropped before the kernel retired the submission.
     pub const FLAG_ORPHANED: u32 = 1 << 1;
+    /// Operation has no waiting task and should be reclaimed on completion.
     pub const FLAG_DETACHED: u32 = 1 << 2;
 
     #[inline(always)]
-    pub fn is_completed(&self) -> bool
-    {
+    pub fn is_completed(&self) -> bool {
         self.state_flags & Self::FLAG_COMPLETED != 0
     }
 
     #[inline(always)]
-    pub fn is_orphaned(&self) -> bool
-    {
+    pub fn is_orphaned(&self) -> bool {
         self.state_flags & Self::FLAG_ORPHANED != 0
     }
 
     #[inline(always)]
-    pub fn is_detached(&self) -> bool
-    {
+    pub fn is_detached(&self) -> bool {
         self.state_flags & Self::FLAG_DETACHED != 0
     }
 
     #[inline(always)]
-    pub fn set_completed(&mut self)
-    {
+    pub fn set_completed(&mut self) {
         self.state_flags |= Self::FLAG_COMPLETED;
     }
 
     #[inline(always)]
-    pub fn set_orphaned(&mut self)
-    {
+    pub fn set_orphaned(&mut self) {
         self.state_flags |= Self::FLAG_ORPHANED;
     }
 
     #[inline(always)]
-    pub fn set_detached(&mut self)
-    {
+    pub fn set_detached(&mut self) {
         self.state_flags |= Self::FLAG_DETACHED;
     }
 
     #[inline(always)]
-    pub fn register_waiter(&mut self, task: *mut TaskHeader)
-    {
+    pub fn register_waiter(&mut self, task: *mut TaskHeader) {
         self.waiter = task;
     }
 
     #[inline(always)]
-    pub fn take_waiter(&mut self) -> *mut TaskHeader
-    {
+    pub fn take_waiter(&mut self) -> *mut TaskHeader {
         let waiter = self.waiter;
         self.waiter = std::ptr::null_mut();
         waiter
     }
 
     #[inline(always)]
-    pub fn clear_waiter(&mut self)
-    {
+    pub fn clear_waiter(&mut self) {
         self.waiter = std::ptr::null_mut();
     }
 
@@ -92,8 +87,7 @@ impl CompletionState
     /// fully consumed by the owning future. It must not be used while the slot
     /// still corresponds to an in-flight submission.
     #[inline(always)]
-    pub fn reset_for_resubmit(&mut self)
-    {
+    pub fn reset_for_resubmit(&mut self) {
         self.result = 0;
         self.cqe_flags = 0;
         self.state_flags = 0;
@@ -101,12 +95,10 @@ impl CompletionState
     }
 }
 
-impl InPlaceInit for CompletionState
-{
+impl InPlaceInit for CompletionState {
     type Args = ();
 
-    fn init_at(slot: &mut MaybeUninit<Self>, _: Self::Args)
-    {
+    fn init_at(slot: &mut MaybeUninit<Self>, _: Self::Args) {
         unsafe {
             slot.as_mut_ptr().write(Self {
                 result: 0,
