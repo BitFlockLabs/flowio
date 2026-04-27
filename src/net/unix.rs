@@ -100,7 +100,7 @@
 //! [`IoBuffVec`]: crate::runtime::buffer::iobuffvec::IoBuffVec
 
 use super::stream;
-use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
+use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::fd::RuntimeFd;
 use std::io;
@@ -247,6 +247,18 @@ impl UnixStream {
         stream::WritevFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
+    /// Gather-write from a generic read-only vectored buffer chain.
+    ///
+    /// The chain owns buffers implementing [`IoBuffReadOnly`] and is returned
+    /// alongside the result. This is the zero-copy send path for already
+    /// encoded non-FlowIO buffer segments.
+    pub fn writev_read_only<B: IoBuffReadOnly, const N: usize>(
+        &mut self,
+        buffer: IoBuffReadOnlyVec<B, N>,
+    ) -> stream::WritevReadOnlyFuture<'_, B, N, Self> {
+        stream::WritevReadOnlyFuture::new(self.fd.as_raw_fd(), buffer)
+    }
+
     /// Gather-write the entire vectored chain, handling partial writes.
     ///
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
@@ -261,6 +273,18 @@ impl UnixStream {
         buffer: IoBuffVec<N>,
     ) -> stream::WritevAllFuture<'_, N, Self> {
         stream::WritevAllFuture::new(self.fd.as_raw_fd(), buffer)
+    }
+
+    /// Gather-write the entire generic read-only vectored chain.
+    ///
+    /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
+    /// success. The future materializes `iovec` scratch once and advances it
+    /// in place across partial writes.
+    pub fn writev_all_read_only<B: IoBuffReadOnly, const N: usize>(
+        &mut self,
+        buffer: IoBuffReadOnlyVec<B, N>,
+    ) -> stream::WritevAllReadOnlyFuture<'_, B, N, Self> {
+        stream::WritevAllReadOnlyFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
     /// Scatter-read exactly `len` total bytes into a vectored chain.

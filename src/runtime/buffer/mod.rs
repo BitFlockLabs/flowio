@@ -8,6 +8,7 @@
 //! For vectored I/O:
 //! - [`iobuffvec::IoBuffVecMut`] holds mutable recv/read segments
 //! - [`iobuffvec::IoBuffVec`] holds frozen send/write segments
+//! - [`iobuffvec::IoBuffReadOnlyVec`] holds generic read-only send/write segments
 //!
 //! For zero-alloc steady-state reuse:
 //! - [`pool::IoBuffPool`] produces identically-shaped pool-backed [`IoBuffMut`] values
@@ -25,8 +26,9 @@
 //!   path in this crate because it avoids heap allocation after warmup.
 //! - Use [`IoBuff`] when already-built bytes should be frozen once and then
 //!   reused or fanned out zero-copy.
-//! - Use [`iobuffvec::IoBuffVecMut`] / [`iobuffvec::IoBuffVec`] only when a
-//!   protocol is already naturally segmented.
+//! - Use [`iobuffvec::IoBuffVecMut`] / [`iobuffvec::IoBuffVec`] /
+//!   [`iobuffvec::IoBuffReadOnlyVec`] only when a protocol is already
+//!   naturally segmented.
 //!
 //! Prefer not to use on the fast path:
 //! - Prefer not to use [`IoBuffMut::new`] for fixed-shape steady-state

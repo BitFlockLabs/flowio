@@ -1,4 +1,4 @@
-use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
+use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use flowio::runtime::executor::Executor;
 use std::future::Future;
 
@@ -38,6 +38,16 @@ pub fn make_payload_chain<const N: usize>(segments: [&[u8]; N]) -> IoBuffVec<N> 
         chain.push(buf).unwrap();
     }
     chain.freeze()
+}
+
+/// Builds a generic read-only vectored chain from `Vec<u8>` payload segments.
+#[allow(dead_code)]
+pub fn make_read_only_chain<const N: usize>(segments: [&[u8]; N]) -> IoBuffReadOnlyVec<Vec<u8>, N> {
+    let mut chain = IoBuffReadOnlyVec::<Vec<u8>, N>::new();
+    for segment in segments {
+        chain.push(segment.to_vec()).unwrap();
+    }
+    chain
 }
 
 /// Builds a writable vectored chain with one buffer per requested capacity.

@@ -18,7 +18,7 @@
 //! reclaims the pool slot. If a future is dropped after completion but before
 //! polling its result, the completed state is freed immediately from `Drop`.
 
-use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
+use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
     PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, submit_tracked_sqe,
@@ -113,6 +113,24 @@ unsafe fn iovec_ref<const N: usize>(
     index: usize,
 ) -> &libc::iovec {
     unsafe { &*(iovecs.as_ptr().add(index) as *const libc::iovec) }
+}
+
+trait WriteBufferChain<const N: usize>: Sized {
+    fn fill_write_iovecs_and_len(&self, dst: &mut [MaybeUninit<libc::iovec>; N]) -> (usize, usize);
+}
+
+impl<const N: usize> WriteBufferChain<N> for IoBuffVec<N> {
+    #[inline(always)]
+    fn fill_write_iovecs_and_len(&self, dst: &mut [MaybeUninit<libc::iovec>; N]) -> (usize, usize) {
+        IoBuffVec::fill_write_iovecs_and_len(self, dst)
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize> WriteBufferChain<N> for IoBuffReadOnlyVec<B, N> {
+    #[inline(always)]
+    fn fill_write_iovecs_and_len(&self, dst: &mut [MaybeUninit<libc::iovec>; N]) -> (usize, usize) {
+        IoBuffReadOnlyVec::fill_write_iovecs_and_len(self, dst)
+    }
 }
 
 #[inline(always)]
@@ -759,14 +777,13 @@ impl<const N: usize, S> Drop for ReadvFuture<'_, N, S> {
 // WritevFuture
 // ---------------------------------------------------------------------------
 
-/// Gather-write from a vectored buffer chain (rental pattern).
-#[doc(hidden)]
-pub struct WritevFuture<'a, const N: usize, S> {
+/// Shared gather-write future core for owned read-only vectored chains.
+struct WritevFutureCore<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state for the submitted writev/write SQE, if any.
     state_ptr: *mut CompletionState,
-    /// Caller-owned immutable segment chain returned on completion.
-    buffer: Option<IoBuffVec<N>>,
-    /// Future-owned `iovec` scratch describing the source segments.
+    /// Caller-owned read-only segment chain returned on completion.
+    buffer: Option<C>,
+    /// Future-owned `iovec` scratch describing non-empty source segments.
     iovecs: [MaybeUninit<libc::iovec>; N],
     /// Number of valid entries currently present in `iovecs`.
     iov_count: usize,
@@ -778,10 +795,14 @@ pub struct WritevFuture<'a, const N: usize, S> {
     _marker: PhantomData<&'a mut S>,
 }
 
-impl<'a, const N: usize, S> WritevFuture<'a, N, S> {
-    pub(crate) fn new(fd: RawFd, buffer: IoBuffVec<N>) -> Self {
+impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevFutureCore<'a, C, N, S> {
+    fn new(fd: RawFd, buffer: C) -> Self {
         let mut iovecs = uninit_iovecs();
         let (iov_count, total) = buffer.fill_write_iovecs_and_len(&mut iovecs);
+        debug_assert!(
+            total == 0 || iov_count > 0,
+            "non-empty write chain produced no iovecs"
+        );
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
@@ -794,8 +815,8 @@ impl<'a, const N: usize, S> WritevFuture<'a, N, S> {
     }
 }
 
-impl<const N: usize, S> Future for WritevFuture<'_, N, S> {
-    type Output = (io::Result<usize>, IoBuffVec<N>);
+impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFutureCore<'_, C, N, S> {
+    type Output = (io::Result<usize>, C);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -846,9 +867,55 @@ impl<const N: usize, S> Future for WritevFuture<'_, N, S> {
     }
 }
 
-impl<const N: usize, S> Drop for WritevFuture<'_, N, S> {
+impl<C: WriteBufferChain<N>, const N: usize, S> Drop for WritevFutureCore<'_, C, N, S> {
     fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+    }
+}
+
+/// Gather-write from a FlowIO frozen vectored buffer chain (rental pattern).
+#[doc(hidden)]
+pub struct WritevFuture<'a, const N: usize, S> {
+    inner: WritevFutureCore<'a, IoBuffVec<N>, N, S>,
+}
+
+impl<'a, const N: usize, S> WritevFuture<'a, N, S> {
+    pub(crate) fn new(fd: RawFd, buffer: IoBuffVec<N>) -> Self {
+        Self {
+            inner: WritevFutureCore::new(fd, buffer),
+        }
+    }
+}
+
+impl<const N: usize, S> Future for WritevFuture<'_, N, S> {
+    type Output = (io::Result<usize>, IoBuffVec<N>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
+    }
+}
+
+/// Gather-write from a generic read-only vectored buffer chain.
+#[doc(hidden)]
+pub struct WritevReadOnlyFuture<'a, B: IoBuffReadOnly, const N: usize, S> {
+    inner: WritevFutureCore<'a, IoBuffReadOnlyVec<B, N>, N, S>,
+}
+
+impl<'a, B: IoBuffReadOnly, const N: usize, S> WritevReadOnlyFuture<'a, B, N, S> {
+    pub(crate) fn new(fd: RawFd, buffer: IoBuffReadOnlyVec<B, N>) -> Self {
+        Self {
+            inner: WritevFutureCore::new(fd, buffer),
+        }
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize, S> Future for WritevReadOnlyFuture<'_, B, N, S> {
+    type Output = (io::Result<usize>, IoBuffReadOnlyVec<B, N>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
     }
 }
 
@@ -856,14 +923,12 @@ impl<const N: usize, S> Drop for WritevFuture<'_, N, S> {
 // WritevAllFuture
 // ---------------------------------------------------------------------------
 
-/// Gather-write the entire vectored buffer chain, re-submitting on partial
-/// writes and reusing future-owned `iovec` scratch across retries.
-#[doc(hidden)]
-pub struct WritevAllFuture<'a, const N: usize, S> {
+/// Shared gather-write-all future core for owned read-only vectored chains.
+struct WritevAllFutureCore<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state reused across sequential retry submissions.
     state_ptr: *mut CompletionState,
-    /// Caller-owned immutable segment chain returned when the operation finishes.
-    buffer: Option<IoBuffVec<N>>,
+    /// Caller-owned read-only segment chain returned when the operation finishes.
+    buffer: Option<C>,
     /// Future-owned `iovec` scratch advanced in place after partial writes.
     iovecs: [MaybeUninit<libc::iovec>; N],
     /// Number of valid entries currently present in `iovecs`.
@@ -880,10 +945,14 @@ pub struct WritevAllFuture<'a, const N: usize, S> {
     _marker: PhantomData<&'a mut S>,
 }
 
-impl<'a, const N: usize, S> WritevAllFuture<'a, N, S> {
-    pub(crate) fn new(fd: RawFd, buffer: IoBuffVec<N>) -> Self {
+impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevAllFutureCore<'a, C, N, S> {
+    fn new(fd: RawFd, buffer: C) -> Self {
         let mut iovecs = uninit_iovecs();
         let (iov_count, total) = buffer.fill_write_iovecs_and_len(&mut iovecs);
+        debug_assert!(
+            total == 0 || iov_count > 0,
+            "non-empty write-all chain produced no iovecs"
+        );
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
@@ -898,8 +967,8 @@ impl<'a, const N: usize, S> WritevAllFuture<'a, N, S> {
     }
 }
 
-impl<const N: usize, S> Future for WritevAllFuture<'_, N, S> {
-    type Output = (io::Result<usize>, IoBuffVec<N>);
+impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFutureCore<'_, C, N, S> {
+    type Output = (io::Result<usize>, C);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -976,9 +1045,55 @@ impl<const N: usize, S> Future for WritevAllFuture<'_, N, S> {
     }
 }
 
-impl<const N: usize, S> Drop for WritevAllFuture<'_, N, S> {
+impl<C: WriteBufferChain<N>, const N: usize, S> Drop for WritevAllFutureCore<'_, C, N, S> {
     fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+    }
+}
+
+/// Gather-write the entire FlowIO frozen vectored chain, handling partial writes.
+#[doc(hidden)]
+pub struct WritevAllFuture<'a, const N: usize, S> {
+    inner: WritevAllFutureCore<'a, IoBuffVec<N>, N, S>,
+}
+
+impl<'a, const N: usize, S> WritevAllFuture<'a, N, S> {
+    pub(crate) fn new(fd: RawFd, buffer: IoBuffVec<N>) -> Self {
+        Self {
+            inner: WritevAllFutureCore::new(fd, buffer),
+        }
+    }
+}
+
+impl<const N: usize, S> Future for WritevAllFuture<'_, N, S> {
+    type Output = (io::Result<usize>, IoBuffVec<N>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
+    }
+}
+
+/// Gather-write an entire generic read-only vectored chain.
+#[doc(hidden)]
+pub struct WritevAllReadOnlyFuture<'a, B: IoBuffReadOnly, const N: usize, S> {
+    inner: WritevAllFutureCore<'a, IoBuffReadOnlyVec<B, N>, N, S>,
+}
+
+impl<'a, B: IoBuffReadOnly, const N: usize, S> WritevAllReadOnlyFuture<'a, B, N, S> {
+    pub(crate) fn new(fd: RawFd, buffer: IoBuffReadOnlyVec<B, N>) -> Self {
+        Self {
+            inner: WritevAllFutureCore::new(fd, buffer),
+        }
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize, S> Future for WritevAllReadOnlyFuture<'_, B, N, S> {
+    type Output = (io::Result<usize>, IoBuffReadOnlyVec<B, N>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
     }
 }
 

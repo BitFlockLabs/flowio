@@ -1,6 +1,8 @@
 mod common;
 
-use common::{TestIoBuffMut as IoBuffMut, make_payload_chain, make_read_chain, run_test};
+use common::{
+    TestIoBuffMut as IoBuffMut, make_payload_chain, make_read_chain, make_read_only_chain, run_test,
+};
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -646,6 +648,72 @@ fn runtime_unix_vectored_zero_length_operations() {
         let (res, read_chain) = reader.readv_exact(make_read_chain::<0>([]), 0).await;
         assert_eq!(res.expect("readv_exact zero failed"), 0);
         assert!(read_chain.is_empty());
+    });
+}
+
+#[test]
+fn runtime_unix_writev_read_only_empty_and_single_segment() {
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        let (res, chain) = writer.writev_read_only(make_read_only_chain::<0>([])).await;
+        assert_eq!(res.expect("writev_read_only empty failed"), 0);
+        assert!(chain.is_empty());
+
+        let (res, chain) = writer
+            .writev_all_read_only(make_read_only_chain([&b"single"[..]]))
+            .await;
+        assert_eq!(res.expect("writev_all_read_only failed"), 6);
+        let recovered: Vec<Vec<u8>> = chain.into_iter().collect();
+        assert_eq!(recovered, vec![b"single".to_vec()]);
+
+        let (res, buf) = reader.read_exact(vec![0u8; 6], 6).await;
+        assert_eq!(res.expect("read_exact failed"), 6);
+        assert_eq!(&buf[..], b"single");
+    });
+}
+
+#[test]
+fn runtime_unix_writev_all_read_only_writes_segments_in_order() {
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        let chain = make_read_only_chain([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
+        let (res, chain) = writer.writev_all_read_only(chain).await;
+        assert_eq!(res.expect("writev_all_read_only failed"), 11);
+        assert_eq!(chain.segments(), 4);
+
+        let (res, buf) = reader.read_exact(vec![0u8; 11], 11).await;
+        assert_eq!(res.expect("read_exact failed"), 11);
+        assert_eq!(&buf[..], b"hello world");
+    });
+}
+
+#[test]
+fn runtime_unix_writev_all_read_only_large() {
+    let seg_size = 128 * 1024;
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        Executor::spawn(async move {
+            let total = seg_size * 2;
+            let (res, buf) = reader.read_exact(vec![0u8; total], total).await;
+            assert_eq!(res.expect("read_exact failed"), total);
+            assert!(buf[..seg_size].iter().all(|&b| b == 0xAB));
+            assert!(buf[seg_size..].iter().all(|&b| b == 0xCD));
+        })
+        .expect("spawn reader failed");
+
+        let first = vec![0xABu8; seg_size];
+        let second = vec![0xCDu8; seg_size];
+        let chain =
+            flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec::<Vec<u8>, 2>::from_array([
+                first, second,
+            ]);
+
+        let (res, chain) = writer.writev_all_read_only(chain).await;
+        assert_eq!(res.expect("writev_all_read_only failed"), seg_size * 2);
+        assert_eq!(chain.segments(), 2);
     });
 }
 

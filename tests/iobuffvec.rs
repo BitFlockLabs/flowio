@@ -1,8 +1,40 @@
 mod common;
 
 use common::TestIoBuffMut as IoBuffMut;
-use flowio::runtime::buffer::IoBuffError;
-use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
+use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
+use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly};
+use std::cell::Cell;
+use std::rc::Rc;
+
+struct DropTrackedReadOnly {
+    bytes: &'static [u8],
+    drops: Rc<Cell<usize>>,
+}
+
+impl DropTrackedReadOnly {
+    fn new(bytes: &'static [u8], drops: &Rc<Cell<usize>>) -> Self {
+        Self {
+            bytes,
+            drops: Rc::clone(drops),
+        }
+    }
+}
+
+impl Drop for DropTrackedReadOnly {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
 
 macro_rules! seg {
     ($chain:expr, $index:expr) => {
@@ -210,6 +242,98 @@ fn vec_frozen_push_at_capacity_returns_error() {
     chain.push(b2.freeze()).unwrap();
     let result = chain.push(b3.freeze());
     assert_eq!(result, Err(IoBuffError::ChainFull));
+}
+
+// ============================================================================
+// IoBuffReadOnlyVec — generic read-only chain construction
+// ============================================================================
+
+#[test]
+fn vec_read_only_new_empty() {
+    let chain = IoBuffReadOnlyVec::<Vec<u8>, 4>::new();
+    assert_eq!(chain.segments(), 0);
+    assert_eq!(chain.capacity(), 4);
+    assert_eq!(chain.len(), 0);
+    assert!(chain.is_empty());
+}
+
+#[test]
+fn vec_read_only_from_array() {
+    let chain = IoBuffReadOnlyVec::<Vec<u8>, 3>::from_array([
+        b"header".to_vec(),
+        b"body".to_vec(),
+        b"tail".to_vec(),
+    ]);
+
+    assert_eq!(chain.segments(), 3);
+    assert_eq!(chain.capacity(), 3);
+    assert_eq!(chain.len(), 14);
+    assert_eq!(seg!(chain, 0).as_slice(), b"header");
+    assert_eq!(seg!(chain, 1).as_slice(), b"body");
+    assert_eq!(seg!(chain, 2).as_slice(), b"tail");
+}
+
+#[test]
+fn vec_read_only_push_multiple_and_get_mut() {
+    let mut chain = IoBuffReadOnlyVec::<Vec<u8>, 3>::new();
+    chain.push(b"one".to_vec()).unwrap();
+    chain.push(Vec::new()).unwrap();
+    chain.push(b"three".to_vec()).unwrap();
+
+    seg_mut!(chain, 1).extend_from_slice(b"two");
+
+    assert_eq!(chain.segments(), 3);
+    assert_eq!(chain.len(), 11);
+    assert_eq!(seg!(chain, 0).as_slice(), b"one");
+    assert_eq!(seg!(chain, 1).as_slice(), b"two");
+    assert_eq!(seg!(chain, 2).as_slice(), b"three");
+    assert!(!chain.is_empty());
+}
+
+#[test]
+fn vec_read_only_push_at_capacity_returns_error() {
+    let mut chain = IoBuffReadOnlyVec::<Vec<u8>, 1>::new();
+    chain.push(b"a".to_vec()).unwrap();
+
+    let result = chain.push(b"b".to_vec());
+    assert_eq!(result, Err(IoBuffError::ChainFull));
+    assert_eq!(chain.segments(), 1);
+    assert_eq!(chain.len(), 1);
+}
+
+#[test]
+fn vec_read_only_get_out_of_bounds_returns_error() {
+    let chain = IoBuffReadOnlyVec::<Vec<u8>, 1>::new();
+    assert!(matches!(chain.get(0), Err(IoBuffError::IndexOutOfBounds)));
+}
+
+#[test]
+fn vec_read_only_iter_and_into_iter_recover_segments() {
+    let chain = IoBuffReadOnlyVec::<Vec<u8>, 2>::from_array([b"left".to_vec(), b"right".to_vec()]);
+
+    let borrowed: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+    assert_eq!(borrowed, vec![b"left".as_slice(), b"right".as_slice()]);
+
+    let recovered: Vec<Vec<u8>> = chain.into_iter().collect();
+    assert_eq!(recovered, vec![b"left".to_vec(), b"right".to_vec()]);
+}
+
+#[test]
+fn vec_read_only_drop_only_initialized_segments() {
+    let drops = Rc::new(Cell::new(0));
+
+    {
+        let mut chain = IoBuffReadOnlyVec::<DropTrackedReadOnly, 4>::new();
+        chain
+            .push(DropTrackedReadOnly::new(b"first", &drops))
+            .unwrap();
+        chain
+            .push(DropTrackedReadOnly::new(b"second", &drops))
+            .unwrap();
+        assert_eq!(drops.get(), 0);
+    }
+
+    assert_eq!(drops.get(), 2);
 }
 
 // ============================================================================

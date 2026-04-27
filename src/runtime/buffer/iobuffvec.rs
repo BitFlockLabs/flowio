@@ -2,7 +2,9 @@
 //!
 //! [`IoBuffVecMut`] holds a fixed number of [`IoBuffMut`] segments for
 //! `readv`/`recvmsg` operations. [`IoBuffVec`] holds frozen [`IoBuff`]
-//! segments for `writev`/`sendmsg` operations.
+//! segments for `writev`/`sendmsg` operations. [`IoBuffReadOnlyVec`] is the
+//! generic send-side chain for already-owned buffers implementing
+//! [`IoBuffReadOnly`].
 //!
 //! The segment count is a const generic determined at compile time. All
 //! segment storage is inline; no heap allocation is performed by the chain
@@ -29,7 +31,7 @@
 //!
 //! # Example
 //! ```
-//! use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
+//! use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 //! use flowio::runtime::buffer::IoBuffMut;
 //!
 //! let mut seg1 = IoBuffMut::new(0, 16, 0).unwrap();
@@ -55,6 +57,10 @@
 //! b.payload_append(b"!").unwrap();
 //! let frozen_chain: IoBuffVec<2> = [a.freeze(), b.freeze()].into();
 //! assert_eq!(frozen_chain.len(), 3);
+//!
+//! let generic_chain: IoBuffReadOnlyVec<Vec<u8>, 2> =
+//!     IoBuffReadOnlyVec::from_array([b"hello".to_vec(), b"!".to_vec()]);
+//! assert_eq!(generic_chain.len(), 6);
 //! ```
 
 use super::{IoBuff, IoBuffError, IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
@@ -371,16 +377,21 @@ impl<const N: usize> IoBuffVec<N> {
         dst: &mut [MaybeUninit<libc::iovec>; N],
     ) -> (usize, usize) {
         let mut total = 0;
-        for (i, slot) in dst.iter_mut().enumerate().take(self.count) {
+        let mut iov_count = 0;
+        for i in 0..self.count {
             let buf = unsafe { self.buffers[i].assume_init_ref() };
             let len = buf.len();
-            slot.write(libc::iovec {
+            total += len;
+            if len == 0 {
+                continue;
+            }
+            dst[iov_count].write(libc::iovec {
                 iov_base: buf.as_ptr() as *mut libc::c_void,
                 iov_len: len,
             });
-            total += len;
+            iov_count += 1;
         }
-        (self.count, total)
+        (iov_count, total)
     }
 
     /// Attempts to convert the frozen chain back to a mutable chain.
@@ -433,6 +444,221 @@ impl<const N: usize> Clone for IoBuffVec<N> {
 impl<const N: usize> Drop for IoBuffVec<N> {
     fn drop(&mut self) {
         for i in 0..self.count {
+            unsafe { self.buffers[i].assume_init_drop() };
+        }
+    }
+}
+
+// ============================================================================
+// IoBuffReadOnlyVec — generic read-only vectored buffer chain
+// ============================================================================
+
+/// Generic owned read-only vectored buffer chain.
+///
+/// `B` is any concrete buffer type implementing [`IoBuffReadOnly`], and `N`
+/// is the maximum number of segments stored inline. The chain itself performs
+/// no heap allocation and stores only initialized entries in `0..segments()`.
+///
+/// The chain owns every buffer for the full lifetime of a vectored write
+/// future. That preserves the [`IoBuffReadOnly`] pointer-stability contract
+/// while an SQE is in flight, and the future returns the chain alongside the
+/// I/O result so callers can recover or reuse the original buffers.
+pub struct IoBuffReadOnlyVec<B: IoBuffReadOnly, const N: usize> {
+    /// Inline array of read-only buffer handles. Only indices `0..count` are
+    /// initialized.
+    buffers: [MaybeUninit<B>; N],
+    /// Number of initialized read-only segments currently stored.
+    count: usize,
+}
+
+impl<B: IoBuffReadOnly, const N: usize> Default for IoBuffReadOnlyVec<B, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize> From<[B; N]> for IoBuffReadOnlyVec<B, N> {
+    fn from(buffers: [B; N]) -> Self {
+        Self::from_array(buffers)
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
+    /// Creates an empty generic read-only vectored chain.
+    pub fn new() -> Self {
+        Self {
+            buffers: unsafe { MaybeUninit::uninit().assume_init() },
+            count: 0,
+        }
+    }
+
+    /// Creates a fully-initialized chain from an array of read-only buffers.
+    pub fn from_array(buffers: [B; N]) -> Self {
+        let mut out = Self::new();
+        for (i, buf) in buffers.into_iter().enumerate() {
+            out.buffers[i] = MaybeUninit::new(buf);
+        }
+        out.count = N;
+        out
+    }
+
+    /// Returns the number of segments currently in the chain.
+    #[inline(always)]
+    pub fn segments(&self) -> usize {
+        self.count
+    }
+
+    /// Returns the maximum number of segments this chain can hold.
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        N
+    }
+
+    /// Adds a read-only buffer segment to the chain.
+    ///
+    /// Returns [`IoBuffError::ChainFull`] if the chain is at capacity.
+    pub fn push(&mut self, buf: B) -> Result<(), IoBuffError> {
+        if self.count >= N {
+            return Err(IoBuffError::ChainFull);
+        }
+
+        self.buffers[self.count] = MaybeUninit::new(buf);
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Returns a reference to the buffer segment at the given index.
+    #[inline(always)]
+    pub fn get(&self, index: usize) -> Result<&B, IoBuffError> {
+        if index >= self.count {
+            return Err(IoBuffError::IndexOutOfBounds);
+        }
+        Ok(unsafe { self.buffers[index].assume_init_ref() })
+    }
+
+    /// Returns a mutable reference to the buffer segment at the given index.
+    ///
+    /// This is intended for chain construction or recovery before submission
+    /// and after completion. While a vectored write future owns the chain,
+    /// callers cannot access the segments.
+    #[inline(always)]
+    pub fn get_mut(&mut self, index: usize) -> Result<&mut B, IoBuffError> {
+        if index >= self.count {
+            return Err(IoBuffError::IndexOutOfBounds);
+        }
+        Ok(unsafe { self.buffers[index].assume_init_mut() })
+    }
+
+    /// Returns the total number of readable bytes across all segments.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        let mut total = 0;
+        for i in 0..self.count {
+            total += unsafe { self.buffers[i].assume_init_ref() }.len();
+        }
+        total
+    }
+
+    /// Returns `true` if the chain has no segments or all segments are empty.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0 || self.len() == 0
+    }
+
+    /// Returns an iterator over the read-only buffer segments.
+    pub fn iter(&self) -> impl Iterator<Item = &B> {
+        (0..self.count).map(move |i| unsafe { self.buffers[i].assume_init_ref() })
+    }
+
+    /// Fills a caller-provided `iovec` scratch array for `writev`/`sendmsg`.
+    ///
+    /// Empty segments are skipped in the scratch array but still remain owned
+    /// by the chain and are returned to the caller with the result. Returns
+    /// `(iov_count, total_len)` for the initialized scratch entries and total
+    /// readable bytes.
+    pub(crate) fn fill_write_iovecs_and_len(
+        &self,
+        dst: &mut [MaybeUninit<libc::iovec>; N],
+    ) -> (usize, usize) {
+        let mut iov_count = 0;
+        let mut total = 0;
+        for i in 0..self.count {
+            let buf = unsafe { self.buffers[i].assume_init_ref() };
+            let len = buf.len();
+            total += len;
+            if len == 0 {
+                continue;
+            }
+            dst[iov_count].write(libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: len,
+            });
+            iov_count += 1;
+        }
+        (iov_count, total)
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVec<B, N> {
+    fn drop(&mut self) {
+        for i in 0..self.count {
+            unsafe { self.buffers[i].assume_init_drop() };
+        }
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize> IntoIterator for IoBuffReadOnlyVec<B, N> {
+    type Item = B;
+    type IntoIter = IoBuffReadOnlyVecIntoIter<B, N>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        let buffers = unsafe { std::ptr::read(&self.buffers) };
+        let count = self.count;
+        self.count = 0;
+
+        IoBuffReadOnlyVecIntoIter {
+            buffers,
+            index: 0,
+            count,
+        }
+    }
+}
+
+/// Consuming iterator over a generic read-only vectored chain.
+pub struct IoBuffReadOnlyVecIntoIter<B: IoBuffReadOnly, const N: usize> {
+    /// Inline array moved out of the source chain. Entries in `index..count`
+    /// remain initialized until yielded or dropped.
+    buffers: [MaybeUninit<B>; N],
+    /// Next initialized segment to yield.
+    index: usize,
+    /// Total initialized segments moved from the source chain.
+    count: usize,
+}
+
+impl<B: IoBuffReadOnly, const N: usize> Iterator for IoBuffReadOnlyVecIntoIter<B, N> {
+    type Item = B;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.count {
+            return None;
+        }
+
+        let item = unsafe { self.buffers[self.index].assume_init_read() };
+        self.index += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<B: IoBuffReadOnly, const N: usize> ExactSizeIterator for IoBuffReadOnlyVecIntoIter<B, N> {}
+
+impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVecIntoIter<B, N> {
+    fn drop(&mut self) {
+        for i in self.index..self.count {
             unsafe { self.buffers[i].assume_init_drop() };
         }
     }
