@@ -10,6 +10,10 @@
 //! segment storage is inline; no heap allocation is performed by the chain
 //! itself.
 //!
+//! These are fixed-capacity containers. If a push would exceed capacity, the
+//! operation returns [`PushError`] with the original segment so the caller
+//! retains ownership; the container never drops a value it failed to insert.
+//!
 //! These chain types own only buffer segments. Kernel-facing `iovec` arrays
 //! are materialized into caller- or future-owned scratch storage at I/O
 //! submission time instead of being cached inside the chain.
@@ -65,6 +69,64 @@
 
 use super::{IoBuff, IoBuffError, IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use std::mem::MaybeUninit;
+
+/// Error returned when a fixed-capacity vectored chain cannot accept a value.
+///
+/// The original value is returned intact so callers can retry, recycle, or
+/// otherwise recover ownership. This is especially important for buffer
+/// handles, where dropping on overflow would silently release caller-owned I/O
+/// storage.
+pub struct PushError<T> {
+    error: IoBuffError,
+    value: T,
+}
+
+impl<T> PushError<T> {
+    /// Creates a new push error with the original value.
+    #[inline(always)]
+    fn new(error: IoBuffError, value: T) -> Self {
+        Self { error, value }
+    }
+
+    /// Returns the reason the push failed.
+    #[inline(always)]
+    pub fn error(&self) -> IoBuffError {
+        self.error
+    }
+
+    /// Returns a reference to the original value.
+    #[inline(always)]
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Returns a mutable reference to the original value.
+    #[inline(always)]
+    pub fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    /// Consumes the error and returns the original value.
+    #[inline(always)]
+    pub fn into_value(self) -> T {
+        self.value
+    }
+
+    /// Consumes the error and returns both the reason and original value.
+    #[inline(always)]
+    pub fn into_parts(self) -> (IoBuffError, T) {
+        (self.error, self.value)
+    }
+}
+
+impl<T> std::fmt::Debug for PushError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushError")
+            .field("error", &self.error)
+            .field("value", &"<returned>")
+            .finish()
+    }
+}
 
 // ============================================================================
 // IoBuffVecMut — mutable vectored buffer chain (const generic, inline)
@@ -129,12 +191,20 @@ impl<const N: usize> IoBuffVecMut<N> {
         N
     }
 
-    /// Adds a buffer segment to the chain. Takes ownership of the buffer.
+    /// Adds a buffer segment to the chain.
     ///
-    /// Returns `IoBuffError::ChainFull` if the chain is at capacity.
-    pub fn push(&mut self, buf: IoBuffMut) -> Result<(), IoBuffError> {
+    /// Returns [`PushError`] containing `buf` if the chain is at capacity.
+    pub fn push(&mut self, buf: IoBuffMut) -> Result<(), PushError<IoBuffMut>> {
+        self.try_push(buf)
+    }
+
+    /// Attempts to add a buffer segment to the chain.
+    ///
+    /// Returns [`PushError`] containing the original buffer if the chain is at
+    /// capacity.
+    pub fn try_push(&mut self, buf: IoBuffMut) -> Result<(), PushError<IoBuffMut>> {
         if self.count >= N {
-            return Err(IoBuffError::ChainFull);
+            return Err(PushError::new(IoBuffError::ChainFull, buf));
         }
 
         self.buffers[self.count] = MaybeUninit::new(buf);
@@ -351,12 +421,20 @@ impl<const N: usize> IoBuffVec<N> {
         Ok(unsafe { self.buffers[index].assume_init_ref() })
     }
 
-    /// Adds a frozen buffer segment to the chain. Takes ownership of the buffer.
+    /// Adds a frozen buffer segment to the chain.
     ///
-    /// Returns `IoBuffError::ChainFull` if the chain is at capacity.
-    pub fn push(&mut self, buf: IoBuff) -> Result<(), IoBuffError> {
+    /// Returns [`PushError`] containing `buf` if the chain is at capacity.
+    pub fn push(&mut self, buf: IoBuff) -> Result<(), PushError<IoBuff>> {
+        self.try_push(buf)
+    }
+
+    /// Attempts to add a frozen buffer segment to the chain.
+    ///
+    /// Returns [`PushError`] containing the original buffer if the chain is at
+    /// capacity.
+    pub fn try_push(&mut self, buf: IoBuff) -> Result<(), PushError<IoBuff>> {
         if self.count >= N {
-            return Err(IoBuffError::ChainFull);
+            return Err(PushError::new(IoBuffError::ChainFull, buf));
         }
 
         self.buffers[self.count] = MaybeUninit::new(buf);
@@ -516,10 +594,18 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
 
     /// Adds a read-only buffer segment to the chain.
     ///
-    /// Returns [`IoBuffError::ChainFull`] if the chain is at capacity.
-    pub fn push(&mut self, buf: B) -> Result<(), IoBuffError> {
+    /// Returns [`PushError`] containing `buf` if the chain is at capacity.
+    pub fn push(&mut self, buf: B) -> Result<(), PushError<B>> {
+        self.try_push(buf)
+    }
+
+    /// Attempts to add a read-only buffer segment to the chain.
+    ///
+    /// Returns [`PushError`] containing the original buffer if the chain is at
+    /// capacity.
+    pub fn try_push(&mut self, buf: B) -> Result<(), PushError<B>> {
         if self.count >= N {
-            return Err(IoBuffError::ChainFull);
+            return Err(PushError::new(IoBuffError::ChainFull, buf));
         }
 
         self.buffers[self.count] = MaybeUninit::new(buf);

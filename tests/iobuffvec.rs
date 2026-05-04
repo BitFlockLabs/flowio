@@ -1,7 +1,7 @@
 mod common;
 
 use common::TestIoBuffMut as IoBuffMut;
-use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
+use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut, PushError};
 use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -48,6 +48,14 @@ macro_rules! seg_mut {
             .get_mut($index)
             .expect("valid mutable vectored segment in test")
     };
+}
+
+fn expect_chain_full<T>(result: Result<(), PushError<T>>) -> T {
+    let err = result.expect_err("push should fail when the chain is full");
+    assert_eq!(err.error(), IoBuffError::ChainFull);
+    let (error, value) = err.into_parts();
+    assert_eq!(error, IoBuffError::ChainFull);
+    value
 }
 
 // ============================================================================
@@ -153,10 +161,15 @@ fn vec_mut_push_at_capacity_returns_error() {
     chain.push(IoBuffMut::new(0, 8, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 8, 0)).unwrap();
 
-    let result = chain.push(IoBuffMut::new(0, 8, 0));
+    let mut overflow = IoBuffMut::new(0, 8, 0);
+    overflow.payload_append(b"saved").unwrap();
+    let ptr = IoBuffReadOnly::as_ptr(&overflow);
+    let result = chain.try_push(overflow);
     println!("  Push #3 on capacity=2: {:?}", result);
-    assert_eq!(result, Err(IoBuffError::ChainFull));
+    let returned = expect_chain_full(result);
     assert_eq!(chain.segments(), 2);
+    assert_eq!(IoBuffReadOnly::as_ptr(&returned), ptr);
+    assert_eq!(returned.payload_bytes(), b"saved");
 }
 
 #[test]
@@ -240,8 +253,12 @@ fn vec_frozen_push_at_capacity_returns_error() {
     let mut chain = flowio::runtime::buffer::iobuffvec::IoBuffVec::<2>::new();
     chain.push(b1.freeze()).unwrap();
     chain.push(b2.freeze()).unwrap();
-    let result = chain.push(b3.freeze());
-    assert_eq!(result, Err(IoBuffError::ChainFull));
+    let overflow = b3.freeze();
+    let ptr = overflow.bytes().as_ptr();
+    let result = chain.try_push(overflow);
+    let returned = expect_chain_full(result);
+    assert_eq!(returned.bytes().as_ptr(), ptr);
+    assert_eq!(returned.bytes(), b"c");
 }
 
 // ============================================================================
@@ -295,10 +312,36 @@ fn vec_read_only_push_at_capacity_returns_error() {
     let mut chain = IoBuffReadOnlyVec::<Vec<u8>, 1>::new();
     chain.push(b"a".to_vec()).unwrap();
 
-    let result = chain.push(b"b".to_vec());
-    assert_eq!(result, Err(IoBuffError::ChainFull));
+    let overflow = b"b".to_vec();
+    let ptr = overflow.as_ptr();
+    let result = chain.try_push(overflow);
+    let returned = expect_chain_full(result);
     assert_eq!(chain.segments(), 1);
     assert_eq!(chain.len(), 1);
+    assert_eq!(returned.as_ptr(), ptr);
+    assert_eq!(returned, b"b".to_vec());
+}
+
+#[test]
+fn vec_read_only_failed_push_does_not_drop_value() {
+    let drops = Rc::new(Cell::new(0));
+    let mut chain = IoBuffReadOnlyVec::<DropTrackedReadOnly, 1>::new();
+    chain
+        .push(DropTrackedReadOnly::new(b"stored", &drops))
+        .unwrap();
+
+    let result = chain.push(DropTrackedReadOnly::new(b"returned", &drops));
+    assert_eq!(drops.get(), 0);
+
+    let returned = expect_chain_full(result);
+    assert_eq!(returned.bytes, b"returned");
+    assert_eq!(drops.get(), 0);
+
+    drop(returned);
+    assert_eq!(drops.get(), 1);
+
+    drop(chain);
+    assert_eq!(drops.get(), 2);
 }
 
 #[test]
@@ -670,7 +713,8 @@ fn vec_mut_single_capacity() {
     chain.push(buf).unwrap();
 
     let result = chain.push(IoBuffMut::new(0, 8, 0));
-    assert_eq!(result, Err(IoBuffError::ChainFull));
+    let returned = expect_chain_full(result);
+    assert_eq!(returned.payload_len(), 0);
 
     assert_eq!(chain.len(), 8);
     assert_eq!(seg!(chain, 0).payload_bytes(), b"only one");
