@@ -101,7 +101,7 @@
 
 use super::stream;
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
-use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
+use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::fd::RuntimeFd;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -217,6 +217,23 @@ impl UnixStream {
         len: usize,
     ) -> stream::ReadExactFuture<'_, B, Self> {
         stream::ReadExactFuture::new(self.fd.as_raw_fd(), buffer, len)
+    }
+
+    /// Appends exactly `len` bytes to the current payload end of `buffer`.
+    ///
+    /// Returns `UnexpectedEof` if the peer closes before `len` bytes arrive.
+    /// On success the returned buffer payload length is the original payload
+    /// length plus `len`; on EOF or error it includes any bytes appended before
+    /// completion.
+    ///
+    /// This preserves [`UnixStream::read_exact`] semantics while supporting
+    /// staged protocol reads into one [`IoBuffMut`].
+    pub fn read_exact_append(
+        &mut self,
+        buffer: IoBuffMut,
+        len: usize,
+    ) -> stream::ReadExactAppendFuture<'_, Self> {
+        stream::ReadExactAppendFuture::new(self.fd.as_raw_fd(), buffer, len)
     }
 
     /// Scatter-read into a vectored buffer chain.

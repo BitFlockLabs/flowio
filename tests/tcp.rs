@@ -475,6 +475,41 @@ fn runtime_tcp_write_all_read_exact_iobuff() {
     peer.join().expect("peer panicked");
 }
 
+/// Staged IoBuffMut append reads preserve previously-read payload bytes.
+#[test]
+fn runtime_tcp_read_exact_append_iobuff_staged() {
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+
+    let peer = std::thread::spawn(move || {
+        use std::io::Write;
+
+        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+        stream.write_all(b"HEADbody").expect("std write failed");
+    });
+
+    executor
+        .run(async move {
+            let (mut stream, _addr) = listener.accept().await.expect("accept failed");
+
+            let recv_buf = IoBuffMut::new(0, 8, 0);
+            let (res, buf) = stream.read_exact_append(recv_buf, 4).await;
+            assert_eq!(res.expect("header append read failed"), 4);
+            assert_eq!(buf.payload_bytes(), b"HEAD");
+
+            let (res, buf) = stream.read_exact_append(buf, 4).await;
+            assert_eq!(res.expect("body append read failed"), 4);
+            assert_eq!(buf.payload_len(), 8);
+            assert_eq!(buf.payload_bytes(), b"HEADbody");
+        })
+        .expect("executor run failed");
+
+    peer.join().expect("peer panicked");
+}
+
 /// IoBuffMut with headroom — prepend a protocol header before sending.
 #[test]
 fn runtime_tcp_iobuff_headroom() {

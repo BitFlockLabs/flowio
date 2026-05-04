@@ -334,6 +334,82 @@ fn runtime_unix_write_all_read_exact_iobuff() {
         .expect("executor run failed");
 }
 
+/// Staged IoBuffMut append reads preserve previously-read payload bytes.
+#[test]
+fn runtime_unix_read_exact_append_iobuff_staged() {
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+            Executor::spawn(async move {
+                let (res, _buf) = writer.write_all(b"HEADbody".to_vec()).await;
+                res.expect("writer write_all failed");
+            })
+            .expect("spawn writer failed");
+
+            let recv_buf = IoBuffMut::new(0, 8, 0);
+            let (res, buf) = reader.read_exact_append(recv_buf, 4).await;
+            assert_eq!(res.expect("header append read failed"), 4);
+            assert_eq!(buf.payload_bytes(), b"HEAD");
+
+            let (res, buf) = reader.read_exact_append(buf, 4).await;
+            assert_eq!(res.expect("body append read failed"), 4);
+            assert_eq!(buf.payload_len(), 8);
+            assert_eq!(buf.payload_bytes(), b"HEADbody");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_unix_read_exact_append_rejects_oversize_iobuff() {
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            let (_writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+            let mut recv = IoBuffMut::new(0, 6, 0);
+            recv.payload_append(b"seed").unwrap();
+
+            let (res, buf) = reader.read_exact_append(recv, 3).await;
+            let err = res.expect_err("oversize read_exact_append should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(buf.payload_len(), 4);
+            assert_eq!(buf.payload_remaining(), 2);
+            assert_eq!(buf.payload_bytes(), b"seed");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_unix_read_exact_append_eof_preserves_partial_iobuff() {
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+            Executor::spawn(async move {
+                let (res, _buf) = writer.write_all(b"tail".to_vec()).await;
+                res.expect("writer write_all failed");
+                drop(writer);
+            })
+            .expect("spawn writer failed");
+
+            let mut recv = IoBuffMut::new(0, 12, 0);
+            recv.payload_append(b"head").unwrap();
+
+            let (res, buf) = reader.read_exact_append(recv, 8).await;
+            let err = res.expect_err("should fail with UnexpectedEof");
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert_eq!(buf.payload_len(), 8);
+            assert_eq!(buf.payload_bytes(), b"headtail");
+        })
+        .expect("executor run failed");
+}
+
 /// IoBuffMut with headroom — prepend a protocol header after filling payload.
 #[test]
 fn runtime_unix_iobuff_headroom() {

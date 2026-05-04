@@ -19,7 +19,7 @@
 //! polling its result, the completed state is freed immediately from `Drop`.
 
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
-use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
+use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
     PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, submit_tracked_sqe,
 };
@@ -667,6 +667,154 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
 }
 
 impl<B: IoBuffReadWrite, S> Drop for ReadExactFuture<'_, B, S> {
+    fn drop(&mut self) {
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadExactAppendFuture
+// ---------------------------------------------------------------------------
+
+/// Reads exactly `target` bytes into the current writable tail of an
+/// [`IoBuffMut`], preserving any existing payload bytes.
+#[doc(hidden)]
+pub struct ReadExactAppendFuture<'a, S> {
+    /// Completion state reused across sequential retry submissions.
+    state_ptr: *mut CompletionState,
+    /// Caller-owned destination buffer returned when the operation finishes.
+    buffer: Option<IoBuffMut>,
+    /// Stable base pointer into the current unwritten payload tail.
+    base_ptr: *mut u8,
+    /// Stream descriptor read from by this future.
+    fd: RawFd,
+    /// Payload length present before this append operation started.
+    start_len: usize,
+    /// Exact append byte count required before the future can succeed.
+    target: u32,
+    /// Bytes already appended into the destination buffer.
+    filled: u32,
+    /// Deferred validation error returned before any SQE submission.
+    input_error: Option<io::Error>,
+    /// Borrows the parent stream for the future lifetime.
+    _marker: PhantomData<&'a mut S>,
+}
+
+impl<'a, S> ReadExactAppendFuture<'a, S> {
+    pub(crate) fn new(fd: RawFd, mut buffer: IoBuffMut, len: usize) -> Self {
+        let start_len = buffer.payload_len();
+        let mut input_error = None;
+        let target =
+            match super::checked_read_len("read_exact_append", len, buffer.payload_remaining()) {
+                Ok(target) => target,
+                Err(err) => {
+                    input_error = Some(err);
+                    0
+                }
+            };
+        let base_ptr = buffer.as_mut_ptr();
+        Self {
+            state_ptr: std::ptr::null_mut(),
+            buffer: Some(buffer),
+            base_ptr,
+            fd,
+            start_len,
+            target,
+            filled: 0,
+            input_error,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn set_appended_len(&mut self, appended: u32) -> IoBuffMut {
+        let mut buffer = unsafe { opt_take(&mut self.buffer) };
+        unsafe { buffer.set_written_len(self.start_len + appended as usize) };
+        buffer
+    }
+}
+
+impl<S> Future for ReadExactAppendFuture<'_, S> {
+    type Output = (io::Result<usize>, IoBuffMut);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.state_ptr.is_null()
+            && let Some(err) = this.input_error.take()
+        {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
+        }
+
+        // Fast path: still in flight — return without any context extraction.
+        if !this.state_ptr.is_null() {
+            let state = unsafe { &*this.state_ptr };
+            if !state.is_completed() {
+                return Poll::Pending;
+            }
+        }
+
+        // Zero-length append completes immediately and preserves the payload.
+        if this.state_ptr.is_null() && this.target == 0 {
+            let buffer = unsafe { this.set_appended_len(0) };
+            return Poll::Ready((Ok(0), buffer));
+        }
+
+        // One context extraction covers free + alloc + submit.
+        let pctx = unsafe { poll_ctx_from_waker(cx) };
+
+        // Process completed state if any. Sequential retries reuse the same
+        // completion slot once the previous CQE has been fully consumed.
+        if !this.state_ptr.is_null() {
+            let result = unsafe { (*this.state_ptr).result };
+
+            if result < 0 {
+                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                let buffer = unsafe { this.set_appended_len(this.filled) };
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+            }
+
+            let n = result as u32;
+            if n == 0 {
+                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                let buffer = unsafe { this.set_appended_len(this.filled) };
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::UnexpectedEof)), buffer));
+            }
+
+            this.filled += n;
+            if this.filled >= this.target {
+                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                let buffer = unsafe { this.set_appended_len(this.target) };
+                return Poll::Ready((Ok(this.target as usize), buffer));
+            }
+        }
+        if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
+            let buffer = unsafe { this.set_appended_len(this.filled) };
+            return Poll::Ready((Err(err), buffer));
+        }
+
+        let ptr = unsafe { this.base_ptr.add(this.filled as usize) };
+        let remaining = this.target - this.filled;
+
+        let sqe = opcode::Read::new(types::Fd(this.fd), ptr, remaining)
+            .build()
+            .user_data(this.state_ptr as u64);
+
+        unsafe {
+            if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
+                (*pctx.reactor()).free_op(this.state_ptr);
+                this.state_ptr = std::ptr::null_mut();
+                let buffer = this.set_appended_len(this.filled);
+                return Poll::Ready((Err(e), buffer));
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<S> Drop for ReadExactAppendFuture<'_, S> {
     fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
