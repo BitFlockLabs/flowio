@@ -91,6 +91,20 @@ pub struct RuntimeStats {
     pub retained_heap_fallbacks: usize,
     /// Retained operation payload heap fallback blocks released.
     pub retained_heap_frees: usize,
+    /// Retained writev scratch requests served by inline scratch storage.
+    pub writev_scratch_inline_allocs: usize,
+    /// Retained writev scratch requests served by pooled sidecar storage.
+    pub writev_scratch_pooled_allocs: usize,
+    /// Retained writev scratch requests served from a returned sidecar block.
+    pub writev_scratch_pooled_reuses: usize,
+    /// Retained writev scratch sidecar blocks returned to the pool.
+    pub writev_scratch_pooled_frees: usize,
+    /// Retained writev scratch slab pages requested by the sidecar pool.
+    pub writev_scratch_slab_allocs: usize,
+    /// Writev requests rejected for exceeding the per-submission iovec limit.
+    pub writev_scratch_oversize_rejections: usize,
+    /// Writev scratch sidecar allocation failures.
+    pub writev_scratch_alloc_failures: usize,
 }
 
 struct ExecutorTaskMemProvider {
@@ -728,6 +742,20 @@ impl Executor {
                     runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
                     runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
                     runtime_state.stats.retained_heap_frees = retained.heap_frees;
+                    runtime_state.stats.writev_scratch_inline_allocs =
+                        retained.writev_scratch_inline_allocs;
+                    runtime_state.stats.writev_scratch_pooled_allocs =
+                        retained.writev_scratch_pooled_allocs;
+                    runtime_state.stats.writev_scratch_pooled_reuses =
+                        retained.writev_scratch_pooled_reuses;
+                    runtime_state.stats.writev_scratch_pooled_frees =
+                        retained.writev_scratch_pooled_frees;
+                    runtime_state.stats.writev_scratch_slab_allocs =
+                        retained.writev_scratch_slab_allocs;
+                    runtime_state.stats.writev_scratch_oversize_rejections =
+                        retained.writev_scratch_oversize_rejections;
+                    runtime_state.stats.writev_scratch_alloc_failures =
+                        retained.writev_scratch_alloc_failures;
                     self.last_stats = runtime_state.stats;
                 }
                 EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
@@ -755,6 +783,20 @@ impl Executor {
                     runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
                     runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
                     runtime_state.stats.retained_heap_frees = retained.heap_frees;
+                    runtime_state.stats.writev_scratch_inline_allocs =
+                        retained.writev_scratch_inline_allocs;
+                    runtime_state.stats.writev_scratch_pooled_allocs =
+                        retained.writev_scratch_pooled_allocs;
+                    runtime_state.stats.writev_scratch_pooled_reuses =
+                        retained.writev_scratch_pooled_reuses;
+                    runtime_state.stats.writev_scratch_pooled_frees =
+                        retained.writev_scratch_pooled_frees;
+                    runtime_state.stats.writev_scratch_slab_allocs =
+                        retained.writev_scratch_slab_allocs;
+                    runtime_state.stats.writev_scratch_oversize_rejections =
+                        retained.writev_scratch_oversize_rejections;
+                    runtime_state.stats.writev_scratch_alloc_failures =
+                        retained.writev_scratch_alloc_failures;
                     self.last_stats = runtime_state.stats;
                 }
                 EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));

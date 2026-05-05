@@ -5,11 +5,18 @@
 //! dropped.
 //!
 //! The common path is slab-backed and heap-free after warmup. Payloads larger
-//! than 4096 bytes, payloads requiring alignment greater than 64 bytes, and
+//! than 65536 bytes, payloads requiring alignment greater than 64 bytes, and
 //! slab-allocation failures fall back to the global heap. That fallback is
 //! intentional so I/O submission does not fail merely because a retained
 //! payload is unusual, but it must stay visible through debug counters and
 //! documentation because it is not the desired steady-state fast path.
+//!
+//! Retained writev scratch is separate from retained payload storage. The
+//! scratch stores only kernel-facing `iovec` pointer/length metadata; message
+//! bytes remain in the owned payload buffers. Scratch uses inline storage for
+//! small submissions and size-classed slab storage for larger submissions. It
+//! never uses heap fallback: oversized requests return `InvalidInput`, and
+//! slab allocation failure returns `WouldBlock`.
 
 use crate::utils::list::intrusive::slist::{Link, SList};
 use crate::utils::memory::provider::BasicMemoryProvider;
@@ -18,11 +25,18 @@ use std::alloc::Layout;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::slice;
 
 const RETAINED_BLOCK_ALIGN: usize = 64;
 const RETAINED_SLAB_TARGET_BYTES: usize = 64 * 1024;
-const RETAINED_SIZE_CLASSES: [usize; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+const RETAINED_SIZE_CLASSES: [usize; 11] = [
+    64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+];
+pub(crate) const RETAINED_IOVEC_INLINE_COUNT: usize = 16;
+pub(crate) const RETAINED_IOVEC_MAX_COUNT: usize = 1024;
+const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
 
 #[derive(Clone, Copy)]
 pub(crate) struct RetainedPayloadVtable {
@@ -40,11 +54,19 @@ pub(crate) struct RetainedPayloadPoolStats {
     pub(crate) slab_allocs: usize,
     pub(crate) heap_fallbacks: usize,
     pub(crate) heap_frees: usize,
+    pub(crate) writev_scratch_inline_allocs: usize,
+    pub(crate) writev_scratch_pooled_allocs: usize,
+    pub(crate) writev_scratch_pooled_reuses: usize,
+    pub(crate) writev_scratch_pooled_frees: usize,
+    pub(crate) writev_scratch_slab_allocs: usize,
+    pub(crate) writev_scratch_oversize_rejections: usize,
+    pub(crate) writev_scratch_alloc_failures: usize,
 }
 
 /// Raw, size-classed pool for retained operation payloads.
 pub(crate) struct RetainedPayloadPool {
     classes: [RetainedSizeClass; RETAINED_SIZE_CLASSES.len()],
+    iovec_classes: [RetainedSizeClass; RETAINED_IOVEC_SIZE_CLASSES.len()],
     #[cfg(debug_assertions)]
     stats: RetainedPayloadPoolStats,
 }
@@ -60,6 +82,16 @@ impl RetainedPayloadPool {
                 RetainedSizeClass::new(RETAINED_SIZE_CLASSES[4])?,
                 RetainedSizeClass::new(RETAINED_SIZE_CLASSES[5])?,
                 RetainedSizeClass::new(RETAINED_SIZE_CLASSES[6])?,
+                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[7])?,
+                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[8])?,
+                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[9])?,
+                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[10])?,
+            ],
+            iovec_classes: [
+                RetainedSizeClass::new(iovec_class_block_size(0))?,
+                RetainedSizeClass::new(iovec_class_block_size(1))?,
+                RetainedSizeClass::new(iovec_class_block_size(2))?,
+                RetainedSizeClass::new(iovec_class_block_size(3))?,
             ],
             #[cfg(debug_assertions)]
             stats: RetainedPayloadPoolStats::default(),
@@ -130,9 +162,172 @@ impl RetainedPayloadPool {
         }
     }
 
+    /// Allocates retained kernel-facing `iovec` scratch for a writev
+    /// submission.
+    ///
+    /// Scratch is sized by active non-empty iovec count, not by the
+    /// const-generic chain capacity. It stores metadata only and has no heap
+    /// fallback.
+    #[inline(always)]
+    pub(crate) fn alloc_iovec_scratch(
+        &mut self,
+        iov_count: usize,
+    ) -> io::Result<RetainedIovecScratch> {
+        if iov_count <= RETAINED_IOVEC_INLINE_COUNT {
+            #[cfg(debug_assertions)]
+            {
+                self.stats.writev_scratch_inline_allocs += 1;
+            }
+            return Ok(RetainedIovecScratch::inline(iov_count));
+        }
+
+        let class_index = match iovec_class_index_for_count(iov_count) {
+            Some(class_index) => class_index,
+            None => {
+                #[cfg(debug_assertions)]
+                {
+                    self.stats.writev_scratch_oversize_rejections += 1;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writev active iovec count exceeds retained scratch capacity",
+                ));
+            }
+        };
+
+        let Some(result) = self.iovec_classes[class_index].alloc_block() else {
+            #[cfg(debug_assertions)]
+            {
+                self.stats.writev_scratch_alloc_failures += 1;
+            }
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        };
+
+        #[cfg(debug_assertions)]
+        {
+            self.stats.writev_scratch_pooled_allocs += 1;
+            if result.reused {
+                self.stats.writev_scratch_pooled_reuses += 1;
+            }
+            if result.new_slab {
+                self.stats.writev_scratch_slab_allocs += 1;
+            }
+        }
+
+        Ok(unsafe {
+            RetainedIovecScratch::pooled(result.ptr, iov_count, class_index, self as *mut Self)
+        })
+    }
+
+    #[inline(always)]
+    unsafe fn free_iovec_scratch_block(&mut self, class_index: usize, ptr: *mut u8) {
+        unsafe { self.iovec_classes[class_index].free_block(ptr) };
+        #[cfg(debug_assertions)]
+        {
+            self.stats.writev_scratch_pooled_frees += 1;
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn stats(&self) -> RetainedPayloadPoolStats {
         self.stats
+    }
+}
+
+/// Retained writev scratch storing kernel-facing `iovec` metadata.
+///
+/// This type is move-safe: inline storage is addressed from the enum field on
+/// every access, while sidecar storage carries a stable slab pointer. The
+/// sidecar pointer remains valid until the scratch handle is dropped, which is
+/// tied to the retained writev payload lifetime.
+pub(crate) struct RetainedIovecScratch {
+    len: usize,
+    inline: [MaybeUninit<libc::iovec>; RETAINED_IOVEC_INLINE_COUNT],
+    storage: RetainedIovecScratchStorage,
+}
+
+enum RetainedIovecScratchStorage {
+    Inline,
+    Pooled {
+        ptr: NonNull<MaybeUninit<libc::iovec>>,
+        class_index: usize,
+        pool: *mut RetainedPayloadPool,
+    },
+}
+
+impl RetainedIovecScratch {
+    #[inline(always)]
+    fn inline(len: usize) -> Self {
+        debug_assert!(len <= RETAINED_IOVEC_INLINE_COUNT);
+        Self {
+            len,
+            inline: uninit_iovec_inline(),
+            storage: RetainedIovecScratchStorage::Inline,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must be a block allocated from `pool.iovec_classes[class_index]`
+    /// and large enough for `len` `libc::iovec` values.
+    #[inline(always)]
+    unsafe fn pooled(
+        ptr: *mut u8,
+        len: usize,
+        class_index: usize,
+        pool: *mut RetainedPayloadPool,
+    ) -> Self {
+        debug_assert!(len > RETAINED_IOVEC_INLINE_COUNT);
+        debug_assert!(len <= RETAINED_IOVEC_SIZE_CLASSES[class_index]);
+        Self {
+            len,
+            inline: uninit_iovec_inline(),
+            storage: RetainedIovecScratchStorage::Pooled {
+                ptr: unsafe { NonNull::new_unchecked(ptr as *mut MaybeUninit<libc::iovec>) },
+                class_index,
+                pool,
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_uninit_slice(&self) -> &[MaybeUninit<libc::iovec>] {
+        match &self.storage {
+            RetainedIovecScratchStorage::Inline => &self.inline[..self.len],
+            RetainedIovecScratchStorage::Pooled { ptr, .. } => unsafe {
+                slice::from_raw_parts(ptr.as_ptr(), self.len)
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_uninit_slice_mut(&mut self) -> &mut [MaybeUninit<libc::iovec>] {
+        match &mut self.storage {
+            RetainedIovecScratchStorage::Inline => &mut self.inline[..self.len],
+            RetainedIovecScratchStorage::Pooled { ptr, .. } => unsafe {
+                slice::from_raw_parts_mut(ptr.as_ptr(), self.len)
+            },
+        }
+    }
+}
+
+impl Drop for RetainedIovecScratch {
+    fn drop(&mut self) {
+        if let RetainedIovecScratchStorage::Pooled {
+            ptr,
+            class_index,
+            pool,
+        } = &self.storage
+        {
+            let pool_ptr = *pool;
+            debug_assert!(!pool_ptr.is_null(), "writev scratch pool pointer is null");
+            unsafe { (*pool_ptr).free_iovec_scratch_block(*class_index, ptr.as_ptr() as *mut u8) };
+        }
     }
 }
 
@@ -362,6 +557,22 @@ fn pooled_vtable<T: 'static>(class_index: usize) -> RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 6>,
             free_storage: pooled_free_storage::<T, 6>,
         },
+        7 => RetainedPayloadVtable {
+            drop_and_free: pooled_drop_and_free::<T, 7>,
+            free_storage: pooled_free_storage::<T, 7>,
+        },
+        8 => RetainedPayloadVtable {
+            drop_and_free: pooled_drop_and_free::<T, 8>,
+            free_storage: pooled_free_storage::<T, 8>,
+        },
+        9 => RetainedPayloadVtable {
+            drop_and_free: pooled_drop_and_free::<T, 9>,
+            free_storage: pooled_free_storage::<T, 9>,
+        },
+        10 => RetainedPayloadVtable {
+            drop_and_free: pooled_drop_and_free::<T, 10>,
+            free_storage: pooled_free_storage::<T, 10>,
+        },
         _ => unreachable!("invalid retained payload size class"),
     }
 }
@@ -410,4 +621,21 @@ fn slab_config_error_to_io(err: SlabAllocatorConfigError) -> io::Error {
         | SlabAllocatorConfigError::SizeOverflow => io::ErrorKind::InvalidInput,
     };
     io::Error::new(kind, err)
+}
+
+#[inline(always)]
+fn iovec_class_block_size(class_index: usize) -> usize {
+    RETAINED_IOVEC_SIZE_CLASSES[class_index] * std::mem::size_of::<libc::iovec>()
+}
+
+#[inline(always)]
+fn iovec_class_index_for_count(iov_count: usize) -> Option<usize> {
+    RETAINED_IOVEC_SIZE_CLASSES
+        .iter()
+        .position(|class_count| iov_count <= *class_count)
+}
+
+#[inline(always)]
+fn uninit_iovec_inline() -> [MaybeUninit<libc::iovec>; RETAINED_IOVEC_INLINE_COUNT] {
+    unsafe { MaybeUninit::uninit().assume_init() }
 }

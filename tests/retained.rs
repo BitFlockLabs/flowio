@@ -100,23 +100,38 @@ fn retained_payload_drop_and_free_drops_value_once() {
 }
 
 #[test]
-fn retained_payload_pool_uses_heap_for_large_payloads() {
+fn retained_payload_pool_allocates_larger_payload_classes_on_demand() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
-    let payload = pool.alloc([9u8; 4097]);
+    let payload = pool.alloc([9u8; 8192]);
     assert_eq!(unsafe { payload.as_ref() }[0], 9);
     unsafe { payload.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("large heap fallback stats: {stats:?}");
+    println!("large pooled payload stats: {stats:?}");
+    assert_eq!(stats.pooled_allocs, 1);
+    assert_eq!(stats.slab_allocs, 1);
+    assert_eq!(stats.pooled_frees, 1);
+    assert_eq!(stats.heap_fallbacks, 0);
+}
+
+#[test]
+fn retained_payload_pool_uses_heap_for_oversized_payloads() {
+    let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    let payload = pool.alloc([9u8; 65537]);
+    assert_eq!(unsafe { payload.as_ref() }[0], 9);
+    unsafe { payload.drop_and_free(&mut pool) };
+
+    let stats = pool.stats();
+    println!("oversized heap fallback stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 0);
     assert_eq!(stats.heap_fallbacks, 1);
     assert_eq!(stats.heap_frees, 1);
 }
 
 #[test]
-fn retained_payload_take_frees_heap_storage_for_large_payloads() {
+fn retained_payload_take_frees_heap_storage_for_oversized_payloads() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
-    let payload = pool.alloc([3u8; 4097]);
+    let payload = pool.alloc([3u8; 65537]);
     let value = unsafe { payload.take(&mut pool) };
 
     assert_eq!(value[0], 3);
@@ -159,4 +174,81 @@ fn retained_payload_pool_requests_new_slab_after_class_exhaustion() {
     let stats = pool.stats();
     println!("class exhaustion stats: {stats:?}");
     assert_eq!(stats.pooled_frees, count);
+}
+
+#[test]
+fn retained_iovec_scratch_uses_inline_for_small_counts() {
+    let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    let mut scratch = pool
+        .alloc_iovec_scratch(16)
+        .expect("inline scratch allocation failed");
+    assert_eq!(scratch.as_uninit_slice().len(), 16);
+    scratch.as_uninit_slice_mut()[0].write(libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 1,
+    });
+    drop(scratch);
+
+    let stats = pool.stats();
+    println!("inline iovec scratch stats: {stats:?}");
+    assert_eq!(stats.writev_scratch_inline_allocs, 1);
+    assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+    assert_eq!(stats.writev_scratch_pooled_frees, 0);
+}
+
+#[test]
+fn retained_iovec_scratch_uses_pool_for_512_iovecs() {
+    let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    {
+        let scratch = pool
+            .alloc_iovec_scratch(512)
+            .expect("512 iovec scratch allocation failed");
+        assert_eq!(scratch.as_uninit_slice().len(), 512);
+    }
+
+    let stats = pool.stats();
+    println!("512 iovec scratch stats: {stats:?}");
+    assert_eq!(stats.writev_scratch_inline_allocs, 0);
+    assert_eq!(stats.writev_scratch_pooled_allocs, 1);
+    assert_eq!(stats.writev_scratch_slab_allocs, 1);
+    assert_eq!(stats.writev_scratch_pooled_frees, 1);
+    assert_eq!(stats.heap_fallbacks, 0);
+}
+
+#[test]
+fn retained_iovec_scratch_reuses_returned_sidecar_block() {
+    let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    let first = pool
+        .alloc_iovec_scratch(512)
+        .expect("first scratch allocation failed");
+    let first_ptr = first.as_uninit_slice().as_ptr();
+    drop(first);
+
+    let second = pool
+        .alloc_iovec_scratch(512)
+        .expect("second scratch allocation failed");
+    assert_eq!(second.as_uninit_slice().as_ptr(), first_ptr);
+    drop(second);
+
+    let stats = pool.stats();
+    println!("512 iovec scratch reuse stats: {stats:?}");
+    assert_eq!(stats.writev_scratch_pooled_allocs, 2);
+    assert_eq!(stats.writev_scratch_pooled_reuses, 1);
+    assert_eq!(stats.writev_scratch_slab_allocs, 1);
+    assert_eq!(stats.writev_scratch_pooled_frees, 2);
+}
+
+#[test]
+fn retained_iovec_scratch_rejects_oversized_count() {
+    let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    let err = match pool.alloc_iovec_scratch(1025) {
+        Ok(_) => panic!("oversized scratch request should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let stats = pool.stats();
+    println!("oversized iovec scratch stats: {stats:?}");
+    assert_eq!(stats.writev_scratch_oversize_rejections, 1);
+    assert_eq!(stats.writev_scratch_pooled_allocs, 0);
 }

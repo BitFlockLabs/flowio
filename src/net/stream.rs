@@ -27,6 +27,7 @@ use crate::runtime::executor::{
     PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, submit_tracked_sqe,
 };
 use crate::runtime::op::CompletionState;
+use crate::runtime::retained::RetainedIovecScratch;
 use io_uring::{opcode, squeue, types};
 use std::future::Future;
 use std::io;
@@ -111,7 +112,7 @@ unsafe fn prepare_retry_state(
     Ok(())
 }
 
-use super::{opt_mut, opt_take};
+use super::{opt_mut, opt_ref, opt_take};
 
 #[inline(always)]
 fn uninit_iovecs<const N: usize>() -> [MaybeUninit<libc::iovec>; N] {
@@ -142,21 +143,91 @@ unsafe fn iovec_ref<const N: usize>(
     unsafe { &*(iovecs.as_ptr().add(index) as *const libc::iovec) }
 }
 
+#[inline(always)]
+unsafe fn iovec_slice_mut_from_uninit(
+    iovecs: &mut [MaybeUninit<libc::iovec>],
+) -> &mut [libc::iovec] {
+    unsafe { slice::from_raw_parts_mut(iovecs.as_mut_ptr() as *mut libc::iovec, iovecs.len()) }
+}
+
+#[inline(always)]
+unsafe fn iovec_slice_ptr(iovecs: &[MaybeUninit<libc::iovec>], skip: usize) -> *const libc::iovec {
+    unsafe { iovecs.as_ptr().add(skip) as *const libc::iovec }
+}
+
+#[inline(always)]
+unsafe fn iovec_slice_ref(iovecs: &[MaybeUninit<libc::iovec>], index: usize) -> &libc::iovec {
+    unsafe { &*(iovecs.as_ptr().add(index) as *const libc::iovec) }
+}
+
 trait WriteBufferChain<const N: usize>: Sized {
-    fn fill_write_iovecs_and_len(&self, dst: &mut [MaybeUninit<libc::iovec>; N]) -> (usize, usize);
+    fn write_iovec_count_and_len(&self) -> (usize, usize);
+    fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]);
 }
 
 impl<const N: usize> WriteBufferChain<N> for IoBuffVec<N> {
     #[inline(always)]
-    fn fill_write_iovecs_and_len(&self, dst: &mut [MaybeUninit<libc::iovec>; N]) -> (usize, usize) {
-        IoBuffVec::fill_write_iovecs_and_len(self, dst)
+    fn write_iovec_count_and_len(&self) -> (usize, usize) {
+        let mut iov_count = 0;
+        let mut total = 0;
+        for buf in self.iter() {
+            let len = buf.len();
+            total += len;
+            if len != 0 {
+                iov_count += 1;
+            }
+        }
+        (iov_count, total)
+    }
+
+    #[inline(always)]
+    fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
+        let mut iov_count = 0;
+        for buf in self.iter() {
+            let len = buf.len();
+            if len == 0 {
+                continue;
+            }
+            debug_assert!(iov_count < dst.len(), "writev scratch too small");
+            dst[iov_count].write(libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: len,
+            });
+            iov_count += 1;
+        }
     }
 }
 
 impl<B: IoBuffReadOnly, const N: usize> WriteBufferChain<N> for IoBuffReadOnlyVec<B, N> {
     #[inline(always)]
-    fn fill_write_iovecs_and_len(&self, dst: &mut [MaybeUninit<libc::iovec>; N]) -> (usize, usize) {
-        IoBuffReadOnlyVec::fill_write_iovecs_and_len(self, dst)
+    fn write_iovec_count_and_len(&self) -> (usize, usize) {
+        let mut iov_count = 0;
+        let mut total = 0;
+        for buf in self.iter() {
+            let len = buf.len();
+            total += len;
+            if len != 0 {
+                iov_count += 1;
+            }
+        }
+        (iov_count, total)
+    }
+
+    #[inline(always)]
+    fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
+        let mut iov_count = 0;
+        for buf in self.iter() {
+            let len = buf.len();
+            if len == 0 {
+                continue;
+            }
+            debug_assert!(iov_count < dst.len(), "writev scratch too small");
+            dst[iov_count].write(libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: len,
+            });
+            iov_count += 1;
+        }
     }
 }
 
@@ -164,10 +235,28 @@ struct RetainedWritePayload<B: IoBuffReadOnly> {
     buffer: B,
 }
 
-struct RetainedWritevPayload<C, const N: usize> {
+struct RetainedWritevPayload<C> {
     buffer: C,
-    iovecs: [MaybeUninit<libc::iovec>; N],
-    iov_count: usize,
+    scratch: RetainedIovecScratch,
+    written: usize,
+    skip: usize,
+}
+
+impl<C> RetainedWritevPayload<C> {
+    #[inline(always)]
+    fn iovecs(&self) -> &[MaybeUninit<libc::iovec>] {
+        self.scratch.as_uninit_slice()
+    }
+
+    #[inline(always)]
+    fn iovecs_mut(&mut self) -> &mut [libc::iovec] {
+        unsafe { iovec_slice_mut_from_uninit(self.scratch.as_uninit_slice_mut()) }
+    }
+
+    #[inline(always)]
+    fn remaining_iovs(&self) -> usize {
+        self.scratch.len() - self.skip
+    }
 }
 
 #[inline(always)]
@@ -207,9 +296,9 @@ fn build_read_vectored_entry<const N: usize>(
 ///
 /// When only one segment remains and its length fits in `u32`, this downgrades
 /// to `IORING_OP_WRITE` to avoid an unnecessary `writev`.
-fn build_write_vectored_entry<const N: usize>(
+fn build_write_vectored_entry(
     fd: RawFd,
-    iovecs: &[MaybeUninit<libc::iovec>; N],
+    iovecs: &[MaybeUninit<libc::iovec>],
     skip: usize,
     count: usize,
     user_data: u64,
@@ -217,7 +306,7 @@ fn build_write_vectored_entry<const N: usize>(
     debug_assert!(count > 0, "writev submission requires at least one iovec");
 
     if count == 1 {
-        let iov = unsafe { iovec_ref(iovecs, skip) };
+        let iov = unsafe { iovec_slice_ref(iovecs, skip) };
         if let Ok(len) = u32::try_from(iov.iov_len) {
             return opcode::Write::new(types::Fd(fd), iov.iov_base as *const u8, len)
                 .build()
@@ -227,7 +316,7 @@ fn build_write_vectored_entry<const N: usize>(
 
     opcode::Writev::new(
         types::Fd(fd),
-        unsafe { iovec_ptr(iovecs, skip) },
+        unsafe { iovec_slice_ptr(iovecs, skip) },
         count as u32,
     )
     .build()
@@ -1001,8 +1090,6 @@ struct WritevFutureCore<'a, C: WriteBufferChain<N> + 'static, const N: usize, S>
     state_ptr: *mut CompletionState,
     /// Caller-owned read-only segment chain returned on completion.
     buffer: Option<C>,
-    /// Future-owned `iovec` scratch describing non-empty source segments.
-    iovecs: [MaybeUninit<libc::iovec>; N],
     /// Number of valid entries currently present in `iovecs`.
     iov_count: usize,
     /// Total initialized bytes available across all segments.
@@ -1015,8 +1102,7 @@ struct WritevFutureCore<'a, C: WriteBufferChain<N> + 'static, const N: usize, S>
 
 impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevFutureCore<'a, C, N, S> {
     fn new(fd: RawFd, buffer: C) -> Self {
-        let mut iovecs = uninit_iovecs();
-        let (iov_count, total) = buffer.fill_write_iovecs_and_len(&mut iovecs);
+        let (iov_count, total) = buffer.write_iovec_count_and_len();
         debug_assert!(
             total == 0 || iov_count > 0,
             "non-empty write chain produced no iovecs"
@@ -1024,7 +1110,6 @@ impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevFutureCore<'
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
-            iovecs,
             iov_count,
             total,
             fd,
@@ -1040,10 +1125,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
         let this = unsafe { self.get_unchecked_mut() };
 
         if let Some((result, payload)) = unsafe {
-            take_completed_result_and_payload::<RetainedWritevPayload<C, N>>(
-                cx,
-                &mut this.state_ptr,
-            )
+            take_completed_result_and_payload::<RetainedWritevPayload<C>>(cx, &mut this.state_ptr)
         } {
             let buffer = payload.buffer;
             if result < 0 {
@@ -1059,6 +1141,17 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
 
         if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let mut scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) }
+            {
+                Ok(scratch) => scratch,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+
+            unsafe { opt_ref(&this.buffer) }.fill_write_iovecs(scratch.as_uninit_slice_mut());
+
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -1071,17 +1164,18 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
             let payload = unsafe {
                 (*pctx.reactor()).alloc_retained_payload(RetainedWritevPayload {
                     buffer: opt_take(&mut this.buffer),
-                    iovecs: std::mem::replace(&mut this.iovecs, uninit_iovecs()),
-                    iov_count: this.iov_count,
+                    scratch,
+                    written: 0,
+                    skip: 0,
                 })
             };
             let payload_ref = unsafe { payload.as_ref() };
 
             let sqe = build_write_vectored_entry(
                 this.fd,
-                &payload_ref.iovecs,
+                payload_ref.iovecs(),
                 0,
-                payload_ref.iov_count,
+                payload_ref.scratch.len(),
                 state_ptr as u64,
             );
             unsafe { (*state_ptr).attach_retained_payload(payload) };
@@ -1089,7 +1183,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
             unsafe {
                 if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                     let payload = (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C, N>>(state_ptr);
+                        .take_retained_payload::<RetainedWritevPayload<C>>(state_ptr);
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
@@ -1163,26 +1257,19 @@ struct WritevAllFutureCore<'a, C: WriteBufferChain<N> + 'static, const N: usize,
     state_ptr: *mut CompletionState,
     /// Caller-owned read-only segment chain returned when the operation finishes.
     buffer: Option<C>,
-    /// Future-owned `iovec` scratch advanced in place after partial writes.
-    iovecs: [MaybeUninit<libc::iovec>; N],
     /// Number of valid entries currently present in `iovecs`.
     iov_count: usize,
     /// Stream descriptor written by this future.
     fd: RawFd,
     /// Total bytes that must be written before completion.
     total: usize,
-    /// Bytes already confirmed written by completed submissions.
-    written: usize,
-    /// Index of the first still-active `iovec` entry after partial progress.
-    skip: usize,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevAllFutureCore<'a, C, N, S> {
     fn new(fd: RawFd, buffer: C) -> Self {
-        let mut iovecs = uninit_iovecs();
-        let (iov_count, total) = buffer.fill_write_iovecs_and_len(&mut iovecs);
+        let (iov_count, total) = buffer.write_iovec_count_and_len();
         debug_assert!(
             total == 0 || iov_count > 0,
             "non-empty write-all chain produced no iovecs"
@@ -1190,12 +1277,9 @@ impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevAllFutureCor
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
-            iovecs,
             iov_count,
             fd,
             total,
-            written: 0,
-            skip: 0,
             _marker: PhantomData,
         }
     }
@@ -1229,7 +1313,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
             if result < 0 {
                 let payload = unsafe {
                     (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C, N>>(this.state_ptr)
+                        .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr)
                 };
                 unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), payload.buffer));
@@ -1239,7 +1323,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
             if n == 0 {
                 let payload = unsafe {
                     (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C, N>>(this.state_ptr)
+                        .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr)
                 };
                 unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
                 return Poll::Ready((
@@ -1248,24 +1332,26 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
                 ));
             }
 
-            this.written += n;
-            if this.written >= this.total {
+            let completed = unsafe {
+                let payload = (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
+                payload.written += n;
+                payload.written >= this.total
+            };
+            if completed {
                 let payload = unsafe {
                     (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C, N>>(this.state_ptr)
+                        .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr)
                 };
+                let written = payload.written;
                 unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Ok(this.written), payload.buffer));
+                return Poll::Ready((Ok(written), payload.buffer));
             }
 
             unsafe {
-                let payload =
-                    (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C, N>>();
-                advance_iovecs_in_place(
-                    iovec_slice_mut(&mut payload.iovecs, payload.iov_count),
-                    &mut this.skip,
-                    n,
-                );
+                let payload = (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
+                let mut skip = payload.skip;
+                advance_iovecs_in_place(payload.iovecs_mut(), &mut skip, n);
+                payload.skip = skip;
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
@@ -1274,23 +1360,34 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
         }
 
         if this.buffer.is_some() {
+            let mut scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) }
+            {
+                Ok(scratch) => scratch,
+                Err(err) => {
+                    unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            unsafe { opt_ref(&this.buffer) }.fill_write_iovecs(scratch.as_uninit_slice_mut());
+
             let payload = unsafe {
                 (*pctx.reactor()).alloc_retained_payload(RetainedWritevPayload {
                     buffer: opt_take(&mut this.buffer),
-                    iovecs: std::mem::replace(&mut this.iovecs, uninit_iovecs()),
-                    iov_count: this.iov_count,
+                    scratch,
+                    written: 0,
+                    skip: 0,
                 })
             };
             unsafe { (*this.state_ptr).attach_retained_payload(payload) };
         }
 
-        let payload =
-            unsafe { (*this.state_ptr).retained_payload::<RetainedWritevPayload<C, N>>() };
-        let remaining_iovs = payload.iov_count - this.skip;
+        let payload = unsafe { (*this.state_ptr).retained_payload::<RetainedWritevPayload<C>>() };
+        let remaining_iovs = payload.remaining_iovs();
         let sqe = build_write_vectored_entry(
             this.fd,
-            &payload.iovecs,
-            this.skip,
+            payload.iovecs(),
+            payload.skip,
             remaining_iovs,
             this.state_ptr as u64,
         );
@@ -1298,7 +1395,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                 let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedWritevPayload<C, N>>(this.state_ptr);
+                    .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr);
                 (*pctx.reactor()).free_op(this.state_ptr);
                 this.state_ptr = std::ptr::null_mut();
                 return Poll::Ready((Err(e), payload.buffer));

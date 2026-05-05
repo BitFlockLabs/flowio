@@ -3,7 +3,7 @@
 use crate::runtime::op::CompletionState;
 #[cfg(debug_assertions)]
 use crate::runtime::retained::RetainedPayloadPoolStats;
-use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool};
+use crate::runtime::retained::{RetainedIovecScratch, RetainedPayload, RetainedPayloadPool};
 use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use io_uring::{IoUring, opcode, types};
@@ -94,6 +94,15 @@ impl Reactor {
     #[inline(always)]
     pub(crate) fn alloc_retained_payload<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
         self.retained_pool.alloc(value)
+    }
+
+    /// Allocate retained kernel-facing `iovec` scratch for a writev op.
+    #[inline(always)]
+    pub(crate) fn alloc_iovec_scratch(
+        &mut self,
+        iov_count: usize,
+    ) -> io::Result<RetainedIovecScratch> {
+        self.retained_pool.alloc_iovec_scratch(iov_count)
     }
 
     /// Detach a retained payload from a completed operation and return it.

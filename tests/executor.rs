@@ -9,6 +9,7 @@ use flowio::runtime::task::TaskHeader;
 use flowio::runtime::timer::{sleep, sleep_until, timeout, timeout_at};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 fn new_executor() -> Executor {
@@ -51,6 +52,43 @@ unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
 
     fn len(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StaticReadOnly;
+
+unsafe impl IoBuffReadOnly for StaticReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        b"x".as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        1
+    }
+}
+
+static SMALL_TRACKED_DROPS: AtomicUsize = AtomicUsize::new(0);
+static SMALL_TRACKED_BLOCKS: [[u8; 4096]; 4] =
+    [[0x11; 4096], [0x22; 4096], [0x33; 4096], [0x44; 4096]];
+
+struct SmallTrackedReadOnly<const LEN: usize> {
+    index: u8,
+}
+
+impl<const LEN: usize> Drop for SmallTrackedReadOnly<LEN> {
+    fn drop(&mut self) {
+        SMALL_TRACKED_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+unsafe impl<const LEN: usize> IoBuffReadOnly for SmallTrackedReadOnly<LEN> {
+    fn as_ptr(&self) -> *const u8 {
+        SMALL_TRACKED_BLOCKS[self.index as usize % SMALL_TRACKED_BLOCKS.len()].as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        LEN
     }
 }
 
@@ -97,6 +135,34 @@ fn tracked_chain<const N: usize>(
         chain
             .push(DropTrackedReadOnly::new(bytes, drops))
             .expect("tracked chain has enough capacity");
+    }
+    chain
+}
+
+fn small_tracked_chain<const N: usize, const LEN: usize>(
+    start_index: usize,
+) -> (IoBuffReadOnlyVec<SmallTrackedReadOnly<LEN>, N>, Vec<u8>) {
+    let mut chain = IoBuffReadOnlyVec::new();
+    let mut expected = Vec::with_capacity(N * LEN);
+    for i in 0..N {
+        let index = start_index + i;
+        let block = &SMALL_TRACKED_BLOCKS[index % SMALL_TRACKED_BLOCKS.len()];
+        expected.extend_from_slice(&block[..LEN]);
+        chain
+            .push(SmallTrackedReadOnly {
+                index: (index % SMALL_TRACKED_BLOCKS.len()) as u8,
+            })
+            .expect("small tracked chain has enough capacity");
+    }
+    (chain, expected)
+}
+
+fn static_read_only_chain<const N: usize>() -> IoBuffReadOnlyVec<StaticReadOnly, N> {
+    let mut chain = IoBuffReadOnlyVec::new();
+    for _ in 0..N {
+        chain
+            .push(StaticReadOnly)
+            .expect("static chain has enough capacity");
     }
     chain
 }
@@ -888,6 +954,23 @@ fn runtime_writev_read_only_returns_retained_payload_on_success() {
             assert_eq!(drops.get(), 2, "returned chain should drop segments once");
         })
         .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.writev_scratch_inline_allocs >= 1,
+            "small writev should use inline retained scratch"
+        );
+        assert_eq!(
+            stats.writev_scratch_pooled_allocs, 0,
+            "small writev should not allocate sidecar scratch"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "small writev payload should not use heap fallback"
+        );
+    }
 }
 
 #[test]
@@ -923,6 +1006,206 @@ fn runtime_writev_all_read_only_returns_retained_payload_on_success() {
         assert_eq!(
             stats.retained_heap_fallbacks, 0,
             "small writev_all payload should not use heap fallback"
+        );
+    }
+}
+
+#[test]
+fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
+            let (chain, expected) = small_tracked_chain::<512, 1>(0);
+            println!(
+                "created 512-segment writev chain: segments={}, bytes={}",
+                chain.segments(),
+                expected.len()
+            );
+
+            let (res, chain) = writer.writev_read_only(chain).await;
+            assert_eq!(res.expect("512 writev_read_only failed"), expected.len());
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                0,
+                "512 chain dropped before being returned"
+            );
+
+            let (res, recv) = reader
+                .read_exact(vec![0u8; expected.len()], expected.len())
+                .await;
+            res.expect("512 writev readback failed");
+            assert_eq!(&recv[..], &expected[..]);
+
+            drop(chain);
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                512,
+                "returned 512 chain should drop once"
+            );
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        println!(
+            "512 writev retained stats: payload_pooled={}, payload_heap={}, scratch_pooled={}, scratch_slab={}, scratch_frees={}",
+            stats.retained_pooled_allocs,
+            stats.retained_heap_fallbacks,
+            stats.writev_scratch_pooled_allocs,
+            stats.writev_scratch_slab_allocs,
+            stats.writev_scratch_pooled_frees
+        );
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "512 writev should allocate sidecar scratch"
+        );
+        assert_eq!(
+            stats.writev_scratch_oversize_rejections, 0,
+            "512 writev should fit supported scratch classes"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "512 writev should not heap-fallback after sidecar scratch split"
+        );
+    }
+}
+
+#[test]
+fn runtime_writev_all_read_only_512_returns_chain_on_success() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
+            let (chain, expected) = small_tracked_chain::<512, 1>(0);
+            println!(
+                "created 512-segment writev_all chain: segments={}, bytes={}",
+                chain.segments(),
+                expected.len()
+            );
+
+            let (res, chain) = writer.writev_all_read_only(chain).await;
+            assert_eq!(
+                res.expect("512 writev_all_read_only failed"),
+                expected.len()
+            );
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                0,
+                "512 chain dropped before being returned"
+            );
+
+            let (res, recv) = reader
+                .read_exact(vec![0u8; expected.len()], expected.len())
+                .await;
+            res.expect("512 writev_all readback failed");
+            assert_eq!(&recv[..], &expected[..]);
+
+            drop(chain);
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                512,
+                "returned 512 chain should drop once"
+            );
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "512 writev_all should allocate sidecar scratch"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "512 writev_all should not heap-fallback after sidecar scratch split"
+        );
+    }
+}
+
+#[test]
+fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
+            let (chain, expected) = small_tracked_chain::<512, 4096>(0);
+            let total = expected.len();
+            println!("created large 512-segment writev_all chain: segments=512, bytes={total}");
+
+            let reader_handle = Executor::spawn(async move {
+                let mut out = Vec::with_capacity(total);
+                while out.len() < total {
+                    let want = std::cmp::min(8192, total - out.len());
+                    let (res, buf) = reader.read(vec![0u8; want], want).await;
+                    let n = res.expect("large 512 read failed");
+                    assert!(n > 0, "reader made no progress before EOF");
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn large 512 reader failed");
+
+            let (res, chain) = writer.writev_all_read_only(chain).await;
+            assert_eq!(res.expect("large 512 writev_all failed"), total);
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                0,
+                "large 512 chain dropped early"
+            );
+
+            let received = reader_handle.await;
+            assert_eq!(received, expected);
+
+            drop(chain);
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                512,
+                "large 512 chain should drop once"
+            );
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_writev_read_only_oversized_iovec_count_returns_invalid_input() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let chain = static_read_only_chain::<1025>();
+            println!(
+                "created oversized writev chain: segments={}, bytes={}",
+                chain.segments(),
+                chain.len()
+            );
+
+            let (res, chain) = writer.writev_read_only(chain).await;
+            let err = res.expect_err("oversized writev should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(chain.segments(), 1025);
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.writev_scratch_oversize_rejections, 1,
+            "oversized writev should be counted separately from payload fallback"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "oversized writev should fail before retaining a payload"
         );
     }
 }
@@ -1046,6 +1329,78 @@ fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
             wait_for_drop_count(&drops, 2).await;
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
+            let (chain, _expected) = small_tracked_chain::<512, 1024>(0);
+            println!(
+                "created cancellable 512-segment writev chain: segments={}, bytes={}",
+                chain.segments(),
+                chain.len()
+            );
+
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _chain) = writer.writev_read_only(chain).await;
+                res
+            })
+            .await;
+
+            assert!(
+                result.is_err(),
+                "512 writev_read_only should time out under backpressure"
+            );
+            let drops_after_timeout = SMALL_TRACKED_DROPS.load(Ordering::Relaxed);
+            assert!(
+                drops_after_timeout == 0 || drops_after_timeout == 512,
+                "512 retained payload should be either still retained or fully retired, got {drops_after_timeout}"
+            );
+
+            drop(reader);
+            if drops_after_timeout == 0 {
+                for _ in 0..100 {
+                    if SMALL_TRACKED_DROPS.load(Ordering::Relaxed) == 512 {
+                        return;
+                    }
+                    sleep(Duration::from_millis(5))
+                        .await
+                        .expect("512 drop wait sleep failed");
+                }
+            }
+            assert_eq!(
+                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                512,
+                "512 retained payload was not dropped exactly once after CQE retirement"
+            );
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        println!(
+            "cancelled 512 writev stats: payload_heap={}, scratch_pooled={}, scratch_frees={}",
+            stats.retained_heap_fallbacks,
+            stats.writev_scratch_pooled_allocs,
+            stats.writev_scratch_pooled_frees
+        );
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "cancelled 512 writev should allocate sidecar scratch"
+        );
+        assert!(
+            stats.writev_scratch_pooled_frees >= 1,
+            "cancelled 512 writev should free sidecar scratch after target CQE"
+        );
+    }
 }
 
 /// Dropping a read_exact future mid-flight after partial progress cancels the

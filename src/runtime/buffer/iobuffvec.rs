@@ -655,34 +655,6 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
     pub fn iter(&self) -> impl Iterator<Item = &B> {
         (0..self.count).map(move |i| unsafe { self.buffers[i].assume_init_ref() })
     }
-
-    /// Fills a caller-provided `iovec` scratch array for `writev`/`sendmsg`.
-    ///
-    /// Empty segments are skipped in the scratch array but still remain owned
-    /// by the chain and are returned to the caller with the result. Returns
-    /// `(iov_count, total_len)` for the initialized scratch entries and total
-    /// readable bytes.
-    pub(crate) fn fill_write_iovecs_and_len(
-        &self,
-        dst: &mut [MaybeUninit<libc::iovec>; N],
-    ) -> (usize, usize) {
-        let mut iov_count = 0;
-        let mut total = 0;
-        for i in 0..self.count {
-            let buf = unsafe { self.buffers[i].assume_init_ref() };
-            let len = buf.len();
-            total += len;
-            if len == 0 {
-                continue;
-            }
-            dst[iov_count].write(libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: len,
-            });
-            iov_count += 1;
-        }
-        (iov_count, total)
-    }
 }
 
 impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVec<B, N> {
