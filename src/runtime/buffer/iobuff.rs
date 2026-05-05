@@ -7,6 +7,8 @@
 //!   Used for send/write operations where the same data goes to multiple destinations.
 //! - [`IoBuffView`] — read-only byte subview. Useful for parsing/slicing
 //!   without keeping region structure.
+//! - [`IoBuffOwnedView`] — consuming read-only byte subview that owns the
+//!   original [`IoBuff`] without taking another reference.
 //!
 //! Every buffer has three regions: headroom (for prepending protocol headers),
 //! payload (the main data region), and tailroom (for appending trailers).
@@ -49,6 +51,7 @@
 //! | Type | [`IoBuffReadOnly`] | [`IoBuffReadWrite`] |
 //! |------|---------------------|----------------------|
 //! | [`IoBuff`] | yes | — |
+//! | [`IoBuffOwnedView`] | yes | — |
 //! | [`IoBuffMut`] | yes | yes |
 //! | `Vec<u8>` | yes | yes |
 //! | `Box<[u8]>` | yes | yes |
@@ -103,11 +106,11 @@ fn resolve_slice_bounds(
 ) -> Result<(usize, usize), IoBuffError> {
     let start = match range.start_bound() {
         std::ops::Bound::Included(&s) => s,
-        std::ops::Bound::Excluded(&s) => s + 1,
+        std::ops::Bound::Excluded(&s) => s.checked_add(1).ok_or(IoBuffError::SliceOutOfBounds)?,
         std::ops::Bound::Unbounded => 0,
     };
     let end = match range.end_bound() {
-        std::ops::Bound::Included(&e) => e + 1,
+        std::ops::Bound::Included(&e) => e.checked_add(1).ok_or(IoBuffError::SliceOutOfBounds)?,
         std::ops::Bound::Excluded(&e) => e,
         std::ops::Bound::Unbounded => len,
     };
@@ -903,6 +906,35 @@ impl IoBuff {
         })
     }
 
+    /// Consumes this buffer and returns an owned read-only view over `range`.
+    ///
+    /// Unlike [`IoBuff::slice`], this does not increment the backing
+    /// reference count because the returned [`IoBuffOwnedView`] owns the
+    /// original `IoBuff` handle. Creation is O(1), zero-copy, and allocation
+    /// free.
+    ///
+    /// On bounds error, the original buffer is returned with the error so the
+    /// caller retains ownership.
+    ///
+    /// The returned view is a raw immutable byte range. It does not preserve
+    /// headroom/payload/tailroom structure; call [`IoBuffOwnedView::into_inner`]
+    /// to recover the original structured buffer.
+    pub fn into_owned_view(
+        self,
+        range: impl RangeBounds<usize>,
+    ) -> Result<IoBuffOwnedView, (IoBuff, IoBuffError)> {
+        let (start, end) = match resolve_slice_bounds(range, self.len(), "IoBuff") {
+            Ok(bounds) => bounds,
+            Err(err) => return Err((self, err)),
+        };
+        let offset = self.offset + start;
+        Ok(IoBuffOwnedView {
+            buffer: self,
+            offset,
+            len: end - start,
+        })
+    }
+
     /// Attempts to convert back to a mutable buffer.  Succeeds only if this
     /// is the sole reference (refcount == 1), making it a zero-copy operation.
     ///
@@ -1014,6 +1046,80 @@ impl AsRef<[u8]> for IoBuff {
 }
 
 impl std::ops::Deref for IoBuff {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+/// Consuming read-only byte-range view over an [`IoBuff`].
+///
+/// `IoBuffOwnedView` owns the original frozen buffer and exposes only a
+/// validated subrange of its active byte window. It is intended for parsers
+/// that consume an `IoBuff` and need a narrowed immutable view without the
+/// extra retain/release performed by [`IoBuffView`].
+///
+/// This type is O(1), zero-copy, allocation-free, and has no public unsafe API.
+/// Internally it keeps the original `IoBuff` alive, so the backing allocation
+/// remains valid for the lifetime of the view.
+pub struct IoBuffOwnedView {
+    /// Original structured buffer. Owning this handle keeps the backing
+    /// allocation alive without incrementing its refcount.
+    buffer: IoBuff,
+    /// Byte offset of the view start within the shared data region.
+    offset: usize,
+    /// Length of the visible byte range.
+    len: usize,
+}
+
+impl std::fmt::Debug for IoBuffOwnedView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoBuffOwnedView")
+            .field("len", &self.len)
+            .field("bytes", &self.bytes())
+            .finish()
+    }
+}
+
+impl IoBuffOwnedView {
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    pub fn bytes(&self) -> &[u8] {
+        unsafe {
+            let ptr = self.buffer.header.as_ref().headroom_ptr().add(self.offset);
+            std::slice::from_raw_parts(ptr, self.len)
+        }
+    }
+
+    /// Recovers the original structured buffer.
+    ///
+    /// This is useful when a parser needs to inspect a narrowed range and then
+    /// return to APIs such as [`IoBuff::try_mut`] or [`IoBuff::make_mut`].
+    #[inline(always)]
+    pub fn into_inner(self) -> IoBuff {
+        self.buffer
+    }
+}
+
+impl AsRef<[u8]> for IoBuffOwnedView {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+impl std::ops::Deref for IoBuffOwnedView {
     type Target = [u8];
 
     #[inline(always)]
@@ -1166,6 +1272,22 @@ unsafe impl IoBuffReadOnly for IoBuffView {
     #[inline(always)]
     fn as_ptr(&self) -> *const u8 {
         unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+// --- IoBuffOwnedView (consuming read-only byte subview) ---
+
+// SAFETY: IoBuffOwnedView owns an IoBuff whose backing storage is heap/pool-
+// allocated and pointer-stable. Its offset and len are validated at creation.
+unsafe impl IoBuffReadOnly for IoBuffOwnedView {
+    #[inline(always)]
+    fn as_ptr(&self) -> *const u8 {
+        unsafe { self.buffer.header.as_ref().headroom_ptr().add(self.offset) }
     }
 
     #[inline(always)]

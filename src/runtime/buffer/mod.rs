@@ -4,6 +4,8 @@
 //! - [`IoBuffMut`] — mutable, exclusively owned, structured headroom/payload/tailroom buffer
 //! - [`IoBuff`] — frozen, shared, structure-preserving buffer for send/write paths
 //! - [`IoBuffView`] — read-only byte subview for slicing without preserving region structure
+//! - [`IoBuffOwnedView`] — consuming read-only byte subview that owns the
+//!   original [`IoBuff`] without taking another reference
 //!
 //! For vectored I/O:
 //! - [`iobuffvec::IoBuffVecMut`] holds mutable recv/read segments

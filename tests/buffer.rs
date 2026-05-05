@@ -2,12 +2,17 @@ mod common;
 
 use common::TestIoBuffMut as IoBuffMut;
 use flowio::runtime::buffer::{
-    IoBuffError, IoBuffMut as RealIoBuffMut, IoBuffReadOnly, IoBuffReadWrite, IoBuffView,
+    IoBuff, IoBuffError, IoBuffMut as RealIoBuffMut, IoBuffOwnedView, IoBuffReadOnly,
+    IoBuffReadWrite, IoBuffView,
 };
 use static_assertions::assert_not_impl_any;
 
 fn expect_view(view: Result<IoBuffView, IoBuffError>) -> IoBuffView {
     view.expect("valid IoBuff slice in test")
+}
+
+fn expect_owned_view(view: Result<IoBuffOwnedView, (IoBuff, IoBuffError)>) -> IoBuffOwnedView {
+    view.expect("valid IoBuff owned view in test")
 }
 
 // ============================================================================
@@ -663,6 +668,140 @@ fn buffer_frozen_slice_empty() {
     let empty = expect_view(frozen.slice(1..1));
     assert!(empty.is_empty());
     assert_eq!(empty.len(), 0);
+}
+
+// ============================================================================
+// IoBuff — owned views
+// ============================================================================
+
+#[test]
+fn buffer_frozen_owned_view_full_range() {
+    let mut buf = IoBuffMut::new(4, 16, 4);
+    buf.payload_append(b"payload").unwrap();
+    buf.headroom_prepend(b"H:").unwrap();
+    buf.tailroom_append(b":T").unwrap();
+    let frozen = buf.freeze();
+    let expected_ptr = frozen.bytes().as_ptr();
+
+    let view = expect_owned_view(frozen.into_owned_view(..));
+
+    assert_eq!(view.bytes(), b"H:payload:T");
+    assert_eq!(view.len(), 11);
+    assert!(!view.is_empty());
+    assert_eq!(view.bytes().as_ptr(), expected_ptr);
+}
+
+#[test]
+fn buffer_frozen_owned_view_middle_range() {
+    let mut buf = IoBuffMut::new(4, 16, 4);
+    buf.payload_append(b"payload").unwrap();
+    buf.headroom_prepend(b"H:").unwrap();
+    buf.tailroom_append(b":T").unwrap();
+    let frozen = buf.freeze();
+    let expected_ptr = frozen.bytes()[2..9].as_ptr();
+
+    let view = expect_owned_view(frozen.into_owned_view(2..9));
+
+    let as_ref: &[u8] = view.as_ref();
+    assert_eq!(view.bytes(), b"payload");
+    assert_eq!(as_ref, b"payload");
+    assert_eq!(&*view, b"payload");
+    assert_eq!(view.len(), 7);
+    assert_eq!(view.bytes().as_ptr(), expected_ptr);
+}
+
+#[test]
+fn buffer_frozen_owned_view_empty_range() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+    buf.payload_append(b"abc").unwrap();
+    let frozen = buf.freeze();
+
+    let view = expect_owned_view(frozen.into_owned_view(1..1));
+
+    assert!(view.is_empty());
+    assert_eq!(view.len(), 0);
+    assert_eq!(view.bytes(), b"");
+}
+
+#[test]
+fn buffer_frozen_owned_view_unbounded_and_inclusive_ranges() {
+    let mut buf = IoBuffMut::new(0, 16, 0);
+    buf.payload_append(b"abcdef").unwrap();
+    let frozen = buf.freeze();
+
+    let inclusive = expect_owned_view(frozen.into_owned_view(..=2));
+    assert_eq!(inclusive.bytes(), b"abc");
+
+    let frozen = inclusive.into_inner();
+    let to_end = expect_owned_view(frozen.into_owned_view(2..));
+    assert_eq!(to_end.bytes(), b"cdef");
+}
+
+#[test]
+fn buffer_frozen_owned_view_out_of_bounds_returns_original() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+    buf.payload_append(b"abc").unwrap();
+    let frozen = buf.freeze();
+    let expected_ptr = frozen.bytes().as_ptr();
+
+    let result = frozen.into_owned_view(0..4);
+    let (original, err) = result.expect_err("out-of-bounds owned view should fail");
+
+    assert_eq!(err, IoBuffError::SliceOutOfBounds);
+    assert_eq!(original.bytes(), b"abc");
+    assert_eq!(original.bytes().as_ptr(), expected_ptr);
+    assert!(
+        original.try_mut().is_ok(),
+        "failed owned view must not retain or lose ownership"
+    );
+}
+
+#[test]
+fn buffer_frozen_owned_view_from_sole_owner_does_not_retain() {
+    let mut buf = IoBuffMut::new(0, 16, 0);
+    buf.payload_append(b"exclusive").unwrap();
+    let frozen = buf.freeze();
+    let expected_ptr = frozen.bytes().as_ptr();
+
+    let view = expect_owned_view(frozen.into_owned_view(1..5));
+    assert_eq!(view.bytes(), b"xclu");
+
+    let original = view.into_inner();
+    let unfrozen = original
+        .try_mut()
+        .expect("owned view must not add a backing refcount");
+    assert_eq!(unfrozen.bytes().as_ptr(), expected_ptr);
+    assert_eq!(unfrozen.bytes(), b"exclusive");
+}
+
+#[test]
+fn buffer_frozen_owned_view_respects_existing_clone_refcount() {
+    let mut buf = IoBuffMut::new(0, 16, 0);
+    buf.payload_append(b"shared").unwrap();
+    let frozen = buf.freeze();
+    let clone = frozen.clone();
+    let expected_ptr = frozen.bytes().as_ptr();
+
+    let view = expect_owned_view(frozen.into_owned_view(1..4));
+    assert_eq!(view.bytes(), b"har");
+
+    let original = view.into_inner();
+    let result = original.try_mut();
+    assert!(
+        result.is_err(),
+        "existing clone must still prevent mutable recovery"
+    );
+
+    let original = result
+        .err()
+        .expect("failed try_mut returns original buffer");
+    drop(clone);
+
+    let unfrozen = original
+        .try_mut()
+        .expect("dropping the clone should restore sole ownership");
+    assert_eq!(unfrozen.bytes().as_ptr(), expected_ptr);
+    assert_eq!(unfrozen.bytes(), b"shared");
 }
 
 // ============================================================================
