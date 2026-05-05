@@ -3010,12 +3010,8 @@ pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()> {
     }
 
     let fd = dummy_fd()?;
-    let mut state = CompletionState {
-        result: fd,
-        cqe_flags: 0,
-        state_flags: 0,
-        waiter: std::ptr::null_mut(),
-    };
+    let mut state = CompletionState::empty();
+    state.result = fd;
     state.set_completed();
 
     let mut slot = AcceptSlot::new();

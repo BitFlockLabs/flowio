@@ -1,4 +1,6 @@
 use flowio::net::unix::UnixStream;
+use flowio::runtime::buffer::IoBuffReadOnly;
+use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
 use flowio::runtime::executor::{Executor, ExecutorConfig};
 use flowio::runtime::io::{Nop, NopSlot};
 use flowio::runtime::op::CompletionState;
@@ -20,6 +22,83 @@ fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Execu
         cpu_affinity,
     })
     .expect("failed to construct runtime executor")
+}
+
+struct DropTrackedReadOnly {
+    bytes: Vec<u8>,
+    drops: Rc<Cell<usize>>,
+}
+
+impl DropTrackedReadOnly {
+    fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
+        Self {
+            bytes,
+            drops: Rc::clone(drops),
+        }
+    }
+}
+
+impl Drop for DropTrackedReadOnly {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+async fn fill_unix_send_buffer(writer: &mut UnixStream) {
+    loop {
+        let buf = vec![0xAAu8; 65536];
+        let result = timeout(Duration::from_millis(5), async {
+            let (res, _buf) = writer.write(buf).await;
+            res
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => panic!("fill write failed: {err}"),
+            Err(_) => break,
+        }
+    }
+}
+
+async fn wait_for_drop_count(drops: &Rc<Cell<usize>>, expected: usize) {
+    for _ in 0..100 {
+        if drops.get() == expected {
+            return;
+        }
+        sleep(Duration::from_millis(5))
+            .await
+            .expect("drop wait sleep failed");
+    }
+
+    assert_eq!(
+        drops.get(),
+        expected,
+        "retained payload was not dropped exactly once after CQE retirement"
+    );
+}
+
+fn tracked_chain<const N: usize>(
+    segments: [Vec<u8>; N],
+    drops: &Rc<Cell<usize>>,
+) -> IoBuffReadOnlyVec<DropTrackedReadOnly, N> {
+    let mut chain = IoBuffReadOnlyVec::new();
+    for bytes in segments {
+        chain
+            .push(DropTrackedReadOnly::new(bytes, drops))
+            .expect("tracked chain has enough capacity");
+    }
+    chain
 }
 
 #[test]
@@ -718,6 +797,253 @@ fn runtime_cancel_write_all_mid_flight() {
             sleep(Duration::from_millis(5))
                 .await
                 .expect("post-cancel sleep failed");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_write_returns_retained_payload_on_success() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"ok".to_vec(), &drops);
+
+            let (res, tracked) = writer.write(tracked).await;
+            assert_eq!(res.expect("write failed"), 2);
+            assert_eq!(drops.get(), 0, "payload dropped before being returned");
+
+            let (res, recv) = reader.read_exact(vec![0u8; 2], 2).await;
+            res.expect("read failed");
+            assert_eq!(&recv[..], b"ok");
+
+            drop(tracked);
+            assert_eq!(drops.get(), 1, "returned payload should drop once");
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.retained_pooled_allocs >= 1,
+            "write payload should use retained pool"
+        );
+        assert!(
+            stats.retained_pooled_frees >= 1,
+            "write payload storage should return to retained pool"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "small write payload should not use heap fallback"
+        );
+    }
+}
+
+#[test]
+fn runtime_write_all_returns_retained_payload_on_success() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"all".to_vec(), &drops);
+
+            let (res, tracked) = writer.write_all(tracked).await;
+            assert_eq!(res.expect("write_all failed"), 3);
+            assert_eq!(drops.get(), 0, "payload dropped before being returned");
+
+            let (res, recv) = reader.read_exact(vec![0u8; 3], 3).await;
+            res.expect("read failed");
+            assert_eq!(&recv[..], b"all");
+
+            drop(tracked);
+            assert_eq!(drops.get(), 1, "returned payload should drop once");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_writev_read_only_returns_retained_payload_on_success() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([b"vec".to_vec(), b"tor".to_vec()], &drops);
+
+            let (res, chain) = writer.writev_read_only(chain).await;
+            assert_eq!(res.expect("writev_read_only failed"), 6);
+            assert_eq!(drops.get(), 0, "chain dropped before being returned");
+
+            let (res, recv) = reader.read_exact(vec![0u8; 6], 6).await;
+            res.expect("read failed");
+            assert_eq!(&recv[..], b"vector");
+
+            drop(chain);
+            assert_eq!(drops.get(), 2, "returned chain should drop segments once");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_writev_all_read_only_returns_retained_payload_on_success() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([b"write".to_vec(), b"v_all".to_vec()], &drops);
+
+            let (res, chain) = writer.writev_all_read_only(chain).await;
+            assert_eq!(res.expect("writev_all_read_only failed"), 10);
+            assert_eq!(drops.get(), 0, "chain dropped before being returned");
+
+            let (res, recv) = reader.read_exact(vec![0u8; 10], 10).await;
+            res.expect("read failed");
+            assert_eq!(&recv[..], b"writev_all");
+
+            drop(chain);
+            assert_eq!(drops.get(), 2, "returned chain should drop segments once");
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.retained_pooled_allocs >= 1,
+            "writev_all payload should use retained pool"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "small writev_all payload should not use heap fallback"
+        );
+    }
+}
+
+#[test]
+fn runtime_cancelled_write_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(vec![0x11; 65536], &drops);
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _tracked) = writer.write(tracked).await;
+                res
+            })
+            .await;
+
+            assert!(result.is_err(), "write should time out under backpressure");
+            assert_eq!(
+                drops.get(),
+                0,
+                "payload dropped while original SQE was live"
+            );
+
+            drop(reader);
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_cancelled_write_all_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(vec![0x22; 1024 * 1024], &drops);
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _tracked) = writer.write_all(tracked).await;
+                res
+            })
+            .await;
+
+            assert!(
+                result.is_err(),
+                "write_all should time out under backpressure"
+            );
+            assert_eq!(
+                drops.get(),
+                0,
+                "payload dropped while original SQE was live"
+            );
+
+            drop(reader);
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_cancelled_writev_read_only_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            let drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([vec![0x33; 32768], vec![0x44; 32768]], &drops);
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _chain) = writer.writev_read_only(chain).await;
+                res
+            })
+            .await;
+
+            assert!(
+                result.is_err(),
+                "writev_read_only should time out under backpressure"
+            );
+            assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
+
+            drop(reader);
+            wait_for_drop_count(&drops, 2).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            let drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([vec![0x55; 32768], vec![0x66; 32768]], &drops);
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _chain) = writer.writev_all_read_only(chain).await;
+                res
+            })
+            .await;
+
+            assert!(
+                result.is_err(),
+                "writev_all_read_only should time out under backpressure"
+            );
+            assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
+
+            drop(reader);
+            wait_for_drop_count(&drops, 2).await;
         })
         .expect("executor run failed");
 }

@@ -45,5 +45,7 @@ pub(crate) mod fd;
 pub mod io;
 pub mod op;
 pub mod reactor;
+#[allow(dead_code)]
+pub(crate) mod retained;
 pub mod task;
 pub mod timer;

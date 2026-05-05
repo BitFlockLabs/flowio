@@ -79,6 +79,18 @@ pub struct RuntimeStats {
     pub timer_now_tick_calls: usize,
     /// Number of timer entries that expired and fired.
     pub timer_expired: usize,
+    /// Retained operation payload allocations served by the private pool.
+    pub retained_pooled_allocs: usize,
+    /// Retained operation payload allocations served from a returned block.
+    pub retained_pooled_reuses: usize,
+    /// Retained operation payload blocks returned to the private pool.
+    pub retained_pooled_frees: usize,
+    /// Retained operation payload slab pages requested by the private pool.
+    pub retained_slab_allocs: usize,
+    /// Retained operation payloads that used the documented heap fallback.
+    pub retained_heap_fallbacks: usize,
+    /// Retained operation payload heap fallback blocks released.
+    pub retained_heap_frees: usize,
 }
 
 struct ExecutorTaskMemProvider {
@@ -709,6 +721,13 @@ impl Executor {
                 {
                     runtime_state.stats.task_slab_allocs = self.provider.request_count;
                     runtime_state.stats.task_slab_frees = self.provider.free_count;
+                    let retained = self.reactor.retained_payload_stats();
+                    runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
+                    runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
+                    runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
+                    runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
+                    runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
+                    runtime_state.stats.retained_heap_frees = retained.heap_frees;
                     self.last_stats = runtime_state.stats;
                 }
                 EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
@@ -729,6 +748,13 @@ impl Executor {
                 {
                     runtime_state.stats.task_slab_allocs = self.provider.request_count;
                     runtime_state.stats.task_slab_frees = self.provider.free_count;
+                    let retained = self.reactor.retained_payload_stats();
+                    runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
+                    runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
+                    runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
+                    runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
+                    runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
+                    runtime_state.stats.retained_heap_frees = retained.heap_frees;
                     self.last_stats = runtime_state.stats;
                 }
                 EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));

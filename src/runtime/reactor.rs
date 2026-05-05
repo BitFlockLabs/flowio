@@ -1,6 +1,9 @@
 //! `io_uring` reactor: SQE submission, CQE completion, and operation lifecycle.
 
 use crate::runtime::op::CompletionState;
+#[cfg(debug_assertions)]
+use crate::runtime::retained::RetainedPayloadPoolStats;
+use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool};
 use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use io_uring::{IoUring, opcode, types};
@@ -48,6 +51,9 @@ pub(crate) struct Reactor {
     pending: bool,
     /// Pool of reusable completion-state records for in-flight operations.
     op_pool: ManuallyDrop<Pool<'static, CompletionState, BasicMemoryProvider>>,
+    /// Pool of pointer-stable retained payload blocks referenced by in-flight
+    /// operations after their owning futures are dropped.
+    retained_pool: RetainedPayloadPool,
     /// Stable memory provider backing `op_pool`.
     _op_pool_provider: Box<BasicMemoryProvider>,
     /// Set after `op_pool.init()` so drop knows whether the pool is live.
@@ -67,6 +73,7 @@ impl Reactor {
             ring: IoUring::new(config.ring_entries)?,
             pending: false,
             op_pool,
+            retained_pool: RetainedPayloadPool::new()?,
             _op_pool_provider: provider,
             initialized: false,
         })
@@ -83,10 +90,40 @@ impl Reactor {
         unsafe { self.op_pool.alloc(()).unwrap_or(std::ptr::null_mut()) }
     }
 
+    /// Allocate pointer-stable retained payload storage for an in-flight op.
+    #[inline(always)]
+    pub(crate) fn alloc_retained_payload<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
+        self.retained_pool.alloc(value)
+    }
+
+    /// Detach a retained payload from a completed operation and return it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a live completion state that has a retained payload
+    /// of exactly type `T`.
+    #[inline(always)]
+    pub(crate) unsafe fn take_retained_payload<T: 'static>(
+        &mut self,
+        ptr: *mut CompletionState,
+    ) -> T {
+        unsafe { (*ptr).take_retained_payload::<T>(&mut self.retained_pool) }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn retained_payload_stats(&self) -> RetainedPayloadPoolStats {
+        self.retained_pool.stats()
+    }
+
     /// Return a retired `CompletionState` to the pool.
+    ///
+    /// This releases any retained payload before recycling the state slot. The
+    /// retained payload, if present, owns memory referenced by the original
+    /// SQE and must only be released after that original CQE has been observed.
     #[inline(always)]
     pub fn free_op(&mut self, ptr: *mut CompletionState) {
         debug_assert!(!ptr.is_null(), "reactor free_op called with null pointer");
+        unsafe { (*ptr).drop_retained_payload(&mut self.retained_pool) };
         unsafe { self.op_pool.free(ptr) };
     }
 
@@ -182,7 +219,8 @@ impl Reactor {
             }
             let user_data = cqe.user_data();
             if user_data == 0 {
-                // Cancel SQE completion — silently skip.
+                // Cancel SQE completion — silently skip. Retained payloads are
+                // released only when the original target CQE is observed.
                 seen += 1;
                 continue;
             }
@@ -204,6 +242,7 @@ impl Reactor {
                 if (*state).is_orphaned() || (*state).is_detached() {
                     // Cancelled/abandoned or detached op — free the pool slot,
                     // no task wake.
+                    (*state).drop_retained_payload(&mut self.retained_pool);
                     self.op_pool.free(state);
                 } else {
                     let waiter = (*state).take_waiter();

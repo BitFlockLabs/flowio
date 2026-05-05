@@ -183,7 +183,10 @@ impl UnixStream {
     ///
     /// This is the lowest-overhead contiguous send API when the caller can
     /// handle short writes itself.
-    pub fn write<B: IoBuffReadOnly>(&mut self, buffer: B) -> stream::WriteFuture<'_, B, Self> {
+    pub fn write<B: IoBuffReadOnly + 'static>(
+        &mut self,
+        buffer: B,
+    ) -> stream::WriteFuture<'_, B, Self> {
         stream::WriteFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
@@ -196,7 +199,7 @@ impl UnixStream {
     /// This is not the lowest-overhead send fast path because it may
     /// resubmit after partial writes. Prefer [`UnixStream::write`] when the
     /// caller can handle partial progress.
-    pub fn write_all<B: IoBuffReadOnly>(
+    pub fn write_all<B: IoBuffReadOnly + 'static>(
         &mut self,
         buffer: B,
     ) -> stream::WriteAllFuture<'_, B, Self> {
@@ -269,7 +272,7 @@ impl UnixStream {
     /// The chain owns buffers implementing [`IoBuffReadOnly`] and is returned
     /// alongside the result. This is the zero-copy send path for already
     /// encoded non-FlowIO buffer segments.
-    pub fn writev_read_only<B: IoBuffReadOnly, const N: usize>(
+    pub fn writev_read_only<B: IoBuffReadOnly + 'static, const N: usize>(
         &mut self,
         buffer: IoBuffReadOnlyVec<B, N>,
     ) -> stream::WritevReadOnlyFuture<'_, B, N, Self> {
@@ -297,7 +300,7 @@ impl UnixStream {
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
     /// success. The future materializes `iovec` scratch once and advances it
     /// in place across partial writes.
-    pub fn writev_all_read_only<B: IoBuffReadOnly, const N: usize>(
+    pub fn writev_all_read_only<B: IoBuffReadOnly + 'static, const N: usize>(
         &mut self,
         buffer: IoBuffReadOnlyVec<B, N>,
     ) -> stream::WritevAllReadOnlyFuture<'_, B, N, Self> {
