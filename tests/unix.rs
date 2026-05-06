@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    TestIoBuffMut as IoBuffMut, make_payload_chain, make_read_chain, make_read_only_chain, run_test,
+    TestIoBuffMut as IoBuffMut, TestProjected, make_payload_chain, make_read_chain,
+    make_read_only_chain, run_test,
 };
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
@@ -762,6 +763,48 @@ fn runtime_unix_writev_all_read_only_writes_segments_in_order() {
         let (res, buf) = reader.read_exact(vec![0u8; 11], 11).await;
         assert_eq!(res.expect("read_exact failed"), 11);
         assert_eq!(&buf[..], b"hello world");
+    });
+}
+
+#[test]
+fn runtime_unix_writev_projected_empty_and_single_segment() {
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        let (res, source) = writer.writev_projected(TestProjected::<0>::new([])).await;
+        assert_eq!(res.expect("writev_projected empty failed"), 0);
+        assert!(source.expected().is_empty());
+
+        let source = TestProjected::new([&b"single"[..]]);
+        let expected = source.expected();
+        let (res, source) = writer.writev_all_projected(source).await;
+        assert_eq!(res.expect("writev_all_projected failed"), expected.len());
+        assert_eq!(source.expected(), expected);
+
+        let (res, buf) = reader
+            .read_exact(vec![0u8; expected.len()], expected.len())
+            .await;
+        assert_eq!(res.expect("read_exact failed"), expected.len());
+        assert_eq!(&buf[..], &expected[..]);
+    });
+}
+
+#[test]
+fn runtime_unix_writev_all_projected_writes_segments_in_order() {
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        let source = TestProjected::new([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
+        let expected = source.expected();
+        let (res, source) = writer.writev_all_projected(source).await;
+        assert_eq!(res.expect("writev_all_projected failed"), expected.len());
+        assert_eq!(source.expected(), expected);
+
+        let (res, buf) = reader
+            .read_exact(vec![0u8; expected.len()], expected.len())
+            .await;
+        assert_eq!(res.expect("read_exact failed"), expected.len());
+        assert_eq!(&buf[..], &expected[..]);
     });
 }
 

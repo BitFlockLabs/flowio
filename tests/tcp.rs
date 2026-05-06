@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    TestIoBuffMut as IoBuffMut, make_payload_chain, make_read_chain, make_read_only_chain, run_test,
+    TestIoBuffMut as IoBuffMut, TestProjected, make_payload_chain, make_read_chain,
+    make_read_only_chain, run_test,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -692,6 +693,30 @@ fn runtime_tcp_writev_all_read_only_to_std_peer() {
         let (res, chain) = stream.writev_all_read_only(chain).await;
         assert_eq!(res.expect("writev_all_read_only failed"), 11);
         assert_eq!(chain.segments(), 4);
+
+        let (res, buf) = stream.read_exact(vec![0u8; 3], 3).await;
+        assert_eq!(res.expect("read_exact failed"), 3);
+        assert_eq!(&buf[..], b"ack");
+    });
+
+    peer.join().expect("peer panicked");
+}
+
+#[test]
+fn runtime_tcp_writev_all_projected_to_std_peer() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+    let peer = spawn_std_tcp_peer(addr, b"hello world".to_vec(), b"ack".to_vec());
+
+    run_test(async move {
+        let (mut stream, _addr) = listener.accept().await.expect("accept failed");
+
+        let source = TestProjected::new([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
+        let expected = source.expected();
+        let (res, source) = stream.writev_all_projected(source).await;
+        assert_eq!(res.expect("writev_all_projected failed"), expected.len());
+        assert_eq!(source.expected(), expected);
 
         let (res, buf) = stream.read_exact(vec![0u8; 3], 3).await;
         assert_eq!(res.expect("read_exact failed"), 3);

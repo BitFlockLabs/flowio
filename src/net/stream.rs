@@ -27,6 +27,7 @@ use crate::runtime::executor::{
     PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, submit_tracked_sqe,
 };
 use crate::runtime::op::CompletionState;
+use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::RetainedIovecScratch;
 use io_uring::{opcode, squeue, types};
 use std::future::Future;
@@ -112,7 +113,7 @@ unsafe fn prepare_retry_state(
     Ok(())
 }
 
-use super::{opt_mut, opt_ref, opt_take};
+use super::{WritevPieces, WritevProjection, opt_mut, opt_ref, opt_take};
 
 #[inline(always)]
 fn uninit_iovecs<const N: usize>() -> [MaybeUninit<libc::iovec>; N] {
@@ -259,6 +260,66 @@ impl<C> RetainedWritevPayload<C> {
     }
 }
 
+struct RetainedProjectedWritevPayload<T> {
+    source: T,
+    scratch: RetainedIovecScratch,
+    written: usize,
+    skip: usize,
+}
+
+impl<T> RetainedProjectedWritevPayload<T> {
+    #[inline(always)]
+    fn iovecs(&self) -> &[MaybeUninit<libc::iovec>] {
+        self.scratch.as_uninit_slice()
+    }
+
+    #[inline(always)]
+    fn iovecs_mut(&mut self) -> &mut [libc::iovec] {
+        unsafe { iovec_slice_mut_from_uninit(self.scratch.as_uninit_slice_mut()) }
+    }
+
+    #[inline(always)]
+    fn remaining_iovs(&self) -> usize {
+        self.scratch.len() - self.skip
+    }
+}
+
+struct UnsubmittedOpGuard {
+    reactor: *mut Reactor,
+    state_ptr: *mut CompletionState,
+}
+
+impl UnsubmittedOpGuard {
+    #[inline(always)]
+    fn new(reactor: *mut Reactor, state_ptr: *mut CompletionState) -> Self {
+        Self { reactor, state_ptr }
+    }
+
+    #[inline(always)]
+    fn free(mut self) {
+        if !self.state_ptr.is_null() {
+            unsafe { (*self.reactor).free_op(self.state_ptr) };
+            self.state_ptr = std::ptr::null_mut();
+        }
+    }
+
+    #[inline(always)]
+    fn disarm(mut self) -> *mut CompletionState {
+        let state_ptr = self.state_ptr;
+        self.state_ptr = std::ptr::null_mut();
+        state_ptr
+    }
+}
+
+impl Drop for UnsubmittedOpGuard {
+    fn drop(&mut self) {
+        if !self.state_ptr.is_null() {
+            unsafe { (*self.reactor).free_op(self.state_ptr) };
+            self.state_ptr = std::ptr::null_mut();
+        }
+    }
+}
+
 #[inline(always)]
 /// Builds the next read-style SQE from the current vectored scratch window.
 ///
@@ -346,6 +407,57 @@ fn advance_iovecs_in_place(iovecs: &mut [libc::iovec], skip: &mut usize, bytes: 
         "advance_iovecs_in_place: {} bytes left over after consuming scratch iovecs",
         remaining
     );
+}
+
+#[inline(always)]
+fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[inline(always)]
+fn validate_projected_count_and_len(iov_count: usize, total: usize) -> io::Result<()> {
+    if iov_count == 0 && total == 0 {
+        return Ok(());
+    }
+    if iov_count == 0 {
+        return Err(invalid_input(
+            "projected writev reported bytes but no active pieces",
+        ));
+    }
+    if total == 0 {
+        return Err(invalid_input(
+            "projected writev reported active pieces but no bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn project_retained_writev_payload<T: WritevProjection>(
+    payload: &mut RetainedProjectedWritevPayload<T>,
+    expected_count: usize,
+    expected_total: usize,
+) -> io::Result<()> {
+    let (projected_count, projected_total) = {
+        let source = &payload.source;
+        let scratch = payload.scratch.as_uninit_slice_mut();
+        let mut pieces = WritevPieces::new(scratch);
+        source.project_writev(&mut pieces)?;
+        (pieces.count(), pieces.total())
+    };
+
+    if projected_count != expected_count {
+        return Err(invalid_input(
+            "projected writev piece count did not match counted pieces",
+        ));
+    }
+    if projected_total != expected_total {
+        return Err(invalid_input(
+            "projected writev byte length did not match counted length",
+        ));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,6 +1571,348 @@ impl<B: IoBuffReadOnly + 'static, const N: usize, S> Future
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projected WritevFuture
+// ---------------------------------------------------------------------------
+
+/// Gather-write from one compact retained source projected into write pieces.
+#[doc(hidden)]
+pub struct WritevProjectedFuture<'a, T: WritevProjection, S> {
+    state_ptr: *mut CompletionState,
+    source: Option<T>,
+    iov_count: usize,
+    total: usize,
+    fd: RawFd,
+    _marker: PhantomData<&'a mut S>,
+}
+
+impl<'a, T: WritevProjection, S> WritevProjectedFuture<'a, T, S> {
+    pub(crate) fn new(fd: RawFd, source: T) -> Self {
+        let (iov_count, total) = source.writev_count_and_len();
+        Self {
+            state_ptr: std::ptr::null_mut(),
+            source: Some(source),
+            iov_count,
+            total,
+            fd,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
+    type Output = (io::Result<usize>, T);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if let Some((result, payload)) = unsafe {
+            take_completed_result_and_payload::<RetainedProjectedWritevPayload<T>>(
+                cx,
+                &mut this.state_ptr,
+            )
+        } {
+            let source = payload.source;
+            if result < 0 {
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), source));
+            }
+            return Poll::Ready((Ok(result as usize), source));
+        }
+
+        if let Err(err) = validate_projected_count_and_len(this.iov_count, this.total) {
+            let source = unsafe { opt_take(&mut this.source) };
+            return Poll::Ready((Err(err), source));
+        }
+
+        if this.total == 0 {
+            let source = unsafe { opt_take(&mut this.source) };
+            return Poll::Ready((Ok(0), source));
+        }
+
+        if this.state_ptr.is_null() {
+            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) } {
+                Ok(scratch) => scratch,
+                Err(err) => {
+                    let source = unsafe { opt_take(&mut this.source) };
+                    return Poll::Ready((Err(err), source));
+                }
+            };
+
+            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+            if state_ptr.is_null() {
+                let source = unsafe { opt_take(&mut this.source) };
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), source));
+            }
+            let guard = UnsubmittedOpGuard::new(pctx.reactor(), state_ptr);
+            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+
+            let payload = unsafe {
+                (*pctx.reactor()).alloc_retained_payload(RetainedProjectedWritevPayload {
+                    source: opt_take(&mut this.source),
+                    scratch,
+                    written: 0,
+                    skip: 0,
+                })
+            };
+            unsafe { (*state_ptr).attach_retained_payload(payload) };
+
+            if let Err(err) = unsafe {
+                let payload =
+                    (*state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+                project_retained_writev_payload(payload, this.iov_count, this.total)
+            } {
+                let payload = unsafe {
+                    (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr)
+                };
+                guard.free();
+                return Poll::Ready((Err(err), payload.source));
+            }
+
+            let payload =
+                unsafe { (*state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
+            let sqe = build_write_vectored_entry(
+                this.fd,
+                payload.iovecs(),
+                0,
+                payload.scratch.len(),
+                state_ptr as u64,
+            );
+
+            unsafe {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
+                    let payload = (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr);
+                    guard.free();
+                    return Poll::Ready((Err(e), payload.source));
+                }
+            }
+
+            this.state_ptr = guard.disarm();
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T: WritevProjection, S> Drop for WritevProjectedFuture<'_, T, S> {
+    fn drop(&mut self) {
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projected WritevAllFuture
+// ---------------------------------------------------------------------------
+
+/// Gather-write all projected pieces from one compact retained source.
+#[doc(hidden)]
+pub struct WritevAllProjectedFuture<'a, T: WritevProjection, S> {
+    state_ptr: *mut CompletionState,
+    source: Option<T>,
+    iov_count: usize,
+    fd: RawFd,
+    total: usize,
+    _marker: PhantomData<&'a mut S>,
+}
+
+impl<'a, T: WritevProjection, S> WritevAllProjectedFuture<'a, T, S> {
+    pub(crate) fn new(fd: RawFd, source: T) -> Self {
+        let (iov_count, total) = source.writev_count_and_len();
+        Self {
+            state_ptr: std::ptr::null_mut(),
+            source: Some(source),
+            iov_count,
+            fd,
+            total,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
+    type Output = (io::Result<usize>, T);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if !this.state_ptr.is_null() {
+            let state = unsafe { &*this.state_ptr };
+            if !state.is_completed() {
+                return Poll::Pending;
+            }
+        }
+
+        if this.source.is_some() {
+            if let Err(err) = validate_projected_count_and_len(this.iov_count, this.total) {
+                let source = unsafe { opt_take(&mut this.source) };
+                return Poll::Ready((Err(err), source));
+            }
+            if this.total == 0 {
+                let source = unsafe { opt_take(&mut this.source) };
+                return Poll::Ready((Ok(0), source));
+            }
+        }
+
+        let pctx = unsafe { poll_ctx_from_waker(cx) };
+
+        if !this.state_ptr.is_null() {
+            let result = unsafe { (*this.state_ptr).result };
+
+            if result < 0 {
+                let payload = unsafe {
+                    (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr)
+                };
+                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), payload.source));
+            }
+
+            let n = result as usize;
+            if n == 0 {
+                let payload = unsafe {
+                    (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr)
+                };
+                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                return Poll::Ready((
+                    Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    payload.source,
+                ));
+            }
+
+            let completed = unsafe {
+                let payload =
+                    (*this.state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+                payload.written += n;
+                payload.written >= this.total
+            };
+            if completed {
+                let payload = unsafe {
+                    (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr)
+                };
+                let written = payload.written;
+                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
+                return Poll::Ready((Ok(written), payload.source));
+            }
+
+            unsafe {
+                let payload =
+                    (*this.state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+                let mut skip = payload.skip;
+                advance_iovecs_in_place(payload.iovecs_mut(), &mut skip, n);
+                payload.skip = skip;
+            }
+        }
+
+        if this.source.is_some() {
+            let scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) } {
+                Ok(scratch) => scratch,
+                Err(err) => {
+                    let source = unsafe { opt_take(&mut this.source) };
+                    return Poll::Ready((Err(err), source));
+                }
+            };
+
+            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+            if state_ptr.is_null() {
+                let source = unsafe { opt_take(&mut this.source) };
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), source));
+            }
+            let guard = UnsubmittedOpGuard::new(pctx.reactor(), state_ptr);
+            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+
+            let payload = unsafe {
+                (*pctx.reactor()).alloc_retained_payload(RetainedProjectedWritevPayload {
+                    source: opt_take(&mut this.source),
+                    scratch,
+                    written: 0,
+                    skip: 0,
+                })
+            };
+            unsafe { (*state_ptr).attach_retained_payload(payload) };
+
+            if let Err(err) = unsafe {
+                let payload =
+                    (*state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+                project_retained_writev_payload(payload, this.iov_count, this.total)
+            } {
+                let payload = unsafe {
+                    (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr)
+                };
+                guard.free();
+                return Poll::Ready((Err(err), payload.source));
+            }
+
+            let payload =
+                unsafe { (*state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
+            let sqe = build_write_vectored_entry(
+                this.fd,
+                payload.iovecs(),
+                0,
+                payload.scratch.len(),
+                state_ptr as u64,
+            );
+
+            unsafe {
+                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
+                    let payload = (*pctx.reactor())
+                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr);
+                    guard.free();
+                    return Poll::Ready((Err(e), payload.source));
+                }
+            }
+
+            this.state_ptr = guard.disarm();
+            return Poll::Pending;
+        }
+
+        debug_assert!(
+            !this.state_ptr.is_null(),
+            "projected writev retry state unexpectedly missing"
+        );
+        if this.state_ptr.is_null() {
+            return Poll::Pending;
+        }
+        unsafe {
+            (*this.state_ptr).reset_for_resubmit();
+            (*this.state_ptr).register_waiter(pctx.owner_task());
+        }
+
+        let payload =
+            unsafe { (*this.state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
+        let remaining_iovs = payload.remaining_iovs();
+        let sqe = build_write_vectored_entry(
+            this.fd,
+            payload.iovecs(),
+            payload.skip,
+            remaining_iovs,
+            this.state_ptr as u64,
+        );
+
+        unsafe {
+            if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
+                let payload = (*pctx.reactor())
+                    .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr);
+                (*pctx.reactor()).free_op(this.state_ptr);
+                this.state_ptr = std::ptr::null_mut();
+                return Poll::Ready((Err(e), payload.source));
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T: WritevProjection, S> Drop for WritevAllProjectedFuture<'_, T, S> {
+    fn drop(&mut self) {
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 

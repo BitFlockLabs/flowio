@@ -155,9 +155,9 @@
 
 use super::stream;
 use super::{
-    close_fd, close_if_valid, current_local_addr, current_peer_addr, get_sock_opt,
-    new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
-    socket_addr_to_c, socket_domain,
+    WritevProjection, close_fd, close_if_valid, current_local_addr, current_peer_addr,
+    get_sock_opt, new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt,
+    socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
@@ -622,6 +622,19 @@ impl TcpStream {
         stream::WritevReadOnlyFuture::new(self.fd.as_raw_fd(), buffer)
     }
 
+    /// Gather-write projected pieces from one compact owned source.
+    ///
+    /// FlowIO retains `source`, then projects borrowed byte slices from that
+    /// retained source into retained kernel-facing `iovec` scratch. This is
+    /// the zero-copy send path for protocols with one compact owner/carrier
+    /// and many already-encoded pieces.
+    pub fn writev_projected<T: WritevProjection>(
+        &mut self,
+        source: T,
+    ) -> stream::WritevProjectedFuture<'_, T, Self> {
+        stream::WritevProjectedFuture::new(self.fd.as_raw_fd(), source)
+    }
+
     /// Gather-write the entire vectored chain, handling partial writes.
     ///
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
@@ -648,6 +661,18 @@ impl TcpStream {
         buffer: IoBuffReadOnlyVec<B, N>,
     ) -> stream::WritevAllReadOnlyFuture<'_, B, N, Self> {
         stream::WritevAllReadOnlyFuture::new(self.fd.as_raw_fd(), buffer)
+    }
+
+    /// Gather-write all projected pieces from one compact owned source.
+    ///
+    /// Returns `(Ok(n), source)` where `n` equals the projected total byte
+    /// count on success. On error the source is returned with an unspecified
+    /// amount already written.
+    pub fn writev_all_projected<T: WritevProjection>(
+        &mut self,
+        source: T,
+    ) -> stream::WritevAllProjectedFuture<'_, T, Self> {
+        stream::WritevAllProjectedFuture::new(self.fd.as_raw_fd(), source)
     }
 
     /// Scatter-read exactly `len` total bytes into a vectored chain.

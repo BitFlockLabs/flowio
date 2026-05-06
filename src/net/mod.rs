@@ -10,6 +10,10 @@
 //! - TCP / Unix: `readv`, `writev`, `writev_all`, `readv_exact`
 //! - SCTP: `recv_msg_vectored`, `send_msg_vectored`
 //!
+//! TCP and Unix streams also support [`WritevProjection`], which lets a caller
+//! pass one compact owned carrier and project borrowed byte pieces from that
+//! retained carrier into FlowIO-owned kernel-facing `iovec` scratch.
+//!
 //! Client-side TLS is provided separately by [`tls`], which wraps an existing
 //! connected [`tcp::TcpStream`] with an explicit rustls-driven handshake and
 //! encrypted I/O API.
@@ -97,6 +101,7 @@
 //! ```
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 
@@ -107,6 +112,101 @@ pub mod tcp;
 pub mod tls;
 pub mod udp;
 pub mod unix;
+
+/// Safe projection interface for retained owned vectored writes.
+///
+/// Implement this for compact owned message carriers that can expose their
+/// already-encoded byte pieces as borrowed slices. FlowIO moves the carrier
+/// into retained operation state before calling [`WritevProjection::project_writev`],
+/// so slices may safely point into inline fields or owned allocations inside
+/// the carrier. The retained carrier and FlowIO-owned `iovec` scratch remain
+/// alive until the original write CQE retires, even if the future is dropped.
+///
+/// `writev_count_and_len` must report the number of active non-empty pieces
+/// and the total byte length that `project_writev` will push. Empty pieces are
+/// ignored by [`WritevPieces::push`]. Mismatches are rejected with
+/// [`io::ErrorKind::InvalidInput`].
+///
+/// This trait does not expose a borrowed-SQE API. Callers pass ownership of
+/// the carrier to the stream method and receive it back with the I/O result.
+pub trait WritevProjection: 'static {
+    /// Returns `(active_non_empty_piece_count, total_byte_len)`.
+    fn writev_count_and_len(&self) -> (usize, usize);
+
+    /// Projects borrowed byte pieces from this retained carrier.
+    ///
+    /// The lifetime on `pieces` ties every pushed slice to the borrow of
+    /// `self`, preventing safe implementations from pushing temporary slices
+    /// that die when this method returns.
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()>;
+}
+
+/// Sink used by [`WritevProjection`] implementations to expose write pieces.
+///
+/// Values of this type are constructed only by FlowIO. Implementations push
+/// slices borrowed from the retained carrier; FlowIO stores only pointer/length
+/// metadata in retained scratch and never copies the slice bytes.
+pub struct WritevPieces<'a> {
+    iovecs: &'a mut [MaybeUninit<libc::iovec>],
+    count: usize,
+    total: usize,
+}
+
+impl<'a> WritevPieces<'a> {
+    #[inline(always)]
+    pub(crate) fn new(iovecs: &'a mut [MaybeUninit<libc::iovec>]) -> Self {
+        Self {
+            iovecs,
+            count: 0,
+            total: 0,
+        }
+    }
+
+    /// Adds a non-empty byte piece to the projected write.
+    ///
+    /// Empty slices are ignored, matching FlowIO's existing owned-chain
+    /// `writev` behavior. If the projection pushes more non-empty pieces than
+    /// were reported by `writev_count_and_len`, this returns
+    /// [`io::ErrorKind::InvalidInput`].
+    #[inline(always)]
+    pub fn push(&mut self, bytes: &'a [u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        if self.count >= self.iovecs.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projected writev produced more pieces than counted",
+            ));
+        }
+
+        let total = self.total.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projected writev byte length overflowed",
+            )
+        })?;
+
+        self.iovecs[self.count].write(libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        });
+        self.count += 1;
+        self.total = total;
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    #[inline(always)]
+    pub(crate) fn total(&self) -> usize {
+        self.total
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared option helpers for rental-pattern futures.

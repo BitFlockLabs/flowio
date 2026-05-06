@@ -1,4 +1,5 @@
 use flowio::net::unix::UnixStream;
+use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::IoBuffReadOnly;
 use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
 use flowio::runtime::executor::{Executor, ExecutorConfig};
@@ -8,6 +9,7 @@ use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::task::TaskHeader;
 use flowio::runtime::timer::{sleep, sleep_until, timeout, timeout_at};
 use std::cell::{Cell, RefCell};
+use std::io;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -68,17 +70,31 @@ unsafe impl IoBuffReadOnly for StaticReadOnly {
     }
 }
 
-static SMALL_TRACKED_DROPS: AtomicUsize = AtomicUsize::new(0);
+static SMALL_TRACKED_DROPS_0: AtomicUsize = AtomicUsize::new(0);
+static SMALL_TRACKED_DROPS_1: AtomicUsize = AtomicUsize::new(0);
+static SMALL_TRACKED_DROPS_2: AtomicUsize = AtomicUsize::new(0);
+static SMALL_TRACKED_DROPS_3: AtomicUsize = AtomicUsize::new(0);
 static SMALL_TRACKED_BLOCKS: [[u8; 4096]; 4] =
     [[0x11; 4096], [0x22; 4096], [0x33; 4096], [0x44; 4096]];
 
+fn small_tracked_drops(counter: u8) -> &'static AtomicUsize {
+    match counter {
+        0 => &SMALL_TRACKED_DROPS_0,
+        1 => &SMALL_TRACKED_DROPS_1,
+        2 => &SMALL_TRACKED_DROPS_2,
+        3 => &SMALL_TRACKED_DROPS_3,
+        _ => &SMALL_TRACKED_DROPS_0,
+    }
+}
+
 struct SmallTrackedReadOnly<const LEN: usize> {
     index: u8,
+    counter: u8,
 }
 
 impl<const LEN: usize> Drop for SmallTrackedReadOnly<LEN> {
     fn drop(&mut self) {
-        SMALL_TRACKED_DROPS.fetch_add(1, Ordering::Relaxed);
+        small_tracked_drops(self.counter).fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -89,6 +105,106 @@ unsafe impl<const LEN: usize> IoBuffReadOnly for SmallTrackedReadOnly<LEN> {
 
     fn len(&self) -> usize {
         LEN
+    }
+}
+
+static PROJECTED_SOURCE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct ProjectedBytes<const N: usize> {
+    bytes: [u8; N],
+    counted_pieces: usize,
+    counted_total: usize,
+    projected_len: usize,
+    track_drop: bool,
+}
+
+impl<const N: usize> ProjectedBytes<N> {
+    fn new(track_drop: bool) -> Self {
+        Self {
+            bytes: std::array::from_fn(|i| (i % 251) as u8),
+            counted_pieces: N,
+            counted_total: N,
+            projected_len: N,
+            track_drop,
+        }
+    }
+
+    fn with_projection(counted_pieces: usize, counted_total: usize, projected_len: usize) -> Self {
+        Self {
+            bytes: std::array::from_fn(|i| (i % 251) as u8),
+            counted_pieces,
+            counted_total,
+            projected_len,
+            track_drop: false,
+        }
+    }
+
+    fn expected(&self) -> Vec<u8> {
+        self.bytes[..self.projected_len].to_vec()
+    }
+}
+
+impl<const N: usize> Drop for ProjectedBytes<N> {
+    fn drop(&mut self) {
+        if self.track_drop {
+            PROJECTED_SOURCE_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<const N: usize> WritevProjection for ProjectedBytes<N> {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (self.counted_pieces, self.counted_total)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        for byte in &self.bytes[..self.projected_len] {
+            pieces.push(std::slice::from_ref(byte))?;
+        }
+        Ok(())
+    }
+}
+
+struct ProjectedStaticSegments<const N: usize, const LEN: usize> {
+    indices: [u8; N],
+    track_drop: bool,
+}
+
+impl<const N: usize, const LEN: usize> ProjectedStaticSegments<N, LEN> {
+    fn new(track_drop: bool) -> Self {
+        Self {
+            indices: std::array::from_fn(|i| (i % SMALL_TRACKED_BLOCKS.len()) as u8),
+            track_drop,
+        }
+    }
+
+    fn expected(&self) -> Vec<u8> {
+        let mut expected = Vec::with_capacity(N * LEN);
+        for index in self.indices {
+            expected.extend_from_slice(&SMALL_TRACKED_BLOCKS[index as usize][..LEN]);
+        }
+        expected
+    }
+}
+
+impl<const N: usize, const LEN: usize> Drop for ProjectedStaticSegments<N, LEN> {
+    fn drop(&mut self) {
+        if self.track_drop {
+            PROJECTED_SOURCE_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<const N: usize, const LEN: usize> WritevProjection for ProjectedStaticSegments<N, LEN> {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (N, N * LEN)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        for index in self.indices {
+            pieces.push(&SMALL_TRACKED_BLOCKS[index as usize][..LEN])?;
+        }
+        Ok(())
     }
 }
 
@@ -140,6 +256,7 @@ fn tracked_chain<const N: usize>(
 }
 
 fn small_tracked_chain<const N: usize, const LEN: usize>(
+    counter: u8,
     start_index: usize,
 ) -> (IoBuffReadOnlyVec<SmallTrackedReadOnly<LEN>, N>, Vec<u8>) {
     let mut chain = IoBuffReadOnlyVec::new();
@@ -151,6 +268,7 @@ fn small_tracked_chain<const N: usize, const LEN: usize>(
         chain
             .push(SmallTrackedReadOnly {
                 index: (index % SMALL_TRACKED_BLOCKS.len()) as u8,
+                counter,
             })
             .expect("small tracked chain has enough capacity");
     }
@@ -1017,8 +1135,9 @@ fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
     executor
         .run(async move {
             let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
-            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
-            let (chain, expected) = small_tracked_chain::<512, 1>(0);
+            let drops = small_tracked_drops(0);
+            drops.store(0, Ordering::Relaxed);
+            let (chain, expected) = small_tracked_chain::<512, 1>(0, 0);
             println!(
                 "created 512-segment writev chain: segments={}, bytes={}",
                 chain.segments(),
@@ -1028,7 +1147,7 @@ fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
             let (res, chain) = writer.writev_read_only(chain).await;
             assert_eq!(res.expect("512 writev_read_only failed"), expected.len());
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 0,
                 "512 chain dropped before being returned"
             );
@@ -1041,7 +1160,7 @@ fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
 
             drop(chain);
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 512,
                 "returned 512 chain should drop once"
             );
@@ -1081,8 +1200,9 @@ fn runtime_writev_all_read_only_512_returns_chain_on_success() {
     executor
         .run(async move {
             let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
-            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
-            let (chain, expected) = small_tracked_chain::<512, 1>(0);
+            let drops = small_tracked_drops(1);
+            drops.store(0, Ordering::Relaxed);
+            let (chain, expected) = small_tracked_chain::<512, 1>(1, 0);
             println!(
                 "created 512-segment writev_all chain: segments={}, bytes={}",
                 chain.segments(),
@@ -1095,7 +1215,7 @@ fn runtime_writev_all_read_only_512_returns_chain_on_success() {
                 expected.len()
             );
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 0,
                 "512 chain dropped before being returned"
             );
@@ -1108,7 +1228,7 @@ fn runtime_writev_all_read_only_512_returns_chain_on_success() {
 
             drop(chain);
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 512,
                 "returned 512 chain should drop once"
             );
@@ -1136,8 +1256,9 @@ fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
     executor
         .run(async move {
             let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
-            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
-            let (chain, expected) = small_tracked_chain::<512, 4096>(0);
+            let drops = small_tracked_drops(2);
+            drops.store(0, Ordering::Relaxed);
+            let (chain, expected) = small_tracked_chain::<512, 4096>(2, 0);
             let total = expected.len();
             println!("created large 512-segment writev_all chain: segments=512, bytes={total}");
 
@@ -1157,7 +1278,7 @@ fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
             let (res, chain) = writer.writev_all_read_only(chain).await;
             assert_eq!(res.expect("large 512 writev_all failed"), total);
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 0,
                 "large 512 chain dropped early"
             );
@@ -1167,7 +1288,7 @@ fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
 
             drop(chain);
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 512,
                 "large 512 chain should drop once"
             );
@@ -1208,6 +1329,181 @@ fn runtime_writev_read_only_oversized_iovec_count_returns_invalid_input() {
             "oversized writev should fail before retaining a payload"
         );
     }
+}
+
+#[test]
+fn runtime_writev_all_projected_512_writes_in_order_and_fits_task_slot() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let source = ProjectedBytes::<512>::new(false);
+            let expected = source.expected();
+            println!(
+                "created compact projected source: pieces=512, bytes={}",
+                expected.len()
+            );
+
+            let writer_handle = Executor::spawn(async move {
+                let mut writer = writer;
+                writer.writev_all_projected(source).await
+            })
+            .expect("compact projected 512 writer should fit task slot");
+
+            let (res, recv) = reader
+                .read_exact(vec![0u8; expected.len()], expected.len())
+                .await;
+            res.expect("projected 512 readback failed");
+            assert_eq!(&recv[..], &expected[..]);
+
+            let (res, source) = writer_handle.await;
+            assert_eq!(
+                res.expect("projected 512 writev_all failed"),
+                expected.len()
+            );
+            assert_eq!(source.expected(), expected);
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        println!(
+            "projected 512 stats: payload_heap={}, scratch_pooled={}, scratch_slab={}, scratch_frees={}",
+            stats.retained_heap_fallbacks,
+            stats.writev_scratch_pooled_allocs,
+            stats.writev_scratch_slab_allocs,
+            stats.writev_scratch_pooled_frees
+        );
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "projected 512 should allocate sidecar scratch"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "compact projected 512 carrier should not heap-fallback"
+        );
+    }
+}
+
+#[test]
+fn runtime_writev_projected_empty_returns_source() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let source = ProjectedBytes::<0>::new(false);
+
+            let (res, source) = writer.writev_projected(source).await;
+            assert_eq!(res.expect("empty projected writev failed"), 0);
+            assert!(source.expected().is_empty());
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_writev_projected_rejects_oversized_iovec_count() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let source = ProjectedBytes::<1025>::new(false);
+
+            let (res, source) = writer.writev_projected(source).await;
+            let err = res.expect_err("oversized projected writev should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(source.expected().len(), 1025);
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.writev_scratch_oversize_rejections, 1,
+            "oversized projected writev should be counted as scratch oversize"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "oversized projected writev should fail before retaining payload"
+        );
+    }
+}
+
+#[test]
+fn runtime_writev_projected_rejects_projection_mismatches() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+
+            let too_many = ProjectedBytes::<2>::with_projection(1, 2, 2);
+            let (res, source) = writer.writev_projected(too_many).await;
+            assert_eq!(
+                res.expect_err("too many projected pieces should fail")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(source.expected(), vec![0, 1]);
+
+            let too_few = ProjectedBytes::<2>::with_projection(3, 2, 2);
+            let (res, source) = writer.writev_projected(too_few).await;
+            assert_eq!(
+                res.expect_err("too few projected pieces should fail")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(source.expected(), vec![0, 1]);
+
+            let wrong_total = ProjectedBytes::<2>::with_projection(2, 3, 2);
+            let (res, source) = writer.writev_projected(wrong_total).await;
+            assert_eq!(
+                res.expect_err("wrong projected byte total should fail")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(source.expected(), vec![0, 1]);
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_writev_all_projected_large_512_advances_across_iovec_boundaries() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let source = ProjectedStaticSegments::<512, 4096>::new(false);
+            let expected = source.expected();
+            let total = expected.len();
+            println!("created large projected source: pieces=512, bytes={total}");
+
+            let reader_handle = Executor::spawn(async move {
+                let mut out = Vec::with_capacity(total);
+                while out.len() < total {
+                    let want = std::cmp::min(8192, total - out.len());
+                    let (res, buf) = reader.read(vec![0u8; want], want).await;
+                    let n = res.expect("large projected read failed");
+                    assert!(n > 0, "reader made no progress before EOF");
+                    out.extend_from_slice(&buf[..n]);
+                }
+                out
+            })
+            .expect("spawn large projected reader failed");
+
+            let (res, source) = writer.writev_all_projected(source).await;
+            assert_eq!(res.expect("large projected writev_all failed"), total);
+            assert_eq!(source.expected(), expected);
+
+            let received = reader_handle.await;
+            assert_eq!(received, expected);
+        })
+        .expect("executor run failed");
 }
 
 #[test]
@@ -1340,8 +1636,9 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
             let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
             fill_unix_send_buffer(&mut writer).await;
 
-            SMALL_TRACKED_DROPS.store(0, Ordering::Relaxed);
-            let (chain, _expected) = small_tracked_chain::<512, 1024>(0);
+            let drops = small_tracked_drops(3);
+            drops.store(0, Ordering::Relaxed);
+            let (chain, _expected) = small_tracked_chain::<512, 1024>(3, 0);
             println!(
                 "created cancellable 512-segment writev chain: segments={}, bytes={}",
                 chain.segments(),
@@ -1358,7 +1655,7 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
                 result.is_err(),
                 "512 writev_read_only should time out under backpressure"
             );
-            let drops_after_timeout = SMALL_TRACKED_DROPS.load(Ordering::Relaxed);
+            let drops_after_timeout = drops.load(Ordering::Relaxed);
             assert!(
                 drops_after_timeout == 0 || drops_after_timeout == 512,
                 "512 retained payload should be either still retained or fully retired, got {drops_after_timeout}"
@@ -1367,7 +1664,7 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
             drop(reader);
             if drops_after_timeout == 0 {
                 for _ in 0..100 {
-                    if SMALL_TRACKED_DROPS.load(Ordering::Relaxed) == 512 {
+                    if drops.load(Ordering::Relaxed) == 512 {
                         return;
                     }
                     sleep(Duration::from_millis(5))
@@ -1376,7 +1673,7 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
                 }
             }
             assert_eq!(
-                SMALL_TRACKED_DROPS.load(Ordering::Relaxed),
+                drops.load(Ordering::Relaxed),
                 512,
                 "512 retained payload was not dropped exactly once after CQE retirement"
             );
@@ -1399,6 +1696,77 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
         assert!(
             stats.writev_scratch_pooled_frees >= 1,
             "cancelled 512 writev should free sidecar scratch after target CQE"
+        );
+    }
+}
+
+#[test]
+fn runtime_cancelled_writev_projected_512_retains_source_and_scratch_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            PROJECTED_SOURCE_DROPS.store(0, Ordering::Relaxed);
+            let source = ProjectedStaticSegments::<512, 1024>::new(true);
+            println!(
+                "created cancellable projected source: pieces=512, bytes={}",
+                source.writev_count_and_len().1
+            );
+
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _source) = writer.writev_projected(source).await;
+                res
+            })
+            .await;
+
+            assert!(
+                result.is_err(),
+                "512 projected writev should time out under backpressure"
+            );
+            let drops_after_timeout = PROJECTED_SOURCE_DROPS.load(Ordering::Relaxed);
+            assert!(
+                drops_after_timeout == 0 || drops_after_timeout == 1,
+                "projected source should be either still retained or fully retired, got {drops_after_timeout}"
+            );
+
+            drop(reader);
+            if drops_after_timeout == 0 {
+                for _ in 0..100 {
+                    if PROJECTED_SOURCE_DROPS.load(Ordering::Relaxed) == 1 {
+                        return;
+                    }
+                    sleep(Duration::from_millis(5))
+                        .await
+                        .expect("projected drop wait sleep failed");
+                }
+            }
+            assert_eq!(
+                PROJECTED_SOURCE_DROPS.load(Ordering::Relaxed),
+                1,
+                "projected retained source was not dropped exactly once after CQE retirement"
+            );
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        println!(
+            "cancelled projected 512 stats: payload_heap={}, scratch_pooled={}, scratch_frees={}",
+            stats.retained_heap_fallbacks,
+            stats.writev_scratch_pooled_allocs,
+            stats.writev_scratch_pooled_frees
+        );
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "cancelled projected 512 writev should allocate sidecar scratch"
+        );
+        assert!(
+            stats.writev_scratch_pooled_frees >= 1,
+            "cancelled projected 512 writev should free sidecar scratch after target CQE"
         );
     }
 }

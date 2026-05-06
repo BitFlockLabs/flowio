@@ -1,6 +1,8 @@
+use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use flowio::runtime::executor::Executor;
 use std::future::Future;
+use std::io;
 
 /// Runs one integration-test future on a fresh executor.
 #[allow(dead_code)]
@@ -58,4 +60,47 @@ pub fn make_read_chain<const N: usize>(capacities: [usize; N]) -> IoBuffVecMut<N
         chain.push(TestIoBuffMut::new(0, capacity, 0)).unwrap();
     }
     chain
+}
+
+/// Compact projected write source for stream integration tests.
+#[allow(dead_code)]
+pub struct TestProjected<const N: usize> {
+    segments: [&'static [u8]; N],
+}
+
+impl<const N: usize> TestProjected<N> {
+    #[allow(dead_code)]
+    pub fn new(segments: [&'static [u8]; N]) -> Self {
+        Self { segments }
+    }
+
+    #[allow(dead_code)]
+    pub fn expected(&self) -> Vec<u8> {
+        let mut expected = Vec::new();
+        for segment in self.segments {
+            expected.extend_from_slice(segment);
+        }
+        expected
+    }
+}
+
+impl<const N: usize> WritevProjection for TestProjected<N> {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        let mut count = 0;
+        let mut total = 0;
+        for segment in self.segments {
+            if !segment.is_empty() {
+                count += 1;
+                total += segment.len();
+            }
+        }
+        (count, total)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        for segment in self.segments {
+            pieces.push(segment)?;
+        }
+        Ok(())
+    }
 }
