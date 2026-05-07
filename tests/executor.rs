@@ -1399,6 +1399,11 @@ fn runtime_writev_projected_empty_returns_source() {
             let (res, source) = writer.writev_projected(source).await;
             assert_eq!(res.expect("empty projected writev failed"), 0);
             assert!(source.expected().is_empty());
+
+            let source = ProjectedBytes::<0>::new(false);
+            let (res, source) = writer.writev_all_projected(source).await;
+            assert_eq!(res.expect("empty projected writev_all failed"), 0);
+            assert!(source.expected().is_empty());
         })
         .expect("executor run failed");
 }
@@ -1463,6 +1468,15 @@ fn runtime_writev_projected_rejects_projection_mismatches() {
             let (res, source) = writer.writev_projected(wrong_total).await;
             assert_eq!(
                 res.expect_err("wrong projected byte total should fail")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(source.expected(), vec![0, 1]);
+
+            let all_wrong_total = ProjectedBytes::<2>::with_projection(2, 3, 2);
+            let (res, source) = writer.writev_all_projected(all_wrong_total).await;
+            assert_eq!(
+                res.expect_err("wrong projected byte total should fail for writev_all")
                     .kind(),
                 std::io::ErrorKind::InvalidInput
             );

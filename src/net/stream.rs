@@ -243,45 +243,11 @@ struct RetainedWritevPayload<C> {
     skip: usize,
 }
 
-impl<C> RetainedWritevPayload<C> {
-    #[inline(always)]
-    fn iovecs(&self) -> &[MaybeUninit<libc::iovec>] {
-        self.scratch.as_uninit_slice()
-    }
-
-    #[inline(always)]
-    fn iovecs_mut(&mut self) -> &mut [libc::iovec] {
-        unsafe { iovec_slice_mut_from_uninit(self.scratch.as_uninit_slice_mut()) }
-    }
-
-    #[inline(always)]
-    fn remaining_iovs(&self) -> usize {
-        self.scratch.len() - self.skip
-    }
-}
-
 struct RetainedProjectedWritevPayload<T> {
     source: T,
     scratch: RetainedIovecScratch,
     written: usize,
     skip: usize,
-}
-
-impl<T> RetainedProjectedWritevPayload<T> {
-    #[inline(always)]
-    fn iovecs(&self) -> &[MaybeUninit<libc::iovec>] {
-        self.scratch.as_uninit_slice()
-    }
-
-    #[inline(always)]
-    fn iovecs_mut(&mut self) -> &mut [libc::iovec] {
-        unsafe { iovec_slice_mut_from_uninit(self.scratch.as_uninit_slice_mut()) }
-    }
-
-    #[inline(always)]
-    fn remaining_iovs(&self) -> usize {
-        self.scratch.len() - self.skip
-    }
 }
 
 struct UnsubmittedOpGuard {
@@ -410,6 +376,21 @@ fn advance_iovecs_in_place(iovecs: &mut [libc::iovec], skip: &mut usize, bytes: 
 }
 
 #[inline(always)]
+fn retained_iovecs(scratch: &RetainedIovecScratch) -> &[MaybeUninit<libc::iovec>] {
+    scratch.as_uninit_slice()
+}
+
+#[inline(always)]
+fn retained_iovecs_mut(scratch: &mut RetainedIovecScratch) -> &mut [libc::iovec] {
+    unsafe { iovec_slice_mut_from_uninit(scratch.as_uninit_slice_mut()) }
+}
+
+#[inline(always)]
+fn remaining_iovec_count(scratch: &RetainedIovecScratch, skip: usize) -> usize {
+    scratch.len() - skip
+}
+
+#[inline(always)]
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -458,6 +439,73 @@ fn project_retained_writev_payload<T: WritevProjection>(
     }
 
     Ok(())
+}
+
+#[inline]
+fn submit_initial_projected_writev<T: WritevProjection>(
+    pctx: &PollCtx,
+    fd: RawFd,
+    source: &mut Option<T>,
+    iov_count: usize,
+    total: usize,
+) -> Result<*mut CompletionState, (io::Error, T)> {
+    let scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(iov_count) } {
+        Ok(scratch) => scratch,
+        Err(err) => {
+            let source = unsafe { opt_take(source) };
+            return Err((err, source));
+        }
+    };
+
+    let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+    if state_ptr.is_null() {
+        let source = unsafe { opt_take(source) };
+        return Err((io::Error::from(io::ErrorKind::WouldBlock), source));
+    }
+
+    let guard = UnsubmittedOpGuard::new(pctx.reactor(), state_ptr);
+    unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+
+    let payload = unsafe {
+        (*pctx.reactor()).alloc_retained_payload(RetainedProjectedWritevPayload {
+            source: opt_take(source),
+            scratch,
+            written: 0,
+            skip: 0,
+        })
+    };
+    unsafe { (*state_ptr).attach_retained_payload(payload) };
+
+    if let Err(err) = unsafe {
+        let payload = (*state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+        project_retained_writev_payload(payload, iov_count, total)
+    } {
+        let payload = unsafe {
+            (*pctx.reactor()).take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr)
+        };
+        guard.free();
+        return Err((err, payload.source));
+    }
+
+    let payload = unsafe { (*state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
+    let sqe = build_write_vectored_entry(
+        fd,
+        retained_iovecs(&payload.scratch),
+        0,
+        payload.scratch.len(),
+        state_ptr as u64,
+    );
+
+    unsafe {
+        if let Err(err) = submit_tracked_sqe(pctx, sqe) {
+            let payload = (*pctx.reactor())
+                .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr);
+            guard.free();
+            return Err((err, payload.source));
+        }
+    }
+
+    Ok(guard.disarm())
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,7 +1333,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
 
             let sqe = build_write_vectored_entry(
                 this.fd,
-                payload_ref.iovecs(),
+                retained_iovecs(&payload_ref.scratch),
                 0,
                 payload_ref.scratch.len(),
                 state_ptr as u64,
@@ -1462,7 +1510,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
             unsafe {
                 let payload = (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
                 let mut skip = payload.skip;
-                advance_iovecs_in_place(payload.iovecs_mut(), &mut skip, n);
+                advance_iovecs_in_place(retained_iovecs_mut(&mut payload.scratch), &mut skip, n);
                 payload.skip = skip;
             }
         }
@@ -1495,10 +1543,10 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
         }
 
         let payload = unsafe { (*this.state_ptr).retained_payload::<RetainedWritevPayload<C>>() };
-        let remaining_iovs = payload.remaining_iovs();
+        let remaining_iovs = remaining_iovec_count(&payload.scratch, payload.skip);
         let sqe = build_write_vectored_entry(
             this.fd,
-            payload.iovecs(),
+            retained_iovecs(&payload.scratch),
             payload.skip,
             remaining_iovs,
             this.state_ptr as u64,
@@ -1634,65 +1682,18 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
 
         if this.state_ptr.is_null() {
             let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) } {
-                Ok(scratch) => scratch,
-                Err(err) => {
-                    let source = unsafe { opt_take(&mut this.source) };
-                    return Poll::Ready((Err(err), source));
-                }
-            };
-
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let source = unsafe { opt_take(&mut this.source) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), source));
-            }
-            let guard = UnsubmittedOpGuard::new(pctx.reactor(), state_ptr);
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
-
-            let payload = unsafe {
-                (*pctx.reactor()).alloc_retained_payload(RetainedProjectedWritevPayload {
-                    source: opt_take(&mut this.source),
-                    scratch,
-                    written: 0,
-                    skip: 0,
-                })
-            };
-            unsafe { (*state_ptr).attach_retained_payload(payload) };
-
-            if let Err(err) = unsafe {
-                let payload =
-                    (*state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                project_retained_writev_payload(payload, this.iov_count, this.total)
-            } {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr)
-                };
-                guard.free();
-                return Poll::Ready((Err(err), payload.source));
-            }
-
-            let payload =
-                unsafe { (*state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
-            let sqe = build_write_vectored_entry(
+            match submit_initial_projected_writev(
+                &pctx,
                 this.fd,
-                payload.iovecs(),
-                0,
-                payload.scratch.len(),
-                state_ptr as u64,
-            );
-
-            unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                    let payload = (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr);
-                    guard.free();
-                    return Poll::Ready((Err(e), payload.source));
+                &mut this.source,
+                this.iov_count,
+                this.total,
+            ) {
+                Ok(state_ptr) => {
+                    this.state_ptr = state_ptr;
                 }
+                Err((err, source)) => return Poll::Ready((Err(err), source)),
             }
-
-            this.state_ptr = guard.disarm();
         }
 
         Poll::Pending
@@ -1805,72 +1806,25 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
                 let payload =
                     (*this.state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
                 let mut skip = payload.skip;
-                advance_iovecs_in_place(payload.iovecs_mut(), &mut skip, n);
+                advance_iovecs_in_place(retained_iovecs_mut(&mut payload.scratch), &mut skip, n);
                 payload.skip = skip;
             }
         }
 
         if this.source.is_some() {
-            let scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) } {
-                Ok(scratch) => scratch,
-                Err(err) => {
-                    let source = unsafe { opt_take(&mut this.source) };
-                    return Poll::Ready((Err(err), source));
-                }
-            };
-
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let source = unsafe { opt_take(&mut this.source) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), source));
-            }
-            let guard = UnsubmittedOpGuard::new(pctx.reactor(), state_ptr);
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
-
-            let payload = unsafe {
-                (*pctx.reactor()).alloc_retained_payload(RetainedProjectedWritevPayload {
-                    source: opt_take(&mut this.source),
-                    scratch,
-                    written: 0,
-                    skip: 0,
-                })
-            };
-            unsafe { (*state_ptr).attach_retained_payload(payload) };
-
-            if let Err(err) = unsafe {
-                let payload =
-                    (*state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                project_retained_writev_payload(payload, this.iov_count, this.total)
-            } {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr)
-                };
-                guard.free();
-                return Poll::Ready((Err(err), payload.source));
-            }
-
-            let payload =
-                unsafe { (*state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
-            let sqe = build_write_vectored_entry(
+            match submit_initial_projected_writev(
+                &pctx,
                 this.fd,
-                payload.iovecs(),
-                0,
-                payload.scratch.len(),
-                state_ptr as u64,
-            );
-
-            unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                    let payload = (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(state_ptr);
-                    guard.free();
-                    return Poll::Ready((Err(e), payload.source));
+                &mut this.source,
+                this.iov_count,
+                this.total,
+            ) {
+                Ok(state_ptr) => {
+                    this.state_ptr = state_ptr;
+                    return Poll::Pending;
                 }
+                Err((err, source)) => return Poll::Ready((Err(err), source)),
             }
-
-            this.state_ptr = guard.disarm();
-            return Poll::Pending;
         }
 
         debug_assert!(
@@ -1887,10 +1841,10 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
 
         let payload =
             unsafe { (*this.state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
-        let remaining_iovs = payload.remaining_iovs();
+        let remaining_iovs = remaining_iovec_count(&payload.scratch, payload.skip);
         let sqe = build_write_vectored_entry(
             this.fd,
-            payload.iovecs(),
+            retained_iovecs(&payload.scratch),
             payload.skip,
             remaining_iovs,
             this.state_ptr as u64,
