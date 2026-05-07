@@ -145,6 +145,9 @@ use super::{
     checked_read_len, close_fd, close_if_valid, current_local_addr, set_reuse_addr, set_sock_opt,
     socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
+use crate::runtime::buffer::bytes::{
+    BufferRangeError, read_i32_at, read_u16_at, read_u16_be_at, read_u32_at,
+};
 use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{drop_op_ptr_unchecked, poll_ctx_from_waker, submit_tracked_sqe};
@@ -3342,6 +3345,10 @@ fn parse_assoc_addrs(
     Err(io::Error::from(io::ErrorKind::InvalidData))
 }
 
+fn byte_range_invalid_data(err: BufferRangeError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
 fn parse_assoc_addrs_inner(
     payload: &[u8],
     remaining: usize,
@@ -3356,7 +3363,10 @@ fn parse_assoc_addrs_inner(
         return false;
     }
 
-    let family = libc::sa_family_t::from_ne_bytes([payload[0], payload[1]]) as libc::c_int;
+    let Ok(family) = read_u16_at(payload, 0) else {
+        return false;
+    };
+    let family = family as libc::sa_family_t as libc::c_int;
     for candidate in assoc_addr_candidates(family, storage_len) {
         if payload.len() < candidate.entry_len {
             continue;
@@ -3453,7 +3463,7 @@ fn parse_assoc_addr_entry(bytes: &[u8], family: libc::c_int) -> io::Result<Socke
     match family {
         libc::AF_INET => {
             if bytes.len() >= 8 {
-                let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+                let port = read_u16_be_at(bytes, 2).map_err(byte_range_invalid_data)?;
                 let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
                 Ok(SocketAddr::from((ip, port)))
             } else {
@@ -3465,14 +3475,14 @@ fn parse_assoc_addr_entry(bytes: &[u8], family: libc::c_int) -> io::Result<Socke
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
 
-            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-            let flowinfo = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let port = read_u16_be_at(bytes, 2).map_err(byte_range_invalid_data)?;
+            let flowinfo = read_u32_at(bytes, 4).map_err(byte_range_invalid_data)?;
             let ip = Ipv6Addr::from([
                 bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
                 bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21],
                 bytes[22], bytes[23],
             ]);
-            let scope_id = u32::from_ne_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+            let scope_id = read_u32_at(bytes, 24).map_err(byte_range_invalid_data)?;
             Ok(SocketAddr::V6(SocketAddrV6::new(
                 ip, port, flowinfo, scope_id,
             )))
@@ -3542,9 +3552,9 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
-    let sn_type = u16::from_ne_bytes([buffer[0], buffer[1]]);
-    let sn_flags = u16::from_ne_bytes([buffer[2], buffer[3]]);
-    let sn_length = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+    let sn_type = read_u16_at(buffer, 0).map_err(byte_range_invalid_data)?;
+    let sn_flags = read_u16_at(buffer, 2).map_err(byte_range_invalid_data)?;
+    let sn_length = read_u32_at(buffer, 4).map_err(byte_range_invalid_data)?;
 
     let notification = match sn_type as libc::c_int {
         x if x == local_sctp_assoc_change() => {
@@ -3552,11 +3562,11 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::AssocChange {
-                state: u16::from_ne_bytes([buffer[8], buffer[9]]),
-                error: u16::from_ne_bytes([buffer[10], buffer[11]]),
-                outbound_streams: u16::from_ne_bytes([buffer[12], buffer[13]]),
-                inbound_streams: u16::from_ne_bytes([buffer[14], buffer[15]]),
-                assoc_id: i32::from_ne_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]),
+                state: read_u16_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                error: read_u16_at(buffer, 10).map_err(byte_range_invalid_data)?,
+                outbound_streams: read_u16_at(buffer, 12).map_err(byte_range_invalid_data)?,
+                inbound_streams: read_u16_at(buffer, 14).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, 16).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_peer_addr_change() => {
@@ -3581,24 +3591,9 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
             let base = 8 + storage_len;
             SctpNotification::PeerAddrChange {
                 addr,
-                state: i32::from_ne_bytes([
-                    buffer[base],
-                    buffer[base + 1],
-                    buffer[base + 2],
-                    buffer[base + 3],
-                ]),
-                error: i32::from_ne_bytes([
-                    buffer[base + 4],
-                    buffer[base + 5],
-                    buffer[base + 6],
-                    buffer[base + 7],
-                ]),
-                assoc_id: i32::from_ne_bytes([
-                    buffer[base + 8],
-                    buffer[base + 9],
-                    buffer[base + 10],
-                    buffer[base + 11],
-                ]),
+                state: read_i32_at(buffer, base).map_err(byte_range_invalid_data)?,
+                error: read_i32_at(buffer, base + 4).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, base + 8).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_remote_error() => {
@@ -3606,8 +3601,8 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::RemoteError {
-                error: u16::from_be_bytes([buffer[8], buffer[9]]),
-                assoc_id: i32::from_ne_bytes([buffer[10], buffer[11], buffer[12], buffer[13]]),
+                error: read_u16_be_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, 10).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_shutdown_event() => {
@@ -3615,7 +3610,7 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::Shutdown {
-                assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
+                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_adaptation_indication() => {
@@ -3623,8 +3618,8 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::Adaptation {
-                indication: u32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                assoc_id: i32::from_ne_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
+                indication: read_u32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_partial_delivery_event() => {
@@ -3632,10 +3627,10 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::PartialDelivery {
-                indication: u32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                assoc_id: i32::from_ne_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
-                stream: u32::from_ne_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]),
-                sequence: u32::from_ne_bytes([buffer[20], buffer[21], buffer[22], buffer[23]]),
+                indication: read_u32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
+                stream: read_u32_at(buffer, 16).map_err(byte_range_invalid_data)?,
+                sequence: read_u32_at(buffer, 20).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_sender_dry_event() => {
@@ -3643,7 +3638,7 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::SenderDry {
-                assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
+                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_stream_reset_event() => {
@@ -3652,7 +3647,7 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
             }
             SctpNotification::StreamReset {
                 flags: sn_flags,
-                assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
+                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_assoc_reset_event() => {
@@ -3661,9 +3656,9 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
             }
             SctpNotification::AssocReset {
                 flags: sn_flags,
-                assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                local_tsn: u32::from_ne_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
-                remote_tsn: u32::from_ne_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]),
+                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                local_tsn: read_u32_at(buffer, 12).map_err(byte_range_invalid_data)?,
+                remote_tsn: read_u32_at(buffer, 16).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_stream_change_event() => {
@@ -3672,9 +3667,9 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
             }
             SctpNotification::StreamChange {
                 flags: sn_flags,
-                assoc_id: i32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                inbound_streams: u16::from_ne_bytes([buffer[12], buffer[13]]),
-                outbound_streams: u16::from_ne_bytes([buffer[14], buffer[15]]),
+                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                inbound_streams: read_u16_at(buffer, 12).map_err(byte_range_invalid_data)?,
+                outbound_streams: read_u16_at(buffer, 14).map_err(byte_range_invalid_data)?,
             }
         }
         x if x == local_sctp_send_failed_event() => {
@@ -3683,7 +3678,7 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
             if buffer.len() < min_len {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
-            let error = u32::from_ne_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+            let error = read_u32_at(buffer, 8).map_err(byte_range_invalid_data)?;
             let sndinfo_ptr = unsafe { buffer.as_ptr().add(12) as *const libc::sctp_sndinfo };
             let sndinfo = unsafe { std::ptr::read_unaligned(sndinfo_ptr) };
             let assoc_base = 12 + sndinfo_len;
@@ -3696,12 +3691,7 @@ fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                     context: sndinfo.snd_context,
                     assoc_id: sndinfo.snd_assoc_id,
                 },
-                assoc_id: i32::from_ne_bytes([
-                    buffer[assoc_base],
-                    buffer[assoc_base + 1],
-                    buffer[assoc_base + 2],
-                    buffer[assoc_base + 3],
-                ]),
+                assoc_id: read_i32_at(buffer, assoc_base).map_err(byte_range_invalid_data)?,
             }
         }
         _ => SctpNotification::Other {

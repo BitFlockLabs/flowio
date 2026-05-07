@@ -1,4 +1,5 @@
 use flowio::net::resolver::{DnsResolver, resolve_host};
+use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
@@ -193,7 +194,21 @@ fn parse_qtype(packet: &[u8]) -> io::Result<u16> {
         ));
     }
 
-    Ok(u16::from_be_bytes([packet[offset], packet[offset + 1]]))
+    read_u16_be_at(packet, offset).map_err(|err| io::Error::new(io::ErrorKind::UnexpectedEof, err))
+}
+
+fn push_u16_be(dst: &mut Vec<u8>, value: u16) {
+    let offset = dst.len();
+    dst.resize(offset + 2, 0);
+    dst.write_u16_be_at(offset, value)
+        .expect("test u16 big-endian write should fit");
+}
+
+fn push_u32_be(dst: &mut Vec<u8>, value: u32) {
+    let offset = dst.len();
+    dst.resize(offset + 4, 0);
+    dst.write_u32_be_at(offset, value)
+        .expect("test u32 big-endian write should fit");
 }
 
 fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
@@ -209,20 +224,20 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
 
     let mut response = Vec::with_capacity(128);
     response.extend_from_slice(&query[0..2]);
-    response.extend_from_slice(&flags.to_be_bytes());
-    response.extend_from_slice(&1u16.to_be_bytes());
-    response.extend_from_slice(&answer_count.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes());
+    push_u16_be(&mut response, flags);
+    push_u16_be(&mut response, 1);
+    push_u16_be(&mut response, answer_count);
+    push_u16_be(&mut response, 0);
+    push_u16_be(&mut response, 0);
     response.extend_from_slice(&query[12..question_end]);
 
     match answer {
         TestAnswer::A(ip) => {
-            response.extend_from_slice(&0xC00Cu16.to_be_bytes());
-            response.extend_from_slice(&1u16.to_be_bytes());
-            response.extend_from_slice(&1u16.to_be_bytes());
-            response.extend_from_slice(&60u32.to_be_bytes());
-            response.extend_from_slice(&4u16.to_be_bytes());
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 1);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 4);
             response.extend_from_slice(&ip.octets());
         }
         TestAnswer::Cname(target) => {
@@ -233,11 +248,11 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             }
             encoded.push(0);
 
-            response.extend_from_slice(&0xC00Cu16.to_be_bytes());
-            response.extend_from_slice(&5u16.to_be_bytes());
-            response.extend_from_slice(&1u16.to_be_bytes());
-            response.extend_from_slice(&60u32.to_be_bytes());
-            response.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, encoded.len() as u16);
             response.extend_from_slice(&encoded);
         }
         TestAnswer::Empty | TestAnswer::NxDomain => {}

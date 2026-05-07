@@ -14,8 +14,11 @@
 //!
 //! For zero-alloc steady-state reuse:
 //! - [`pool::IoBuffPool`] produces identically-shaped pool-backed [`IoBuffMut`] values
+//! - [`bytes`] provides checked allocation-free primitive byte reads/writes
+//!   for protocol encoders and decoders
 //!
 //! Module layout:
+//! - `bytes` — checked byte-order helpers and cursors over byte slices
 //! - `iobuff` — core buffer types, traits, and error codes
 //! - `iobuffvec` — vectored I/O buffer chains
 //! - `pool` — pool allocator for zero-allocation steady-state reuse
@@ -69,6 +72,7 @@
 //! assert_eq!(chain.len(), 11);
 //! ```
 
+pub mod bytes;
 mod iobuff;
 pub mod iobuffvec;
 pub mod pool;

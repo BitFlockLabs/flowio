@@ -12,6 +12,7 @@ use flowio::net::sctp::{
     test_send_failed_event_type, test_sender_dry_event_type, test_shutdown_event_type,
     test_stream_change_event_type, test_stream_reset_event_type,
 };
+use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u32_at};
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::timeout;
@@ -30,9 +31,12 @@ fn sctp_unsupported(err: &std::io::Error) -> bool {
 
 fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
-    buf[0..2].copy_from_slice(&(notification_type as u16).to_ne_bytes());
-    buf[2..4].copy_from_slice(&flags.to_ne_bytes());
-    buf[4..8].copy_from_slice(&(len as u32).to_ne_bytes());
+    buf.write_u16_at(0, notification_type as u16)
+        .expect("test notification type write should fit");
+    buf.write_u16_at(2, flags)
+        .expect("test notification flags write should fit");
+    buf.write_u32_at(4, len as u32)
+        .expect("test notification length write should fit");
     buf
 }
 
@@ -42,7 +46,7 @@ fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: port.to_be(),
         sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            s_addr: read_u32_at(&[127, 0, 0, 1], 0).expect("IPv4 octets should fit"),
         },
         sin_zero: [0; 8],
     };
@@ -68,14 +72,21 @@ fn sctp_connect_slot_drop_future_closes_socket_fd() {
 #[test]
 fn parse_assoc_change_notification() {
     let mut buf = vec![0u8; 20];
-    buf[0..2].copy_from_slice(&(test_assoc_change_type() as u16).to_ne_bytes());
-    buf[2..4].copy_from_slice(&0u16.to_ne_bytes());
-    buf[4..8].copy_from_slice(&(20u32).to_ne_bytes());
-    buf[8..10].copy_from_slice(&1u16.to_ne_bytes());
-    buf[10..12].copy_from_slice(&2u16.to_ne_bytes());
-    buf[12..14].copy_from_slice(&3u16.to_ne_bytes());
-    buf[14..16].copy_from_slice(&4u16.to_ne_bytes());
-    buf[16..20].copy_from_slice(&5i32.to_ne_bytes());
+    buf.write_u16_at(0, test_assoc_change_type() as u16)
+        .expect("assoc change type write should fit");
+    buf.write_u16_at(2, 0)
+        .expect("assoc change flags write should fit");
+    buf.write_u32_at(4, 20)
+        .expect("assoc change length write should fit");
+    buf.write_u16_at(8, 1)
+        .expect("assoc state write should fit");
+    buf.write_u16_at(10, 2)
+        .expect("assoc error write should fit");
+    buf.write_u16_at(12, 3)
+        .expect("assoc outbound streams write should fit");
+    buf.write_u16_at(14, 4)
+        .expect("assoc inbound streams write should fit");
+    buf.write_i32_at(16, 5).expect("assoc id write should fit");
 
     let parsed = test_parse_notification(&buf).expect("assoc change parse failed");
     assert_eq!(
@@ -93,11 +104,16 @@ fn parse_assoc_change_notification() {
 #[test]
 fn parse_adaptation_notification() {
     let mut buf = vec![0u8; 16];
-    buf[0..2].copy_from_slice(&(test_adaptation_indication_type() as u16).to_ne_bytes());
-    buf[2..4].copy_from_slice(&0u16.to_ne_bytes());
-    buf[4..8].copy_from_slice(&(16u32).to_ne_bytes());
-    buf[8..12].copy_from_slice(&0x0102_0304u32.to_ne_bytes());
-    buf[12..16].copy_from_slice(&7i32.to_ne_bytes());
+    buf.write_u16_at(0, test_adaptation_indication_type() as u16)
+        .expect("adaptation type write should fit");
+    buf.write_u16_at(2, 0)
+        .expect("adaptation flags write should fit");
+    buf.write_u32_at(4, 16)
+        .expect("adaptation length write should fit");
+    buf.write_u32_at(8, 0x0102_0304)
+        .expect("adaptation indication write should fit");
+    buf.write_i32_at(12, 7)
+        .expect("adaptation assoc id write should fit");
 
     let parsed = test_parse_notification(&buf).expect("adaptation parse failed");
     assert_eq!(
@@ -113,10 +129,14 @@ fn parse_adaptation_notification() {
 fn parse_send_failed_event_notification() {
     let sndinfo_len = std::mem::size_of::<libc::sctp_sndinfo>();
     let mut buf = vec![0u8; 12 + sndinfo_len + 4];
-    buf[0..2].copy_from_slice(&(test_send_failed_event_type() as u16).to_ne_bytes());
-    buf[2..4].copy_from_slice(&0u16.to_ne_bytes());
-    buf[4..8].copy_from_slice(&((12 + sndinfo_len + 4) as u32).to_ne_bytes());
-    buf[8..12].copy_from_slice(&9u32.to_ne_bytes());
+    buf.write_u16_at(0, test_send_failed_event_type() as u16)
+        .expect("send failed type write should fit");
+    buf.write_u16_at(2, 0)
+        .expect("send failed flags write should fit");
+    buf.write_u32_at(4, (12 + sndinfo_len + 4) as u32)
+        .expect("send failed length write should fit");
+    buf.write_u32_at(8, 9)
+        .expect("send failed error write should fit");
 
     let sndinfo = libc::sctp_sndinfo {
         snd_sid: 3,
@@ -129,7 +149,8 @@ fn parse_send_failed_event_notification() {
         std::ptr::write_unaligned(buf.as_mut_ptr().add(12) as *mut libc::sctp_sndinfo, sndinfo);
     }
     let assoc_base = 12 + sndinfo_len;
-    buf[assoc_base..assoc_base + 4].copy_from_slice(&12i32.to_ne_bytes());
+    buf.write_i32_at(assoc_base, 12)
+        .expect("send failed assoc id write should fit");
 
     let parsed = test_parse_notification(&buf).expect("send failed parse failed");
     assert_eq!(
@@ -163,9 +184,12 @@ fn parse_peer_addr_change_notification() {
         );
     }
     let base = 8 + storage_len;
-    buf[base..base + 4].copy_from_slice(&SctpPeerAddrInfo::ACTIVE.to_ne_bytes());
-    buf[base + 4..base + 8].copy_from_slice(&9i32.to_ne_bytes());
-    buf[base + 8..base + 12].copy_from_slice(&10i32.to_ne_bytes());
+    buf.write_i32_at(base, SctpPeerAddrInfo::ACTIVE)
+        .expect("peer addr state write should fit");
+    buf.write_i32_at(base + 4, 9)
+        .expect("peer addr error write should fit");
+    buf.write_i32_at(base + 8, 10)
+        .expect("peer addr assoc id write should fit");
 
     let parsed = test_parse_notification(&buf).expect("peer addr change parse failed");
     assert_eq!(
@@ -182,8 +206,12 @@ fn parse_peer_addr_change_notification() {
 #[test]
 fn parse_remote_error_and_shutdown_notifications() {
     let mut remote_error = notification_buffer(test_remote_error_type(), 0, 14);
-    remote_error[8..10].copy_from_slice(&0x1122u16.to_be_bytes());
-    remote_error[10..14].copy_from_slice(&12i32.to_ne_bytes());
+    remote_error
+        .write_u16_be_at(8, 0x1122)
+        .expect("remote error code write should fit");
+    remote_error
+        .write_i32_at(10, 12)
+        .expect("remote error assoc id write should fit");
     let parsed = test_parse_notification(&remote_error).expect("remote error parse failed");
     assert_eq!(
         parsed,
@@ -194,7 +222,9 @@ fn parse_remote_error_and_shutdown_notifications() {
     );
 
     let mut shutdown = notification_buffer(test_shutdown_event_type(), 0, 12);
-    shutdown[8..12].copy_from_slice(&13i32.to_ne_bytes());
+    shutdown
+        .write_i32_at(8, 13)
+        .expect("shutdown assoc id write should fit");
     let parsed = test_parse_notification(&shutdown).expect("shutdown parse failed");
     assert_eq!(
         parsed,
@@ -202,7 +232,9 @@ fn parse_remote_error_and_shutdown_notifications() {
     );
 
     let mut sender_dry = notification_buffer(test_sender_dry_event_type(), 0, 12);
-    sender_dry[8..12].copy_from_slice(&14i32.to_ne_bytes());
+    sender_dry
+        .write_i32_at(8, 14)
+        .expect("sender dry assoc id write should fit");
     let parsed = test_parse_notification(&sender_dry).expect("sender dry parse failed");
     assert_eq!(
         parsed,
@@ -213,10 +245,18 @@ fn parse_remote_error_and_shutdown_notifications() {
 #[test]
 fn parse_partial_delivery_and_reset_notifications() {
     let mut partial_delivery = notification_buffer(test_partial_delivery_event_type(), 0, 24);
-    partial_delivery[8..12].copy_from_slice(&7u32.to_ne_bytes());
-    partial_delivery[12..16].copy_from_slice(&15i32.to_ne_bytes());
-    partial_delivery[16..20].copy_from_slice(&16u32.to_ne_bytes());
-    partial_delivery[20..24].copy_from_slice(&17u32.to_ne_bytes());
+    partial_delivery
+        .write_u32_at(8, 7)
+        .expect("partial delivery indication write should fit");
+    partial_delivery
+        .write_i32_at(12, 15)
+        .expect("partial delivery assoc id write should fit");
+    partial_delivery
+        .write_u32_at(16, 16)
+        .expect("partial delivery stream write should fit");
+    partial_delivery
+        .write_u32_at(20, 17)
+        .expect("partial delivery sequence write should fit");
     let parsed = test_parse_notification(&partial_delivery).expect("partial delivery parse failed");
     assert_eq!(
         parsed,
@@ -229,7 +269,9 @@ fn parse_partial_delivery_and_reset_notifications() {
     );
 
     let mut stream_reset = notification_buffer(test_stream_reset_event_type(), 0x0123, 12);
-    stream_reset[8..12].copy_from_slice(&18i32.to_ne_bytes());
+    stream_reset
+        .write_i32_at(8, 18)
+        .expect("stream reset assoc id write should fit");
     let parsed = test_parse_notification(&stream_reset).expect("stream reset parse failed");
     assert_eq!(
         parsed,
@@ -240,9 +282,15 @@ fn parse_partial_delivery_and_reset_notifications() {
     );
 
     let mut assoc_reset = notification_buffer(test_assoc_reset_event_type(), 0x0456, 20);
-    assoc_reset[8..12].copy_from_slice(&19i32.to_ne_bytes());
-    assoc_reset[12..16].copy_from_slice(&20u32.to_ne_bytes());
-    assoc_reset[16..20].copy_from_slice(&21u32.to_ne_bytes());
+    assoc_reset
+        .write_i32_at(8, 19)
+        .expect("assoc reset assoc id write should fit");
+    assoc_reset
+        .write_u32_at(12, 20)
+        .expect("assoc reset local tsn write should fit");
+    assoc_reset
+        .write_u32_at(16, 21)
+        .expect("assoc reset remote tsn write should fit");
     let parsed = test_parse_notification(&assoc_reset).expect("assoc reset parse failed");
     assert_eq!(
         parsed,
@@ -255,9 +303,15 @@ fn parse_partial_delivery_and_reset_notifications() {
     );
 
     let mut stream_change = notification_buffer(test_stream_change_event_type(), 0x0789, 16);
-    stream_change[8..12].copy_from_slice(&22i32.to_ne_bytes());
-    stream_change[12..14].copy_from_slice(&23u16.to_ne_bytes());
-    stream_change[14..16].copy_from_slice(&24u16.to_ne_bytes());
+    stream_change
+        .write_i32_at(8, 22)
+        .expect("stream change assoc id write should fit");
+    stream_change
+        .write_u16_at(12, 23)
+        .expect("stream change inbound write should fit");
+    stream_change
+        .write_u16_at(14, 24)
+        .expect("stream change outbound write should fit");
     let parsed = test_parse_notification(&stream_change).expect("stream change parse failed");
     assert_eq!(
         parsed,

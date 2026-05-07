@@ -42,6 +42,9 @@
 //! ```
 
 use crate::net::udp::UdpSocket;
+use crate::runtime::buffer::bytes::{
+    BufferCursorMut, BufferRangeError, read_u16_be_at, write_u16_be_at,
+};
 use crate::runtime::timer::{Elapsed, timeout};
 use std::fs;
 use std::io;
@@ -347,6 +350,10 @@ fn host_not_found(host: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("host not found: {host}"))
 }
 
+fn byte_range_eof(err: BufferRangeError) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, err)
+}
+
 fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port: u16) {
     for ip in ips {
         let addr = SocketAddr::new(*ip, port);
@@ -358,12 +365,17 @@ fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port:
 
 fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
     let mut packet = Vec::with_capacity(512);
-    packet.extend_from_slice(&query_id.to_be_bytes());
-    packet.extend_from_slice(&0x0100u16.to_be_bytes());
-    packet.extend_from_slice(&1u16.to_be_bytes());
-    packet.extend_from_slice(&0u16.to_be_bytes());
-    packet.extend_from_slice(&0u16.to_be_bytes());
-    packet.extend_from_slice(&0u16.to_be_bytes());
+    let mut header = [0u8; 12];
+    {
+        let mut cursor = BufferCursorMut::new(&mut header);
+        cursor.put_u16_be(query_id).map_err(byte_range_eof)?;
+        cursor.put_u16_be(0x0100).map_err(byte_range_eof)?;
+        cursor.put_u16_be(1).map_err(byte_range_eof)?;
+        cursor.put_u16_be(0).map_err(byte_range_eof)?;
+        cursor.put_u16_be(0).map_err(byte_range_eof)?;
+        cursor.put_u16_be(0).map_err(byte_range_eof)?;
+    }
+    packet.extend_from_slice(&header);
 
     for label in host.split('.') {
         if label.is_empty() {
@@ -384,8 +396,10 @@ fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<
     }
 
     packet.push(0);
-    packet.extend_from_slice(&qtype.to_be_bytes());
-    packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    let start = packet.len();
+    packet.resize(start + 4, 0);
+    write_u16_be_at(&mut packet, start, qtype).map_err(byte_range_eof)?;
+    write_u16_be_at(&mut packet, start + 2, DNS_CLASS_IN).map_err(byte_range_eof)?;
     Ok(packet)
 }
 
@@ -397,7 +411,7 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
         ));
     }
 
-    let response_id = u16::from_be_bytes([packet[0], packet[1]]);
+    let response_id = read_u16_be_at(packet, 0).map_err(byte_range_eof)?;
     if response_id != query_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -405,7 +419,7 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
         ));
     }
 
-    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    let flags = read_u16_be_at(packet, 2).map_err(byte_range_eof)?;
     if flags & 0x8000 == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -433,10 +447,10 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
         )));
     }
 
-    let qdcount = u16::from_be_bytes([packet[4], packet[5]]) as usize;
-    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
-    let nscount = u16::from_be_bytes([packet[8], packet[9]]) as usize;
-    let arcount = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+    let qdcount = read_u16_be_at(packet, 4).map_err(byte_range_eof)? as usize;
+    let ancount = read_u16_be_at(packet, 6).map_err(byte_range_eof)? as usize;
+    let nscount = read_u16_be_at(packet, 8).map_err(byte_range_eof)? as usize;
+    let arcount = read_u16_be_at(packet, 10).map_err(byte_range_eof)? as usize;
 
     let mut offset = 12usize;
     for _ in 0..qdcount {
@@ -498,9 +512,9 @@ struct RrHeader {
 
 fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
     let end = checked_add(offset, 10, packet.len())?;
-    let rr_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-    let class = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
-    let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]);
+    let rr_type = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
+    let class = read_u16_be_at(packet, offset + 2).map_err(byte_range_eof)?;
+    let rdlength = read_u16_be_at(packet, offset + 8).map_err(byte_range_eof)?;
     let data_offset = end;
     checked_add(data_offset, rdlength as usize, packet.len())?;
 
