@@ -396,6 +396,11 @@ fn invalid_input(message: &'static str) -> io::Error {
 }
 
 #[inline(always)]
+fn invalid_input_kind() -> io::Error {
+    io::Error::from(io::ErrorKind::InvalidInput)
+}
+
+#[inline(always)]
 fn validate_projected_count_and_len(iov_count: usize, total: usize) -> io::Result<()> {
     if iov_count == 0 && total == 0 {
         return Ok(());
@@ -409,6 +414,17 @@ fn validate_projected_count_and_len(iov_count: usize, total: usize) -> io::Resul
         return Err(invalid_input(
             "projected writev reported active pieces but no bytes",
         ));
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn validate_try_projected_count_and_len(iov_count: usize, total: usize) -> io::Result<()> {
+    if iov_count == 0 && total == 0 {
+        return Ok(());
+    }
+    if iov_count == 0 || total == 0 {
+        return Err(invalid_input_kind());
     }
     Ok(())
 }
@@ -439,6 +455,168 @@ fn project_retained_writev_payload<T: WritevProjection>(
     }
 
     Ok(())
+}
+
+#[inline(always)]
+fn one_shot_syscall_result(result: libc::ssize_t) -> io::Result<usize> {
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result as usize)
+}
+
+#[inline(always)]
+fn checked_try_write_len(len: usize) -> io::Result<usize> {
+    if len > u32::MAX as usize {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    Ok(len)
+}
+
+/// Attempts one nonblocking read syscall into the caller-owned buffer.
+#[inline]
+pub(crate) fn try_read_once<B: IoBuffReadWrite>(
+    fd: RawFd,
+    mut buffer: B,
+    len: usize,
+) -> (io::Result<usize>, B) {
+    let len = match super::checked_read_len("try_read", len, buffer.writable_len()) {
+        Ok(len) => len as usize,
+        Err(err) => return (Err(err), buffer),
+    };
+
+    if len == 0 {
+        unsafe { buffer.set_written_len(0) };
+        return (Ok(0), buffer);
+    }
+
+    let result = unsafe { libc::recv(fd, buffer.as_mut_ptr() as *mut libc::c_void, len, 0) };
+    match one_shot_syscall_result(result) {
+        Ok(actual) => {
+            unsafe { buffer.set_written_len(actual) };
+            (Ok(actual), buffer)
+        }
+        Err(err) => (Err(err), buffer),
+    }
+}
+
+/// Attempts one nonblocking read syscall into the current payload tail.
+#[inline]
+pub(crate) fn try_read_append_once(
+    fd: RawFd,
+    mut buffer: IoBuffMut,
+    len: usize,
+) -> (io::Result<usize>, IoBuffMut) {
+    let start_len = buffer.payload_len();
+    let len = match super::checked_read_len("try_read_append", len, buffer.payload_remaining()) {
+        Ok(len) => len as usize,
+        Err(err) => return (Err(err), buffer),
+    };
+
+    if len == 0 {
+        unsafe { buffer.set_written_len(start_len) };
+        return (Ok(0), buffer);
+    }
+
+    let result = unsafe { libc::recv(fd, buffer.as_mut_ptr() as *mut libc::c_void, len, 0) };
+    match one_shot_syscall_result(result) {
+        Ok(actual) => {
+            unsafe { buffer.set_written_len(start_len + actual) };
+            (Ok(actual), buffer)
+        }
+        Err(err) => (Err(err), buffer),
+    }
+}
+
+/// Attempts one nonblocking write syscall from the caller-owned buffer.
+#[inline]
+pub(crate) fn try_write_once<B: IoBuffReadOnly>(fd: RawFd, buffer: B) -> (io::Result<usize>, B) {
+    let len = match checked_try_write_len(buffer.len()) {
+        Ok(len) => len,
+        Err(err) => return (Err(err), buffer),
+    };
+
+    if len == 0 {
+        return (Ok(0), buffer);
+    }
+
+    let result = unsafe {
+        libc::send(
+            fd,
+            buffer.as_ptr() as *const libc::c_void,
+            len,
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    (one_shot_syscall_result(result), buffer)
+}
+
+const TRY_WRITEV_INLINE_IOVECS: usize = 16;
+const TRY_WRITEV_MAX_IOVECS: usize = 1024;
+
+#[inline]
+fn try_writev_projected_with_scratch<T: WritevProjection>(
+    fd: RawFd,
+    source: T,
+    expected_count: usize,
+    expected_total: usize,
+    scratch: &mut [MaybeUninit<libc::iovec>],
+) -> (io::Result<usize>, T) {
+    let projection = {
+        let mut pieces = WritevPieces::new(&mut scratch[..expected_count]);
+        source
+            .project_writev(&mut pieces)
+            .map(|()| (pieces.count(), pieces.total()))
+    };
+
+    let (projected_count, projected_total) = match projection {
+        Ok(count_and_total) => count_and_total,
+        Err(err) => return (Err(err), source),
+    };
+
+    if projected_count != expected_count || projected_total != expected_total {
+        return (Err(invalid_input_kind()), source);
+    }
+
+    let iovecs = unsafe { iovec_slice_mut_from_uninit(&mut scratch[..expected_count]) };
+    let msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iovecs.as_mut_ptr(),
+        msg_iovlen: iovecs.len(),
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+
+    let result = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+    (one_shot_syscall_result(result), source)
+}
+
+/// Attempts one nonblocking gather-write syscall from a projected source.
+#[inline]
+pub(crate) fn try_writev_projected_once<T: WritevProjection>(
+    fd: RawFd,
+    source: T,
+) -> (io::Result<usize>, T) {
+    let (iov_count, total) = source.writev_count_and_len();
+    if let Err(err) = validate_try_projected_count_and_len(iov_count, total) {
+        return (Err(err), source);
+    }
+    if total == 0 {
+        return (Ok(0), source);
+    }
+    if iov_count > TRY_WRITEV_MAX_IOVECS {
+        return (Err(invalid_input_kind()), source);
+    }
+
+    if iov_count <= TRY_WRITEV_INLINE_IOVECS {
+        let mut scratch = uninit_iovecs::<TRY_WRITEV_INLINE_IOVECS>();
+        return try_writev_projected_with_scratch(fd, source, iov_count, total, &mut scratch);
+    }
+
+    let mut scratch = uninit_iovecs::<TRY_WRITEV_MAX_IOVECS>();
+    try_writev_projected_with_scratch(fd, source, iov_count, total, &mut scratch)
 }
 
 #[inline]

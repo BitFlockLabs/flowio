@@ -13,6 +13,9 @@
 //! - For steady-state stream I/O, [`TcpStream::read`] / [`TcpStream::write`]
 //!   are the lowest-overhead contiguous APIs when the caller can handle short
 //!   reads and writes.
+//! - For timeout-edge callers whose phase deadline has already reached
+//!   `Duration::ZERO`, the `try_*` methods attempt one nonblocking syscall on
+//!   the existing socket and return immediately with the rental buffer.
 //! - Use vectored APIs only when data is already segmented. For one
 //!   contiguous payload, the contiguous APIs stay simpler and usually faster.
 //! - For fixed-shape hot-path buffers, pair TCP with
@@ -436,6 +439,10 @@ pub struct TcpStream {
 
 impl TcpStream {
     /// Wraps an already-owned connected socket.
+    ///
+    /// FlowIO-created TCP sockets are nonblocking. Callers that pass an
+    /// external descriptor must preserve that invariant; the `try_*`
+    /// deadline-edge APIs rely on the fd already being nonblocking.
     pub fn from_raw_fd(fd: RawFd) -> Self {
         Self {
             fd: RuntimeFd::new(fd),
@@ -511,6 +518,68 @@ impl TcpStream {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Attempts one nonblocking read syscall and returns immediately.
+    ///
+    /// This is a deadline-edge primitive for callers whose phase timeout has
+    /// already reached `Duration::ZERO`. It does not submit an `io_uring`
+    /// operation, register a waiter, park, retry, or allocate. If no data is
+    /// immediately available on the existing nonblocking socket, it returns
+    /// [`io::ErrorKind::WouldBlock`] and returns `buffer` unchanged.
+    ///
+    /// Prefer [`TcpStream::read`] for normal FlowIO async I/O.
+    pub fn try_read<B: IoBuffReadWrite>(
+        &mut self,
+        buffer: B,
+        len: usize,
+    ) -> (io::Result<usize>, B) {
+        stream::try_read_once(self.fd.as_raw_fd(), buffer, len)
+    }
+
+    /// Attempts one nonblocking read syscall into the current payload tail.
+    ///
+    /// On success, only the bytes actually read are appended to `buffer`.
+    /// Existing payload bytes are preserved. If no data is immediately
+    /// available, this returns [`io::ErrorKind::WouldBlock`] and leaves the
+    /// payload length unchanged.
+    ///
+    /// This is a deadline-edge primitive, not a replacement for
+    /// [`TcpStream::read_exact_append`] in normal async protocol flow.
+    pub fn try_read_append(
+        &mut self,
+        buffer: IoBuffMut,
+        len: usize,
+    ) -> (io::Result<usize>, IoBuffMut) {
+        stream::try_read_append_once(self.fd.as_raw_fd(), buffer, len)
+    }
+
+    /// Attempts one nonblocking write syscall and returns immediately.
+    ///
+    /// This sends from the initialized bytes in `buffer` with no reactor
+    /// registration and no retry. If the socket cannot accept bytes now, it
+    /// returns [`io::ErrorKind::WouldBlock`] and returns `buffer` unchanged.
+    ///
+    /// Prefer [`TcpStream::write`] for normal FlowIO async I/O.
+    pub fn try_write<B: IoBuffReadOnly + 'static>(&mut self, buffer: B) -> (io::Result<usize>, B) {
+        stream::try_write_once(self.fd.as_raw_fd(), buffer)
+    }
+
+    /// Attempts one nonblocking projected gather-write syscall.
+    ///
+    /// FlowIO projects borrowed byte pieces from the owned `source` into
+    /// stack-owned `iovec` scratch, performs one `sendmsg`, and returns the
+    /// source immediately. Message bytes are not copied, and no retained
+    /// operation state is created.
+    ///
+    /// This is intended for timeout-edge callers. Prefer
+    /// [`TcpStream::writev_projected`] / [`TcpStream::writev_all_projected`]
+    /// for normal FlowIO async I/O.
+    pub fn try_writev_projected<T: WritevProjection>(
+        &mut self,
+        source: T,
+    ) -> (io::Result<usize>, T) {
+        stream::try_writev_projected_once(self.fd.as_raw_fd(), source)
     }
 
     /// Reads up to `len` bytes into `buffer`.

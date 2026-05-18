@@ -5,9 +5,12 @@ use common::{
     make_read_only_chain, run_test,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
+use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr};
+use std::os::fd::IntoRawFd;
 use std::time::Duration;
 
 fn spawn_std_tcp_peer(
@@ -24,6 +27,262 @@ fn spawn_std_tcp_peer(
         assert_eq!(buf, expected_recv, "std peer received unexpected payload");
         stream.write_all(&response).expect("std write failed");
     })
+}
+
+fn connected_try_tcp_stream() -> (TcpStream, std::net::TcpStream) {
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let peer = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let (stream, _) = listener.accept().expect("std accept failed");
+    stream
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+    (TcpStream::from_raw_fd(stream.into_raw_fd()), peer)
+}
+
+fn fill_try_send_buffer(stream: &mut TcpStream) -> (bool, Vec<u8>) {
+    stream
+        .set_send_buffer_size(4096)
+        .expect("set send buffer size failed");
+
+    let mut payload = vec![0xA5; 1024 * 1024];
+    let mut saw_partial = false;
+    for _ in 0..256 {
+        let requested = payload.len();
+        let (res, returned) = stream.try_write(payload);
+        payload = returned;
+        match res {
+            Ok(n) if n == requested => {}
+            Ok(n) => {
+                assert!(n < requested, "short write must report partial progress");
+                saw_partial = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return (saw_partial, payload);
+            }
+            Err(err) => panic!("try_write failed unexpectedly: {err}"),
+        }
+    }
+
+    panic!("socket send buffer did not fill within bounded attempts");
+}
+
+struct TryMismatchedProjected;
+
+impl WritevProjection for TryMismatchedProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (1, 2)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        pieces.push(b"x")
+    }
+}
+
+struct TryOversizedProjected;
+
+impl WritevProjection for TryOversizedProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (1025, 1025)
+    }
+
+    fn project_writev<'a>(&'a self, _pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        panic!("oversized try_writev_projected should fail before projection")
+    }
+}
+
+#[test]
+fn runtime_tcp_try_read_immediate_success() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+    peer.write_all(b"pong").expect("std write failed");
+
+    let (res, buf) = stream.try_read(vec![0u8; 4], 4);
+    assert_eq!(res.expect("try_read failed"), 4);
+    assert_eq!(&buf[..], b"pong");
+}
+
+#[test]
+fn runtime_tcp_try_read_would_block() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+
+    let (res, buf) = stream.try_read(vec![0u8; 4], 4);
+    let err = res.expect_err("try_read should report WouldBlock");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        buf.len(),
+        4,
+        "buffer ownership and length should be preserved"
+    );
+}
+
+#[test]
+fn runtime_tcp_try_read_partial_success() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+    peer.write_all(b"hi").expect("std write failed");
+
+    let (res, buf) = stream.try_read(vec![0u8; 5], 5);
+    assert_eq!(res.expect("try_read failed"), 2);
+    assert_eq!(&buf[..], b"hi");
+}
+
+#[test]
+fn runtime_tcp_try_read_eof() {
+    let (mut stream, peer) = connected_try_tcp_stream();
+    peer.shutdown(Shutdown::Write)
+        .expect("std shutdown write failed");
+
+    let mut buf = vec![0u8; 4];
+    for _ in 0..100 {
+        let (res, returned) = stream.try_read(buf, 4);
+        buf = returned;
+        match res {
+            Ok(0) => {
+                assert!(buf.is_empty(), "EOF should set read buffer length to zero");
+                return;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
+            other => panic!("unexpected try_read EOF result: {other:?}"),
+        }
+    }
+
+    panic!("try_read did not observe EOF");
+}
+
+#[test]
+fn runtime_tcp_try_read_rejects_invalid_len() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+    let mut recv = IoBuffMut::new(0, 4, 0);
+    recv.payload_append(b"ab").unwrap();
+
+    let (res, recv) = stream.try_read(recv, 3);
+    let err = res.expect_err("oversize try_read should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(recv.payload_bytes(), b"ab");
+}
+
+#[test]
+fn runtime_tcp_try_read_append_success_and_partial() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+    peer.write_all(b"body").expect("std write failed");
+
+    let mut recv = IoBuffMut::new(0, 12, 0);
+    recv.payload_append(b"HEAD").unwrap();
+    let (res, recv) = stream.try_read_append(recv, 4);
+    assert_eq!(res.expect("try_read_append failed"), 4);
+    assert_eq!(recv.payload_bytes(), b"HEADbody");
+
+    peer.write_all(b"!!").expect("std write failed");
+    let (res, recv) = stream.try_read_append(recv, 4);
+    assert_eq!(res.expect("partial try_read_append failed"), 2);
+    assert_eq!(recv.payload_bytes(), b"HEADbody!!");
+}
+
+#[test]
+fn runtime_tcp_try_read_append_would_block_and_invalid_len() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+    let mut recv = IoBuffMut::new(0, 6, 0);
+    recv.payload_append(b"HEAD").unwrap();
+
+    let (res, recv) = stream.try_read_append(recv, 2);
+    let err = res.expect_err("try_read_append should report WouldBlock");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(recv.payload_bytes(), b"HEAD");
+
+    let (res, recv) = stream.try_read_append(recv, 3);
+    let err = res.expect_err("oversize try_read_append should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(recv.payload_bytes(), b"HEAD");
+}
+
+#[test]
+fn runtime_tcp_try_read_append_eof_preserves_payload() {
+    let (mut stream, peer) = connected_try_tcp_stream();
+    peer.shutdown(Shutdown::Write)
+        .expect("std shutdown write failed");
+
+    let mut recv = IoBuffMut::new(0, 8, 0);
+    recv.payload_append(b"HEAD").unwrap();
+
+    for _ in 0..100 {
+        let (res, returned) = stream.try_read_append(recv, 4);
+        recv = returned;
+        match res {
+            Ok(0) => {
+                assert_eq!(recv.payload_bytes(), b"HEAD");
+                return;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
+            other => panic!("unexpected try_read_append EOF result: {other:?}"),
+        }
+    }
+
+    panic!("try_read_append did not observe EOF");
+}
+
+#[test]
+fn runtime_tcp_try_write_immediate_success() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+
+    let (res, buf) = stream.try_write(b"ping".to_vec());
+    assert_eq!(res.expect("try_write failed"), 4);
+    assert_eq!(buf, b"ping".to_vec());
+
+    let mut got = [0u8; 4];
+    peer.read_exact(&mut got).expect("std read failed");
+    assert_eq!(&got, b"ping");
+}
+
+#[test]
+fn runtime_tcp_try_write_partial_and_would_block() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+
+    let (saw_partial, payload) = fill_try_send_buffer(&mut stream);
+    assert!(
+        saw_partial,
+        "bounded nonblocking fill should observe at least one partial write"
+    );
+
+    let source = TestProjected::new([&b"x"[..]]);
+    let (res, source) = stream.try_writev_projected(source);
+    let err = res.expect_err("full socket should reject try_writev_projected");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(source.expected(), b"x".to_vec());
+
+    let (res, payload) = stream.try_write(payload);
+    let err = res.expect_err("full socket should reject try_write");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(payload.len(), 1024 * 1024);
+}
+
+#[test]
+fn runtime_tcp_try_writev_projected_immediate_success() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+
+    let source = TestProjected::new([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
+    let expected = source.expected();
+    let (res, source) = stream.try_writev_projected(source);
+    assert_eq!(res.expect("try_writev_projected failed"), expected.len());
+    assert_eq!(source.expected(), expected);
+
+    let mut got = vec![0u8; expected.len()];
+    peer.read_exact(&mut got).expect("std read failed");
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn runtime_tcp_try_writev_projected_invalid_projection_returns_source() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+
+    let (res, source) = stream.try_writev_projected(TryMismatchedProjected);
+    let err = res.expect_err("mismatched projection should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let _source = source;
+
+    let (res, source) = stream.try_writev_projected(TryOversizedProjected);
+    let err = res.expect_err("oversized projection should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let _source = source;
 }
 
 #[test]

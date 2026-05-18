@@ -175,18 +175,13 @@ impl<'a> WritevPieces<'a> {
         }
 
         if self.count >= self.iovecs.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "projected writev produced more pieces than counted",
-            ));
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
 
-        let total = self.total.checked_add(bytes.len()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "projected writev byte length overflowed",
-            )
-        })?;
+        let total = self
+            .total
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 
         self.iovecs[self.count].write(libc::iovec {
             iov_base: bytes.as_ptr() as *mut libc::c_void,
