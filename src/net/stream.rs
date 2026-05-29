@@ -18,6 +18,9 @@
 //! reclaims the pool slot. Write-side futures attach caller buffers and
 //! vectored scratch to the `CompletionState` before submission so
 //! kernel-referenced memory stays alive until the original CQE retires.
+//! Single-read futures retain caller buffers the same way; if a read future is
+//! dropped before completion, any bytes consumed by a racing completion are
+//! discarded with the retained buffer when the original CQE retires.
 //! If a future is dropped after completion but before polling its result, the
 //! completed state is freed immediately from `Drop`.
 
@@ -113,7 +116,7 @@ unsafe fn prepare_retry_state(
     Ok(())
 }
 
-use super::{WritevPieces, WritevProjection, opt_mut, opt_ref, opt_take};
+use super::{WritevPieces, WritevProjection, opt_ref, opt_take};
 
 #[inline(always)]
 fn uninit_iovecs<const N: usize>() -> [MaybeUninit<libc::iovec>; N] {
@@ -233,6 +236,10 @@ impl<B: IoBuffReadOnly, const N: usize> WriteBufferChain<N> for IoBuffReadOnlyVe
 }
 
 struct RetainedWritePayload<B: IoBuffReadOnly> {
+    buffer: B,
+}
+
+struct RetainedReadPayload<B: IoBuffReadWrite> {
     buffer: B,
 }
 
@@ -741,8 +748,10 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
             return Poll::Ready((Err(err), buffer));
         }
 
-        if let Some(result) = take_completed_result(cx, &mut this.state_ptr) {
-            let mut buffer = unsafe { opt_take(&mut this.buffer) };
+        if let Some((result, payload)) = unsafe {
+            take_completed_result_and_payload::<RetainedReadPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let mut buffer = payload.buffer;
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
@@ -762,18 +771,25 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
-            let buf = unsafe { opt_mut(&mut this.buffer) };
-            let ptr = buf.as_mut_ptr();
+            let mut payload = unsafe {
+                (*pctx.reactor()).alloc_retained_payload(RetainedReadPayload {
+                    buffer: opt_take(&mut this.buffer),
+                })
+            };
+            let ptr = unsafe { payload.as_mut() }.buffer.as_mut_ptr();
+            unsafe { (*state_ptr).attach_retained_payload(payload) };
+
             let sqe = opcode::Read::new(types::Fd(this.fd), ptr, this.len)
                 .build()
                 .user_data(state_ptr as u64);
 
             unsafe {
                 if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
+                    let payload = (*pctx.reactor())
+                        .take_retained_payload::<RetainedReadPayload<B>>(state_ptr);
                     (*pctx.reactor()).free_op(state_ptr);
                     this.state_ptr = std::ptr::null_mut();
-                    let buffer = opt_take(&mut this.buffer);
-                    return Poll::Ready((Err(e), buffer));
+                    return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }

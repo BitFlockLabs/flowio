@@ -1,7 +1,7 @@
 use flowio::net::unix::UnixStream;
 use flowio::net::{WritevPieces, WritevProjection};
-use flowio::runtime::buffer::IoBuffReadOnly;
 use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
+use flowio::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::{Executor, ExecutorConfig};
 use flowio::runtime::io::{Nop, NopSlot};
 use flowio::runtime::op::CompletionState;
@@ -54,6 +54,42 @@ unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
 
     fn len(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+struct DropTrackedReadWrite {
+    bytes: Vec<u8>,
+    written: usize,
+    drops: Rc<Cell<usize>>,
+}
+
+impl DropTrackedReadWrite {
+    fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
+        Self {
+            bytes,
+            written: 0,
+            drops: Rc::clone(drops),
+        }
+    }
+}
+
+impl Drop for DropTrackedReadWrite {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+unsafe impl IoBuffReadWrite for DropTrackedReadWrite {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    fn writable_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    unsafe fn set_written_len(&mut self, len: usize) {
+        self.written = len;
     }
 }
 
@@ -864,6 +900,35 @@ fn runtime_cancel_in_flight_read_on_drop() {
             sleep(Duration::from_millis(5))
                 .await
                 .expect("post-cancel sleep failed");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_cancelled_read_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadWrite::new(vec![0; 65536], &drops);
+            let result = timeout(Duration::from_millis(10), async {
+                let (res, _tracked) = reader.read(tracked, 65536).await;
+                res
+            })
+            .await;
+
+            assert!(result.is_err(), "read should time out with no writer");
+            assert_eq!(
+                drops.get(),
+                0,
+                "read payload dropped while original SQE was live"
+            );
+
+            drop(writer);
+            wait_for_drop_count(&drops, 1).await;
         })
         .expect("executor run failed");
 }
