@@ -11,6 +11,9 @@
 //!   over time.
 //! - Use [`Executor::spawn`] from inside [`Executor::run`] to add concurrent
 //!   work without rebuilding runtime state.
+//! - Use [`Executor::try_spawn`] when the caller must keep
+//!   ownership of the submitted future if the scheduler cannot accept it, such
+//!   as RPC generated-method dispatch.
 //!
 //! Prefer not to use on the fast path:
 //! - Prefer not to construct a fresh [`Executor`] around each operation or
@@ -110,28 +113,33 @@ pub struct RuntimeStats {
 struct ExecutorTaskMemProvider {
     /// Minimum alignment guaranteed for task slab allocations.
     alignment: usize,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     /// Number of task slab allocations requested since the last debug reset.
     request_count: usize,
     #[cfg(debug_assertions)]
     /// Number of task slab frees issued since the last debug reset.
     free_count: usize,
+    #[cfg(test)]
+    /// Optional task slab request cap used by executor allocation-failure tests.
+    max_request_count: Option<usize>,
 }
 
 impl ExecutorTaskMemProvider {
     fn new() -> Self {
         Self {
             alignment: std::mem::align_of::<usize>(),
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, test))]
             request_count: 0,
             #[cfg(debug_assertions)]
             free_count: 0,
+            #[cfg(test)]
+            max_request_count: None,
         }
     }
 
     #[inline(always)]
     fn note_request(&mut self) {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, test))]
         {
             self.request_count += 1;
         }
@@ -147,9 +155,12 @@ impl ExecutorTaskMemProvider {
 
     #[inline(always)]
     fn reset_debug_counts(&mut self) {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, test))]
         {
             self.request_count = 0;
+        }
+        #[cfg(debug_assertions)]
+        {
             self.free_count = 0;
         }
     }
@@ -165,6 +176,16 @@ impl MemoryProvider for ExecutorTaskMemProvider {
     }
 
     fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
+        #[cfg(test)]
+        {
+            if self
+                .max_request_count
+                .is_some_and(|max_requests| self.request_count >= max_requests)
+            {
+                return None;
+            }
+        }
+
         let layout = Layout::from_size_align(size, self.alignment).ok()?;
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
@@ -354,6 +375,85 @@ struct JoinTask<F: Future> {
     /// once when the spawned future stores its output.
     join_waker: Option<Waker>,
 }
+
+/// Error returned by [`Executor::try_spawn`].
+///
+/// Each variant contains the original future so callers that own external
+/// state, such as an active RPC answer, can retry, reject, or clean up without
+/// losing task ownership when the executor cannot accept new work.
+pub enum TrySpawnError<F> {
+    /// No executor is currently active on this thread.
+    NoExecutor {
+        /// The original future passed to `try_spawn`.
+        future: F,
+    },
+    /// The concrete `JoinTask<F>` does not fit in the executor's fixed task
+    /// slot.
+    TaskTooLarge {
+        /// The original future passed to `try_spawn`.
+        future: F,
+    },
+    /// The task pool could not allocate a task slot.
+    AtCapacity {
+        /// The original future passed to `try_spawn`.
+        future: F,
+    },
+}
+
+impl<F> TrySpawnError<F> {
+    /// Returns the original future that could not be spawned.
+    pub fn into_future(self) -> F {
+        match self {
+            Self::NoExecutor { future }
+            | Self::TaskTooLarge { future }
+            | Self::AtCapacity { future } => future,
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NoExecutor { .. } | Self::TaskTooLarge { .. } => {
+                io::Error::from(ErrorKind::InvalidInput)
+            }
+            Self::AtCapacity { .. } => io::Error::from(ErrorKind::OutOfMemory),
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::NoExecutor { .. } => "NoExecutor",
+            Self::TaskTooLarge { .. } => "TaskTooLarge",
+            Self::AtCapacity { .. } => "AtCapacity",
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::NoExecutor { .. } => "no executor is currently active on this thread",
+            Self::TaskTooLarge { .. } => {
+                "spawned task does not fit in the executor's fixed task slot"
+            }
+            Self::AtCapacity { .. } => "executor task pool could not allocate a task slot",
+        }
+    }
+}
+
+impl<F> std::fmt::Debug for TrySpawnError<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrySpawnError")
+            .field("kind", &self.kind_name())
+            .field("future", &"<returned>")
+            .finish()
+    }
+}
+
+impl<F> std::fmt::Display for TrySpawnError<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.description())
+    }
+}
+
+impl<F> std::error::Error for TrySpawnError<F> {}
 
 /// Handle returned by [`Executor::spawn`] that can be `.await`ed to obtain
 /// the spawned task's return value.
@@ -549,22 +649,43 @@ impl Executor {
         F: Future + 'static,
         F::Output: 'static,
     {
+        Self::try_spawn(future).map_err(TrySpawnError::into_io_error)
+    }
+
+    /// Attempts to spawn a task and returns the original future on every
+    /// failure path.
+    ///
+    /// This is for callers that cannot lose ownership of the task body on
+    /// scheduler pressure. For example, generated RPC method dispatch may own
+    /// an active answer inside the future; if the executor cannot accept the
+    /// work, the caller needs the future back so it can retry, reject, or clean
+    /// up explicitly.
+    ///
+    /// On success, ownership transfers to the executor exactly as with
+    /// [`Executor::spawn`], and the returned [`JoinHandle`] yields the future's
+    /// output. On failure, the future has not been polled, pinned, stored in a
+    /// task slot, or dropped by the executor path.
+    pub fn try_spawn<F>(future: F) -> Result<JoinHandle<F::Output>, TrySpawnError<F>>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
         EXECUTOR_CTX.with(|ctx_cell| {
             let ctx_ptr = ctx_cell.get();
             if ctx_ptr.is_null() {
-                return Err(io::Error::from(ErrorKind::InvalidInput));
+                return Err(TrySpawnError::NoExecutor { future });
             }
             let ctx = unsafe { &*ctx_ptr };
 
             if size_of::<JoinTask<F>>() > TASK_POOL_SIZE {
-                return Err(io::Error::from(ErrorKind::InvalidInput));
+                return Err(TrySpawnError::TaskTooLarge { future });
             }
 
             unsafe {
                 let slot_ptr = match (*ctx.task_pool).alloc(()) {
                     Some(ptr) => ptr,
                     None => {
-                        return Err(io::Error::from(ErrorKind::OutOfMemory));
+                        return Err(TrySpawnError::AtCapacity { future });
                     }
                 };
 
@@ -1271,5 +1392,188 @@ unsafe fn enqueue_ready_task_unchecked(
 pub unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
     unsafe {
         schedule_task(task_ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct GateFuture {
+        id: usize,
+        release: Rc<Cell<bool>>,
+        drops: Rc<Cell<usize>>,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl GateFuture {
+        fn new(
+            id: usize,
+            release: &Rc<Cell<bool>>,
+            drops: &Rc<Cell<usize>>,
+            polls: &Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                id,
+                release: Rc::clone(release),
+                drops: Rc::clone(drops),
+                polls: Rc::clone(polls),
+            }
+        }
+    }
+
+    impl Future for GateFuture {
+        type Output = usize;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.set(this.polls.get() + 1);
+            if this.release.get() {
+                Poll::Ready(this.id)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for GateFuture {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    fn executor_with_one_task_slab() -> Executor {
+        let mut executor = Executor::new().expect("failed to construct executor");
+        executor.provider.max_request_count = Some(1);
+        executor
+    }
+
+    #[test]
+    fn try_spawn_at_capacity_returns_future_without_drop() {
+        let mut executor = executor_with_one_task_slab();
+        let release = Rc::new(Cell::new(false));
+        let filler_drops = Rc::new(Cell::new(0usize));
+        let filler_polls = Rc::new(Cell::new(0usize));
+        let rejected_drops = Rc::new(Cell::new(0usize));
+        let rejected_polls = Rc::new(Cell::new(0usize));
+        let returned_id = Rc::new(Cell::new(0usize));
+        let release_flag = release.clone();
+        let filler_drops_flag = filler_drops.clone();
+        let filler_polls_flag = filler_polls.clone();
+        let rejected_drops_flag = rejected_drops.clone();
+        let rejected_polls_flag = rejected_polls.clone();
+        let returned_id_flag = returned_id.clone();
+
+        executor
+            .run(async move {
+                for id in 0..(TASKS_PER_SLAB - 1) {
+                    let handle = match Executor::try_spawn(GateFuture::new(
+                        id,
+                        &release_flag,
+                        &filler_drops_flag,
+                        &filler_polls_flag,
+                    )) {
+                        Ok(handle) => handle,
+                        Err(_) => panic!("filler task should fit in the first task slab"),
+                    };
+                    drop(handle);
+                }
+
+                let rejected = GateFuture::new(
+                    777,
+                    &release_flag,
+                    &rejected_drops_flag,
+                    &rejected_polls_flag,
+                );
+                let returned = match Executor::try_spawn(rejected) {
+                    Ok(_) => panic!("task pool should be at capacity"),
+                    Err(TrySpawnError::AtCapacity { future }) => future,
+                    Err(_) => panic!("task pool exhaustion returned the wrong failure class"),
+                };
+
+                returned_id_flag.set(returned.id);
+                assert_eq!(
+                    rejected_polls_flag.get(),
+                    0,
+                    "AtCapacity future must not be polled"
+                );
+                assert_eq!(
+                    rejected_drops_flag.get(),
+                    0,
+                    "AtCapacity future must be returned before being dropped"
+                );
+                drop(returned);
+
+                release_flag.set(true);
+            })
+            .expect("executor run failed");
+
+        assert_eq!(returned_id.get(), 777);
+        assert_eq!(rejected_polls.get(), 0);
+        assert_eq!(rejected_drops.get(), 1);
+        assert_eq!(filler_drops.get(), TASKS_PER_SLAB - 1);
+        assert!(filler_polls.get() >= TASKS_PER_SLAB - 1);
+    }
+
+    #[test]
+    fn spawn_at_capacity_returns_io_error() {
+        let mut executor = executor_with_one_task_slab();
+        let release = Rc::new(Cell::new(false));
+        let filler_drops = Rc::new(Cell::new(0usize));
+        let filler_polls = Rc::new(Cell::new(0usize));
+        let rejected_drops = Rc::new(Cell::new(0usize));
+        let rejected_polls = Rc::new(Cell::new(0usize));
+        let release_flag = release.clone();
+        let filler_drops_flag = filler_drops.clone();
+        let filler_polls_flag = filler_polls.clone();
+        let rejected_drops_flag = rejected_drops.clone();
+        let rejected_polls_flag = rejected_polls.clone();
+
+        executor
+            .run(async move {
+                for id in 0..(TASKS_PER_SLAB - 1) {
+                    let handle = match Executor::spawn(GateFuture::new(
+                        id,
+                        &release_flag,
+                        &filler_drops_flag,
+                        &filler_polls_flag,
+                    )) {
+                        Ok(handle) => handle,
+                        Err(err) => panic!("filler task should fit in the first task slab: {err}"),
+                    };
+                    drop(handle);
+                }
+
+                let err = match Executor::spawn(GateFuture::new(
+                    888,
+                    &release_flag,
+                    &rejected_drops_flag,
+                    &rejected_polls_flag,
+                )) {
+                    Ok(_) => panic!("task pool should be at capacity"),
+                    Err(err) => err,
+                };
+                assert_eq!(err.kind(), ErrorKind::OutOfMemory);
+                assert_eq!(
+                    rejected_polls_flag.get(),
+                    0,
+                    "legacy spawn AtCapacity future must not be polled"
+                );
+                assert_eq!(
+                    rejected_drops_flag.get(),
+                    1,
+                    "legacy spawn consumes the rejected future"
+                );
+
+                release_flag.set(true);
+            })
+            .expect("executor run failed");
+
+        assert_eq!(rejected_polls.get(), 0);
+        assert_eq!(rejected_drops.get(), 1);
+        assert_eq!(filler_drops.get(), TASKS_PER_SLAB - 1);
+        assert!(filler_polls.get() >= TASKS_PER_SLAB - 1);
     }
 }

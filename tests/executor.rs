@@ -2,16 +2,19 @@ use flowio::net::unix::UnixStream;
 use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
 use flowio::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
-use flowio::runtime::executor::{Executor, ExecutorConfig};
+use flowio::runtime::executor::{Executor, ExecutorConfig, TrySpawnError};
 use flowio::runtime::io::{Nop, NopSlot};
 use flowio::runtime::op::CompletionState;
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::task::TaskHeader;
 use flowio::runtime::timer::{sleep, sleep_until, timeout, timeout_at};
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 fn new_executor() -> Executor {
@@ -141,6 +144,40 @@ unsafe impl<const LEN: usize> IoBuffReadOnly for SmallTrackedReadOnly<LEN> {
 
     fn len(&self) -> usize {
         LEN
+    }
+}
+
+struct RecoverableSpawnFuture<const PAD: usize> {
+    id: usize,
+    drops: Rc<Cell<usize>>,
+    polls: Rc<Cell<usize>>,
+    _pad: [u8; PAD],
+}
+
+impl<const PAD: usize> RecoverableSpawnFuture<PAD> {
+    fn new(id: usize, drops: &Rc<Cell<usize>>, polls: &Rc<Cell<usize>>) -> Self {
+        Self {
+            id,
+            drops: Rc::clone(drops),
+            polls: Rc::clone(polls),
+            _pad: [0; PAD],
+        }
+    }
+}
+
+impl<const PAD: usize> Future for RecoverableSpawnFuture<PAD> {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.polls.set(this.polls.get() + 1);
+        Poll::Ready(this.id)
+    }
+}
+
+impl<const PAD: usize> Drop for RecoverableSpawnFuture<PAD> {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
     }
 }
 
@@ -460,6 +497,148 @@ fn runtime_executor_runs_spawned_task_and_drains() {
         .expect("executor run failed");
 
     assert_eq!(completed.get(), 2, "did not drain both tasks");
+}
+
+#[test]
+fn runtime_try_spawn_returns_join_handle() {
+    let mut executor = new_executor();
+    let observed = Rc::new(Cell::new(0usize));
+    let observed_flag = observed.clone();
+
+    executor
+        .run(async move {
+            let handle = match Executor::try_spawn(async { 42usize }) {
+                Ok(handle) => handle,
+                Err(_) => panic!("try_spawn failed inside Executor::run"),
+            };
+            observed_flag.set(handle.await);
+        })
+        .expect("executor run failed");
+
+    assert_eq!(observed.get(), 42);
+}
+
+#[test]
+fn runtime_try_spawn_outside_run_returns_future() {
+    fn assert_std_error<E: std::error::Error>() {}
+
+    let drops = Rc::new(Cell::new(0usize));
+    let polls = Rc::new(Cell::new(0usize));
+
+    let future = RecoverableSpawnFuture::<0>::new(7, &drops, &polls);
+    let err = match Executor::try_spawn(future) {
+        Ok(_) => panic!("try_spawn should fail outside Executor::run"),
+        Err(err @ TrySpawnError::NoExecutor { .. }) => err,
+        Err(_) => panic!("try_spawn returned the wrong failure class"),
+    };
+
+    assert_std_error::<TrySpawnError<RecoverableSpawnFuture<0>>>();
+    assert_eq!(
+        format!("{err:?}"),
+        r#"TrySpawnError { kind: "NoExecutor", future: "<returned>" }"#
+    );
+    assert_eq!(
+        err.to_string(),
+        "no executor is currently active on this thread"
+    );
+
+    let returned = err.into_future();
+    assert_eq!(returned.id, 7);
+    assert_eq!(polls.get(), 0, "rejected future must not be polled");
+    assert_eq!(
+        drops.get(),
+        0,
+        "rejected future must be returned before being dropped"
+    );
+
+    drop(returned);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn runtime_try_spawn_task_too_large_returns_future() {
+    let mut executor = new_executor();
+    let drops = Rc::new(Cell::new(0usize));
+    let polls = Rc::new(Cell::new(0usize));
+    let returned_id = Rc::new(Cell::new(0usize));
+    let drops_flag = drops.clone();
+    let polls_flag = polls.clone();
+    let returned_id_flag = returned_id.clone();
+
+    executor
+        .run(async move {
+            let future = RecoverableSpawnFuture::<8192>::new(99, &drops_flag, &polls_flag);
+            let returned = match Executor::try_spawn(future) {
+                Ok(_) => panic!("oversized task should not spawn"),
+                Err(TrySpawnError::TaskTooLarge { future }) => future,
+                Err(_) => panic!("oversized task returned the wrong failure class"),
+            };
+
+            returned_id_flag.set(returned.id);
+            assert_eq!(
+                polls_flag.get(),
+                0,
+                "oversized rejected future must not be polled"
+            );
+            assert_eq!(
+                drops_flag.get(),
+                0,
+                "oversized rejected future must be returned before being dropped"
+            );
+            drop(returned);
+        })
+        .expect("executor run failed");
+
+    assert_eq!(returned_id.get(), 99);
+    assert_eq!(polls.get(), 0);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn runtime_spawn_preserves_existing_error_mapping() {
+    let drops = Rc::new(Cell::new(0usize));
+    let polls = Rc::new(Cell::new(0usize));
+
+    let err = match Executor::spawn(RecoverableSpawnFuture::<0>::new(1, &drops, &polls)) {
+        Ok(_) => panic!("spawn should fail outside Executor::run"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(polls.get(), 0);
+    assert_eq!(
+        drops.get(),
+        1,
+        "legacy spawn still consumes rejected futures"
+    );
+
+    let mut executor = new_executor();
+    let oversized_drops = Rc::new(Cell::new(0usize));
+    let oversized_polls = Rc::new(Cell::new(0usize));
+    let oversized_drops_flag = oversized_drops.clone();
+    let oversized_polls_flag = oversized_polls.clone();
+
+    executor
+        .run(async move {
+            let err = match Executor::spawn(RecoverableSpawnFuture::<8192>::new(
+                2,
+                &oversized_drops_flag,
+                &oversized_polls_flag,
+            )) {
+                Ok(_) => panic!("oversized spawn should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(oversized_polls_flag.get(), 0);
+            assert_eq!(
+                oversized_drops_flag.get(),
+                1,
+                "legacy spawn still consumes oversized rejected futures"
+            );
+        })
+        .expect("executor run failed");
+
+    assert_eq!(oversized_drops.get(), 1);
+    assert_eq!(oversized_polls.get(), 0);
 }
 
 #[test]
