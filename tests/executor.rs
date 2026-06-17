@@ -1,7 +1,8 @@
 use flowio::net::unix::UnixStream;
 use flowio::net::{WritevPieces, WritevProjection};
-use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
-use flowio::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
+use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
+use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
+use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::{Executor, ExecutorConfig, TrySpawnError};
 use flowio::runtime::io::{Nop, NopSlot};
 use flowio::runtime::op::CompletionState;
@@ -30,8 +31,12 @@ fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Execu
     .expect("failed to construct runtime executor")
 }
 
+/// Drop-tracking read-only buffer used by retained-payload tests.
+/// The counter proves the payload outlives the original CQE.
 struct DropTrackedReadOnly {
+    /// Payload bytes exposed through IoBuffReadOnly.
     bytes: Vec<u8>,
+    /// Shared drop counter bumped exactly once by Drop.
     drops: Rc<Cell<usize>>,
 }
 
@@ -60,9 +65,17 @@ unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
     }
 }
 
+/// Drop-tracking writable buffer used by retained read tests.
+///
+/// `written` mirrors the kernel-reported length through set_written_len so the
+/// test fixture still follows the buffer contract even when tests only assert
+/// drop timing.
 struct DropTrackedReadWrite {
+    /// Writable backing bytes.
     bytes: Vec<u8>,
+    /// Last length reported through set_written_len.
     written: usize,
+    /// Shared drop counter bumped exactly once by Drop.
     drops: Rc<Cell<usize>>,
 }
 
@@ -109,10 +122,13 @@ unsafe impl IoBuffReadOnly for StaticReadOnly {
     }
 }
 
+// Static per-test drop counters for large SmallTrackedReadOnly chains. The
+// segments move into kernel-retained operations, so they cannot borrow an Rc.
 static SMALL_TRACKED_DROPS_0: AtomicUsize = AtomicUsize::new(0);
 static SMALL_TRACKED_DROPS_1: AtomicUsize = AtomicUsize::new(0);
 static SMALL_TRACKED_DROPS_2: AtomicUsize = AtomicUsize::new(0);
 static SMALL_TRACKED_DROPS_3: AtomicUsize = AtomicUsize::new(0);
+// Shared static payload pages used by SmallTrackedReadOnly segments.
 static SMALL_TRACKED_BLOCKS: [[u8; 4096]; 4] =
     [[0x11; 4096], [0x22; 4096], [0x33; 4096], [0x44; 4096]];
 
@@ -126,8 +142,11 @@ fn small_tracked_drops(counter: u8) -> &'static AtomicUsize {
     }
 }
 
+/// Static read-only segment that increments its selected drop counter.
 struct SmallTrackedReadOnly<const LEN: usize> {
+    /// Index into SMALL_TRACKED_BLOCKS for the segment bytes.
     index: u8,
+    /// Which static drop counter to increment.
     counter: u8,
 }
 
@@ -147,6 +166,10 @@ unsafe impl<const LEN: usize> IoBuffReadOnly for SmallTrackedReadOnly<LEN> {
     }
 }
 
+/// Test future whose size is controlled by PAD.
+///
+/// PAD=0 fits the task slot; large PAD values force try_spawn/spawn to reject
+/// the future as TaskTooLarge while preserving ownership.
 struct RecoverableSpawnFuture<const PAD: usize> {
     id: usize,
     drops: Rc<Cell<usize>>,
@@ -183,11 +206,18 @@ impl<const PAD: usize> Drop for RecoverableSpawnFuture<PAD> {
 
 static PROJECTED_SOURCE_DROPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Test WritevProjection source with independently controlled reported and
+/// projected lengths so rejection tests can fabricate mismatches.
 struct ProjectedBytes<const N: usize> {
+    /// Backing bytes projected one byte per piece.
     bytes: [u8; N],
+    /// Piece count reported by writev_count_and_len.
     counted_pieces: usize,
+    /// Total bytes reported by writev_count_and_len.
     counted_total: usize,
+    /// Actual number of bytes pushed by project_writev.
     projected_len: usize,
+    /// Whether Drop should increment PROJECTED_SOURCE_DROPS.
     track_drop: bool,
 }
 
@@ -282,6 +312,8 @@ impl<const N: usize, const LEN: usize> WritevProjection for ProjectedStaticSegme
 }
 
 async fn fill_unix_send_buffer(writer: &mut UnixStream) {
+    // Timeout is the success signal: it establishes socket backpressure so the
+    // next write/writev blocks and can be cancelled.
     loop {
         let buf = vec![0xAAu8; 65536];
         let result = timeout(Duration::from_millis(5), async {
@@ -299,6 +331,7 @@ async fn fill_unix_send_buffer(writer: &mut UnixStream) {
 }
 
 async fn wait_for_drop_count(drops: &Rc<Cell<usize>>, expected: usize) {
+    // Wait for the original CQE to retire and free the retained payload.
     for _ in 0..100 {
         if drops.get() == expected {
             return;
@@ -328,10 +361,43 @@ fn tracked_chain<const N: usize>(
     chain
 }
 
+fn read_chain<const N: usize>(segments: [usize; N]) -> IoBuffVecMut<N> {
+    let mut chain = IoBuffVecMut::new();
+    for len in segments {
+        chain
+            .push(IoBuffMut::new(0, len, 0).expect("read segment allocation failed"))
+            .unwrap_or_else(|_| panic!("read chain has enough capacity"));
+    }
+    chain
+}
+
+fn spawn_stalling_writer(mut writer: UnixStream, chunk_len: usize) -> Rc<Cell<bool>> {
+    // Sends optional priming bytes, then parks until released so read tests
+    // control when a cancelled operation's original CQE can retire.
+    let release = Rc::new(Cell::new(false));
+    let release_flag = release.clone();
+    Executor::spawn(async move {
+        if chunk_len != 0 {
+            let chunk = vec![0xDDu8; chunk_len];
+            let (res, _chunk) = writer.write_all(chunk).await;
+            let _ = res;
+        }
+        while !release_flag.get() {
+            sleep(Duration::from_millis(5))
+                .await
+                .expect("stalling writer sleep failed");
+        }
+    })
+    .expect("spawn stalling writer failed");
+    release
+}
+
 fn small_tracked_chain<const N: usize, const LEN: usize>(
     counter: u8,
     start_index: usize,
 ) -> (IoBuffReadOnlyVec<SmallTrackedReadOnly<LEN>, N>, Vec<u8>) {
+    // Build N static segments plus the expected flattened payload. `counter`
+    // selects which static drop counter the segments increment.
     let mut chain = IoBuffReadOnlyVec::new();
     let mut expected = Vec::with_capacity(N * LEN);
     for i in 0..N {
@@ -892,7 +958,6 @@ fn runtime_concurrent_io_tasks() {
                 let done = completed_flag.clone();
                 let (mut pinger, mut ponger) = UnixStream::pair().expect("socketpair failed");
 
-                // Spawn ponger.
                 Executor::spawn(async move {
                     for _ in 0..rounds {
                         let buf = vec![0u8; msg_size];
@@ -904,7 +969,6 @@ fn runtime_concurrent_io_tasks() {
                 })
                 .expect("spawn ponger failed");
 
-                // Spawn pinger.
                 Executor::spawn(async move {
                     let mut data = vec![0xAAu8; msg_size];
                     for _ in 0..rounds {
@@ -1083,6 +1147,8 @@ fn runtime_cancel_in_flight_read_on_drop() {
         .expect("executor run failed");
 }
 
+/// A read cancelled by timeout must retain its payload until the original CQE
+/// retires; the cancel CQE does not free kernel-visible memory.
 #[test]
 fn runtime_cancelled_read_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
@@ -1112,7 +1178,40 @@ fn runtime_cancelled_read_retains_payload_until_original_cqe() {
         .expect("executor run failed");
 }
 
-/// Dropping a single write future mid-flight cancels the operation cleanly.
+/// Same retain invariant as the timeout variant, but the read is dropped
+/// directly after one manual poll with its SQE already in flight.
+#[test]
+fn runtime_drop_polled_read_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadWrite::new(vec![0; 65536], &drops);
+            let mut read = Box::pin(reader.read(tracked, 65536));
+            std::future::poll_fn(|cx| match Future::poll(read.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("read completed before cancellation point"),
+            })
+            .await;
+
+            drop(read);
+            assert_eq!(
+                drops.get(),
+                0,
+                "read payload dropped while original SQE was live"
+            );
+
+            drop(writer);
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("executor run failed");
+}
+
+/// Fills the send buffer until a timed write blocks, then verifies the
+/// executor stays healthy after that in-flight write is cancelled.
 #[test]
 fn runtime_cancel_in_flight_write_on_drop() {
     let mut executor = new_executor();
@@ -1433,6 +1532,91 @@ fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
         assert_eq!(
             stats.retained_heap_fallbacks, 0,
             "512 writev should not heap-fallback after sidecar scratch split"
+        );
+    }
+}
+
+#[test]
+fn runtime_readv_64_uses_sidecar_scratch_without_heap_fallback() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let expected: Vec<u8> = (0..64).map(|i| (i % 251) as u8).collect();
+
+            let (res, _buf) = writer.write_all(expected.clone()).await;
+            assert_eq!(res.expect("64 readv writer failed"), expected.len());
+
+            let (res, chain) = reader.readv(read_chain([1usize; 64])).await;
+            assert_eq!(res.expect("64 readv failed"), expected.len());
+            assert_eq!(chain.segments(), 64);
+            for (index, expected_byte) in expected.iter().copied().enumerate() {
+                let segment = chain.get(index).expect("readv segment should exist");
+                assert_eq!(segment.payload_bytes(), &[expected_byte]);
+            }
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        println!(
+            "64 readv retained stats: payload_heap={}, scratch_pooled={}, scratch_slab={}, scratch_frees={}",
+            stats.retained_heap_fallbacks,
+            stats.writev_scratch_pooled_allocs,
+            stats.writev_scratch_slab_allocs,
+            stats.writev_scratch_pooled_frees
+        );
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "64 readv should allocate sidecar scratch"
+        );
+        assert_eq!(
+            stats.writev_scratch_oversize_rejections, 0,
+            "64 readv should fit supported scratch classes"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "64 readv should not heap-fallback after sidecar scratch split"
+        );
+    }
+}
+
+#[test]
+fn runtime_readv_exact_64_uses_sidecar_scratch_without_heap_fallback() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let expected: Vec<u8> = (0..64).map(|i| (i % 251) as u8).collect();
+
+            let (res, _buf) = writer.write_all(expected.clone()).await;
+            assert_eq!(res.expect("64 readv_exact writer failed"), expected.len());
+
+            let (res, chain) = reader
+                .readv_exact(read_chain([1usize; 64]), expected.len())
+                .await;
+            assert_eq!(res.expect("64 readv_exact failed"), expected.len());
+            assert_eq!(chain.segments(), 64);
+            for (index, expected_byte) in expected.iter().copied().enumerate() {
+                let segment = chain.get(index).expect("readv_exact segment should exist");
+                assert_eq!(segment.payload_bytes(), &[expected_byte]);
+            }
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.writev_scratch_pooled_allocs >= 1,
+            "64 readv_exact should allocate sidecar scratch"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "64 readv_exact should not heap-fallback after sidecar scratch split"
         );
     }
 }
@@ -1764,6 +1948,8 @@ fn runtime_writev_all_projected_large_512_advances_across_iovec_boundaries() {
         .expect("executor run failed");
 }
 
+/// A write cancelled under backpressure must retain its payload until the
+/// original CQE retires; dropping the peer lets that CQE complete.
 #[test]
 fn runtime_cancelled_write_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
@@ -1794,6 +1980,41 @@ fn runtime_cancelled_write_retains_payload_until_original_cqe() {
         .expect("executor run failed");
 }
 
+/// A backpressured write dropped directly after one manual poll must not free
+/// its payload until the original CQE retires.
+#[test]
+fn runtime_drop_polled_write_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(vec![0x11; 65536], &drops);
+            let mut write = Box::pin(writer.write(tracked));
+            std::future::poll_fn(|cx| match Future::poll(write.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("write completed before cancellation point"),
+            })
+            .await;
+
+            drop(write);
+            assert_eq!(
+                drops.get(),
+                0,
+                "write payload dropped while original SQE was live"
+            );
+
+            drop(reader);
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("executor run failed");
+}
+
+/// write_all cancellation must also retain the large payload across any
+/// partial-write bookkeeping until the original CQE retires.
 #[test]
 fn runtime_cancelled_write_all_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
@@ -1827,6 +2048,8 @@ fn runtime_cancelled_write_all_retains_payload_until_original_cqe() {
         .expect("executor run failed");
 }
 
+/// writev cancellation under backpressure retains the full read-only segment
+/// chain until the original CQE retires.
 #[test]
 fn runtime_cancelled_writev_read_only_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
@@ -1856,6 +2079,37 @@ fn runtime_cancelled_writev_read_only_retains_payload_until_original_cqe() {
         .expect("executor run failed");
 }
 
+/// A manually polled writev dropped in flight keeps both read-only segments
+/// alive until the original CQE retires.
+#[test]
+fn runtime_drop_polled_writev_read_only_retains_payload_until_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            fill_unix_send_buffer(&mut writer).await;
+
+            let drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([vec![0x33; 32768], vec![0x44; 32768]], &drops);
+            let mut writev = Box::pin(writer.writev_read_only(chain));
+            std::future::poll_fn(|cx| match Future::poll(writev.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("writev_read_only completed before cancellation point"),
+            })
+            .await;
+
+            drop(writev);
+            assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
+
+            drop(reader);
+            wait_for_drop_count(&drops, 2).await;
+        })
+        .expect("executor run failed");
+}
+
+/// writev_all cancellation retains all segments across retry bookkeeping until
+/// the original CQE retires.
 #[test]
 fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
@@ -1885,6 +2139,8 @@ fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
         .expect("executor run failed");
 }
 
+/// 512-segment writev cancellation retains both payload and sidecar iovec
+/// scratch until the original CQE retires; the CQE may retire during timeout.
 #[test]
 fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_original_cqe() {
     let mut executor = new_executor();
@@ -1958,6 +2214,8 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
     }
 }
 
+/// Projected writev cancellation retains the compact projection source and
+/// sidecar scratch until the original CQE retires.
 #[test]
 fn runtime_cancelled_writev_projected_512_retains_source_and_scratch_until_original_cqe() {
     let mut executor = new_executor();
@@ -2037,20 +2295,16 @@ fn runtime_cancel_read_exact_mid_flight() {
 
     executor
         .run(async move {
-            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair failed");
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
 
-            // Spawn a writer that sends some data, then stalls forever.
-            Executor::spawn(async move {
-                let chunk = vec![0xDDu8; 65536];
-                let (res, _chunk) = writer.write_all(chunk).await;
-                let _ = res;
-                sleep(Duration::from_secs(10)).await.unwrap();
-            })
-            .expect("spawn writer failed");
+            // Spawn a writer that sends some data, then stalls until the test
+            // releases it so the cancelled read's original CQE can retire.
+            let release_writer = spawn_stalling_writer(writer, 4096);
 
             sleep(Duration::from_millis(1)).await.unwrap();
 
-            let big = vec![0u8; 1024 * 1024];
+            let drops = Rc::new(Cell::new(0));
+            let big = DropTrackedReadWrite::new(vec![0u8; 1024 * 1024], &drops);
             let result = timeout(Duration::from_millis(50), async {
                 let (res, _buf) = reader.read_exact(big, 1024 * 1024).await;
                 res
@@ -2058,10 +2312,151 @@ fn runtime_cancel_read_exact_mid_flight() {
             .await;
 
             assert!(result.is_err(), "read_exact should have timed out");
+            assert_eq!(
+                drops.get(),
+                0,
+                "read_exact destination buffer dropped while original SQE was live"
+            );
 
-            sleep(Duration::from_millis(5))
+            release_writer.set(true);
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("executor run failed");
+}
+
+/// read_exact_append cancelled with no priming bytes must cancel the
+/// outstanding SQE cleanly and keep the executor usable.
+#[test]
+fn runtime_cancel_read_exact_append_mid_flight() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+            let release_writer = spawn_stalling_writer(writer, 0);
+
+            let recv = IoBuffMut::new(0, 1024 * 1024, 0).expect("recv buffer allocation failed");
+            let result = timeout(Duration::from_millis(50), async {
+                let (res, _buf) = reader.read_exact_append(recv, 1024 * 1024).await;
+                res
+            })
+            .await;
+
+            assert!(result.is_err(), "read_exact_append should have timed out");
+
+            release_writer.set(true);
+            sleep(Duration::from_millis(10))
                 .await
-                .expect("post-cancel sleep failed");
+                .expect("post-cancel append sleep failed");
+        })
+        .expect("executor run failed");
+}
+
+/// readv cancellation must cancel the outstanding SQE cleanly; releasing the
+/// stalled writer retires the original CQE.
+#[test]
+fn runtime_cancel_readv_mid_flight() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+            let release_writer = spawn_stalling_writer(writer, 0);
+
+            let recv = read_chain([512 * 1024, 512 * 1024]);
+            let result = timeout(Duration::from_millis(50), async {
+                let (res, _chain) = reader.readv(recv).await;
+                res
+            })
+            .await;
+
+            assert!(result.is_err(), "readv should have timed out");
+
+            release_writer.set(true);
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("post-cancel readv sleep failed");
+        })
+        .expect("executor run failed");
+}
+
+/// Dropping an in-flight readv must keep its pool-backed destination buffers
+/// checked out until the original CQE retires.
+#[test]
+fn runtime_drop_polled_readv_cleans_up_after_original_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+            let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 4096,
+                tailroom: 0,
+                objs_per_slab: 2,
+            })
+            .expect("pool config invalid");
+            pool.init();
+            let recv = IoBuffVecMut::<2>::from_array([
+                pool.alloc().expect("first pool alloc failed"),
+                pool.alloc().expect("second pool alloc failed"),
+            ]);
+            assert_eq!(pool.live_slots_for_test(), 2);
+
+            let mut readv = Box::pin(reader.readv(recv));
+            std::future::poll_fn(|cx| match Future::poll(readv.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("readv completed before cancellation point"),
+            })
+            .await;
+
+            drop(readv);
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "readv buffers were released before the original CQE retired"
+            );
+
+            drop(writer);
+            for _ in 0..100 {
+                if pool.live_slots_for_test() == 0 {
+                    return;
+                }
+                sleep(Duration::from_millis(5))
+                    .await
+                    .expect("post-drop readv sleep failed");
+            }
+            panic!("readv buffers were not released after the original CQE retired");
+        })
+        .expect("executor run failed");
+}
+
+/// readv_exact cancelled after partial progress must cancel the outstanding
+/// SQE cleanly and keep the executor usable after peer release.
+#[test]
+fn runtime_cancel_readv_exact_mid_flight() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+            let release_writer = spawn_stalling_writer(writer, 4096);
+
+            sleep(Duration::from_millis(1)).await.unwrap();
+
+            let recv = read_chain([512 * 1024, 512 * 1024]);
+            let result = timeout(Duration::from_millis(50), async {
+                let (res, _chain) = reader.readv_exact(recv, 1024 * 1024).await;
+                res
+            })
+            .await;
+
+            assert!(result.is_err(), "readv_exact should have timed out");
+
+            release_writer.set(true);
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("post-cancel readv_exact sleep failed");
         })
         .expect("executor run failed");
 }

@@ -1,6 +1,7 @@
 mod common;
 
 use common::TestIoBuffMut as IoBuffMut;
+use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
 use flowio::runtime::buffer::{
     IoBuff, IoBuffError, IoBuffMut as RealIoBuffMut, IoBuffOwnedView, IoBuffReadOnly,
     IoBuffReadWrite, IoBuffView,
@@ -737,6 +738,8 @@ fn buffer_frozen_owned_view_unbounded_and_inclusive_ranges() {
     assert_eq!(to_end.bytes(), b"cdef");
 }
 
+/// On out-of-bounds, into_owned_view returns the original buffer in the error
+/// tuple without retaining or dropping it, so unique ownership is preserved.
 #[test]
 fn buffer_frozen_owned_view_out_of_bounds_returns_original() {
     let mut buf = IoBuffMut::new(0, 8, 0);
@@ -756,6 +759,8 @@ fn buffer_frozen_owned_view_out_of_bounds_returns_original() {
     );
 }
 
+/// Sole-owner into_owned_view does not bump the refcount; after into_inner,
+/// try_mut recovers the original allocation in place.
 #[test]
 fn buffer_frozen_owned_view_from_sole_owner_does_not_retain() {
     let mut buf = IoBuffMut::new(0, 16, 0);
@@ -889,9 +894,8 @@ fn buffer_frozen_make_mut_copies_when_shared() {
     assert_eq!(exclusive.bytes(), b"original");
     assert_eq!(clone.bytes(), b"original");
 
-    // Note: make_mut creates a tight copy (payload_capacity = len), so we
-    // can't append without creating a new buffer.  The important invariant is
-    // that the copy is independent from the clone.
+    // IoBuff::make_mut preserves the original headroom/payload/tailroom
+    // capacities. The key invariant here is independence from the clone.
     drop(exclusive);
     assert_eq!(clone.bytes(), b"original");
 }
@@ -1184,7 +1188,11 @@ fn trait_static_slice_read_only() {
 #[test]
 fn buffer_types_are_not_send() {
     assert_not_impl_any!(RealIoBuffMut: Send);
-    assert_not_impl_any!(flowio::runtime::buffer::IoBuff: Send);
+    assert_not_impl_any!(IoBuff: Send);
+    assert_not_impl_any!(IoBuffView: Send);
+    assert_not_impl_any!(IoBuffOwnedView: Send);
+    assert_not_impl_any!(IoBuffVecMut<1>: Send);
+    assert_not_impl_any!(IoBuffVec<1>: Send);
 }
 
 // ============================================================================

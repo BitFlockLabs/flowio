@@ -3,6 +3,8 @@ mod utils {
 }
 
 #[allow(dead_code)]
+// RetainedPayloadPool is crate-internal; include the module source directly
+// so this white-box test can exercise its pool and fallback behavior.
 #[path = "../src/runtime/retained.rs"]
 mod retained;
 
@@ -10,8 +12,14 @@ use retained::RetainedPayloadPool;
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// Payload fixture that counts its own drops.
+///
+/// Retained-payload tests use this to distinguish take(), which moves a value
+/// out without dropping it, from drop_and_free(), which drops in place.
 struct DropTracked {
+    /// Inner value used to prove take() returns the original payload.
     value: usize,
+    /// Shared drop counter bumped by Drop.
     drops: Rc<Cell<usize>>,
 }
 
@@ -31,6 +39,8 @@ impl Drop for DropTracked {
 }
 
 #[repr(align(128))]
+// Alignment exceeds the retained pool's 64-byte max class alignment and
+// forces the heap-fallback path.
 struct OverAligned([u8; 64]);
 
 #[test]
@@ -67,6 +77,8 @@ fn retained_payload_pool_reuses_returned_block() {
     assert_eq!(stats.pooled_frees, 2);
 }
 
+/// take() moves the payload out of pooled storage without dropping it; the
+/// block is still returned to the pool.
 #[test]
 fn retained_payload_take_moves_value_without_dropping_it() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
@@ -85,6 +97,8 @@ fn retained_payload_take_moves_value_without_dropping_it() {
     assert_eq!(stats.pooled_frees, 1);
 }
 
+/// drop_and_free() runs the payload's Drop exactly once and returns the block
+/// to the pool, unlike take(), which moves the value out.
 #[test]
 fn retained_payload_drop_and_free_drops_value_once() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
@@ -117,6 +131,7 @@ fn retained_payload_pool_allocates_larger_payload_classes_on_demand() {
 #[test]
 fn retained_payload_pool_uses_heap_for_oversized_payloads() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    // One byte over the largest size class (65536) must use heap fallback.
     let payload = pool.alloc([9u8; 65537]);
     assert_eq!(unsafe { payload.as_ref() }[0], 9);
     unsafe { payload.drop_and_free(&mut pool) };
@@ -158,6 +173,7 @@ fn retained_payload_pool_uses_heap_for_overaligned_payloads() {
 #[test]
 fn retained_payload_pool_requests_new_slab_after_class_exhaustion() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    // One more than a full 64KiB slab of 4096-byte blocks forces a second slab.
     let count = 64 * 1024 / 4096 + 1;
     let mut payloads = Vec::with_capacity(count);
 
@@ -179,6 +195,7 @@ fn retained_payload_pool_requests_new_slab_after_class_exhaustion() {
 #[test]
 fn retained_iovec_scratch_uses_inline_for_small_counts() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    // Counts up to the inline threshold (16) use embedded scratch, not a pool.
     let mut scratch = pool
         .alloc_iovec_scratch(16)
         .expect("inline scratch allocation failed");
@@ -241,6 +258,7 @@ fn retained_iovec_scratch_reuses_returned_sidecar_block() {
 #[test]
 fn retained_iovec_scratch_rejects_oversized_count() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    // 1025 exceeds the retained iovec cap (1024) and is rejected up front.
     let err = match pool.alloc_iovec_scratch(1025) {
         Ok(_) => panic!("oversized scratch request should fail"),
         Err(err) => err,

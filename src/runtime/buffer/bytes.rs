@@ -14,6 +14,18 @@
 //! For one-byte values (`u8` and `i8`), the `_le` and `_be` variants are
 //! aliases for the native helper. They exist for API completeness.
 //!
+//! # Fast-Path Guidance
+//!
+//! These helpers are allocation-free and check bounds before every access. Use
+//! the explicit `_be` / `_le` helpers in protocol parsers and encoders so wire
+//! byte order is visible at the call site. Use [`BufferCursor`] and
+//! [`BufferCursorMut`] for sequential frames when a cursor makes progress
+//! tracking simpler than repeated offsets.
+//!
+//! Prefer not to use native-endian helpers for wire or file formats. Prefer
+//! not to open-code indexing in protocol parsers when one of these checked
+//! helpers expresses the same access.
+//!
 //! # Slice Example
 //! ```
 //! use flowio::runtime::buffer::bytes::{read_u32_le_at, write_u32_le_at};
@@ -42,6 +54,21 @@
 use std::fmt;
 
 /// Error returned when a checked byte read/write would exceed a buffer.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::bytes::{BufferRangeError, ByteReadAt};
+///
+/// let err = [0u8; 2].read_u32_be_at(0).unwrap_err();
+/// assert_eq!(
+///     err,
+///     BufferRangeError {
+///         offset: 0,
+///         width: 4,
+///         len: 2,
+///     }
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferRangeError {
     /// Requested byte offset.
@@ -439,8 +466,21 @@ macro_rules! write_trait_impl {
 ///
 /// Reads advance the cursor only on success. Failed reads leave the position
 /// unchanged.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::bytes::BufferCursor;
+///
+/// let frame = [0x12, 0x34, 0x56];
+/// let mut cursor = BufferCursor::new(&frame);
+/// assert_eq!(cursor.get_u16_be().unwrap(), 0x1234);
+/// assert_eq!(cursor.get_u8().unwrap(), 0x56);
+/// assert_eq!(cursor.remaining(), 0);
+/// ```
 pub struct BufferCursor<'a> {
+    /// Source bytes read by this cursor.
     src: &'a [u8],
+    /// Current read offset into `src`.
     position: usize,
 }
 
@@ -602,8 +642,24 @@ impl<'a> BufferCursor<'a> {
 ///
 /// Writes advance the cursor only on success. Failed writes leave the
 /// position and destination bytes unchanged.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::bytes::BufferCursorMut;
+///
+/// let mut frame = [0u8; 3];
+/// {
+///     let mut cursor = BufferCursorMut::new(&mut frame);
+///     cursor.put_u16_be(0x1234).unwrap();
+///     cursor.put_u8(0x56).unwrap();
+///     assert_eq!(cursor.position(), 3);
+/// }
+/// assert_eq!(frame, [0x12, 0x34, 0x56]);
+/// ```
 pub struct BufferCursorMut<'a> {
+    /// Destination bytes written by this cursor.
     dst: &'a mut [u8],
+    /// Current write offset into `dst`.
     position: usize,
 }
 
@@ -766,6 +822,15 @@ impl<'a> BufferCursorMut<'a> {
 /// This trait is blanket-implemented for every `T: AsRef<[u8]>`, including
 /// slices, `Vec<u8>`, `Box<[u8]>`, `IoBuff`, `IoBuffMut`, `IoBuffView`, and
 /// `IoBuffOwnedView`.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::bytes::ByteReadAt;
+///
+/// let frame = [0x12, 0x34, 0x00, 0x2a];
+/// assert_eq!(frame.read_u16_be_at(0).unwrap(), 0x1234);
+/// assert_eq!(frame.read_u16_be_at(2).unwrap(), 42);
+/// ```
 pub trait ByteReadAt {
     read_trait_methods!(u8, read_u8_at, read_u8_le_at, read_u8_be_at);
     read_trait_methods!(i8, read_i8_at, read_i8_le_at, read_i8_be_at);
@@ -901,6 +966,16 @@ impl<T: AsRef<[u8]> + ?Sized> ByteReadAt for T {
 /// window exposed by `bytes_mut()` / `AsMut<[u8]>`. To encode into spare
 /// unwritten payload capacity, write through `payload_unwritten_mut()` and
 /// then commit the initialized length with `payload_set_len()`.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::bytes::ByteWriteAt;
+///
+/// let mut frame = [0u8; 4];
+/// frame.write_u16_be_at(0, 0x1234).unwrap();
+/// frame.write_u16_be_at(2, 42).unwrap();
+/// assert_eq!(frame, [0x12, 0x34, 0x00, 0x2a]);
+/// ```
 pub trait ByteWriteAt {
     write_trait_methods!(u8, write_u8_at, write_u8_le_at, write_u8_be_at);
     write_trait_methods!(i8, write_i8_at, write_i8_le_at, write_i8_be_at);

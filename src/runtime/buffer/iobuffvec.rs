@@ -76,8 +76,23 @@ use std::mem::MaybeUninit;
 /// otherwise recover ownership. This is especially important for buffer
 /// handles, where dropping on overflow would silently release caller-owned I/O
 /// storage.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
+/// use flowio::runtime::buffer::{IoBuffMut, IoBuffReadWrite};
+///
+/// let mut chain = IoBuffVecMut::<1>::new();
+/// chain.push(IoBuffMut::new(0, 8, 0).unwrap()).unwrap();
+///
+/// let err = chain.push(IoBuffMut::new(0, 8, 0).unwrap()).unwrap_err();
+/// let recovered = err.into_value();
+/// assert_eq!(recovered.writable_len(), 8);
+/// ```
 pub struct PushError<T> {
+    /// Reason the value could not be pushed.
     error: IoBuffError,
+    /// Original value returned to the caller intact.
     value: T,
 }
 
@@ -140,6 +155,19 @@ impl<T> std::fmt::Debug for PushError<T> {
 /// This is the right receive-side container when the transport API is
 /// vectored and the application already wants multiple destination segments.
 /// For one contiguous read buffer, [`IoBuffMut`] is the fast-path alternative.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
+/// use flowio::runtime::buffer::IoBuffMut;
+///
+/// let chain = IoBuffVecMut::<2>::from_array([
+///     IoBuffMut::new(0, 8, 0).unwrap(),
+///     IoBuffMut::new(0, 8, 0).unwrap(),
+/// ]);
+/// assert_eq!(chain.segments(), 2);
+/// assert_eq!(chain.writable_len(), 16);
+/// ```
 pub struct IoBuffVecMut<const N: usize> {
     /// Inline array of buffer segment handles. Only indices `0..count`
     /// are initialized.
@@ -256,13 +284,17 @@ impl<const N: usize> IoBuffVecMut<N> {
         total
     }
 
-    /// Fills a caller-provided `iovec` scratch array for `readv`/`recvmsg`.
+    /// Fills caller-provided `iovec` scratch for `readv`/`recvmsg`.
     ///
     /// Returns `(iov_count, total_writable)` for the initialized entries.
     pub(crate) fn fill_read_iovecs_and_writable_len(
         &mut self,
-        dst: &mut [MaybeUninit<libc::iovec>; N],
+        dst: &mut [MaybeUninit<libc::iovec>],
     ) -> (usize, usize) {
+        debug_assert!(
+            dst.len() >= self.count,
+            "readv scratch has fewer entries than active segments"
+        );
         let mut total = 0;
         for (i, slot) in dst.iter_mut().enumerate().take(self.count) {
             let buf = unsafe { self.buffers[i].assume_init_mut() };
@@ -276,14 +308,21 @@ impl<const N: usize> IoBuffVecMut<N> {
         (self.count, total)
     }
 
-    /// Distributes `total_bytes` across the segments in order, setting each
+    /// Distributes `total_bytes` across the segments in order, adding to each
     /// buffer's payload length. The kernel fills iovecs sequentially.
     ///
     /// # Safety
     /// The caller must guarantee that the first `total_bytes` bytes across
     /// the materialized iovec array have been initialized by the kernel.
     pub unsafe fn distribute_written(&mut self, total_bytes: usize) {
-        let mut remaining = total_bytes;
+        let writable = self.writable_len();
+        debug_assert!(
+            total_bytes <= writable,
+            "distribute_written({}) exceeds writable capacity {}",
+            total_bytes,
+            writable
+        );
+        let mut remaining = std::cmp::min(total_bytes, writable);
         for i in 0..self.count {
             let buf = unsafe { self.buffers[i].assume_init_mut() };
             let cap = buf.payload_remaining();
@@ -345,6 +384,21 @@ impl<const N: usize> Drop for IoBuffVecMut<N> {
 /// This is the right send-side container when bytes are already segmented. For
 /// one contiguous payload, a single [`IoBuff`] or [`IoBuffMut`] is the simpler
 /// fast-path alternative.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::iobuffvec::IoBuffVec;
+/// use flowio::runtime::buffer::IoBuffMut;
+///
+/// let mut first = IoBuffMut::new(0, 8, 0).unwrap();
+/// first.payload_append(b"ab").unwrap();
+/// let mut second = IoBuffMut::new(0, 8, 0).unwrap();
+/// second.payload_append(b"cd").unwrap();
+///
+/// let chain: IoBuffVec<2> = [first.freeze(), second.freeze()].into();
+/// assert_eq!(chain.segments(), 2);
+/// assert_eq!(chain.len(), 4);
+/// ```
 pub struct IoBuffVec<const N: usize> {
     /// Inline array of frozen segment handles. Only indices `0..count` are
     /// initialized.
@@ -449,7 +503,9 @@ impl<const N: usize> IoBuffVec<N> {
 
     /// Fills a caller-provided `iovec` scratch array for `writev`/`sendmsg`.
     ///
-    /// Returns `(iov_count, total_len)` for the initialized entries.
+    /// Returns `(iov_count, total_len)` for the initialized entries. Empty
+    /// segments contribute to `total_len` but do not produce iovec entries, so
+    /// `iov_count` can be smaller than the segment count.
     pub(crate) fn fill_write_iovecs_and_len(
         &self,
         dst: &mut [MaybeUninit<libc::iovec>; N],
@@ -541,6 +597,16 @@ impl<const N: usize> Drop for IoBuffVec<N> {
 /// future. That preserves the [`IoBuffReadOnly`] pointer-stability contract
 /// while an SQE is in flight, and the future returns the chain alongside the
 /// I/O result so callers can recover or reuse the original buffers.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
+///
+/// let chain: IoBuffReadOnlyVec<Vec<u8>, 2> =
+///     IoBuffReadOnlyVec::from_array([b"ab".to_vec(), b"cd".to_vec()]);
+/// assert_eq!(chain.segments(), 2);
+/// assert_eq!(chain.len(), 4);
+/// ```
 pub struct IoBuffReadOnlyVec<B: IoBuffReadOnly, const N: usize> {
     /// Inline array of read-only buffer handles. Only indices `0..count` are
     /// initialized.
@@ -683,6 +749,16 @@ impl<B: IoBuffReadOnly, const N: usize> IntoIterator for IoBuffReadOnlyVec<B, N>
 }
 
 /// Consuming iterator over a generic read-only vectored chain.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
+///
+/// let chain: IoBuffReadOnlyVec<Vec<u8>, 2> =
+///     [b"ab".to_vec(), b"cd".to_vec()].into();
+/// let pieces: Vec<Vec<u8>> = chain.into_iter().collect();
+/// assert_eq!(pieces, vec![b"ab".to_vec(), b"cd".to_vec()]);
+/// ```
 pub struct IoBuffReadOnlyVecIntoIter<B: IoBuffReadOnly, const N: usize> {
     /// Inline array moved out of the source chain. Entries in `index..count`
     /// remain initialized until yielded or dropped.

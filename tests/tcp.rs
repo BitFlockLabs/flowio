@@ -4,15 +4,22 @@ use common::{
     TestIoBuffMut as IoBuffMut, TestProjected, make_payload_chain, make_read_chain,
     make_read_only_chain, run_test,
 };
-use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
+use flowio::net::tcp::{
+    TcpConnector, TcpListener, TcpStream, test_accept_slot_drop_cached_state_closes_completed_fd,
+};
 use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
+use flowio::runtime::timer::sleep;
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
 use std::os::fd::IntoRawFd;
+use std::task::Poll;
 use std::time::Duration;
 
+/// Spawns a std TCP peer that connects, verifies the payload it receives, and
+/// writes a fixed response.
 fn spawn_std_tcp_peer(
     addr: SocketAddr,
     expected_recv: Vec<u8>,
@@ -29,6 +36,8 @@ fn spawn_std_tcp_peer(
     })
 }
 
+/// Returns a FlowIO TcpStream wrapping an accepted nonblocking std socket plus
+/// its connected std peer for try_* tests that do not need a reactor.
 fn connected_try_tcp_stream() -> (TcpStream, std::net::TcpStream) {
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
@@ -41,6 +50,34 @@ fn connected_try_tcp_stream() -> (TcpStream, std::net::TcpStream) {
     (TcpStream::from_raw_fd(stream.into_raw_fd()), peer)
 }
 
+/// Asserts that the runtime closed an orphaned accepted fd by observing EOF or
+/// reset on the connected peer, with a bounded poll loop.
+async fn wait_for_tcp_peer_close(mut stream: std::net::TcpStream) {
+    stream
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+    let mut byte = [0u8; 1];
+    for _ in 0..100 {
+        match stream.read(&mut byte) {
+            Ok(0) => return,
+            Ok(n) => panic!("orphaned accept peer unexpectedly read {n} bytes"),
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::Interrupted =>
+            {
+                sleep(Duration::from_millis(5))
+                    .await
+                    .expect("close wait sleep failed");
+            }
+            Err(err) if err.kind() == io::ErrorKind::ConnectionReset => return,
+            Err(err) => panic!("orphaned accept peer read failed unexpectedly: {err}"),
+        }
+    }
+    panic!("orphaned accept result fd was not closed");
+}
+
+/// Fills the socket send buffer with try_write until WouldBlock so callers can
+/// exercise full-socket paths.
 fn fill_try_send_buffer(stream: &mut TcpStream) -> (bool, Vec<u8>) {
     stream
         .set_send_buffer_size(4096)
@@ -68,6 +105,8 @@ fn fill_try_send_buffer(stream: &mut TcpStream) -> (bool, Vec<u8>) {
     panic!("socket send buffer did not fill within bounded attempts");
 }
 
+// Reported length disagrees with projected pieces, so try_writev_projected
+// must reject it as InvalidInput.
 struct TryMismatchedProjected;
 
 impl WritevProjection for TryMismatchedProjected {
@@ -80,6 +119,7 @@ impl WritevProjection for TryMismatchedProjected {
     }
 }
 
+// Count exceeds the iovec cap and must be rejected before project_writev runs.
 struct TryOversizedProjected;
 
 impl WritevProjection for TryOversizedProjected {
@@ -138,7 +178,10 @@ fn runtime_tcp_try_read_eof() {
         buf = returned;
         match res {
             Ok(0) => {
-                assert!(buf.is_empty(), "EOF should set read buffer length to zero");
+                assert!(
+                    buf.is_empty(),
+                    "EOF reports 0 bytes read, so the written length is 0"
+                );
                 return;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
@@ -305,6 +348,41 @@ fn runtime_tcp_ping_pong() {
     });
 
     peer.join().expect("peer panicked");
+}
+
+/// Cancelling accept after a client connected can still leave a completed
+/// kernel accept result; the reactor must close that orphaned fd and keep the
+/// listener reusable.
+#[test]
+fn runtime_tcp_cancelled_accept_closes_orphan_fd_and_reaccepts() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+
+    run_test(async move {
+        let mut accept = Box::pin(listener.accept());
+        std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("accept completed before test client connected"),
+        })
+        .await;
+
+        let orphan_client = std::net::TcpStream::connect(addr).expect("orphan client connect");
+        drop(accept);
+        wait_for_tcp_peer_close(orphan_client).await;
+
+        let client = std::net::TcpStream::connect(addr).expect("second client connect");
+        let client_addr = client.local_addr().expect("client local_addr failed");
+        let (_stream, remote_addr) = listener.accept().await.expect("second accept failed");
+        assert_eq!(remote_addr, client_addr);
+    });
+}
+
+/// Teardown probe: a completed accept CQE held in AcceptSlot must close the
+/// orphaned accepted fd when dropped without being polled.
+#[test]
+fn tcp_accept_slot_drop_cached_state_closes_completed_fd() {
+    test_accept_slot_drop_cached_state_closes_completed_fd().unwrap();
 }
 
 #[test]

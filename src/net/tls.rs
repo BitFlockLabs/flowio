@@ -79,9 +79,10 @@
 //!     let (res, _send) = tls.write_all(b"hello".to_vec()).await;
 //!     res.unwrap();
 //!
+//!     // Application reply bytes come from the peer; this is only the receive shape.
 //!     let (res, recv) = tls.read_exact(vec![0u8; 5], 5).await;
 //!     res.unwrap();
-//!     assert_eq!(&recv[..], b"world");
+//!     let _reply = recv;
 //!
 //!     tls.shutdown().await.unwrap();
 //! })?;
@@ -107,6 +108,19 @@ use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+// 1.2.840.113549.1.1.4 md5WithRSAEncryption
+const RSA_PKCS1_MD5: &[u8] = &[
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x04, 0x05, 0x00,
+];
+// 1.2.840.113549.1.1.5 sha1WithRSAEncryption
+const RSA_PKCS1_SHA1: &[u8] = &[
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05, 0x05, 0x00,
+];
+// 1.2.840.10040.4.3 dsa-with-SHA1
+const DSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x03];
+// 1.2.840.10045.4.1 ecdsa-with-SHA1
+const ECDSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01];
 
 type PendingTlsRead = stream::ReadFuture<'static, Vec<u8>, TlsTransportMarker>;
 type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMarker>;
@@ -220,12 +234,27 @@ pub struct TlsClientStream {
     transport_write_shutdown: bool,
 }
 
+fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]]) -> bool {
+    candidates.contains(&signature_algorithm)
+}
+
 /// Derives RFC 5929 `tls-server-end-point` channel-binding bytes from an
 /// end-entity certificate DER blob.
 ///
 /// Returns `None` when the certificate uses a signature algorithm that does
 /// not define a usable digest for `tls-server-end-point`, such as Ed25519 or
 /// Ed448, or when the certificate DER is malformed.
+///
+/// This allocates the returned channel-binding bytes. Call it after the TLS
+/// handshake when a protocol needs the binding value; it is not steady-state
+/// I/O fast-path work.
+///
+/// # Example
+/// ```
+/// use flowio::net::tls::tls_server_end_point;
+///
+/// assert!(tls_server_end_point(&[]).is_none());
+/// ```
 pub fn tls_server_end_point(certificate_der: &[u8]) -> Option<Vec<u8>> {
     let signature_algorithm = extract_certificate_signature_algorithm(certificate_der)?;
 
@@ -233,17 +262,29 @@ pub fn tls_server_end_point(certificate_der: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    if signature_algorithm == RSA_PKCS1_SHA256.as_ref()
-        || signature_algorithm == ECDSA_SHA256.as_ref()
-        || signature_algorithm == RSA_PSS_SHA256.as_ref()
-    {
+    if matches_signature_algorithm(
+        signature_algorithm,
+        &[
+            RSA_PKCS1_MD5,
+            RSA_PKCS1_SHA1,
+            DSA_SHA1,
+            ECDSA_SHA1,
+            RSA_PKCS1_SHA256.as_ref(),
+            ECDSA_SHA256.as_ref(),
+            RSA_PSS_SHA256.as_ref(),
+        ],
+    ) {
         return Some(Sha256::digest(certificate_der).to_vec());
     }
 
-    if signature_algorithm == RSA_PKCS1_SHA384.as_ref()
-        || signature_algorithm == ECDSA_SHA384.as_ref()
-        || signature_algorithm == RSA_PSS_SHA384.as_ref()
-    {
+    if matches_signature_algorithm(
+        signature_algorithm,
+        &[
+            RSA_PKCS1_SHA384.as_ref(),
+            ECDSA_SHA384.as_ref(),
+            RSA_PSS_SHA384.as_ref(),
+        ],
+    ) {
         return Some(Sha384::digest(certificate_der).to_vec());
     }
 
@@ -438,6 +479,8 @@ impl TlsClientStream {
 
     /// Reads exactly `len` decrypted plaintext bytes into `buffer`.
     ///
+    /// # Errors
+    /// Returns `NotConnected` if the TLS handshake has not completed yet.
     /// Returns `UnexpectedEof` if the TLS session reaches EOF before `len`
     /// plaintext bytes become available.
     ///
@@ -458,6 +501,10 @@ impl TlsClientStream {
     /// The returned count may be short if rustls accepts only part of the
     /// supplied plaintext, for example because of the configured rustls buffer
     /// limit. Use [`Self::write_all`] when the full buffer must be accepted.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` if called before handshake completion and
+    /// `BrokenPipe` if the TLS write side has already been shut down.
     ///
     /// This is the lowest-overhead TLS write API when the caller can handle
     /// short plaintext writes.
@@ -500,8 +547,9 @@ impl TlsClientStream {
 
     /// Returns the end-entity certificate DER after handshake completion.
     ///
-    /// This is sufficient for a later `tls-server-end-point` channel-binding
-    /// implementation in a protocol-specific consumer such as PostgreSQL.
+    /// Callers can pass this to [`tls_server_end_point`] when a
+    /// protocol-specific consumer, such as PostgreSQL, needs that channel
+    /// binding value.
     /// Accessing this once after the handshake is the intended usage; it is
     /// not part of the steady-state I/O fast path.
     pub fn peer_end_entity_certificate_der(&self) -> Option<&[u8]> {

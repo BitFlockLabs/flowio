@@ -42,6 +42,7 @@ pub struct Link {
 }
 
 impl Link {
+    /// Creates a detached link with no successor.
     pub const fn new_unlinked() -> Self {
         Self {
             next: ptr::null_mut(),
@@ -55,6 +56,9 @@ impl Link {
 }
 
 /// Minimal intrusive singly linked list used by free lists and slab chains.
+///
+/// Unlike [`super::dlist::DList`], this list has no self-referential sentinel
+/// and is usable immediately after construction; [`SList::init`] is a no-op.
 pub struct SList<T> {
     /// First link in the list, or null when empty.
     head: *mut Link,
@@ -91,11 +95,11 @@ impl<T> SList<T> {
         self.head.is_null()
     }
 
-    #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
     /// to a detached `Link`.
+    #[inline(always)]
     pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
         debug_assert!(!node_link.is_null());
@@ -107,11 +111,16 @@ impl<T> SList<T> {
         }
     }
 
-    #[inline(always)]
+    /// Pushes `node_link` to the front without checking its detached state.
+    ///
+    /// Callers must track membership so the same link is never inserted into
+    /// two lists or inserted twice into this list.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a detached `Link`.
+    /// to a `Link` that is not currently linked into any list.
+    #[inline(always)]
     pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
         debug_assert!(!node_link.is_null());
@@ -123,11 +132,11 @@ impl<T> SList<T> {
         }
     }
 
-    #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
     /// distance from the start of the container `T` to the `Link` field.
+    #[inline(always)]
     pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T> {
         debug_assert_slist_sanity!(self);
         if self.is_empty() {

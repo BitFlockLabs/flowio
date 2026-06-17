@@ -9,15 +9,36 @@ use crate::utils::memory::provider::BasicMemoryProvider;
 use io_uring::{IoUring, opcode, types};
 use std::io;
 use std::mem::ManuallyDrop;
+use std::os::fd::RawFd;
 use std::time::Duration;
 
-/// Default `io_uring` ring size used by the runtime.
+/// Default number of submission and completion ring entries requested from
+/// `io_uring`.
 pub const DEFAULT_RING_ENTRIES: u32 = 256;
 
 /// Completion-state records allocated per slab in the internal op pool.
 const OP_POOL_OBJS_PER_SLAB: usize = 256;
 
-/// User-facing `io_uring` configuration embedded inside [`crate::runtime::executor::ExecutorConfig`].
+#[inline(always)]
+fn close_result_fd(fd: RawFd) {
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+#[inline(always)]
+fn close_orphan_result_fd_if_needed(state: &CompletionState) {
+    if state.is_orphaned() && state.closes_result_fd_on_orphan() && state.result >= 0 {
+        close_result_fd(state.result as RawFd);
+    }
+}
+
+/// User-facing `io_uring` setup configuration embedded inside
+/// [`crate::runtime::executor::ExecutorConfig`].
+///
+/// This is construction-time configuration, not a per-operation data fast-path
+/// type. Choose the ring size before creating the executor and keep the
+/// executor alive for steady-state work.
 ///
 /// # Example
 /// ```no_run
@@ -30,7 +51,8 @@ const OP_POOL_OBJS_PER_SLAB: usize = 256;
 /// ```
 #[derive(Clone, Copy)]
 pub struct ReactorConfig {
-    /// Number of entries requested for the io_uring submission/completion ring.
+    /// Number of entries requested for both the io_uring submission ring and
+    /// completion ring.
     pub ring_entries: u32,
 }
 
@@ -96,7 +118,7 @@ impl Reactor {
         self.retained_pool.alloc(value)
     }
 
-    /// Allocate retained kernel-facing `iovec` scratch for a writev op.
+    /// Allocate retained kernel-facing `iovec` scratch for a vectored I/O op.
     #[inline(always)]
     pub(crate) fn alloc_iovec_scratch(
         &mut self,
@@ -153,7 +175,7 @@ impl Reactor {
     }
 
     /// Push an SQE into the submission queue without flushing to the kernel.
-    /// The executor calls [`flush_sqes`] after each task-poll batch.
+    /// The executor calls [`Self::flush_sqes`] after each task-poll batch.
     #[inline(always)]
     pub fn submit_sqe(&mut self, sqe: io_uring::squeue::Entry) -> io::Result<()> {
         let mut sq = self.ring.submission();
@@ -240,6 +262,10 @@ impl Reactor {
                 (*state).cqe_flags = cqe.flags();
                 (*state).set_completed();
 
+                debug_assert!(
+                    (*runtime_state).inflight_ops > 0,
+                    "CQE observed with no tracked in-flight operation"
+                );
                 if (*runtime_state).inflight_ops > 0 {
                     (*runtime_state).inflight_ops -= 1;
                 }
@@ -251,6 +277,7 @@ impl Reactor {
                 if (*state).is_orphaned() || (*state).is_detached() {
                     // Cancelled/abandoned or detached op — free the pool slot,
                     // no task wake.
+                    close_orphan_result_fd_if_needed(&*state);
                     (*state).drop_retained_payload(&mut self.retained_pool);
                     self.op_pool.free(state);
                 } else {
@@ -280,5 +307,72 @@ impl Drop for Reactor {
         if self.initialized {
             unsafe { ManuallyDrop::drop(&mut self.op_pool) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::fd::{distinctive_closeable_test_fd, raw_fd_is_closed};
+
+    use super::*;
+
+    fn close_fd_if_open(fd: RawFd) {
+        if !raw_fd_is_closed(fd) {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+
+    #[test]
+    fn orphan_result_fd_helper_closes_positive_accept_result() {
+        let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
+        let mut state = CompletionState::empty();
+        state.result = fd;
+        state.set_orphaned();
+        state.set_close_result_fd_on_orphan();
+
+        close_orphan_result_fd_if_needed(&state);
+
+        assert!(
+            raw_fd_is_closed(fd),
+            "orphaned accept result fd stayed open"
+        );
+    }
+
+    #[test]
+    fn orphan_result_fd_helper_ignores_negative_result() {
+        let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
+        let mut state = CompletionState::empty();
+        state.result = -libc::ECANCELED;
+        state.set_orphaned();
+        state.set_close_result_fd_on_orphan();
+
+        close_orphan_result_fd_if_needed(&state);
+
+        assert!(
+            !raw_fd_is_closed(fd),
+            "negative CQE result should not close unrelated fd"
+        );
+        close_fd_if_open(fd);
+    }
+
+    #[test]
+    fn orphan_result_fd_helper_requires_orphan_and_close_flag() {
+        let fd_without_orphan = distinctive_closeable_test_fd().expect("socketpair fd failed");
+        let mut without_orphan = CompletionState::empty();
+        without_orphan.result = fd_without_orphan;
+        without_orphan.set_close_result_fd_on_orphan();
+        close_orphan_result_fd_if_needed(&without_orphan);
+        assert!(!raw_fd_is_closed(fd_without_orphan));
+        close_fd_if_open(fd_without_orphan);
+
+        let fd_without_flag = distinctive_closeable_test_fd().expect("socketpair fd failed");
+        let mut without_flag = CompletionState::empty();
+        without_flag.result = fd_without_flag;
+        without_flag.set_orphaned();
+        close_orphan_result_fd_if_needed(&without_flag);
+        assert!(!raw_fd_is_closed(fd_without_flag));
+        close_fd_if_open(fd_without_flag);
     }
 }

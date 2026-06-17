@@ -6,8 +6,12 @@ use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly};
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// Read-only payload fixture over a static byte slice that counts drops.
+/// Used to verify IoBuffReadOnlyVec drops each initialized segment once.
 struct DropTrackedReadOnly {
+    /// Borrowed payload bytes exposed through IoBuffReadOnly.
     bytes: &'static [u8],
+    /// Shared drop counter bumped by Drop.
     drops: Rc<Cell<usize>>,
 }
 
@@ -331,6 +335,8 @@ fn vec_read_only_failed_push_does_not_drop_value() {
         .unwrap();
 
     let result = chain.push(DropTrackedReadOnly::new(b"returned", &drops));
+    // ChainFull returns the rejected value without dropping it; the stored
+    // segment is still owned by the chain.
     assert_eq!(drops.get(), 0);
 
     let returned = expect_chain_full(result);
@@ -341,6 +347,7 @@ fn vec_read_only_failed_push_does_not_drop_value() {
     assert_eq!(drops.get(), 1);
 
     drop(chain);
+    // Now the chain drops the one initialized stored segment.
     assert_eq!(drops.get(), 2);
 }
 
@@ -367,6 +374,8 @@ fn vec_read_only_drop_only_initialized_segments() {
 
     {
         let mut chain = IoBuffReadOnlyVec::<DropTrackedReadOnly, 4>::new();
+        // Capacity is 4, but only 2 segments are initialized; Drop must never
+        // touch the uninitialized slots.
         chain
             .push(DropTrackedReadOnly::new(b"first", &drops))
             .unwrap();
@@ -693,7 +702,7 @@ fn vec_mut_writable_len_and_distribute_written() {
 
     // Simulate kernel readv
     unsafe { chain.distribute_written(100) };
-    println!("  After set_written_len(100):");
+    println!("  After distribute_written(100):");
     println!("    seg0 payload_len={}", seg!(chain, 0).payload_len());
     println!("    seg1 payload_len={}", seg!(chain, 1).payload_len());
     assert_eq!(seg!(chain, 0).payload_len(), 64);

@@ -36,7 +36,7 @@ use crate::runtime::timer::TimerRuntime;
 use crate::utils::list::intrusive::dlist::DList;
 use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::MemoryProvider;
-use io_uring::{opcode, types};
+use io_uring::{opcode, squeue, types};
 use std::alloc::{Layout, alloc};
 use std::cell::Cell;
 use std::future::Future;
@@ -53,16 +53,28 @@ use std::task::{Context, Poll, Waker};
 /// The executor applies this limit separately to ready-task polling, CQE
 /// draining, and timer processing so no single queue type monopolizes a pass.
 pub const DEFAULT_PROCESS_QUOTA: usize = 128;
+/// Bytes reserved for each fixed executor task slot.
 const TASK_POOL_SIZE: usize = 4096;
+/// Number of task slots allocated per task-pool slab page.
 const TASKS_PER_SLAB: usize = 1024;
 
 /// Lightweight counters for benchmarking and scheduler inspection.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::executor::RuntimeStats;
+///
+/// let stats = RuntimeStats::default();
+/// assert_eq!(stats.task_polls, 0);
+/// ```
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy, Default)]
 pub struct RuntimeStats {
     /// Number of task slab pages requested from the memory provider.
     pub task_slab_allocs: usize,
-    /// Number of task slab pages returned to the memory provider.
+    /// Number of task slab pages returned to the memory provider. Runtime
+    /// snapshots normally stay at zero; task slabs are freed during executor
+    /// teardown.
     pub task_slab_frees: usize,
     /// Number of task slots allocated from the task pool.
     pub task_allocs: usize,
@@ -76,7 +88,8 @@ pub struct RuntimeStats {
     pub sqe_submits: usize,
     /// Number of CQEs drained from the io_uring completion queue.
     pub cqe_completions: usize,
-    /// Number of times a completed CQE woke a waiting task.
+    /// Number of times a waiting task was woken by a retired CQE or an
+    /// expired timer.
     pub waiter_wakes: usize,
     /// Number of `clock_gettime` calls for timer tick computation.
     pub timer_now_tick_calls: usize,
@@ -94,19 +107,19 @@ pub struct RuntimeStats {
     pub retained_heap_fallbacks: usize,
     /// Retained operation payload heap fallback blocks released.
     pub retained_heap_frees: usize,
-    /// Retained writev scratch requests served by inline scratch storage.
+    /// Retained vectored I/O scratch requests served by inline storage.
     pub writev_scratch_inline_allocs: usize,
-    /// Retained writev scratch requests served by pooled sidecar storage.
+    /// Retained vectored I/O scratch requests served by pooled sidecar storage.
     pub writev_scratch_pooled_allocs: usize,
-    /// Retained writev scratch requests served from a returned sidecar block.
+    /// Retained vectored I/O scratch requests served from a returned block.
     pub writev_scratch_pooled_reuses: usize,
-    /// Retained writev scratch sidecar blocks returned to the pool.
+    /// Retained vectored I/O scratch sidecar blocks returned to the pool.
     pub writev_scratch_pooled_frees: usize,
-    /// Retained writev scratch slab pages requested by the sidecar pool.
+    /// Retained vectored I/O scratch slab pages requested by the sidecar pool.
     pub writev_scratch_slab_allocs: usize,
-    /// Writev requests rejected for exceeding the per-submission iovec limit.
+    /// Vectored I/O requests rejected for exceeding the iovec limit.
     pub writev_scratch_oversize_rejections: usize,
-    /// Writev scratch sidecar allocation failures.
+    /// Vectored I/O scratch sidecar allocation failures.
     pub writev_scratch_alloc_failures: usize,
 }
 
@@ -233,6 +246,8 @@ pub struct ExecutorConfig {
     /// processing fair within one loop pass.
     pub process_quota: usize,
     /// Optional zero-based CPU id to pin the loop thread to on Linux.
+    ///
+    /// On non-Linux targets, `Some(_)` is rejected as unsupported.
     pub cpu_affinity: Option<usize>,
 }
 
@@ -381,6 +396,17 @@ struct JoinTask<F: Future> {
 /// Each variant contains the original future so callers that own external
 /// state, such as an active RPC answer, can retry, reject, or clean up without
 /// losing task ownership when the executor cannot accept new work.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::executor::{Executor, TrySpawnError};
+///
+/// let result = Executor::try_spawn(async { 1 });
+/// match result {
+///     Err(TrySpawnError::NoExecutor { future }) => drop(future),
+///     _ => panic!("try_spawn outside Executor::run should fail with NoExecutor"),
+/// }
+/// ```
 pub enum TrySpawnError<F> {
     /// No executor is currently active on this thread.
     NoExecutor {
@@ -516,6 +542,10 @@ impl<T: 'static> Drop for JoinHandle<T> {
 
 /// Single-threaded executor that drives tasks and `io_uring` completions.
 ///
+/// The intended fast-path shape is one long-lived executor per runtime thread.
+/// Constructing an executor initializes the reactor, task pool, ready queue,
+/// and timer runtime, so it is setup work rather than per-request work.
+///
 /// # Example
 /// ```no_run
 /// use flowio::runtime::executor::Executor;
@@ -531,7 +561,8 @@ pub struct Executor {
     /// timer expiries) in each executor loop iteration.
     pub process_quota: usize,
     /// CPU core to pin the executor thread to via `sched_setaffinity`.
-    /// `None` means no pinning.
+    /// `None` means no pinning. On non-Linux targets, `Some(_)` is rejected
+    /// as unsupported.
     pub cpu_affinity: Option<usize>,
     #[cfg(debug_assertions)]
     /// Scheduler counters captured after the most recent completed run.
@@ -551,9 +582,9 @@ pub struct Executor {
 impl Executor {
     /// Constructs an executor with default configuration.
     ///
-    /// This is a setup-path API. Typical applications construct one executor
-    /// per runtime thread and keep it alive rather than recreating it in the
-    /// steady-state fast path.
+    /// This is a setup/control-plane API. Typical applications construct one
+    /// executor per runtime thread and keep it alive rather than recreating it
+    /// in the steady-state fast path.
     ///
     /// # Example
     /// ```no_run
@@ -569,8 +600,8 @@ impl Executor {
 
     /// Constructs an executor with explicit reactor and scheduling settings.
     ///
-    /// This is also a setup-path API rather than a per-operation fast-path
-    /// primitive.
+    /// This is also a setup/control-plane API rather than a per-operation
+    /// fast-path primitive.
     ///
     /// # Example
     /// ```no_run
@@ -736,6 +767,12 @@ impl Executor {
     /// long-lived `run` boundary, not repeatedly entering and exiting the
     /// executor for tiny units of work.
     ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if live runtime work remains but
+    /// there are no ready tasks, in-flight I/O operations, or timers that can
+    /// make progress. Reactor and timer I/O errors are propagated.
+    ///
     /// # Example
     /// ```no_run
     /// use flowio::runtime::executor::Executor;
@@ -854,30 +891,7 @@ impl Executor {
             if drained {
                 #[cfg(debug_assertions)]
                 {
-                    runtime_state.stats.task_slab_allocs = self.provider.request_count;
-                    runtime_state.stats.task_slab_frees = self.provider.free_count;
-                    let retained = self.reactor.retained_payload_stats();
-                    runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
-                    runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
-                    runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
-                    runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
-                    runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
-                    runtime_state.stats.retained_heap_frees = retained.heap_frees;
-                    runtime_state.stats.writev_scratch_inline_allocs =
-                        retained.writev_scratch_inline_allocs;
-                    runtime_state.stats.writev_scratch_pooled_allocs =
-                        retained.writev_scratch_pooled_allocs;
-                    runtime_state.stats.writev_scratch_pooled_reuses =
-                        retained.writev_scratch_pooled_reuses;
-                    runtime_state.stats.writev_scratch_pooled_frees =
-                        retained.writev_scratch_pooled_frees;
-                    runtime_state.stats.writev_scratch_slab_allocs =
-                        retained.writev_scratch_slab_allocs;
-                    runtime_state.stats.writev_scratch_oversize_rejections =
-                        retained.writev_scratch_oversize_rejections;
-                    runtime_state.stats.writev_scratch_alloc_failures =
-                        retained.writev_scratch_alloc_failures;
-                    self.last_stats = runtime_state.stats;
+                    self.snapshot_stats(&mut runtime_state);
                 }
                 EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
                 return Ok(());
@@ -895,30 +909,7 @@ impl Executor {
             if runtime_state.inflight_ops == 0 && timer_wait.is_none() {
                 #[cfg(debug_assertions)]
                 {
-                    runtime_state.stats.task_slab_allocs = self.provider.request_count;
-                    runtime_state.stats.task_slab_frees = self.provider.free_count;
-                    let retained = self.reactor.retained_payload_stats();
-                    runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
-                    runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
-                    runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
-                    runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
-                    runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
-                    runtime_state.stats.retained_heap_frees = retained.heap_frees;
-                    runtime_state.stats.writev_scratch_inline_allocs =
-                        retained.writev_scratch_inline_allocs;
-                    runtime_state.stats.writev_scratch_pooled_allocs =
-                        retained.writev_scratch_pooled_allocs;
-                    runtime_state.stats.writev_scratch_pooled_reuses =
-                        retained.writev_scratch_pooled_reuses;
-                    runtime_state.stats.writev_scratch_pooled_frees =
-                        retained.writev_scratch_pooled_frees;
-                    runtime_state.stats.writev_scratch_slab_allocs =
-                        retained.writev_scratch_slab_allocs;
-                    runtime_state.stats.writev_scratch_oversize_rejections =
-                        retained.writev_scratch_oversize_rejections;
-                    runtime_state.stats.writev_scratch_alloc_failures =
-                        retained.writev_scratch_alloc_failures;
-                    self.last_stats = runtime_state.stats;
+                    self.snapshot_stats(&mut runtime_state);
                 }
                 EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
                 return Err(io::Error::from(ErrorKind::WouldBlock));
@@ -949,6 +940,28 @@ impl Executor {
                     .process_at_with_budget(now_tick, self.process_quota)?;
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn snapshot_stats(&mut self, runtime_state: &mut RuntimeState) {
+        runtime_state.stats.task_slab_allocs = self.provider.request_count;
+        runtime_state.stats.task_slab_frees = self.provider.free_count;
+        let retained = self.reactor.retained_payload_stats();
+        runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
+        runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
+        runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
+        runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
+        runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
+        runtime_state.stats.retained_heap_frees = retained.heap_frees;
+        runtime_state.stats.writev_scratch_inline_allocs = retained.writev_scratch_inline_allocs;
+        runtime_state.stats.writev_scratch_pooled_allocs = retained.writev_scratch_pooled_allocs;
+        runtime_state.stats.writev_scratch_pooled_reuses = retained.writev_scratch_pooled_reuses;
+        runtime_state.stats.writev_scratch_pooled_frees = retained.writev_scratch_pooled_frees;
+        runtime_state.stats.writev_scratch_slab_allocs = retained.writev_scratch_slab_allocs;
+        runtime_state.stats.writev_scratch_oversize_rejections =
+            retained.writev_scratch_oversize_rejections;
+        runtime_state.stats.writev_scratch_alloc_failures = retained.writev_scratch_alloc_failures;
+        self.last_stats = runtime_state.stats;
     }
 
     /// Returns scheduler counters captured for the most recently completed run.
@@ -991,6 +1004,7 @@ impl Drop for Executor {
     fn drop(&mut self) {
         if self.initialized {
             unsafe {
+                self.ready_queue.unlink_all_for_drop();
                 ManuallyDrop::drop(&mut self.ready_queue);
                 ManuallyDrop::drop(&mut self.task_pool);
                 ManuallyDrop::drop(&mut self.timers);
@@ -1016,6 +1030,13 @@ unsafe fn cancel_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
 /// Free a completed `CompletionState` from a future's `Drop` impl when the
 /// CQE has already been consumed but the future is dropped before polling the
 /// result. Uses one TLS read and only runs on that drop-after-complete path.
+///
+/// Pool-slot and retained-payload reclamation require an active executor TLS
+/// context. If this is called after the executor context has been cleared, it
+/// cannot reach the reactor and therefore leaves operation-pool reclamation to
+/// process teardown. Callers that own external resources, such as accepted
+/// fds in a cached accept state, must release those resources themselves before
+/// delegating here.
 unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1029,6 +1050,8 @@ unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
 
 /// Release a future-owned `CompletionState` pointer from `Drop`.
 /// Completed ops are freed immediately; pending ops are orphaned and cancelled.
+/// Reclamation requires an active executor TLS context; without one this only
+/// clears the caller's pointer after the attempted free/cancel path.
 /// The caller's pointer is always cleared.
 #[inline(always)]
 #[doc(hidden)]
@@ -1065,6 +1088,42 @@ pub(crate) unsafe fn submit_tracked_sqe(
             (*pctx.runtime_state()).stats.sqe_submits += 1;
         }
     }
+    Ok(())
+}
+
+/// Retain a kernel-visible payload, build the SQE from that stable storage,
+/// and submit it with normal in-flight accounting.
+///
+/// On error the retained payload is detached and returned to the caller so
+/// the future can preserve buffer ownership and retire the completion state.
+#[inline(always)]
+#[doc(hidden)]
+pub(crate) unsafe fn submit_retained_sqe<T: 'static, F>(
+    pctx: &PollCtx,
+    state_ptr: *mut crate::runtime::op::CompletionState,
+    payload_value: T,
+    build: F,
+) -> Result<(), (io::Error, T)>
+where
+    F: FnOnce(&mut T) -> io::Result<squeue::Entry>,
+{
+    let reactor = pctx.reactor();
+    let payload = unsafe { (*reactor).alloc_retained_payload(payload_value) };
+    unsafe { (*state_ptr).attach_retained_payload(payload) };
+
+    let sqe = match build(unsafe { (*state_ptr).retained_payload_mut::<T>() }) {
+        Ok(sqe) => sqe,
+        Err(err) => {
+            let payload = unsafe { (*reactor).take_retained_payload::<T>(state_ptr) };
+            return Err((err, payload));
+        }
+    };
+
+    if let Err(err) = unsafe { submit_tracked_sqe(pctx, sqe) } {
+        let payload = unsafe { (*reactor).take_retained_payload::<T>(state_ptr) };
+        return Err((err, payload));
+    }
+
     Ok(())
 }
 
@@ -1175,6 +1234,17 @@ pub unsafe fn timers_unchecked() -> *mut TimerRuntime {
             !ctx_ptr.is_null(),
             "runtime timers_unchecked requested outside executor context"
         );
+        unsafe { (*ctx_ptr).timers }
+    })
+}
+
+#[doc(hidden)]
+pub(crate) unsafe fn timers_or_null() -> *mut TimerRuntime {
+    EXECUTOR_CTX.with(|ctx_cell| {
+        let ctx_ptr = ctx_cell.get();
+        if ctx_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
         unsafe { (*ctx_ptr).timers }
     })
 }
@@ -1448,6 +1518,26 @@ mod tests {
         let mut executor = Executor::new().expect("failed to construct executor");
         executor.provider.max_request_count = Some(1);
         executor
+    }
+
+    #[test]
+    fn executor_drop_unlinks_residual_ready_queue_entries() {
+        let mut executor = Executor::new().expect("failed to construct executor");
+        executor.init().expect("executor init failed");
+
+        let mut header = TaskHeader::new();
+        unsafe {
+            executor
+                .ready_queue
+                .push_back(&mut header.ready_link as *mut _);
+        }
+
+        drop(executor);
+
+        assert!(
+            header.ready_link.is_unlinked(),
+            "executor drop should unlink abandoned ready-queue entries"
+        );
     }
 
     #[test]

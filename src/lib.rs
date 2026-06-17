@@ -1,19 +1,23 @@
+#![doc = include_str!("../README.md")]
+
 //! A single-threaded async runtime built on Linux `io_uring`.
 //!
 //! `flowio` keeps the public surface concrete and transport-oriented. The
-//! crate provides a zero-allocation fast path for steady-state runtime work,
-//! transport implementations for Unix, TCP, UDP, and one-to-one SCTP sockets,
-//! plus a client-side rustls TLS wrapper for connected TCP streams and a
-//! narrow hostname-resolution helper. All transport I/O uses a rental buffer
-//! pattern: callers pass buffers by value and receive them back alongside the
-//! operation result.
+//! crate provides pooled, allocation-avoiding fast paths for steady-state
+//! runtime work, transport implementations for Unix, TCP, UDP, and one-to-one
+//! SCTP sockets, plus a client-side rustls TLS wrapper for connected TCP
+//! streams and a narrow hostname-resolution helper. All transport I/O uses a
+//! rental buffer pattern: callers pass buffers by value and receive them back
+//! alongside the operation result.
 //!
-//! The public API is organized around three layers:
+//! The public API is organized around two layers:
 //! - [`runtime`] — executor, reactor, timers, and the buffer facility
 //! - [`net`] — concrete transport types built on top of the runtime core,
 //!   including TLS and hostname resolution helpers
-//! - [`utils`] — intrusive lists and memory primitives used internally by the
-//!   runtime and transports
+//!
+//! Low-level intrusive-list and allocator primitives live under an internal
+//! `utils` module. They remain public for source compatibility during the
+//! alpha period, but they are not a supported user-facing API.
 //!
 //! The buffer facility supports:
 //! - heap-owned mutable buffers via [`runtime::buffer::IoBuffMut`]
@@ -57,7 +61,7 @@
 //!   progress explicitly.
 //! - Prefer not to keep hostname resolution and per-step deadline wrappers in
 //!   the steady-state data path. [`net::resolver`] and [`runtime::timer`] are
-//!   setup/control-path APIs; resolve once and use coarser-grained timeouts
+//!   setup/control-plane APIs; resolve once and use coarser-grained timeouts
 //!   around larger operations.
 //!
 //! # Modules
@@ -66,9 +70,12 @@
 //!   management.
 //! - [`net`] — concrete transport types built on the runtime core, including
 //!   client-side TLS over TCP.
-//! - [`utils`] — intrusive data structures and memory primitives.
 //!
 //! # Example
+//! The example uses complete-buffer APIs to keep framing short. On a hot path,
+//! use `read` / `write` when the caller can handle partial progress
+//! explicitly.
+//!
 //! ```no_run
 //! use flowio::net::unix::UnixStream;
 //! use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -104,4 +111,5 @@
 
 pub mod net;
 pub mod runtime;
+#[doc(hidden)]
 pub mod utils;

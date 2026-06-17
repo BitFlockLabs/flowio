@@ -1,4 +1,6 @@
+use flowio::utils::memory::owned::{OwnedBuffer, OwnedBufferPool};
 use flowio::utils::memory::pool::*;
+use static_assertions::assert_not_impl_any;
 use std::mem::MaybeUninit;
 
 // verbose memory provider
@@ -64,7 +66,7 @@ impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider {
     }
 }
 
-// 32 bytes test object
+// Small test object; the pool rounds the slot up to the 8-byte slab link size.
 struct Task {
     id: u32,
 }
@@ -87,12 +89,89 @@ impl InPlaceInit for HardwareTask {
     }
 }
 
+/// Pool is !Unpin because buffers keep a raw back-pointer to it; checked-out
+/// OwnedBuffer handles are !Send/!Sync and stay on the runtime thread.
+#[test]
+fn owned_buffer_pool_requires_pin_and_buffers_stay_single_threaded() {
+    assert_not_impl_any!(OwnedBufferPool<'static, Task, VerboseProvider>: Unpin);
+    assert_not_impl_any!(OwnedBuffer<'static, 'static, Task, VerboseProvider>: Send, Sync);
+}
+
+#[test]
+fn owned_buffer_pool_allows_multiple_live_buffers_from_shared_pin() {
+    let mut provider = VerboseProvider::new(4096, 64);
+    let mut pool = OwnedBufferPool::<Task, _>::new_uninit(&mut provider, 2).unwrap();
+    pool.init();
+
+    let pool = Box::pin(pool);
+    let first = pool
+        .as_ref()
+        .alloc(404)
+        .expect("first owned buffer alloc failed");
+    let second = pool
+        .as_ref()
+        .alloc(405)
+        .expect("second owned buffer alloc failed");
+    assert_eq!(first.id, 404);
+    assert_eq!(second.id, 405);
+
+    drop(first);
+    drop(second);
+
+    let reused = pool.as_ref().alloc(406).expect("owned buffer reuse failed");
+    assert_eq!(reused.id, 406);
+}
+
+/// into_raw_parts forgets the handle without changing the outstanding count;
+/// from_raw reconstructs it, so the reconstructed Drop returns the slot.
+#[test]
+fn owned_buffer_raw_parts_round_trip_returns_slot_to_pool() {
+    let mut provider = VerboseProvider::new(127, 64);
+    let mut pool = OwnedBufferPool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
+    pool.init();
+
+    let pool = Box::pin(pool);
+    let buffer = pool.as_ref().alloc(700).expect("owned buffer alloc failed");
+    let (ptr, pool_ptr) = buffer.into_raw_parts();
+
+    let recovered = unsafe { OwnedBuffer::from_raw(ptr, pool_ptr) };
+    assert_eq!(recovered.id, 700);
+    drop(recovered);
+
+    let reused = pool
+        .as_ref()
+        .alloc(701)
+        .expect("raw round-trip did not return slot to pool");
+    assert_eq!(reused.id, 701);
+}
+
+/// into_raw forgets the handle; free_raw returns the slot and decrements the
+/// outstanding count so the pool drop invariant remains balanced.
+#[test]
+fn owned_buffer_free_raw_returns_slot_to_pool() {
+    let mut provider = VerboseProvider::new(127, 64);
+    let mut pool = OwnedBufferPool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
+    pool.init();
+
+    let pool = Box::pin(pool);
+    let buffer = pool.as_ref().alloc(800).expect("owned buffer alloc failed");
+    let ptr = buffer.into_raw();
+
+    unsafe { pool.as_ref().free_raw(ptr) };
+
+    let reused = pool
+        .as_ref()
+        .alloc(801)
+        .expect("free_raw did not return slot to pool");
+    assert_eq!(reused.id, 801);
+}
+
 #[test]
 fn test_verbose_pool_logic() {
     println!("\n=== TEST CASE: Lifecycle & Alignment Verification ===");
 
     // Setup
-    let mut provider = VerboseProvider::new(8192, 4096);
+    let mut provider = VerboseProvider::new(16384, 4096);
     let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 2).unwrap();
 
     // ---------------------------------------------------------
@@ -135,22 +214,15 @@ fn test_verbose_pool_logic() {
     );
 
     // ---------------------------------------------------------
-    println!("\nStep 5: Exhaust slab and trigger growth");
-    println!("  [Expected] Filling the 4KB slab until a NEW slab is requested from Provider.");
+    println!("\nStep 5: Exhaust configured slab slots and trigger growth");
+    println!("  [Expected] objs_per_slab=2, so the next live allocation needs a new slab.");
 
-    unsafe {
-        let mut count = 0;
-        // We know from math ~254 objects fit in a 4KB slab.
-        // We loop until a new request is seen in the logs.
-        for i in 0..300 {
-            if pool.alloc(i).is_none() {
-                println!("  [Actual] Pool reached OOM at {} objects", count);
-                break;
-            }
-            count += 1;
-        }
-        assert!(count > 250);
-    }
+    let t4 = unsafe { pool.alloc(104).expect("T4 failed") };
+    println!("  [Actual] T4 address: {:p}", t4);
+    assert!(
+        (t4 as usize).abs_diff(t2 as usize) > 1024,
+        "T4 should come from a new slab, not first-slab alignment padding"
+    );
 
     println!("\n=== TEST COMPLETED SUCCESSFULLY ===");
 }
@@ -180,6 +252,26 @@ fn test_strict_alignment_64() {
     );
 
     println!("\n=== TEST COMPLETED SUCCESSFULLY ===");
+}
+
+#[test]
+fn slab_does_not_allocate_from_alignment_padding() {
+    let mut provider = VerboseProvider::new(12288, 4096);
+    let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
+    pool.init();
+
+    let first = unsafe { pool.alloc(1).expect("first slot should allocate") };
+    let second = unsafe {
+        pool.alloc(2)
+            .expect("second slot should allocate from new slab")
+    };
+
+    let first_addr = first as usize;
+    let second_addr = second as usize;
+    assert!(
+        second_addr.abs_diff(first_addr) >= 4096,
+        "second allocation reused alignment padding instead of requesting a new slab"
+    );
 }
 
 #[test]

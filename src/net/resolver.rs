@@ -16,9 +16,10 @@
 //! # Fast-Path Guidance
 //!
 //! Best fast-path-adjacent choices:
-//! - Resolver APIs are setup-path helpers rather than steady-state data-plane
-//!   APIs. Resolve host names once, keep the resulting `SocketAddr` values,
-//!   and pass those addresses into transport connectors on the hot path.
+//! - Resolver APIs are setup/control-plane helpers rather than steady-state
+//!   data-plane APIs. Resolve host names once, keep the resulting
+//!   `SocketAddr` values, and pass those addresses into transport connectors
+//!   on the hot path.
 //! - Use [`DnsResolver`] when resolving repeatedly so nameserver selection and
 //!   timeout policy are constructed once and then reused.
 //!
@@ -57,6 +58,11 @@ const DNS_CLASS_IN: u16 = 1;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_AAAA: u16 = 28;
+const DNS_FLAG_QR: u16 = 0x8000;
+const DNS_FLAG_TC: u16 = 0x0200;
+const DNS_RCODE_MASK: u16 = 0x000F;
+const DNS_RCODE_NXDOMAIN: u8 = 3;
+const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CNAME_DEPTH: usize = 4;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -64,13 +70,21 @@ const HOSTS_PATH: &str = "/etc/hosts";
 
 static NEXT_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 
-/// Narrow DNS resolver built on FlowIO UDP sockets.
+/// Reusable DNS resolver built on FlowIO UDP sockets.
 ///
-/// This is the reusable resolver API. Use it when resolution happens often
-/// enough that reusing configured nameservers and timeouts matters.
+/// Use this on setup/control-plane paths when lookups repeat and the configured
+/// nameservers/timeouts should be reused. For one-off convenience resolution,
+/// prefer [`resolve_host`].
 ///
-/// This is the best resolver API to use on the setup path when lookups repeat.
-/// For one-off convenience resolution, prefer [`resolve_host`] instead.
+/// # Example
+/// ```
+/// use flowio::net::resolver::DnsResolver;
+/// use std::net::{Ipv4Addr, SocketAddr};
+///
+/// let mut resolver = DnsResolver::new(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 53))])?;
+/// resolver.set_query_timeout(std::time::Duration::from_secs(1));
+/// # Ok::<(), std::io::Error>(())
+/// ```
 #[derive(Clone, Debug)]
 pub struct DnsResolver {
     /// Upstream recursive resolvers queried over UDP, in retry order.
@@ -117,6 +131,9 @@ impl DnsResolver {
     ///
     /// This first handles IP literals, `localhost`, and `/etc/hosts`, then
     /// falls back to UDP DNS queries if needed.
+    ///
+    /// This is setup/control-plane work. Keep the returned addresses and pass
+    /// them to transport connectors instead of resolving on the data path.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -177,7 +194,7 @@ impl DnsResolver {
 
         for nameserver in self.nameservers.iter().copied() {
             match self.query_nameserver(nameserver, &packet).await {
-                Ok(response) => return parse_response_packet(&response, query_id, qtype),
+                Ok(response) => return parse_response_packet(&response, query_id, host, qtype),
                 Err(err) => last_err = Some(err),
             }
         }
@@ -219,10 +236,27 @@ pub async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> 
 struct LookupResult {
     /// Addresses returned directly for the requested record type.
     addresses: Vec<IpAddr>,
-    /// First CNAME target seen while answering the current query, if any.
+    /// Last in-chain CNAME target reached while answering the current query.
     cname: Option<String>,
     /// True when the upstream resolver returned NXDOMAIN for this name.
     nx_domain: bool,
+}
+
+enum DnsRecord {
+    Address {
+        /// Owner name from the resource record.
+        owner: String,
+        /// Address record type (`A` or `AAAA`) used for qtype matching.
+        rr_type: u16,
+        /// Parsed IP address from the RDATA payload.
+        address: IpAddr,
+    },
+    Cname {
+        /// Owner name that aliases to `target`.
+        owner: String,
+        /// Canonical name reached by following this CNAME record.
+        target: String,
+    },
 }
 
 fn next_query_id() -> u16 {
@@ -403,7 +437,12 @@ fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<
     Ok(packet)
 }
 
-fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result<LookupResult> {
+fn parse_response_packet(
+    packet: &[u8],
+    query_id: u16,
+    query_host: &str,
+    qtype: u16,
+) -> io::Result<LookupResult> {
     if packet.len() < 12 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -420,21 +459,21 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
     }
 
     let flags = read_u16_be_at(packet, 2).map_err(byte_range_eof)?;
-    if flags & 0x8000 == 0 {
+    if flags & DNS_FLAG_QR == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response packet was not marked as a response",
         ));
     }
-    if flags & 0x0200 != 0 {
+    if flags & DNS_FLAG_TC != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response was truncated; TCP fallback is not implemented",
         ));
     }
 
-    let rcode = (flags & 0x000F) as u8;
-    if rcode == 3 {
+    let rcode = (flags & DNS_RCODE_MASK) as u8;
+    if rcode == DNS_RCODE_NXDOMAIN {
         return Ok(LookupResult {
             addresses: Vec::new(),
             cname: None,
@@ -453,16 +492,37 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
     let arcount = read_u16_be_at(packet, 10).map_err(byte_range_eof)? as usize;
 
     let mut offset = 12usize;
-    for _ in 0..qdcount {
-        offset = skip_name(packet, offset)?;
-        offset = checked_add(offset, 4, packet.len())?;
+    if qdcount != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response question count did not match query",
+        ));
     }
+    let (question_name, consumed) = decode_name(packet, offset, 0)?;
+    if !dns_name_eq(&question_name, query_host) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response question name did not match query",
+        ));
+    }
+    offset = checked_add(offset, consumed, packet.len())?;
+    let question_type = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
+    let question_class_offset = checked_add(offset, 2, packet.len())?;
+    let question_class = read_u16_be_at(packet, question_class_offset).map_err(byte_range_eof)?;
+    if question_type != qtype || question_class != DNS_CLASS_IN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response question type/class did not match query",
+        ));
+    }
+    offset = checked_add(offset, 4, packet.len())?;
 
-    let mut addresses = Vec::new();
-    let mut cname = None;
     let total_rrs = ancount + nscount + arcount;
+    let max_rrs_by_packet = packet.len().saturating_sub(offset) / 11;
+    let mut records = Vec::with_capacity(total_rrs.min(max_rrs_by_packet));
     for _ in 0..total_rrs {
-        offset = skip_name(packet, offset)?;
+        let (owner, consumed) = decode_name(packet, offset, 0)?;
+        offset = checked_add(offset, consumed, packet.len())?;
         let rr = parse_rr_header(packet, offset)?;
         offset = rr.data_offset + rr.rdlength as usize;
 
@@ -471,23 +531,74 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
         }
 
         match rr.rr_type {
-            DNS_TYPE_A if qtype == DNS_TYPE_A && rr.rdlength == 4 => {
+            DNS_TYPE_A if rr.rdlength == 4 => {
                 let data = &packet[rr.data_offset..rr.data_offset + 4];
-                addresses.push(IpAddr::V4(Ipv4Addr::new(
-                    data[0], data[1], data[2], data[3],
-                )));
+                records.push(DnsRecord::Address {
+                    owner,
+                    rr_type: rr.rr_type,
+                    address: IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+                });
             }
-            DNS_TYPE_AAAA if qtype == DNS_TYPE_AAAA && rr.rdlength == 16 => {
+            DNS_TYPE_AAAA if rr.rdlength == 16 => {
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
-                addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                records.push(DnsRecord::Address {
+                    owner,
+                    rr_type: rr.rr_type,
+                    address: IpAddr::V6(Ipv6Addr::from(octets)),
+                });
             }
-            DNS_TYPE_CNAME if cname.is_none() => {
-                let (target, _) = decode_name(packet, rr.data_offset, 0)?;
-                cname = Some(target);
+            DNS_TYPE_CNAME => {
+                let (target, consumed) = decode_name(packet, rr.data_offset, 0)?;
+                if consumed > rr.rdlength as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DNS CNAME RDATA exceeded declared length",
+                    ));
+                }
+                records.push(DnsRecord::Cname { owner, target });
             }
             _ => {}
         }
+    }
+
+    let mut addresses = Vec::new();
+    let mut active_owner = query_host;
+    let mut cname = None;
+    let mut cname_hops = 0usize;
+    loop {
+        for record in &records {
+            if let DnsRecord::Address {
+                owner,
+                rr_type,
+                address,
+            } = record
+                && *rr_type == qtype
+                && dns_name_eq(owner, active_owner)
+            {
+                addresses.push(*address);
+            }
+        }
+        if !addresses.is_empty() {
+            break;
+        }
+
+        let Some(target) = records.iter().find_map(|record| match record {
+            DnsRecord::Cname { owner, target } if dns_name_eq(owner, active_owner) => Some(target),
+            _ => None,
+        }) else {
+            break;
+        };
+
+        cname_hops += 1;
+        if cname_hops > MAX_CNAME_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS CNAME chain exceeded maximum depth",
+            ));
+        }
+        active_owner = target;
+        cname = Some(target.clone());
     }
 
     Ok(LookupResult {
@@ -497,8 +608,8 @@ fn parse_response_packet(packet: &[u8], query_id: u16, qtype: u16) -> io::Result
     })
 }
 
-/// Reads and validates the fixed-size header fields for one DNS resource
-/// record body.
+/// Reads and validates the fixed-size resource-record fields that follow the
+/// already-decoded owner name.
 struct RrHeader {
     /// Resource-record type.
     rr_type: u16,
@@ -513,8 +624,10 @@ struct RrHeader {
 fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
     let end = checked_add(offset, 10, packet.len())?;
     let rr_type = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
-    let class = read_u16_be_at(packet, offset + 2).map_err(byte_range_eof)?;
-    let rdlength = read_u16_be_at(packet, offset + 8).map_err(byte_range_eof)?;
+    let class_offset = checked_add(offset, 2, packet.len())?;
+    let rdlength_offset = checked_add(offset, 8, packet.len())?;
+    let class = read_u16_be_at(packet, class_offset).map_err(byte_range_eof)?;
+    let rdlength = read_u16_be_at(packet, rdlength_offset).map_err(byte_range_eof)?;
     let data_offset = end;
     checked_add(data_offset, rdlength as usize, packet.len())?;
 
@@ -524,11 +637,6 @@ fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
         rdlength,
         data_offset,
     })
-}
-
-fn skip_name(packet: &[u8], offset: usize) -> io::Result<usize> {
-    let (_, consumed) = decode_name(packet, offset, 0)?;
-    checked_add(offset, consumed, packet.len())
 }
 
 fn decode_name(packet: &[u8], offset: usize, depth: usize) -> io::Result<(String, usize)> {
@@ -548,7 +656,6 @@ fn decode_name(packet: &[u8], offset: usize, depth: usize) -> io::Result<(String
     let mut labels = Vec::new();
     let mut pos = offset;
     let mut consumed = 0usize;
-    let mut jumped = false;
 
     loop {
         if pos >= packet.len() {
@@ -561,10 +668,20 @@ fn decode_name(packet: &[u8], offset: usize, depth: usize) -> io::Result<(String
         let len = packet[pos];
         if len & 0xC0 == 0xC0 {
             let next = checked_add(pos, 1, packet.len())?;
-            let pointer = (((len & 0x3F) as usize) << 8) | packet[next] as usize;
-            if !jumped {
-                consumed += 2;
+            let next_byte = *packet.get(next).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "DNS compression pointer ended unexpectedly",
+                )
+            })?;
+            let pointer = (((len & 0x3F) as usize) << 8) | next_byte as usize;
+            if pointer >= pos {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DNS compression pointer did not point backward",
+                ));
             }
+            consumed += 2;
             let (suffix, _) = decode_name(packet, pointer, depth + 1)?;
             if !suffix.is_empty() {
                 labels.push(suffix);
@@ -573,24 +690,39 @@ fn decode_name(packet: &[u8], offset: usize, depth: usize) -> io::Result<(String
         }
 
         if len == 0 {
-            if !jumped {
-                consumed += 1;
-            }
+            consumed += 1;
             break;
+        }
+
+        if len & 0xC0 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS label used an unsupported length encoding",
+            ));
         }
 
         let label_len = len as usize;
         let label_start = checked_add(pos, 1, packet.len())?;
         let label_end = checked_add(label_start, label_len, packet.len())?;
         labels.push(String::from_utf8_lossy(&packet[label_start..label_end]).into_owned());
-        if !jumped {
-            consumed += 1 + label_len;
-        }
+        consumed += 1 + label_len;
         pos = label_end;
-        jumped = false;
     }
 
-    Ok((labels.join("."), consumed))
+    let name = labels.join(".");
+    if name.len() > DNS_MAX_NAME_PRESENTATION_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS name exceeded maximum length",
+        ));
+    }
+
+    Ok((name, consumed))
+}
+
+fn dns_name_eq(left: &str, right: &str) -> bool {
+    left.trim_end_matches('.')
+        .eq_ignore_ascii_case(right.trim_end_matches('.'))
 }
 
 fn checked_add(base: usize, add: usize, limit: usize) -> io::Result<usize> {

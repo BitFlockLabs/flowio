@@ -1,6 +1,6 @@
 //! Buffer traits and types for runtime I/O operations.
 //!
-//! The buffer system provides two core buffer types:
+//! The buffer system provides four core buffer types:
 //!
 //! - [`IoBuffMut`] — mutable, exclusively owned. Used for recv/read operations.
 //! - [`IoBuff`] — frozen (immutable), reference-counted, cheaply clonable.
@@ -67,6 +67,17 @@ use std::ptr::NonNull;
 // ============================================================================
 
 /// Error codes returned by buffer operations.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::{IoBuffError, IoBuffMut};
+///
+/// let err = IoBuffMut::new(0, 4, 0)
+///     .unwrap()
+///     .freeze()
+///     .into_owned_view(5..6);
+/// assert!(matches!(err, Err((_buf, IoBuffError::SliceOutOfBounds))));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IoBuffError {
@@ -102,7 +113,6 @@ pub enum IoBuffError {
 fn resolve_slice_bounds(
     range: impl RangeBounds<usize>,
     len: usize,
-    _context: &str,
 ) -> Result<(usize, usize), IoBuffError> {
     let start = match range.start_bound() {
         std::ops::Bound::Included(&s) => s,
@@ -136,9 +146,19 @@ fn resolve_slice_bounds(
 /// bytes for the entire lifetime of the buffer value.  The pointer must not
 /// be invalidated by moves of the buffer value (i.e. the backing storage must
 /// be heap- or pool-allocated, not inline).
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::IoBuffReadOnly;
+///
+/// fn readable_len<B: IoBuffReadOnly>(buffer: &B) -> usize {
+///     buffer.len()
+/// }
+///
+/// assert_eq!(readable_len(&b"payload".to_vec()), 7);
+/// ```
 pub unsafe trait IoBuffReadOnly: Unpin + 'static {
-    /// Returns a raw pointer to the start of the readable data (the full
-    /// active window: headroom written + payload + tailroom written).
+    /// Returns a raw pointer to the first readable byte exposed by this buffer.
     fn as_ptr(&self) -> *const u8;
 
     /// Returns the total number of readable bytes in the active window.
@@ -153,29 +173,49 @@ pub unsafe trait IoBuffReadOnly: Unpin + 'static {
 /// A buffer that can be written into by the runtime for read/recv operations.
 ///
 /// The runtime uses `as_mut_ptr()` and `writable_len()` to determine where
-/// and how much the kernel can write.  After a kernel read completes, the
-/// runtime calls `set_written_len()` to update the payload length.
+/// and how much the kernel can write. After a kernel read completes, the
+/// runtime calls `set_written_len()` to publish the initialized bytes in the
+/// returned buffer.
+///
+/// Implementations choose what their writable region means. [`IoBuffMut`]
+/// writes into its unwritten payload region and updates structured payload
+/// length. `Vec<u8>` writes into spare capacity and updates its length with
+/// `set_written_len()`. `Box<[u8]>` exposes its fixed slice and ignores
+/// `set_written_len()` because there is no separate logical length to update.
 ///
 /// # Safety
 ///
 /// `as_mut_ptr()` must return a pointer that remains valid and writable for
 /// at least `writable_len()` bytes for the entire lifetime of the buffer
 /// value.  The pointer must not be invalidated by moves of the buffer value.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::IoBuffReadWrite;
+///
+/// fn writable_len<B: IoBuffReadWrite>(buffer: &B) -> usize {
+///     buffer.writable_len()
+/// }
+///
+/// assert_eq!(writable_len(&vec![0u8; 16]), 16);
+/// ```
 pub unsafe trait IoBuffReadWrite: Unpin + 'static {
-    /// Returns a raw pointer to the start of the unwritten payload region
-    /// (where the next kernel write will land).
+    /// Returns a raw pointer to the first writable byte exposed by this
+    /// buffer.
     fn as_mut_ptr(&mut self) -> *mut u8;
 
-    /// Returns the number of bytes available for writing in the payload
-    /// region.
+    /// Returns the number of bytes available for writing through
+    /// [`IoBuffReadWrite::as_mut_ptr`].
     fn writable_len(&self) -> usize;
 
     /// Called by the runtime after the kernel has written data into the
-    /// buffer.  Sets the total payload length (absolute, not additive).
+    /// buffer.
     ///
-    /// For example, if the payload was empty and the kernel wrote 100 bytes,
-    /// the runtime calls `set_written_len(100)`.  For `read_exact` with
-    /// retries, the final call sets the total accumulated length.
+    /// Structured buffers use this to set the total payload length (absolute,
+    /// not additive). `Vec<u8>` uses this as a length update for bytes written
+    /// into spare capacity. Fixed-size flat buffers such as `Box<[u8]>` may
+    /// treat this as a no-op because their exposed slice length is not
+    /// adjusted by FlowIO.
     ///
     /// # Safety
     ///
@@ -215,9 +255,9 @@ pub(crate) struct IoBuffHeader {
     /// shrink when payload borrows from it.
     pub(crate) tailroom_capacity: usize,
     /// Owning pool pointer.  Non-null if this buffer was allocated from
-    /// an [`IoBuffPool`]; the buffer is returned to the pool's free list
-    /// when the last reference drops.  Null for heap-allocated buffers,
-    /// which are freed via the global allocator.
+    /// an [`super::pool::IoBuffPool`]; the buffer is returned to the pool's
+    /// free list when the last reference drops. Null for heap-allocated
+    /// buffers, which are freed via the global allocator.
     pub(crate) pool: *mut IoBuffPoolInner,
     // Flexible trailing data:
     // [u8; headroom_capacity + payload_capacity + tailroom_capacity]
@@ -418,7 +458,8 @@ impl IoBuffMut {
         unsafe { self.header.as_ref().headroom_capacity }
     }
 
-    /// Returns the number of headroom bytes still available for prepending.
+    /// Returns the configured pre-payload slack still available for
+    /// prepending before the active window.
     #[inline(always)]
     pub fn headroom_remaining(&self) -> usize {
         self.offset
@@ -502,7 +543,7 @@ impl IoBuffMut {
     /// payload length (absolute, not additive) to update the buffer state.
     ///
     /// # Example
-    /// ```no_run
+    /// ```
     /// use flowio::runtime::buffer::IoBuffMut;
     ///
     /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
@@ -670,7 +711,7 @@ impl IoBuffMut {
     /// skips past it so the remaining data is at the front.
     ///
     /// # Example
-    /// ```no_run
+    /// ```
     /// use flowio::runtime::buffer::IoBuffMut;
     ///
     /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
@@ -886,8 +927,12 @@ impl IoBuff {
     /// Returns a sub-range view of this buffer.  The new [`IoBuffView`] shares the
     /// same backing storage with an incremented refcount.  Zero-copy.
     ///
+    /// # Errors
+    /// Returns [`IoBuffError::SliceOutOfBounds`] if `range` is outside the
+    /// active window.
+    ///
     /// # Example
-    /// ```no_run
+    /// ```
     /// use flowio::runtime::buffer::IoBuffMut;
     ///
     /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
@@ -897,7 +942,7 @@ impl IoBuff {
     /// assert_eq!(hello.bytes(), b"Hello");
     /// ```
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Result<IoBuffView, IoBuffError> {
-        let (start, end) = resolve_slice_bounds(range, self.len(), "IoBuff")?;
+        let (start, end) = resolve_slice_bounds(range, self.len())?;
         unsafe { self.header.as_ref().retain() };
         Ok(IoBuffView {
             header: self.header,
@@ -923,7 +968,7 @@ impl IoBuff {
         self,
         range: impl RangeBounds<usize>,
     ) -> Result<IoBuffOwnedView, (IoBuff, IoBuffError)> {
-        let (start, end) = match resolve_slice_bounds(range, self.len(), "IoBuff") {
+        let (start, end) = match resolve_slice_bounds(range, self.len()) {
             Ok(bounds) => bounds,
             Err(err) => return Err((self, err)),
         };
@@ -941,7 +986,7 @@ impl IoBuff {
     /// Returns `Err(self)` if the buffer is shared (refcount > 1).
     ///
     /// # Example
-    /// ```no_run
+    /// ```
     /// use flowio::runtime::buffer::IoBuffMut;
     ///
     /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
@@ -978,7 +1023,7 @@ impl IoBuff {
     /// (copy-on-write).
     ///
     /// # Example
-    /// ```no_run
+    /// ```
     /// use flowio::runtime::buffer::IoBuffMut;
     ///
     /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
@@ -1064,6 +1109,22 @@ impl std::ops::Deref for IoBuff {
 /// This type is O(1), zero-copy, allocation-free, and has no public unsafe API.
 /// Internally it keeps the original `IoBuff` alive, so the backing allocation
 /// remains valid for the lifetime of the view.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::IoBuffMut;
+///
+/// let mut buf = IoBuffMut::new(2, 16, 2).unwrap();
+/// buf.payload_append(b"hello").unwrap();
+/// buf.headroom_prepend(b"H:").unwrap();
+/// let frozen = buf.freeze();
+///
+/// let owned = frozen.into_owned_view(2..7).unwrap();
+/// assert_eq!(owned.bytes(), b"hello");
+///
+/// let frozen = owned.into_inner();
+/// assert_eq!(frozen.bytes(), b"H:hello");
+/// ```
 pub struct IoBuffOwnedView {
     /// Original structured buffer. Owning this handle keeps the backing
     /// allocation alive without incrementing its refcount.
@@ -1084,16 +1145,19 @@ impl std::fmt::Debug for IoBuffOwnedView {
 }
 
 impl IoBuffOwnedView {
+    /// Returns the number of bytes visible through this owned view.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` when this owned view contains no bytes.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Returns the visible byte range.
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
@@ -1174,16 +1238,19 @@ impl std::fmt::Debug for IoBuffView {
 }
 
 impl IoBuffView {
+    /// Returns the number of bytes visible through this borrowed view.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` when this borrowed view contains no bytes.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Returns the visible byte range.
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
@@ -1192,8 +1259,13 @@ impl IoBuffView {
         }
     }
 
+    /// Returns a zero-copy subview of this view.
+    ///
+    /// # Errors
+    /// Returns [`IoBuffError::SliceOutOfBounds`] if `range` is outside the
+    /// visible byte range.
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Result<IoBuffView, IoBuffError> {
-        let (start, end) = resolve_slice_bounds(range, self.len, "IoBuffView")?;
+        let (start, end) = resolve_slice_bounds(range, self.len)?;
         unsafe { self.header.as_ref().retain() };
         Ok(IoBuffView {
             header: self.header,
@@ -1329,17 +1401,21 @@ unsafe impl IoBuffReadWrite for IoBuffMut {
 
     #[inline(always)]
     unsafe fn set_written_len(&mut self, len: usize) {
+        let capacity = self.payload_capacity();
         debug_assert!(
-            len <= self.payload_capacity(),
+            len <= capacity,
             "set_written_len({}) exceeds payload capacity {}",
             len,
-            self.payload_capacity()
+            capacity
         );
         debug_assert!(
             self.tailroom_len == 0 || len == self.payload_len,
             "set_written_len: cannot change payload length after tailroom_append"
         );
-        self.payload_len = len;
+        if self.tailroom_len != 0 && len != self.payload_len {
+            return;
+        }
+        self.payload_len = std::cmp::min(len, capacity);
     }
 }
 
@@ -1376,6 +1452,13 @@ unsafe impl IoBuffReadWrite for Vec<u8> {
 
     #[inline(always)]
     unsafe fn set_written_len(&mut self, len: usize) {
+        debug_assert!(
+            len <= Vec::capacity(self),
+            "Vec::set_written_len({}) exceeds capacity {}",
+            len,
+            Vec::capacity(self)
+        );
+        let len = std::cmp::min(len, Vec::capacity(self));
         // SAFETY: caller guarantees the first `len` bytes are written.
         unsafe { self.set_len(len) };
     }

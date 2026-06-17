@@ -87,12 +87,107 @@ fn test_verbose_pointer_audit() {
             print!("{} <-> ", (*task).id);
         }
         println!("SENTINEL");
+
+        while list.pop_front(offset).is_some() {}
+    }
+}
+
+#[test]
+fn remove_unlinked_node_is_noop() {
+    let mut list = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
+    list.init();
+    let mut task = Task {
+        id: 1,
+        link: utils::list::intrusive::dlist::Link::new_unlinked(),
+    };
+
+    unsafe {
+        list.remove(&mut task.link);
+    }
+
+    assert!(list.is_empty());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn remove_cross_list_node_panics_in_debug() {
+    let mut left = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
+    left.init();
+    let mut right = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
+    right.init();
+    let mut task = Task {
+        id: 1,
+        link: utils::list::intrusive::dlist::Link::new_unlinked(),
+    };
+
+    unsafe {
+        right.push_back(&mut task.link);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            left.remove(&mut task.link);
+        }));
+        assert!(result.is_err());
+        while right.pop_front(offset_of!(Task, link)).is_some() {}
+    }
+}
+
+#[test]
+fn append_back_moves_nodes_and_empties_source() {
+    let offset = offset_of!(Task, link);
+    let mut left = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
+    left.init();
+    let mut right = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
+    right.init();
+    let mut tasks: Vec<Task> = (0..5)
+        .map(|id| Task {
+            id,
+            link: utils::list::intrusive::dlist::Link::new_unlinked(),
+        })
+        .collect();
+
+    unsafe {
+        left.push_back(&mut tasks[0].link);
+        left.push_back(&mut tasks[1].link);
+        right.push_back(&mut tasks[2].link);
+        right.push_back(&mut tasks[3].link);
+        right.push_back(&mut tasks[4].link);
+
+        left.append_back(&mut right);
+        assert!(right.is_empty());
+
+        let mut cursor = left.cursor_mut();
+        let mut ids = Vec::new();
+        while let Some((task, _)) = cursor.next_with_offset(offset) {
+            ids.push((*task).id);
+        }
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+
+        left.append_back(&mut right);
+        let mut cursor = left.cursor_mut();
+        let mut ids_after_empty_append = Vec::new();
+        while let Some((task, _)) = cursor.next_with_offset(offset) {
+            ids_after_empty_append.push((*task).id);
+        }
+        assert_eq!(ids_after_empty_append, vec![0, 1, 2, 3, 4]);
+
+        while left.pop_front(offset).is_some() {}
     }
 }
 
 #[test]
 #[cfg(debug_assertions)]
-#[should_panic(expected = "broken list")]
+fn append_back_self_alias_panics_in_debug() {
+    let mut list = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
+    list.init();
+    let list_ptr = &mut list as *mut utils::list::intrusive::dlist::DList<Task>;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        (*list_ptr).append_back(&mut *list_ptr);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+#[cfg(debug_assertions)]
 fn test_broken_list_detection() {
     let mut list = utils::list::intrusive::dlist::DList::<Task>::new_uninit();
     list.init();
@@ -105,24 +200,31 @@ fn test_broken_list_detection() {
     unsafe {
         list.push_back(&mut t1.link);
 
-        // MANUALLY CORRUPT THE LIST (Simulating a stray pointer write)
-        // We break the circular link: next.prev != head
+        // Corrupt t1.next so the sentinel's prev.next no longer points back
+        // to head.
         t1.link.next = std::ptr::null_mut();
         std::hint::black_box(&t1.link.next);
 
-        // This should trigger your macro's internal consistency check
-        list.push_back(
-            &mut Task {
-                id: 2,
-                link: utils::list::intrusive::dlist::Link::new_unlinked(),
-            }
-            .link,
-        );
+        // The next push_back runs the debug sentinel consistency check, which
+        // must detect `prev.next != head`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            list.push_back(
+                &mut Task {
+                    id: 2,
+                    link: utils::list::intrusive::dlist::Link::new_unlinked(),
+                }
+                .link,
+            );
+        }));
+        assert!(result.is_err());
+        // The list is intentionally corrupted and non-empty; suppress Drop's
+        // debug assertion after the caught panic.
+        std::mem::forget(list);
     }
 }
 
 #[test]
-fn test_verbose_splice_logic() {
+fn test_verbose_append_logic() {
     let offset = std::mem::offset_of!(Task, link);
 
     // Setup two lists
@@ -154,14 +256,14 @@ fn test_verbose_splice_logic() {
         println!("Ready Queue: ");
         print_list_verbose(&mut ready_queue, offset);
 
-        // Splice
-        println!("\n[PHASE 2] Splicing Ready Queue into Running Queue (O(1))");
-        running_queue.splice_back(&mut ready_queue);
+        // Append
+        println!("\n[PHASE 2] Appending Ready Queue into Running Queue (O(1))");
+        running_queue.append_back(&mut ready_queue);
 
         println!("Combined Running Queue:");
         print_list_verbose(&mut running_queue, offset);
 
-        println!("Ready Queue (Post-Splice):");
+        println!("Ready Queue (Post-Append):");
         if ready_queue.is_empty() {
             println!("  (List is empty as expected)");
         }
@@ -175,7 +277,8 @@ fn test_verbose_splice_logic() {
         }
         assert_eq!(expected_id, 6);
 
-        println!("\n[RESULT] Splice successful and order preserved.");
+        println!("\n[RESULT] Append successful and order preserved.");
+        while running_queue.pop_front(offset).is_some() {}
     }
 }
 
@@ -690,7 +793,6 @@ mod debug_only {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "double insert")]
     fn double_insert_panics_verbose() {
         eprintln!("\n== double_insert_panics_verbose ==");
 
@@ -707,7 +809,11 @@ mod debug_only {
 
             let p2 = link_ptr(&mut n);
             eprintln!("push_back second time (panic expected) link={:p}", p2);
-            list.push_back(p2);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                list.push_back(p2);
+            }));
+            assert!(result.is_err());
+            while list.pop_front(link_offset()).is_some() {}
         }
     }
 
@@ -733,9 +839,8 @@ mod debug_only {
     }
 
     #[test]
-    #[should_panic(expected = "remove on unlinked node")]
-    fn remove_unlinked_panics_verbose() {
-        eprintln!("\n== remove_unlinked_panics_verbose ==");
+    fn remove_unlinked_is_noop_verbose() {
+        eprintln!("\n== remove_unlinked_is_noop_verbose ==");
 
         let mut list: utils::list::intrusive::dlist::DList<Node> =
             utils::list::intrusive::dlist::DList::new_uninit();
@@ -745,8 +850,10 @@ mod debug_only {
 
         unsafe {
             let p = link_ptr(&mut n);
-            eprintln!("remove on unlinked node (panic expected) link={:p}", p);
+            eprintln!("remove on unlinked node link={:p}", p);
             list.remove(p);
         }
+
+        assert!(list.is_empty());
     }
 }

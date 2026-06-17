@@ -2,6 +2,7 @@
 
 use crate::utils;
 
+/// Configuration error returned while constructing a slab allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlabAllocatorConfigError {
     /// `objs_per_slab` must be greater than zero.
@@ -53,6 +54,9 @@ pub struct Slab {
 }
 
 impl Slab {
+    /// Bump-allocates one fixed-size object slot from this slab page.
+    ///
+    /// Returns `None` when fewer than `obj_size` payload bytes remain.
     #[inline(always)]
     pub fn try_alloc(&mut self, obj_size: usize) -> Option<*mut u8> {
         let remaining = self.end_ptr as usize - self.bump_ptr as usize;
@@ -75,11 +79,25 @@ pub struct SlabAllocator<'a, P: super::provider::MemoryProvider> {
     total_slab_size: usize,
     /// Header size rounded up to the object alignment.
     header_padded_size: usize,
+    /// Usable payload bytes reserved for configured object slots.
+    payload_bytes: usize,
     /// Alignment required for the slab allocation as a whole.
     slab_align: usize,
 }
 
 impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
+    /// Creates an uninitialized slab allocator for fixed-size object slots.
+    ///
+    /// Call [`SlabAllocator::init`] before requesting slabs so the provider's
+    /// alignment guarantee is raised to the computed slab alignment.
+    ///
+    /// # Errors
+    /// Returns [`SlabAllocatorConfigError::ObjsPerSlabZero`] when
+    /// `objs_per_slab` is zero.
+    /// Returns [`SlabAllocatorConfigError::InvalidObjectAlign`] when
+    /// `obj_align` is not a non-zero power of two.
+    /// Returns [`SlabAllocatorConfigError::SizeOverflow`] when slab geometry
+    /// overflows addressable memory.
     pub fn new_uninit(
         provider: &'a mut P,
         obj_size: usize,
@@ -125,10 +143,13 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
             provider,
             total_slab_size,
             header_padded_size,
+            payload_bytes,
             slab_align,
         })
     }
 
+    /// Applies the allocator's computed alignment requirement to the backing
+    /// memory provider.
     pub fn init(&mut self) {
         debug_assert!(self.slab_align.is_power_of_two());
 
@@ -150,7 +171,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
                 Slab {
                     link: utils::list::intrusive::slist::Link::new_unlinked(),
                     bump_ptr: raw_mem.add(self.header_padded_size),
-                    end_ptr: raw_mem.add(self.total_slab_size),
+                    end_ptr: raw_mem.add(self.header_padded_size + self.payload_bytes),
                 },
             );
             Some(slab_ptr)

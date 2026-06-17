@@ -65,6 +65,7 @@ pub fn make_read_chain<const N: usize>(capacities: [usize; N]) -> IoBuffVecMut<N
 /// Compact projected write source for stream integration tests.
 #[allow(dead_code)]
 pub struct TestProjected<const N: usize> {
+    /// Per-iovec payload pieces in send order.
     segments: [&'static [u8]; N],
 }
 
@@ -74,6 +75,7 @@ impl<const N: usize> TestProjected<N> {
         Self { segments }
     }
 
+    /// Flattened wire image used to assert received bytes.
     #[allow(dead_code)]
     pub fn expected(&self) -> Vec<u8> {
         let mut expected = Vec::new();

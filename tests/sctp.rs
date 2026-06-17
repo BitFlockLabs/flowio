@@ -5,17 +5,23 @@ use flowio::net::sctp::{
     SctpAddStreams, SctpAssocConfig, SctpAssocStatus, SctpConnector, SctpInitConfig, SctpListener,
     SctpNotification, SctpNotificationKind, SctpNotificationMask, SctpPeerAddrInfo,
     SctpPeerAddrParams, SctpReconfigFlags, SctpRecvMeta, SctpResetStreams, SctpSendInfo,
-    SctpSocketConfig, test_accept_slot_drop_future_closes_completed_fd,
-    test_adaptation_indication_type, test_assoc_change_type, test_assoc_reset_event_type,
-    test_connect_slot_drop_future_closes_socket_fd, test_parse_notification,
-    test_partial_delivery_event_type, test_peer_addr_change_type, test_remote_error_type,
-    test_send_failed_event_type, test_sender_dry_event_type, test_shutdown_event_type,
-    test_stream_change_event_type, test_stream_reset_event_type,
+    SctpSocketConfig, test_accept_slot_drop_cached_state_closes_completed_fd,
+    test_accept_slot_drop_future_closes_completed_fd, test_adaptation_indication_type,
+    test_assoc_change_type, test_assoc_reset_event_type,
+    test_connect_slot_drop_future_closes_socket_fd, test_parse_notification, test_parse_recv_meta,
+    test_partial_delivery_event_type, test_peer_addr_change_type,
+    test_peer_addr_params_rejects_optlen, test_remote_error_type, test_send_failed_error_offset,
+    test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
+    test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
+    test_stream_reset_event_type,
 };
+use flowio::runtime::buffer::IoBuffReadOnly;
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u32_at};
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::timeout;
+use std::future::Future;
+use std::task::Poll;
 use std::time::Duration;
 
 fn sctp_unsupported(err: &std::io::Error) -> bool {
@@ -29,6 +35,58 @@ fn sctp_unsupported(err: &std::io::Error) -> bool {
     )
 }
 
+/// Polls an orphaned SCTP peer until it observes association teardown.
+///
+/// EOF, shutdown/association-change notifications, reset, and not-connected
+/// errors all count as teardown. Data is a failure.
+async fn wait_for_sctp_peer_teardown(stream: &mut flowio::net::sctp::SctpStream) {
+    let mut current_buf = vec![0u8; 256];
+    for _ in 0..8 {
+        let recv_res = timeout(Duration::from_secs(1), stream.recv_msg(current_buf, 256))
+            .await
+            .expect("orphaned SCTP accept peer close wait timed out");
+        let (res, returned_buf) = recv_res;
+
+        match res {
+            Ok((0, _)) => return,
+            Ok((recv_len, SctpRecvMeta::Notification(SctpNotification::Shutdown { .. }))) => {
+                assert!(recv_len > 0, "shutdown notification should carry bytes");
+                return;
+            }
+            Ok((
+                _recv_len,
+                SctpRecvMeta::Notification(SctpNotification::AssocChange { state, .. }),
+            )) if state != 0 => return,
+            Ok((_recv_len, SctpRecvMeta::Notification(_))) => {
+                current_buf = returned_buf;
+                continue;
+            }
+            Ok((recv_len, SctpRecvMeta::Data(_))) => {
+                panic!("orphaned SCTP accept peer unexpectedly read {recv_len} data bytes");
+            }
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::ECONNRESET | libc::ENOTCONN | libc::ESHUTDOWN)
+                ) || matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return;
+            }
+            Err(err) => panic!("orphaned SCTP accept peer read failed unexpectedly: {err}"),
+        }
+    }
+
+    panic!("orphaned SCTP accept peer did not observe association teardown");
+}
+
+/// Builds a zeroed SCTP notification buffer with sn_type/sn_flags/sn_length
+/// header fields prefilled.
 fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     buf.write_u16_at(0, notification_type as u16)
@@ -40,6 +98,7 @@ fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -
     buf
 }
 
+/// Builds raw 127.0.0.1:port sockaddr_storage for notification fixtures.
 fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr = libc::sockaddr_in {
@@ -59,14 +118,46 @@ fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage {
     storage
 }
 
+/// Fake read-only buffer reporting a length above u32::MAX to exercise
+/// oversize-send rejection without allocating that much memory.
+struct HugeReadOnly;
+
+unsafe impl IoBuffReadOnly for HugeReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        b"x".as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        u32::MAX as usize + 1
+    }
+}
+
+/// Dropping an accept future whose CQE already completed must close the
+/// orphaned accepted fd and clear the reusable slot.
 #[test]
 fn sctp_accept_slot_drop_future_closes_completed_fd() {
     test_accept_slot_drop_future_closes_completed_fd().unwrap();
 }
 
+/// Same orphaned-fd-close guarantee on cached-state teardown as on
+/// drop_future: a completed-but-unconsumed accept fd is closed.
+#[test]
+fn sctp_accept_slot_drop_cached_state_closes_completed_fd() {
+    test_accept_slot_drop_cached_state_closes_completed_fd().unwrap();
+}
+
+/// Dropping an in-flight connect future closes the connecting socket fd and
+/// resets the reusable slot.
 #[test]
 fn sctp_connect_slot_drop_future_closes_socket_fd() {
     test_connect_slot_drop_future_closes_socket_fd().unwrap();
+}
+
+#[test]
+fn sctp_peer_addr_params_rejects_gap_optlen() {
+    // 153 lands outside both modern and legacy SCTP_PEER_ADDR_PARAMS optlen
+    // ranges, so decode must reject it.
+    test_peer_addr_params_rejects_optlen(153).unwrap();
 }
 
 #[test]
@@ -125,17 +216,98 @@ fn parse_adaptation_notification() {
     );
 }
 
+/// Parses the legacy SCTP_SEND_FAILED layout that carries sctp_sndrcvinfo.
+#[test]
+fn parse_legacy_send_failed_notification() {
+    let sndrcvinfo_len = std::mem::size_of::<libc::sctp_sndrcvinfo>();
+    let error_offset = test_send_failed_error_offset();
+    let info_offset = test_send_failed_info_offset();
+    assert_eq!(error_offset, 8);
+    assert_eq!(info_offset, 12);
+    let mut buf = vec![0u8; info_offset + sndrcvinfo_len + 4];
+    buf.write_u16_at(0, test_send_failed_type() as u16)
+        .expect("legacy send failed type write should fit");
+    buf.write_u16_at(2, 0)
+        .expect("legacy send failed flags write should fit");
+    buf.write_u32_at(4, (info_offset + sndrcvinfo_len + 4) as u32)
+        .expect("legacy send failed length write should fit");
+    buf.write_u32_at(error_offset, 9)
+        .expect("legacy send failed error write should fit");
+
+    let sndrcvinfo = libc::sctp_sndrcvinfo {
+        sinfo_stream: 3,
+        sinfo_ssn: 0,
+        sinfo_flags: 4,
+        sinfo_ppid: (0x0506_0708u32).to_be(),
+        sinfo_context: 10,
+        sinfo_timetolive: 0,
+        sinfo_tsn: 0,
+        sinfo_cumtsn: 0,
+        sinfo_assoc_id: 11,
+    };
+    unsafe {
+        std::ptr::write_unaligned(
+            buf.as_mut_ptr().add(info_offset) as *mut libc::sctp_sndrcvinfo,
+            sndrcvinfo,
+        );
+    }
+    let assoc_base = info_offset + sndrcvinfo_len;
+    buf.write_i32_at(assoc_base, 12)
+        .expect("legacy send failed assoc id write should fit");
+
+    let parsed = test_parse_notification(&buf).expect("legacy send failed parse failed");
+    assert_eq!(
+        parsed,
+        SctpRecvMeta::Notification(SctpNotification::SendFailed {
+            error: 9,
+            info: SctpSendInfo {
+                stream_id: 3,
+                flags: 4,
+                ppid: 0x0506_0708,
+                context: 10,
+                assoc_id: 11,
+            },
+            assoc_id: 12,
+        })
+    );
+}
+
+#[test]
+fn parse_recv_meta_rejects_truncated_payload_and_control() {
+    let payload_err = test_parse_recv_meta(&[], 0, libc::MSG_TRUNC, &[])
+        .expect_err("MSG_TRUNC should reject truncated SCTP payloads");
+    assert_eq!(payload_err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        payload_err.to_string().contains("payload"),
+        "payload truncation error should name payload truncation: {payload_err}"
+    );
+
+    let control_err = test_parse_recv_meta(&[], 0, libc::MSG_CTRUNC, &[])
+        .expect_err("MSG_CTRUNC should reject missing SCTP control data");
+    assert_eq!(control_err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        control_err.to_string().contains("control"),
+        "control truncation error should name control truncation: {control_err}"
+    );
+}
+
+/// Parses the newer SCTP_SEND_FAILED_EVENT layout; it must produce the same
+/// SendFailed result shape as the legacy layout above.
 #[test]
 fn parse_send_failed_event_notification() {
     let sndinfo_len = std::mem::size_of::<libc::sctp_sndinfo>();
-    let mut buf = vec![0u8; 12 + sndinfo_len + 4];
+    let error_offset = test_send_failed_error_offset();
+    let info_offset = test_send_failed_info_offset();
+    assert_eq!(error_offset, 8);
+    assert_eq!(info_offset, 12);
+    let mut buf = vec![0u8; info_offset + sndinfo_len + 4];
     buf.write_u16_at(0, test_send_failed_event_type() as u16)
         .expect("send failed type write should fit");
     buf.write_u16_at(2, 0)
         .expect("send failed flags write should fit");
-    buf.write_u32_at(4, (12 + sndinfo_len + 4) as u32)
+    buf.write_u32_at(4, (info_offset + sndinfo_len + 4) as u32)
         .expect("send failed length write should fit");
-    buf.write_u32_at(8, 9)
+    buf.write_u32_at(error_offset, 9)
         .expect("send failed error write should fit");
 
     let sndinfo = libc::sctp_sndinfo {
@@ -146,9 +318,12 @@ fn parse_send_failed_event_notification() {
         snd_assoc_id: 11,
     };
     unsafe {
-        std::ptr::write_unaligned(buf.as_mut_ptr().add(12) as *mut libc::sctp_sndinfo, sndinfo);
+        std::ptr::write_unaligned(
+            buf.as_mut_ptr().add(info_offset) as *mut libc::sctp_sndinfo,
+            sndinfo,
+        );
     }
-    let assoc_base = 12 + sndinfo_len;
+    let assoc_base = info_offset + sndinfo_len;
     buf.write_i32_at(assoc_base, 12)
         .expect("send failed assoc id write should fit");
 
@@ -205,12 +380,21 @@ fn parse_peer_addr_change_notification() {
 
 #[test]
 fn parse_remote_error_and_shutdown_notifications() {
-    let mut remote_error = notification_buffer(test_remote_error_type(), 0, 14);
+    let mut too_short = notification_buffer(test_remote_error_type(), 0, 14);
+    too_short
+        .write_u16_be_at(8, 0x1122)
+        .expect("remote error code write should fit");
+    assert!(
+        test_parse_notification(&too_short).is_err(),
+        "14-byte remote error should be rejected"
+    );
+
+    let mut remote_error = notification_buffer(test_remote_error_type(), 0, 16);
     remote_error
         .write_u16_be_at(8, 0x1122)
         .expect("remote error code write should fit");
     remote_error
-        .write_i32_at(10, 12)
+        .write_i32_at(12, 12)
         .expect("remote error assoc id write should fit");
     let parsed = test_parse_notification(&remote_error).expect("remote error parse failed");
     assert_eq!(
@@ -946,9 +1130,6 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state() {
                             assert_eq!(info.stream_id, 1);
                             assert_eq!(info.ppid, 0x0102_0304);
                             saw_data = true;
-                            if recv_len == 0 {
-                                saw_eof = true;
-                            }
                         }
                     }
 
@@ -1031,6 +1212,123 @@ fn runtime_sctp_connect_timeout_success() {
                 .await
                 .expect("connect_timeout failed");
             assert_eq!(stream.peer_addr(), addr);
+        })
+        .expect("executor run failed");
+}
+
+/// Dropping an accept future before any association completes leaves the
+/// listener reusable for a later connector.
+#[test]
+fn runtime_sctp_accept_drop_then_reaccepts() {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let init = SctpInitConfig::diameter_default();
+    let mut listener =
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
+            Ok(listener) => listener,
+            Err(err) => {
+                if sctp_unsupported(&err) {
+                    eprintln!(
+                        "skipping runtime_sctp_accept_drop_then_reaccepts: SCTP unsupported ({err})"
+                    );
+                    return;
+                }
+                panic!("failed to bind sctp listener: {err}");
+            }
+        };
+
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::new(init);
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before test connector started"),
+            })
+            .await;
+            drop(accept);
+
+            let server = Executor::spawn(async move { listener.accept().await })
+                .expect("server accept spawn failed");
+            let stream = connector
+                .connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+            let (_server_stream, remote_addr) = server.await.expect("second accept failed");
+            assert_eq!(
+                remote_addr,
+                stream.local_addr().expect("client local_addr failed")
+            );
+        })
+        .expect("executor run failed");
+}
+
+/// Cancelling an accept after an association was established must close the
+/// orphaned accepted fd and leave the listener reusable.
+#[test]
+fn runtime_sctp_cancelled_accept_after_association_reaccepts() {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let init = SctpInitConfig::diameter_default();
+    let mut listener = match SctpListener::bind(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        128,
+        init,
+    ) {
+        Ok(listener) => listener,
+        Err(err) => {
+            if sctp_unsupported(&err) {
+                eprintln!(
+                    "skipping runtime_sctp_cancelled_accept_after_association_reaccepts: SCTP unsupported ({err})"
+                );
+                return;
+            }
+            panic!("failed to bind sctp listener: {err}");
+        }
+    };
+
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::new(init);
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before test connector started"),
+            })
+            .await;
+
+            let orphan_stream = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("orphan connect_timeout init failed")
+                .await
+                .expect("orphan connect failed");
+            let mut orphan_stream = orphan_stream;
+            drop(accept);
+            wait_for_sctp_peer_teardown(&mut orphan_stream).await;
+            drop(orphan_stream);
+
+            let server = Executor::spawn(async move { listener.accept().await })
+                .expect("server accept spawn failed");
+            let stream = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("second connect_timeout init failed")
+                .await
+                .expect("second connect failed");
+            let (_server_stream, remote_addr) = timeout(Duration::from_secs(1), server)
+                .await
+                .expect("second accept timed out")
+                .expect("second accept failed");
+            assert_eq!(
+                remote_addr,
+                stream.local_addr().expect("client local_addr failed")
+            );
         })
         .expect("executor run failed");
 }
@@ -1252,6 +1550,56 @@ fn runtime_sctp_recv_msg_rejects_oversize_iobuff() {
         .expect("executor run failed");
 }
 
+#[test]
+fn runtime_sctp_send_rejects_oversize_iobuff() {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let init = SctpInitConfig::diameter_default();
+    let mut listener = match SctpListener::bind(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        128,
+        init,
+    ) {
+        Ok(listener) => listener,
+        Err(err) => {
+            if sctp_unsupported(&err) {
+                eprintln!(
+                    "skipping runtime_sctp_send_rejects_oversize_iobuff: SCTP unsupported ({err})"
+                );
+                return;
+            }
+            panic!("failed to bind sctp listener: {err}");
+        }
+    };
+
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::new(init);
+
+    executor
+        .run(async move {
+            Executor::spawn(async move {
+                let (_stream, _remote) = listener.accept().await.expect("accept failed");
+            })
+            .expect("accept spawn failed");
+
+            let mut stream = connector
+                .connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+
+            let (res, _buf) = stream.send(HugeReadOnly).await;
+            let err = res.expect_err("oversize send should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+            let (res, _buf) = stream.send_msg(HugeReadOnly, SctpSendInfo::default()).await;
+            let err = res.expect_err("oversize send_msg should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        })
+        .expect("executor run failed");
+}
+
 // ============================================================================
 // Vectored I/O (send_msg_vectored / recv_msg_vectored) tests
 // ============================================================================
@@ -1368,7 +1716,8 @@ fn runtime_sctp_ping_pong_vectored() {
                 let (recv_len, meta) = recv_res.0.expect("client recv_msg_vectored failed");
                 match meta {
                     SctpRecvMeta::Notification(_) => {
-                        // Rebuild chain for retry (old one consumed by rental).
+                        // A notification returns the rented chain; rebuild it
+                        // before the next recv attempt.
                         recv_chain = IoBuffVecMut::<2>::new();
                         recv_chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
                         recv_chain.push(IoBuffMut::new(0, 128, 0)).unwrap();

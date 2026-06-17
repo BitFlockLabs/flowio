@@ -174,7 +174,7 @@ mod debug_only {
         unsafe {
             list.push_front(&mut n1.link);
             list.push_front(&mut n2.link);
-            // This should panic because the node is already linked (n2.link.next = n1).
+            // n2 is still linked (next -> n1), so double-insert assert fires.
             list.push_front(&mut n2.link);
         }
     }

@@ -75,7 +75,7 @@ impl<T> DList<T> {
         }
     }
 
-    /// Returns `true` when the list has no payload nodes.
+    /// Returns `true` when the list is uninitialized or has no payload nodes.
     ///
     /// In debug builds, callers are still expected to initialize the list
     /// before use.
@@ -100,12 +100,36 @@ impl<T> DList<T> {
         }
     }
 
+    #[cfg(debug_assertions)]
+    fn contains_link(&self, node_link: *mut Link) -> bool {
+        // Debug-only ownership check. Release builds keep remove O(1); debug
+        // builds spend O(n) here to catch cross-list removal bugs early.
+        if node_link.is_null() || self.head.next.is_null() || self.head.prev.is_null() {
+            return false;
+        }
+
+        let head_ptr = &self.head as *const Link as *mut Link;
+        let mut current = self.head.next;
+        while current != head_ptr {
+            if current == node_link {
+                return true;
+            }
+            unsafe {
+                current = (*current).next;
+            }
+            if current.is_null() {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Adds an element to the back of the list.
     #[inline(always)]
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a `Link` that is currently unlinked (unless unchecked).
+    /// to a currently unlinked `Link`.
     pub unsafe fn push_back(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -146,7 +170,7 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a `Link` that is currently unlinked (unless unchecked).
+    /// to a currently unlinked `Link`.
     pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -171,7 +195,7 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a `Link` that is currently unlinked (unless unchecked).
+    /// to a currently unlinked `Link`.
     pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -186,10 +210,20 @@ impl<T> DList<T> {
     }
 
     /// Appends all nodes from `other` to the back of `self` in O(1).
+    ///
+    /// This is reserved low-level infrastructure for queue-splice paths that
+    /// need to move an entire list without per-node relinking.
+    ///
+    /// Both lists must be initialized, and `self` and `other` must be distinct
+    /// lists. After this returns, `other` is empty and reusable.
     #[inline(always)]
     pub fn append_back(&mut self, other: &mut Self) {
         debug_assert_list_inited!(self);
         debug_assert_list_inited!(other);
+        debug_assert!(
+            !std::ptr::eq(self, other),
+            "DList::append_back requires distinct lists"
+        );
 
         if other.is_empty() {
             return;
@@ -213,6 +247,42 @@ impl<T> DList<T> {
         }
     }
 
+    /// Unlinks every payload node without requiring the container offset.
+    ///
+    /// This is for owner teardown paths that are already discarding the
+    /// backing storage for every linked node. Normal list users should remove
+    /// or pop nodes explicitly so ownership remains visible. A fully
+    /// uninitialized list sentinel is tolerated for defensive teardown, but a
+    /// partially initialized sentinel is rejected in debug builds.
+    pub(crate) fn unlink_all_for_drop(&mut self) {
+        let next_null = self.head.next.is_null();
+        let prev_null = self.head.prev.is_null();
+        debug_assert_eq!(
+            next_null, prev_null,
+            "DList teardown saw a partially initialized sentinel"
+        );
+        if next_null || prev_null {
+            return;
+        }
+
+        let head_ptr = &mut self.head as *mut Link;
+        let mut current = self.head.next;
+        while current != head_ptr {
+            unsafe {
+                let next = (*current).next;
+                (*current).next = ptr::null_mut();
+                (*current).prev = ptr::null_mut();
+                if next.is_null() {
+                    break;
+                }
+                current = next;
+            }
+        }
+
+        self.head.next = head_ptr;
+        self.head.prev = head_ptr;
+    }
+
     /// Removes a specific node from the list.
     #[inline(always)]
     /// # Safety
@@ -231,18 +301,20 @@ impl<T> DList<T> {
             return;
         }
 
-        debug_assert!(
-            unsafe { !(*node_link).next.is_null() && !(*node_link).prev.is_null() },
-            "remove on unlinked node"
-        );
-
         unsafe {
             let next = (*node_link).next;
             let prev = (*node_link).prev;
 
-            // Treat already-detached nodes as a no-op on the unchecked path.
             if next.is_null() || prev.is_null() {
                 return;
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    self.contains_link(node_link),
+                    "remove on node that does not belong to this list"
+                );
             }
 
             (*next).prev = prev;
@@ -255,6 +327,9 @@ impl<T> DList<T> {
     }
 
     /// Returns the first element without unlinking it.
+    ///
+    /// `offset` must be the byte distance from the start of `T` to the
+    /// embedded [`Link`] field used by this list.
     #[inline(always)]
     pub fn front(&self, offset: usize) -> Option<*mut T> {
         debug_assert_list_inited!(self);
@@ -326,41 +401,18 @@ impl<T> DList<T> {
             _list: self,
         }
     }
+}
 
-    /// Splices the contents of `other` into the back of `self`.
-    /// After this operation, `other` will be empty.
-    /// This is an O(1) operation regardless of the number of elements.
-    #[inline(always)]
-    /// # Safety
-    ///
-    /// The caller must ensure that `other` is a valid, initialized list.
-    pub unsafe fn splice_back(&mut self, other: &mut DList<T>) {
-        debug_assert_list_inited!(self);
-        debug_assert_list_inited!(other);
-
-        if other.is_empty() {
+impl<T> Drop for DList<T> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
             return;
         }
 
-        unsafe {
-            let self_head = &mut self.head as *mut Link;
-            let other_head = &mut other.head as *mut Link;
-
-            let self_last = (*self_head).prev;
-            let other_first = (*other_head).next;
-            let other_last = (*other_head).prev;
-
-            // 1. Connect the end of self to the start of other
-            (*self_last).next = other_first;
-            (*other_first).prev = self_last;
-
-            // 2. Connect the end of other back to the head of self
-            (*other_last).next = self_head;
-            (*self_head).prev = other_last;
-
-            // 3. Reset the other list to an empty state
-            other.init();
-        }
+        debug_assert!(
+            self.head.next.is_null() || self.is_empty(),
+            "DList dropped while still containing linked nodes"
+        );
     }
 }
 
@@ -454,5 +506,86 @@ impl<'a, T> CursorBackMut<'a, T> {
         unsafe {
             self._list.remove(link);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::offset_of;
+
+    #[repr(C)]
+    struct Node {
+        id: u32,
+        link: Link,
+    }
+
+    #[test]
+    fn unlink_all_for_drop_handles_empty_list() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+
+        list.unlink_all_for_drop();
+
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn unlink_all_for_drop_detaches_single_node() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut node = Node {
+            id: 1,
+            link: Link::new_unlinked(),
+        };
+
+        unsafe {
+            list.push_back(&mut node.link);
+        }
+
+        list.unlink_all_for_drop();
+
+        assert!(list.is_empty());
+        assert!(node.link.is_unlinked());
+    }
+
+    #[test]
+    fn unlink_all_for_drop_detaches_nodes_and_reuses_list() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut nodes = [
+            Node {
+                id: 1,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 2,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 3,
+                link: Link::new_unlinked(),
+            },
+        ];
+
+        unsafe {
+            for node in &mut nodes {
+                list.push_back(&mut node.link);
+            }
+        }
+
+        list.unlink_all_for_drop();
+        assert!(list.is_empty());
+        assert!(nodes.iter().all(|node| node.link.is_unlinked()));
+
+        unsafe {
+            list.push_back(&mut nodes[1].link);
+            let popped = list
+                .pop_front(offset_of!(Node, link))
+                .expect("reused list should pop inserted node");
+            assert_eq!((*popped).id, 2);
+        }
+        assert!(list.is_empty());
+        assert!(nodes[1].link.is_unlinked());
     }
 }

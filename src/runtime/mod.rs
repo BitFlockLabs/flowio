@@ -8,7 +8,6 @@
 //! - [`executor`] for driving async work
 //! - [`buffer`] for heap-, pool-, and vectored I/O buffers
 //! - [`timer`] for runtime-native sleeps and timeouts
-//! - [`io`] for minimal runtime-owned operations such as `NOP`
 //!
 //! # Fast-Path Guidance
 //!
@@ -22,9 +21,8 @@
 //! Prefer not to use on the fast path:
 //! - Prefer not to construct a fresh executor around each request or
 //!   operation. Reuse the thread's long-lived executor instead.
-//! - Prefer not to use [`timer`] and [`io`] as substitutes for the transport
-//!   data path exposed under [`crate::net`]. They are control-path/runtime
-//!   helpers.
+//! - Prefer not to use [`timer`] as a substitute for the transport data path
+//!   exposed under [`crate::net`]. Timers are control-path/runtime helpers.
 //!
 //! # Example
 //! ```no_run
@@ -42,10 +40,13 @@
 pub mod buffer;
 pub mod executor;
 pub(crate) mod fd;
+#[doc(hidden)]
 pub mod io;
+#[doc(hidden)]
 pub mod op;
 pub mod reactor;
 #[allow(dead_code)]
 pub(crate) mod retained;
+#[doc(hidden)]
 pub mod task;
 pub mod timer;

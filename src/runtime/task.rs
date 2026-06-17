@@ -1,4 +1,8 @@
 //! Runtime task headers, cached wakers, and inline task storage.
+//!
+//! FlowIO tasks are executor-thread owned. Cloned task wakers must be woken on
+//! the owning runtime thread; moving them to another thread would race the
+//! non-atomic task reference count and intrusive ready-queue links.
 
 use crate::utils::list::intrusive::dlist;
 use crate::utils::memory::pool::InPlaceInit;
@@ -6,7 +10,7 @@ use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
 
-unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
+unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
     unsafe { crate::runtime::executor::schedule_woken_task(task_ptr) };
 }
 
@@ -129,14 +133,14 @@ unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
 
 unsafe fn wake_waker(ptr: *const ()) {
     unsafe {
-        schedule_task(ptr as *mut TaskHeader);
+        schedule_woken_task(ptr as *mut TaskHeader);
         release_task(ptr as *mut TaskHeader);
     }
 }
 
 unsafe fn wake_by_ref_waker(ptr: *const ()) {
     unsafe {
-        schedule_task(ptr as *mut TaskHeader);
+        schedule_woken_task(ptr as *mut TaskHeader);
     }
 }
 

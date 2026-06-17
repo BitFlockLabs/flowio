@@ -35,6 +35,23 @@ use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 /// Configuration for [`IoBuffPool`] buffer layout.
+///
+/// This is setup-time configuration. Create and initialize pools before the
+/// steady-state I/O path; use [`IoBuffPool::alloc`] to reuse fixed-shape
+/// slots on the fast path.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::pool::IoBuffPoolConfig;
+///
+/// let config = IoBuffPoolConfig {
+///     headroom: 16,
+///     payload: 1500,
+///     tailroom: 0,
+///     objs_per_slab: 64,
+/// };
+/// assert_eq!(config.payload, 1500);
+/// ```
 pub struct IoBuffPoolConfig {
     /// Reserved headroom bytes for prepending protocol headers.
     pub headroom: usize,
@@ -48,6 +65,19 @@ pub struct IoBuffPoolConfig {
 }
 
 /// Errors returned when constructing an [`IoBuffPool`].
+///
+/// # Example
+/// ```
+/// use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig, IoBuffPoolConfigError};
+///
+/// let result = IoBuffPool::new(IoBuffPoolConfig {
+///     headroom: 0,
+///     payload: 1,
+///     tailroom: 0,
+///     objs_per_slab: 0,
+/// });
+/// assert!(matches!(result, Err(IoBuffPoolConfigError::ObjsPerSlabZero)));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoBuffPoolConfigError {
     /// `objs_per_slab` must be greater than zero.
@@ -103,14 +133,16 @@ impl std::error::Error for IoBuffPoolConfigError {}
 /// // buf drops → slot returned to pool's free list (no heap dealloc)
 /// ```
 pub struct IoBuffPool {
-    /// Stable heap-allocated pool state shared with all outstanding buffers.
+    /// Stable heap-allocated pool state intentionally leaked from its `Box`
+    /// and later reclaimed by `IoBuffPoolInner::destroy`.
     inner: NonNull<IoBuffPoolInner>,
 }
 
 /// Stable inner pool state referenced by pool-allocated buffer headers.
 pub(crate) struct IoBuffPoolInner {
-    /// Slab allocator that carves contiguous memory pages into fixed-size
-    /// buffer slots.  Each slot holds one `IoBuffHeader` + data region.
+    /// Manually-dropped slab allocator that carves contiguous memory pages
+    /// into fixed-size buffer slots and is destroyed with the leaked inner.
+    /// Each slot holds one `IoBuffHeader` + data region.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
     /// Heap-allocated memory provider backing the slab allocator.  Boxed
     /// for a stable address that outlives the slab factory's reference.
@@ -120,8 +152,9 @@ pub(crate) struct IoBuffPoolInner {
     /// pops from here first (O(1)) before bump-allocating from a slab.
     free_list: SList<u8>,
     /// Head of the singly-linked list of all allocated slab pages.
-    /// Chained through each Slab header's link.next pointer.  No
-    /// self-referential sentinel — the pool is safe to move.
+    /// Chained through each Slab header's link.next pointer. No
+    /// self-referential sentinel, so the page list itself imposes no move
+    /// constraint; the inner is otherwise heap-pinned for buffer back-pointers.
     slab_page_head: *mut slab::Slab,
     /// The slab currently being bump-allocated from.  When exhausted,
     /// a new slab page is requested from the slab factory.
@@ -316,8 +349,8 @@ impl IoBuffPool {
     /// Creates a new uninitialized buffer pool.  Must call [`init()`](Self::init)
     /// before allocating.
     ///
-    /// This is a setup-path API. Pools are typically created once and then
-    /// reused for many allocations on the hot path.
+    /// This is a setup/control-plane API. Pools are typically created once
+    /// and then reused for many allocations on the hot path.
     ///
     /// Returns an error if the configuration is invalid.
     pub fn new(config: IoBuffPoolConfig) -> Result<Self, IoBuffPoolConfigError> {
@@ -330,7 +363,7 @@ impl IoBuffPool {
     /// Initializes the pool's internal data structures.  Must be called once
     /// after the pool reaches its final memory location.
     ///
-    /// This is also setup-path work rather than part of steady-state
+    /// This is also setup/control-plane work rather than part of steady-state
     /// allocation.
     pub fn init(&mut self) {
         unsafe { self.inner.as_mut() }.init();
@@ -347,6 +380,12 @@ impl IoBuffPool {
     /// supply more slab pages.
     pub fn alloc(&mut self) -> Result<IoBuffMut, IoBuffError> {
         unsafe { self.inner.as_mut() }.alloc()
+    }
+
+    #[doc(hidden)]
+    /// Test-only live-slot counter; not a stable public API.
+    pub fn live_slots_for_test(&self) -> usize {
+        unsafe { self.inner.as_ref() }.live_slots
     }
 }
 

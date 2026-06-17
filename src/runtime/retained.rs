@@ -11,7 +11,7 @@
 //! payload is unusual, but it must stay visible through debug counters and
 //! documentation because it is not the desired steady-state fast path.
 //!
-//! Retained writev scratch is separate from retained payload storage. The
+//! Retained vectored I/O scratch is separate from retained payload storage. The
 //! scratch stores only kernel-facing `iovec` pointer/length metadata; message
 //! bytes remain in the owned payload buffers. Scratch uses inline storage for
 //! small submissions and size-classed slab storage for larger submissions. It
@@ -40,7 +40,9 @@ const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
 
 #[derive(Clone, Copy)]
 pub(crate) struct RetainedPayloadVtable {
+    /// Drops the stored value and releases the backing allocation.
     pub(crate) drop_and_free: unsafe fn(*mut (), *mut RetainedPayloadPool),
+    /// Releases backing storage after the value has been moved out.
     pub(crate) free_storage: unsafe fn(*mut (), *mut RetainedPayloadPool),
 }
 
@@ -48,26 +50,42 @@ pub(crate) struct RetainedPayloadVtable {
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetainedPayloadPoolStats {
+    /// Retained payload allocations served by size-class slabs.
     pub(crate) pooled_allocs: usize,
+    /// Pooled payload allocations served from returned blocks.
     pub(crate) pooled_reuses: usize,
+    /// Pooled payload blocks returned to size-class slabs.
     pub(crate) pooled_frees: usize,
+    /// Retained payload slab pages requested from providers.
     pub(crate) slab_allocs: usize,
+    /// Retained payload allocations that used the heap fallback.
     pub(crate) heap_fallbacks: usize,
+    /// Heap fallback payload blocks released.
     pub(crate) heap_frees: usize,
+    /// Iovec scratch requests served from inline storage.
     pub(crate) writev_scratch_inline_allocs: usize,
+    /// Iovec scratch requests served by pooled sidecar storage.
     pub(crate) writev_scratch_pooled_allocs: usize,
+    /// Pooled sidecar scratch requests served from returned blocks.
     pub(crate) writev_scratch_pooled_reuses: usize,
+    /// Pooled sidecar scratch blocks returned.
     pub(crate) writev_scratch_pooled_frees: usize,
+    /// Sidecar scratch slab pages requested from providers.
     pub(crate) writev_scratch_slab_allocs: usize,
+    /// Scratch requests rejected for exceeding the supported iovec count.
     pub(crate) writev_scratch_oversize_rejections: usize,
+    /// Scratch requests rejected because no sidecar block was available.
     pub(crate) writev_scratch_alloc_failures: usize,
 }
 
 /// Raw, size-classed pool for retained operation payloads.
 pub(crate) struct RetainedPayloadPool {
+    /// Size classes for retained operation payload structs.
     classes: [RetainedSizeClass; RETAINED_SIZE_CLASSES.len()],
+    /// Size classes for retained sidecar `iovec` scratch arrays.
     iovec_classes: [RetainedSizeClass; RETAINED_IOVEC_SIZE_CLASSES.len()],
     #[cfg(debug_assertions)]
+    /// Debug counters exported through runtime stats and tests.
     stats: RetainedPayloadPoolStats,
 }
 
@@ -162,10 +180,10 @@ impl RetainedPayloadPool {
         }
     }
 
-    /// Allocates retained kernel-facing `iovec` scratch for a writev
+    /// Allocates retained kernel-facing `iovec` scratch for a vectored I/O
     /// submission.
     ///
-    /// Scratch is sized by active non-empty iovec count, not by the
+    /// Scratch is sized by active iovec count, not by the
     /// const-generic chain capacity. It stores metadata only and has no heap
     /// fallback.
     #[inline(always)]
@@ -190,7 +208,7 @@ impl RetainedPayloadPool {
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "writev active iovec count exceeds retained scratch capacity",
+                    "active iovec count exceeds retained scratch capacity",
                 ));
             }
         };
@@ -234,23 +252,32 @@ impl RetainedPayloadPool {
     }
 }
 
-/// Retained writev scratch storing kernel-facing `iovec` metadata.
+/// Retained vectored I/O scratch storing kernel-facing `iovec` metadata.
 ///
 /// This type is move-safe: inline storage is addressed from the enum field on
 /// every access, while sidecar storage carries a stable slab pointer. The
 /// sidecar pointer remains valid until the scratch handle is dropped, which is
-/// tied to the retained writev payload lifetime.
+/// tied to the retained vectored I/O payload lifetime. Pooled scratch still
+/// carries the inline array so the handle remains one simple move-safe value;
+/// the extra bytes are a deliberate tradeoff for cancellation-path simplicity.
 pub(crate) struct RetainedIovecScratch {
+    /// Active iovec count visible through this scratch handle.
     len: usize,
+    /// Inline storage used for small vectored submissions.
     inline: [MaybeUninit<libc::iovec>; RETAINED_IOVEC_INLINE_COUNT],
+    /// Selects inline storage or a pooled sidecar block.
     storage: RetainedIovecScratchStorage,
 }
 
 enum RetainedIovecScratchStorage {
+    /// Use the inline array stored inside `RetainedIovecScratch`.
     Inline,
     Pooled {
+        /// Pointer to sidecar storage allocated from an iovec size class.
         ptr: NonNull<MaybeUninit<libc::iovec>>,
+        /// Size-class index used to return `ptr` to the right free list.
         class_index: usize,
+        /// Retained pool that owns the sidecar block.
         pool: *mut RetainedPayloadPool,
     },
 }
@@ -325,7 +352,7 @@ impl Drop for RetainedIovecScratch {
         } = &self.storage
         {
             let pool_ptr = *pool;
-            debug_assert!(!pool_ptr.is_null(), "writev scratch pool pointer is null");
+            debug_assert!(!pool_ptr.is_null(), "iovec scratch pool pointer is null");
             unsafe { (*pool_ptr).free_iovec_scratch_block(*class_index, ptr.as_ptr() as *mut u8) };
         }
     }
@@ -333,8 +360,11 @@ impl Drop for RetainedIovecScratch {
 
 #[must_use = "retained payload handles own storage and must be consumed"]
 pub(crate) struct RetainedPayload<T: 'static> {
+    /// Pointer to initialized retained payload storage.
     ptr: NonNull<T>,
+    /// Release hooks matching the allocation path for `ptr`.
     vtable: RetainedPayloadVtable,
+    /// Carries the concrete payload type for drop-checking and variance.
     _marker: PhantomData<T>,
 }
 
@@ -414,11 +444,17 @@ impl<T: 'static> RetainedPayload<T> {
 }
 
 struct RetainedSizeClass {
+    /// Usable bytes in each block belonging to this class.
     block_size: usize,
+    /// Returned blocks ready for reuse.
     free_list: SList<u8>,
+    /// Head of the singly linked list of slab pages owned by this class.
     slab_page_head: *mut Slab,
+    /// Slab page currently used for bump allocation.
     current_slab: *mut Slab,
+    /// Slab allocator that requests pages for this class.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
+    /// Stable provider backing `slab_factory`.
     _provider: Box<BasicMemoryProvider>,
 }
 
@@ -508,8 +544,11 @@ impl Drop for RetainedSizeClass {
 }
 
 struct ClassAllocResult {
+    /// Raw block pointer returned to the caller.
     ptr: *mut u8,
+    /// True when `ptr` came from the free list.
     reused: bool,
+    /// True when this allocation requested a fresh slab page.
     new_slab: bool,
 }
 

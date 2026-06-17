@@ -8,6 +8,8 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+/// Small buffers force the 8KiB test payload to span multiple TLS records and
+/// exercise partial read/write pumping.
 fn tls_options() -> TlsClientOptions {
     TlsClientOptions {
         rustls_buffer_limit: Some(2048),
@@ -16,6 +18,8 @@ fn tls_options() -> TlsClientOptions {
     }
 }
 
+/// Builds matched self-signed client/server configs plus the localhost server
+/// name and end-entity cert DER used by the handshake assertions.
 fn make_client_server_configs() -> (
     Arc<ClientConfig>,
     Arc<ServerConfig>,

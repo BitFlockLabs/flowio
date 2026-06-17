@@ -21,6 +21,9 @@
 //! framing simple in documentation. On the hot path, prefer the partial-I/O
 //! APIs when the caller can handle progress explicitly.
 //!
+//! Unlike TCP, this module does not expose deadline-edge `try_*` helpers.
+//! Use the async `read` / `write` APIs for FlowIO-managed Unix stream I/O.
+//!
 //! # Example
 //! ```no_run
 //! use flowio::net::unix::UnixStream;
@@ -196,9 +199,9 @@ impl UnixStream {
     /// success.  On error the buffer is returned with an unspecified amount
     /// already written.
     ///
-    /// This is not the lowest-overhead send fast path because it may
-    /// resubmit after partial writes. Prefer [`UnixStream::write`] when the
-    /// caller can handle partial progress.
+    /// This is the complete-buffer convenience API, not the lowest-overhead
+    /// send fast path, because it may resubmit after partial writes. Prefer
+    /// [`UnixStream::write`] when the caller can handle partial progress.
     pub fn write_all<B: IoBuffReadOnly + 'static>(
         &mut self,
         buffer: B,
@@ -231,6 +234,10 @@ impl UnixStream {
     ///
     /// This preserves [`UnixStream::read_exact`] semantics while supporting
     /// staged protocol reads into one [`IoBuffMut`].
+    ///
+    /// This is not the lowest-overhead receive fast path because it may
+    /// resubmit after partial reads. Prefer [`UnixStream::read`] when the
+    /// caller can handle partial progress and manage staged framing directly.
     pub fn read_exact_append(
         &mut self,
         buffer: IoBuffMut,
@@ -272,6 +279,9 @@ impl UnixStream {
     /// The chain owns buffers implementing [`IoBuffReadOnly`] and is returned
     /// alongside the result. This is the zero-copy send path for already
     /// encoded non-FlowIO buffer segments.
+    ///
+    /// Use this when the send path is already naturally segmented. For one
+    /// contiguous payload, prefer [`UnixStream::write`].
     pub fn writev_read_only<B: IoBuffReadOnly + 'static, const N: usize>(
         &mut self,
         buffer: IoBuffReadOnlyVec<B, N>,
@@ -285,6 +295,9 @@ impl UnixStream {
     /// retained source into retained kernel-facing `iovec` scratch. This is
     /// the zero-copy send path for protocols with one compact owner/carrier
     /// and many already-encoded pieces.
+    ///
+    /// Use this when the send path is already naturally segmented inside the
+    /// retained carrier. For one contiguous payload, prefer [`UnixStream::write`].
     pub fn writev_projected<T: WritevProjection>(
         &mut self,
         source: T,
@@ -313,6 +326,10 @@ impl UnixStream {
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
     /// success. The future materializes `iovec` scratch once and advances it
     /// in place across partial writes.
+    ///
+    /// This is the complete-buffer convenience API. Prefer
+    /// [`UnixStream::writev_read_only`] when the caller can handle partial
+    /// progress.
     pub fn writev_all_read_only<B: IoBuffReadOnly + 'static, const N: usize>(
         &mut self,
         buffer: IoBuffReadOnlyVec<B, N>,
@@ -325,6 +342,10 @@ impl UnixStream {
     /// Returns `(Ok(n), source)` where `n` equals the projected total byte
     /// count on success. On error the source is returned with an unspecified
     /// amount already written.
+    ///
+    /// This is the complete-buffer convenience API. Prefer
+    /// [`UnixStream::writev_projected`] when the caller can handle partial
+    /// progress.
     pub fn writev_all_projected<T: WritevProjection>(
         &mut self,
         source: T,
@@ -349,26 +370,41 @@ impl UnixStream {
     }
 
     /// Sets the `SO_SNDBUF` socket send buffer size.
+    ///
+    /// This is socket configuration/control-plane work. Apply it during
+    /// stream setup instead of changing it per write.
     pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
+    ///
+    /// This is socket status/control-plane lookup, not the per-message data
+    /// fast path.
     pub fn send_buffer_size(&self) -> io::Result<usize> {
         super::sock_send_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
+    ///
+    /// This is socket configuration/control-plane work. Apply it during
+    /// stream setup instead of changing it per read.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
+    ///
+    /// This is socket status/control-plane lookup, not the per-message data
+    /// fast path.
     pub fn recv_buffer_size(&self) -> io::Result<usize> {
         super::sock_recv_buffer_size(self.fd.as_raw_fd())
     }
 
     /// Shuts down the read, write, or both halves of this connection.
+    ///
+    /// This is connection control-plane work, normally used for teardown or
+    /// protocol half-close rather than steady-state data transfer.
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         let how = match how {
             std::net::Shutdown::Read => libc::SHUT_RD,

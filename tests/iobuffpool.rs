@@ -249,7 +249,9 @@ fn pool_grows_across_slabs() {
         let buf = pool.alloc().unwrap();
         ptrs.push(IoBuffReadOnly::as_ptr(&buf));
         println!("  alloc #{}: ptr={:?}", i, ptrs.last().unwrap());
-        std::mem::forget(buf); // intentionally leak to keep all slots alive
+        // Keep every slot occupied so the next alloc cannot reuse a freed
+        // slot; this forces new slab pages.
+        std::mem::forget(buf);
     }
 
     // All pointers should be unique
@@ -537,7 +539,9 @@ fn pool_simulated_readv() {
     println!("  writable_len: {}", chain.writable_len());
     assert_eq!(chain.writable_len(), 384);
 
-    // Simulate kernel readv writing 200 bytes across the chain
+    // SAFETY: a real readv would have initialized the first 200 bytes across
+    // the iovec chain; distribute_written advances payload_len per segment in
+    // order, filling 128 bytes, then 72 bytes, then leaving the third empty.
     unsafe { chain.distribute_written(200) };
 
     println!("  seg0 payload_len: {}", seg!(chain, 0).payload_len());

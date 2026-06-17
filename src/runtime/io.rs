@@ -88,6 +88,7 @@ fn complete_nop_op(
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
+#[doc(hidden)]
 pub struct NopSlot {
     /// Completion slot for the currently armed `NOP`, if any.
     state_ptr: *mut CompletionState,

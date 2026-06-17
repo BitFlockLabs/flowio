@@ -3,6 +3,7 @@
 use crate::utils;
 use std::mem::MaybeUninit;
 
+/// Configuration error returned while constructing a slab-backed pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolConfigError {
     /// `objs_per_slab` must be greater than zero.
@@ -44,7 +45,7 @@ impl<const N: usize> InPlaceInit for [u8; N] {
 ///
 /// It allocates large chunks of memory (slabs) from the `MemoryProvider`
 /// and splits them into fixed-size slots. Freed slots are kept in an
-/// intrusive singly linked free list for zero-allocation reuse.
+/// intrusive singly linked free list for allocation-free reuse.
 ///
 /// Slab pages are tracked via a singly-linked list through each Slab header's
 /// `link.next` pointer.  This avoids the DList sentinel's self-referential
@@ -64,8 +65,14 @@ pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider> {
 }
 
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
-    /// Creates an uninitialized pool. Call [`Pool::init`] after moving the
-    /// pool to its final memory location.
+    /// Creates an uninitialized pool.
+    ///
+    /// Call [`Pool::init`] before the first allocation.
+    ///
+    /// # Errors
+    /// Returns [`PoolConfigError::ObjsPerSlabZero`] when `objs_per_slab` is
+    /// zero. Returns [`PoolConfigError::SizeOverflow`] if object slot or slab
+    /// geometry overflows addressable memory.
     pub fn new_uninit(provider: &'a mut P, objs_per_slab: usize) -> Result<Self, PoolConfigError> {
         if objs_per_slab == 0 {
             return Err(PoolConfigError::ObjsPerSlabZero);
@@ -106,6 +113,12 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         self.free_list.init();
     }
 
+    /// Allocates and initializes one object slot.
+    ///
+    /// Reuses a freed slot when available, otherwise bump-allocates from the
+    /// current slab or requests one new slab page from the memory provider.
+    /// Returns `None` if the provider cannot supply a required slab page.
+    ///
     /// # Safety
     ///
     /// The caller must ensure the memory provider is valid and that
@@ -146,6 +159,10 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         Some(raw_ptr)
     }
 
+    /// Drops one live object and returns its slot to the pool free list.
+    ///
+    /// Null pointers are ignored.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that `obj` is a valid pointer to a dynamically
@@ -167,7 +184,9 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T, P> {
     fn drop(&mut self) {
         // Walk the singly linked slab-page chain and return each page to the
-        // backing memory provider.
+        // backing memory provider. Live objects are intentionally not dropped:
+        // executor teardown may abandon task futures whose destructors require
+        // runtime TLS or pools that are already being torn down.
         let mut current = self.slab_page_head;
         while !current.is_null() {
             let next = unsafe { (*current).link.next as *mut super::slab::Slab };

@@ -48,7 +48,7 @@
 //! - Prefer not to use `send_to` / `recv_from` when the peer is stable. Use
 //!   connected UDP `send` / `recv` instead.
 //! - Prefer not to resolve names in the steady-state data path. [`resolver`]
-//!   is a setup-path helper; resolve once and reuse the resulting
+//!   is a setup/control-plane helper; resolve once and reuse the resulting
 //!   `SocketAddr` values.
 //!
 //! The examples below often use `_all` / `_exact` variants because they make
@@ -77,7 +77,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! The same transport methods also work with [`IoBuffMut`]:
+//! The same transport methods also work with [`crate::runtime::buffer::IoBuffMut`]:
 //! ```no_run
 //! use flowio::net::unix::UnixStream;
 //! use flowio::runtime::buffer::IoBuffMut;
@@ -129,6 +129,41 @@ pub mod unix;
 ///
 /// This trait does not expose a borrowed-SQE API. Callers pass ownership of
 /// the carrier to the stream method and receive it back with the I/O result.
+///
+/// This is a fast-path API when a protocol already owns a compact message
+/// carrier with segmented byte fields. Prefer the contiguous stream `write`
+/// APIs for one contiguous byte range, and prefer non-`_all` projected writes
+/// when the caller can track partial progress explicitly.
+///
+/// # Example
+/// ```no_run
+/// use flowio::net::tcp::TcpStream;
+/// use flowio::net::{WritevPieces, WritevProjection};
+/// use std::io;
+///
+/// struct Message {
+///     header: [u8; 4],
+///     body: Vec<u8>,
+/// }
+///
+/// impl WritevProjection for Message {
+///     fn writev_count_and_len(&self) -> (usize, usize) {
+///         (2, self.header.len() + self.body.len())
+///     }
+///
+///     fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+///         pieces.push(&self.header)?;
+///         pieces.push(&self.body)?;
+///         Ok(())
+///     }
+/// }
+///
+/// # async fn send(mut stream: TcpStream, msg: Message) -> io::Result<Message> {
+/// let (result, msg) = stream.writev_projected(msg).await;
+/// result?;
+/// Ok(msg)
+/// # }
+/// ```
 pub trait WritevProjection: 'static {
     /// Returns `(active_non_empty_piece_count, total_byte_len)`.
     fn writev_count_and_len(&self) -> (usize, usize);
@@ -146,9 +181,39 @@ pub trait WritevProjection: 'static {
 /// Values of this type are constructed only by FlowIO. Implementations push
 /// slices borrowed from the retained carrier; FlowIO stores only pointer/length
 /// metadata in retained scratch and never copies the slice bytes.
+///
+/// This type belongs to the projected vectored-write fast path. It should be
+/// used only inside [`WritevProjection::project_writev`]; callers do not build
+/// it directly.
+///
+/// # Example
+/// ```
+/// use flowio::net::{WritevPieces, WritevProjection};
+/// use std::io;
+///
+/// struct Pair {
+///     first: [u8; 2],
+///     second: [u8; 2],
+/// }
+///
+/// impl WritevProjection for Pair {
+///     fn writev_count_and_len(&self) -> (usize, usize) {
+///         (2, self.first.len() + self.second.len())
+///     }
+///
+///     fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+///         pieces.push(&self.first)?;
+///         pieces.push(&self.second)?;
+///         Ok(())
+///     }
+/// }
+/// ```
 pub struct WritevPieces<'a> {
+    /// FlowIO-owned retained scratch where projected slice metadata is written.
     iovecs: &'a mut [MaybeUninit<libc::iovec>],
+    /// Number of initialized non-empty `iovec` entries.
     count: usize,
+    /// Sum of bytes represented by initialized entries.
     total: usize,
 }
 
@@ -236,12 +301,31 @@ pub(crate) unsafe fn opt_mut<T>(opt: &mut Option<T>) -> &mut T {
 
 /// Validates a caller-supplied read length against the writable capacity that
 /// the buffer actually exposes to the kernel.
-pub(crate) fn checked_read_len(_op: &str, requested: usize, writable: usize) -> io::Result<u32> {
+pub(crate) fn checked_read_len(op: &str, requested: usize, writable: usize) -> io::Result<u32> {
     if requested > writable {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op} length exceeds writable buffer capacity"),
+        ));
     }
     if requested > u32::MAX as usize {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op} length exceeds io_uring u32 byte-count limit"),
+        ));
+    }
+
+    Ok(requested as u32)
+}
+
+/// Validates a contiguous send length against io_uring opcodes that accept a
+/// 32-bit byte count.
+pub(crate) fn checked_send_len(op: &str, requested: usize) -> io::Result<u32> {
+    if requested > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op} length exceeds io_uring u32 byte-count limit"),
+        ));
     }
 
     Ok(requested as u32)

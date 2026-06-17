@@ -127,18 +127,21 @@ struct TimerWheel {
     next_deadline_tick: Option<u64>,
     /// True when `next_deadline_tick` must be recomputed before use.
     next_deadline_dirty: bool,
-    // Non-empty bucket occupancy, used to recompute the nearest deadline
-    // without scanning every bucket front after cancels or partial timer work.
+    /// Non-empty occupancy bits for the 256 level-0 buckets.
     lvl0_bits: [u64; 4],
+    /// Non-empty occupancy bits for level-1 buckets.
     lvl1_bits: u64,
+    /// Non-empty occupancy bits for level-2 buckets.
     lvl2_bits: u64,
+    /// Non-empty occupancy bits for level-3 buckets.
     lvl3_bits: u64,
-    // At most one boundary per upper level can need cascading for a given tick.
-    // These arrays remember unfinished cascade work so the executor can resume
-    // it on the next timer phase instead of draining a whole bucket at once.
+    /// Upper wheel levels with unfinished cascade work for the current tick.
     cascade_levels: [u8; 3],
+    /// Bucket indices paired with `cascade_levels`.
     cascade_indices: [usize; 3],
+    /// Number of valid entries in the cascade arrays.
     cascade_count: u8,
+    /// Next cascade-array entry to resume.
     cascade_pos: u8,
     /// Near-future wheel buckets covering the lowest tick bits directly.
     lvl0: [DList<TimerEntry>; LVL0_SLOTS],
@@ -189,6 +192,30 @@ impl TimerWheel {
         Ok(())
     }
 
+    fn unlink_all_for_drop(&mut self) {
+        for bucket in &mut self.lvl0 {
+            bucket.unlink_all_for_drop();
+        }
+        for bucket in &mut self.lvl1 {
+            bucket.unlink_all_for_drop();
+        }
+        for bucket in &mut self.lvl2 {
+            bucket.unlink_all_for_drop();
+        }
+        for bucket in &mut self.lvl3 {
+            bucket.unlink_all_for_drop();
+        }
+
+        self.next_deadline_tick = None;
+        self.next_deadline_dirty = false;
+        self.lvl0_bits = [0; 4];
+        self.lvl1_bits = 0;
+        self.lvl2_bits = 0;
+        self.lvl3_bits = 0;
+        self.cascade_count = 0;
+        self.cascade_pos = 0;
+    }
+
     fn insert(&mut self, entry: *mut TimerEntry) {
         let deadline = unsafe { (*entry).deadline_tick };
         let delta = deadline.saturating_sub(self.current_tick);
@@ -237,6 +264,9 @@ impl TimerWheel {
 
     fn remove(&mut self, entry: *mut TimerEntry) {
         let level = unsafe { (*entry).bucket_level };
+        if level == INVALID_BUCKET_LEVEL || level > 3 {
+            return;
+        }
         let index = unsafe { (*entry).bucket_index as usize };
         unsafe {
             match level {
@@ -464,7 +494,19 @@ impl TimerWheel {
 ///
 /// Most applications should use the free functions in this module. This type
 /// is public for explicit runtime integration and testing rather than as the
-/// normal application fast-path entry point.
+/// normal application fast-path entry point. Creating and initializing a
+/// timer runtime is setup work; timer arming/canceling happens through the
+/// executor-owned runtime.
+///
+/// # Example
+/// ```no_run
+/// use flowio::runtime::timer::TimerRuntime;
+///
+/// let mut timers = TimerRuntime::new()?;
+/// timers.init()?;
+/// let _tick = timers.now_tick()?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct TimerRuntime {
     /// Stable provider backing the timer-entry pool.
     _provider: Box<BasicMemoryProvider>,
@@ -530,16 +572,24 @@ impl TimerRuntime {
         self.arm_base = None;
     }
 
-    /// Creates a duration-based sleep future backed by this timer runtime.
+    /// Creates a duration-based sleep future.
+    ///
+    /// The receiver is not captured; the future binds to the active
+    /// executor's timer runtime when it is first polled.
     ///
     /// Most callers will prefer the top-level [`sleep`] helper.
+    #[doc(hidden)]
     pub fn sleep(&mut self, duration: Duration) -> Sleep {
         Sleep::new_duration(duration)
     }
 
-    /// Creates a deadline-based sleep future backed by this timer runtime.
+    /// Creates a deadline-based sleep future.
+    ///
+    /// The receiver is not captured; the future binds to the active
+    /// executor's timer runtime when it is first polled.
     ///
     /// Most callers will prefer the top-level [`sleep_until`] helper.
+    #[doc(hidden)]
     pub fn sleep_until(&mut self, deadline: Instant) -> Sleep {
         Sleep::new_deadline(deadline)
     }
@@ -749,6 +799,7 @@ impl TimerRuntime {
 impl Drop for TimerRuntime {
     fn drop(&mut self) {
         unsafe {
+            self.wheel.unlink_all_for_drop();
             ManuallyDrop::drop(&mut self.timer_pool);
         }
     }
@@ -767,7 +818,7 @@ fn duration_to_ticks(duration: Duration) -> u64 {
 
 fn tick_to_duration(ticks: u64) -> Duration {
     if ticks == 0 {
-        Duration::from_nanos(1)
+        Duration::ZERO
     } else {
         Duration::from_nanos(ticks.saturating_mul(TIMER_TICK_NS))
     }
@@ -791,6 +842,24 @@ fn now_tick() -> io::Result<u64> {
 ///
 /// Constructed by [`sleep`], [`sleep_until`], or the corresponding
 /// [`TimerRuntime`] methods.
+///
+/// This is a control-path timer primitive. Prefer arming deadlines around
+/// larger protocol phases instead of wrapping every data-path read/write step
+/// with a separate sleep or timeout.
+///
+/// # Example
+/// ```no_run
+/// use flowio::runtime::executor::Executor;
+/// use flowio::runtime::timer::{sleep, Sleep};
+/// use std::time::Duration;
+///
+/// let mut executor = Executor::new()?;
+/// executor.run(async {
+///     let timer: Sleep = sleep(Duration::from_millis(1));
+///     timer.await.unwrap();
+/// })?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct Sleep {
     /// Relative duration to arm on first poll, if this is a duration-based sleep.
     duration: Option<Duration>,
@@ -821,6 +890,14 @@ impl Sleep {
 }
 
 /// Error returned when a future exceeds its configured deadline.
+///
+/// # Example
+/// ```
+/// use flowio::runtime::timer::Elapsed;
+///
+/// let elapsed = Elapsed;
+/// assert_eq!(elapsed.to_string(), "runtime timer elapsed");
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Elapsed;
 
@@ -879,8 +956,13 @@ impl Future for Sleep {
 impl Drop for Sleep {
     fn drop(&mut self) {
         if !self.entry.is_null() {
-            let _ = unsafe { &mut *crate::runtime::executor::timers_unchecked() }
-                .cancel_sleep(self.entry);
+            // Pool teardown intentionally does not drop live task futures.
+            // If that ever changes, this guard keeps an abandoned armed sleep
+            // from dereferencing a cleared executor context during shutdown.
+            let timers = unsafe { crate::runtime::executor::timers_or_null() };
+            if !timers.is_null() {
+                let _ = unsafe { &mut *timers }.cancel_sleep(self.entry);
+            }
             self.entry = std::ptr::null_mut();
         }
     }
@@ -931,6 +1013,21 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 ///
 /// This is a control-path deadline wrapper, not a special transport fast-path
 /// primitive.
+///
+/// # Example
+/// ```no_run
+/// use flowio::runtime::executor::Executor;
+/// use flowio::runtime::timer::{sleep, timeout, Elapsed};
+/// use std::time::Duration;
+///
+/// let mut executor = Executor::new()?;
+/// executor.run(async {
+///     let result: Result<std::io::Result<()>, Elapsed> =
+///         timeout(Duration::from_millis(10), sleep(Duration::from_millis(1))).await;
+///     assert!(result.is_ok());
+/// })?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct Timeout<F> {
     /// User future being raced against the timer.
     future: F,
@@ -1023,4 +1120,111 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
 /// ```
 pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
     Timeout::new_deadline(deadline, future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_wheel_at(wheel: &mut TimerWheel, current_tick: u64) {
+        wheel.init().expect("timer wheel init failed");
+        wheel.current_tick = current_tick;
+        wheel.next_deadline_tick = None;
+        wheel.next_deadline_dirty = false;
+    }
+
+    fn timer_entry_at(deadline_tick: u64) -> TimerEntry {
+        let mut entry = TimerEntry::new();
+        entry.deadline_tick = deadline_tick;
+        entry
+    }
+
+    #[test]
+    fn timer_wheel_remove_clears_bucket_ownership_and_deadline_cache() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 100);
+        let mut entry = timer_entry_at(105);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+        assert_eq!(wheel.next_deadline_tick, Some(105));
+        assert_eq!(wheel.candidate_deadline(0), Some(105));
+        assert_eq!(entry.bucket_level, 0);
+
+        wheel.remove(entry_ptr);
+        wheel.next_deadline_dirty = true;
+        wheel.recompute_next_deadline();
+        wheel.next_deadline_dirty = false;
+
+        assert!(entry.link.is_unlinked());
+        assert_eq!(entry.bucket_level, INVALID_BUCKET_LEVEL);
+        assert_eq!(entry.bucket_index, 0);
+        assert_eq!(wheel.next_deadline_tick, None);
+        assert_eq!(wheel.candidate_deadline(0), None);
+    }
+
+    #[test]
+    fn timer_wheel_remove_is_idempotent_for_unlinked_entries() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 100);
+        let mut entry = timer_entry_at(105);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.remove(entry_ptr);
+        assert!(entry.link.is_unlinked());
+        assert_eq!(entry.bucket_level, INVALID_BUCKET_LEVEL);
+        assert_eq!(entry.bucket_index, 0);
+
+        wheel.insert(entry_ptr);
+        wheel.remove(entry_ptr);
+        wheel.remove(entry_ptr);
+        wheel.next_deadline_dirty = true;
+        wheel.recompute_next_deadline();
+        wheel.next_deadline_dirty = false;
+
+        assert!(entry.link.is_unlinked());
+        assert_eq!(entry.bucket_level, INVALID_BUCKET_LEVEL);
+        assert_eq!(entry.bucket_index, 0);
+        assert_eq!(wheel.next_deadline_tick, None);
+        assert_eq!(wheel.candidate_deadline(0), None);
+    }
+
+    #[test]
+    fn timer_wheel_cascade_budget_preserves_pending_work() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let deadline = LVL0_SLOTS as u64;
+        let mut entry = timer_entry_at(deadline);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+        assert_eq!(entry.bucket_level, 1);
+
+        wheel.current_tick = deadline;
+        wheel.begin_tick_cascade();
+        assert!(wheel.has_pending_cascade());
+        assert_eq!(wheel.process_cascade_with_budget(0), 0);
+        assert!(wheel.has_pending_cascade());
+
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(entry.bucket_level, 0);
+        assert_eq!(entry.bucket_index, 0);
+        assert!(wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some());
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_runtime_drop_unlinks_armed_timer_entries() {
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        let tick = runtime.now_tick().expect("timer tick failed");
+
+        runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), tick.saturating_add(10))
+            .expect("arming test timer failed");
+
+        drop(runtime);
+    }
 }
