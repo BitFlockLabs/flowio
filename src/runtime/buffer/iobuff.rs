@@ -272,6 +272,20 @@ impl IoBuffHeader {
         self.headroom_capacity + self.payload_capacity + self.tailroom_capacity
     }
 
+    /// Returns a pointer to the first byte of the trailing data region
+    /// (the start of the headroom area), given a raw header pointer.
+    ///
+    /// Takes `*mut Self` rather than `&self` so callers can derive the data
+    /// pointer without first materializing a `&IoBuffHeader` that would alias
+    /// the bytes following the header.
+    ///
+    /// # Safety
+    ///
+    /// `header` must point to a live, properly aligned `IoBuffHeader` whose
+    /// backing allocation includes the full trailing data region
+    /// (`headroom + payload + tailroom` bytes) immediately after the header,
+    /// as established by heap or pool allocation. The returned pointer is only
+    /// valid for `total_capacity()` bytes.
     #[inline(always)]
     unsafe fn headroom_ptr_from_raw(header: *mut Self) -> *mut u8 {
         unsafe { (header as *mut u8).add(std::mem::size_of::<Self>()) }

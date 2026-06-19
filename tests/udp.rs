@@ -35,6 +35,10 @@ impl Drop for DropTrackedReadWrite {
     }
 }
 
+// SAFETY: `bytes` is a heap-allocated Vec, so `as_mut_ptr()` stays valid and
+// writable for `writable_len()` bytes across moves of the
+// DropTrackedReadWrite value. The runtime only calls `set_written_len(len)`
+// with `len <= writable_len()`, so `set_len` never exceeds the Vec allocation.
 unsafe impl flowio::runtime::buffer::IoBuffReadWrite for DropTrackedReadWrite {
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.bytes.as_mut_ptr()
@@ -73,6 +77,9 @@ impl Drop for DropTrackedReadOnly {
     }
 }
 
+// SAFETY: `bytes` is a heap-allocated Vec, so `as_ptr()` stays valid for
+// `len()` bytes for the lifetime of the DropTrackedReadOnly value and is not
+// invalidated when the value is moved.
 unsafe impl flowio::runtime::buffer::IoBuffReadOnly for DropTrackedReadOnly {
     fn as_ptr(&self) -> *const u8 {
         self.bytes.as_ptr()

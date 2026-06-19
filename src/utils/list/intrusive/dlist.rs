@@ -4,6 +4,9 @@
 use std::marker::PhantomData;
 use std::ptr;
 
+// Disabled under Miri: the sentinel cross-checks dereference head-derived raw
+// pointers in a way that conflicts with Miri's stricter provenance model.
+// Regular debug builds still run these sentinel consistency checks.
 #[cfg(all(debug_assertions, not(miri)))]
 macro_rules! debug_assert_list_inited {
         ($list:expr) => {{
@@ -102,6 +105,13 @@ impl<T> DList<T> {
         }
     }
 
+    /// Canonicalizes `link` to the list's authoritative `head` pointer.
+    ///
+    /// Stored `next`/`prev` pointers that refer to the sentinel may not carry
+    /// the same provenance as the current `&mut self.head`, for example after
+    /// the list value was moved post-`init`. Mapping any pointer equal to
+    /// `head` back to `head` keeps relink writes targeting the real sentinel
+    /// and keeps pointer provenance consistent under Miri.
     #[inline(always)]
     fn normalize_head_ptr(link: *mut Link, head: *mut Link) -> *mut Link {
         if link == head { head } else { link }

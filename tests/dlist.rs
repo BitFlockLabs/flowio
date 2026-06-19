@@ -8,6 +8,10 @@ pub struct Task {
     pub link: utils::list::intrusive::dlist::Link,
 }
 
+// Derive the link pointer from the container base, not `&mut task.link`, so it
+// keeps whole-`Task` provenance. DList recovers the container with
+// `(link_ptr as *mut u8).sub(offset)`, which is UB under Miri if the pointer
+// was narrowed to just the `link` field.
 fn task_link_ptr(task: &mut Task) -> *mut utils::list::intrusive::dlist::Link {
     let base = task as *mut Task as *mut u8;
     unsafe { base.add(offset_of!(Task, link)) as *mut utils::list::intrusive::dlist::Link }
@@ -320,6 +324,9 @@ fn link_offset() -> usize {
     offset_of!(Node, link)
 }
 
+// Offset-based for the same provenance reason as `task_link_ptr`: the link
+// pointer must keep whole-`Node` provenance so DList's `.sub(offset)` container
+// recovery stays sound under Miri.
 fn link_ptr(n: &mut Node) -> *mut utils::list::intrusive::dlist::Link {
     let base = n as *mut Node as *mut u8;
     unsafe { base.add(offset_of!(Node, link)) as *mut utils::list::intrusive::dlist::Link }

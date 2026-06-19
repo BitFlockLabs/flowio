@@ -608,8 +608,8 @@ pub(crate) fn parse_response_packet(
     })
 }
 
-/// Reads and validates the fixed-size resource-record fields that follow the
-/// already-decoded owner name.
+/// The fixed-size resource-record header fields that follow the already-decoded
+/// owner name, as parsed by `parse_rr_header`.
 struct RrHeader {
     /// Resource-record type.
     rr_type: u16,

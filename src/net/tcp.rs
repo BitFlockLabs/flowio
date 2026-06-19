@@ -760,6 +760,9 @@ impl TcpStream {
 
     /// Reads up to `len` bytes into `buffer`.
     ///
+    /// The buffer is consumed and returned alongside the result on completion
+    /// (rental pattern); the actual byte count is returned in the `Ok` variant.
+    ///
     /// This is the lowest-overhead contiguous receive API when the caller can
     /// handle short reads and track framing itself.
     pub fn read<B: IoBuffReadWrite>(
@@ -771,6 +774,9 @@ impl TcpStream {
     }
 
     /// Writes the initialized portion of `buffer`.
+    ///
+    /// The buffer is consumed and returned alongside the result on completion
+    /// (rental pattern); the actual byte count is returned in the `Ok` variant.
     ///
     /// This is the lowest-overhead contiguous send API when the caller can
     /// handle short writes itself.
@@ -784,6 +790,8 @@ impl TcpStream {
     /// Writes the entire buffer, handling partial writes internally.
     ///
     /// Returns `(Ok(n), buffer)` where `n` equals `buffer.len()` on success.
+    /// On error the buffer is returned with an unspecified amount already
+    /// written.
     ///
     /// This is the complete-buffer convenience API, not the lowest-overhead
     /// send fast path, because it may resubmit after partial writes. Prefer
@@ -797,7 +805,8 @@ impl TcpStream {
 
     /// Reads exactly `len` bytes, handling partial reads internally.
     ///
-    /// Returns `UnexpectedEof` if the peer closes before `len` bytes arrive.
+    /// Returns `(Ok(len), buffer)` on success. Returns `UnexpectedEof` if the
+    /// peer closes before `len` bytes arrive.
     ///
     /// This is not the lowest-overhead receive fast path because it may
     /// resubmit after partial reads. Prefer [`TcpStream::read`] when the
@@ -1079,6 +1088,9 @@ impl Drop for TcpConnector {
 // ---------------------------------------------------------------------------
 
 /// Listening TCP socket with a reusable accept slot.
+///
+/// Listener creation (bind/listen) and `accept` are connection setup /
+/// control-plane work, not a per-message data fast path.
 ///
 /// # Example
 /// ```no_run

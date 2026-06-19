@@ -174,7 +174,8 @@ fn runtime_unix_shutdown_write() {
 
 /// In-process ponger using Executor::spawn — the production pattern for
 /// single-threaded async echo.  Validates write_all / read_exact with both
-/// ends on the same executor, exercising owner_task cycling in the TLS context.
+/// ends on the same executor, exercising owner_task cycling in the executor's
+/// thread-local (TLS) context.
 #[test]
 fn runtime_unix_spawn_ponger_in_process() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");

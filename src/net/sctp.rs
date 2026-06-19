@@ -1627,12 +1627,19 @@ pub struct SctpListener {
 }
 
 impl SctpListener {
-    /// Binds a listener, applies init parameters, enables notifications, and starts listening.
+    /// Binds a listener, applies init parameters, enables notifications, and
+    /// starts listening.
+    ///
+    /// This is setup/control-plane work performed once before serving; it is
+    /// not on the per-message data fast path.
     pub fn bind(addr: SocketAddr, backlog: i32, initmsg: SctpInitConfig) -> io::Result<Self> {
         Self::bind_with_config(addr, backlog, SctpSocketConfig::rich(initmsg))
     }
 
     /// Binds a listener using the provided SCTP socket configuration.
+    ///
+    /// This is setup/control-plane work performed once before serving; it is
+    /// not on the per-message data fast path.
     pub fn bind_with_config(
         addr: SocketAddr,
         backlog: i32,
@@ -1691,6 +1698,10 @@ impl SctpListener {
     }
 
     /// Starts accepting one SCTP association.
+    ///
+    /// Accepting associations is setup/control-plane work, not the per-message
+    /// data fast path. The accepted [`SctpStream`] carries the steady-state
+    /// data path.
     ///
     /// This returns a future directly for compatibility with existing callers.
     /// A concurrent accept on the same listener is reported as an error when
@@ -1974,6 +1985,11 @@ impl SctpConnector {
     }
 
     /// Starts connecting to the provided remote SCTP peer.
+    ///
+    /// Establishing an association is setup/control-plane work, not the
+    /// per-message data fast path. Reusing this connector across attempts is
+    /// the fast-path optimization; once connected, keep steady-state traffic on
+    /// [`SctpStream::send`] / [`SctpStream::recv`].
     pub fn connect(&mut self, remote_addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
         self.connect_slot
             .prepare(self.local_addr, remote_addr, self.config)?;
@@ -1987,6 +2003,11 @@ impl SctpConnector {
     ///
     /// Returns `TimedOut` if the association does not complete before the
     /// provided duration elapses.
+    ///
+    /// This is a setup/control-plane convenience wrapper, not a fast path: it
+    /// pairs an outbound connect with a per-attempt timeout. Resolve and
+    /// connect during setup and keep steady-state traffic on
+    /// [`SctpStream::send`] / [`SctpStream::recv`].
     pub fn connect_timeout(
         &mut self,
         remote_addr: SocketAddr,
@@ -4169,6 +4190,9 @@ fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
     let data_offset = cmsg_align(hdr_len);
     let data_len = std::mem::size_of::<libc::sctp_sndinfo>();
     let needed = data_offset + data_len;
+    // Callers size `control` via cmsg_space(size_of::<sctp_sndinfo>()), so
+    // `needed` should fit; the guard is defensive and avoids writing past a
+    // short slice.
     debug_assert!(control.len() >= needed);
     if control.len() < needed {
         return;

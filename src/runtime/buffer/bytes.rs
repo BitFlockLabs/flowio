@@ -467,6 +467,9 @@ macro_rules! write_trait_impl {
 /// Reads advance the cursor only on success. Failed reads leave the position
 /// unchanged.
 ///
+/// Fast-path: allocation-free and bounds-checked; suitable for per-frame
+/// parsing on the hot path.
+///
 /// # Example
 /// ```
 /// use flowio::runtime::buffer::bytes::BufferCursor;
@@ -642,6 +645,9 @@ impl<'a> BufferCursor<'a> {
 ///
 /// Writes advance the cursor only on success. Failed writes leave the
 /// position and destination bytes unchanged.
+///
+/// Fast-path: allocation-free and bounds-checked; suitable for per-frame
+/// encoding on the hot path.
 ///
 /// # Example
 /// ```
@@ -823,6 +829,9 @@ impl<'a> BufferCursorMut<'a> {
 /// slices, `Vec<u8>`, `Box<[u8]>`, `IoBuff`, `IoBuffMut`, `IoBuffView`, and
 /// `IoBuffOwnedView`.
 ///
+/// Fast-path: allocation-free and bounds-checked; suitable for per-packet
+/// parse paths.
+///
 /// # Example
 /// ```
 /// use flowio::runtime::buffer::bytes::ByteReadAt;
@@ -966,6 +975,9 @@ impl<T: AsRef<[u8]> + ?Sized> ByteReadAt for T {
 /// window exposed by `bytes_mut()` / `AsMut<[u8]>`. To encode into spare
 /// unwritten payload capacity, write through `payload_unwritten_mut()` and
 /// then commit the initialized length with `payload_set_len()`.
+///
+/// Fast-path: allocation-free and bounds-checked; suitable for per-packet
+/// encode paths.
 ///
 /// # Example
 /// ```

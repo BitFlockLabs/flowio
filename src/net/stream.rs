@@ -96,11 +96,21 @@ unsafe fn prepare_retry_state(
 
 use super::{WritevPieces, WritevProjection, opt_ref, opt_take};
 
+/// Returns an uninitialized inline `iovec` scratch array.
+///
+/// `assume_init` is sound here because an array of `MaybeUninit` is itself
+/// initialized; each element remains uninitialized until written.
 #[inline(always)]
 fn uninit_iovecs<const N: usize>() -> [MaybeUninit<libc::iovec>; N] {
     unsafe { MaybeUninit::uninit().assume_init() }
 }
 
+/// Reinterprets an `iovec` scratch slice as initialized `libc::iovec`s.
+///
+/// # Safety
+///
+/// Every entry in `iovecs` must already be initialized before it is read as a
+/// `libc::iovec`.
 #[inline(always)]
 unsafe fn iovec_slice_mut_from_uninit(
     iovecs: &mut [MaybeUninit<libc::iovec>],
@@ -108,11 +118,26 @@ unsafe fn iovec_slice_mut_from_uninit(
     unsafe { slice::from_raw_parts_mut(iovecs.as_mut_ptr() as *mut libc::iovec, iovecs.len()) }
 }
 
+/// Returns a pointer to the `iovec` scratch entry at `skip`.
+///
+/// The returned pointer is used as the base of a `readv`/`writev` submission
+/// window.
+///
+/// # Safety
+///
+/// `skip` must be `<= iovecs.len()`, and entries `[skip, skip + count)` for the
+/// later opcode count must be initialized `libc::iovec`s.
 #[inline(always)]
 unsafe fn iovec_slice_ptr(iovecs: &[MaybeUninit<libc::iovec>], skip: usize) -> *const libc::iovec {
     unsafe { iovecs.as_ptr().add(skip) as *const libc::iovec }
 }
 
+/// Borrows the initialized `iovec` scratch entry at `index`.
+///
+/// # Safety
+///
+/// `index` must be `< iovecs.len()` and that entry must be an initialized
+/// `libc::iovec`.
 #[inline(always)]
 unsafe fn iovec_slice_ref(iovecs: &[MaybeUninit<libc::iovec>], index: usize) -> &libc::iovec {
     unsafe { &*(iovecs.as_ptr().add(index) as *const libc::iovec) }

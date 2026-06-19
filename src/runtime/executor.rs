@@ -60,6 +60,9 @@ const TASKS_PER_SLAB: usize = 1024;
 
 /// Lightweight counters for benchmarking and scheduler inspection.
 ///
+/// This is a debug-build observability snapshot, not a fast-path type. Read it
+/// out of band, for example after a run, rather than on a per-operation path.
+///
 /// # Example
 /// ```
 /// use flowio::runtime::executor::RuntimeStats;
@@ -483,6 +486,10 @@ impl<F> std::error::Error for TrySpawnError<F> {}
 
 /// Handle returned by [`Executor::spawn`] that can be `.await`ed to obtain
 /// the spawned task's return value.
+///
+/// Awaiting or dropping a handle is part of the steady-state task path, as the
+/// await side of [`Executor::spawn`] / [`Executor::try_spawn`]. It does not
+/// allocate.
 ///
 /// Dropping the handle without awaiting detaches the task — it continues
 /// running but its result is discarded.
@@ -1002,6 +1009,8 @@ fn apply_cpu_affinity(cpu_affinity: Option<usize>) -> io::Result<()> {
 
 impl Drop for Executor {
     fn drop(&mut self) {
+        // `ready_queue` and `task_pool` are `new_uninit` until `init()` runs,
+        // so they may only be unlinked/dropped once `initialized` is set.
         if self.initialized {
             unsafe {
                 self.ready_queue.unlink_all_for_drop();
@@ -1009,6 +1018,10 @@ impl Drop for Executor {
                 ManuallyDrop::drop(&mut self.task_pool);
             }
         }
+        // `timers` is always fully constructed by `new_with_config`; its own
+        // Drop handles its internal uninitialized pool. Drop it on every path
+        // so constructing an executor and never running it does not leak timer
+        // state.
         unsafe {
             ManuallyDrop::drop(&mut self.timers);
         }
@@ -1228,6 +1241,11 @@ pub(crate) unsafe fn current_poll_owner_task_unchecked() -> *mut TaskHeader {
     })
 }
 
+/// # Safety
+///
+/// Must be called from within `Executor::run` on the executor thread. The
+/// returned pointer is only valid while that run's TLS context is active; in
+/// release builds a missing context is UB rather than a panic.
 #[doc(hidden)]
 pub unsafe fn timers_unchecked() -> *mut TimerRuntime {
     EXECUTOR_CTX.with(|ctx_cell| {
@@ -1251,6 +1269,11 @@ pub(crate) unsafe fn timers_or_null() -> *mut TimerRuntime {
     })
 }
 
+/// # Safety
+///
+/// Must be called from within `Executor::run` on the executor thread. The
+/// returned pointers are only valid for that run; in release builds a missing
+/// context is UB rather than a panic.
 #[inline(always)]
 #[doc(hidden)]
 pub unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
@@ -1286,6 +1309,11 @@ pub(crate) unsafe fn schedule_timer_woken_task_unchecked(
     }
 }
 
+/// # Safety
+///
+/// `schedule_ctx` must be a context obtained from `schedule_ctx_unchecked()`
+/// during the currently active `Executor::run`; its `runtime_state` pointer is
+/// dereferenced for read and write.
 #[inline(always)]
 #[doc(hidden)]
 pub unsafe fn next_timer_wake_epoch_unchecked(schedule_ctx: ScheduleCtx) -> u64 {

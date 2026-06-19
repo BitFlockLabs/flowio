@@ -268,8 +268,12 @@ impl<const N: usize> WritevProjection for ProjectedBytes<N> {
     }
 }
 
+/// Test `WritevProjection` source backed by indices into `SMALL_TRACKED_BLOCKS`,
+/// projecting one static page per index at length `LEN`.
 struct ProjectedStaticSegments<const N: usize, const LEN: usize> {
+    /// Index into `SMALL_TRACKED_BLOCKS` for each projected segment.
     indices: [u8; N],
+    /// Whether Drop should increment `PROJECTED_SOURCE_DROPS`.
     track_drop: bool,
 }
 

@@ -21,11 +21,17 @@ const fn weird_offset() -> usize {
     std::mem::offset_of!(WeirdOffsetNode, link)
 }
 
+// Derive the link pointer from the container base so it keeps whole-`Node`
+// provenance. SList recovers the container with
+// `(link_ptr as *mut u8).sub(offset)`; narrowing the pointer to the `link`
+// field would make that recovery UB under Miri.
 fn node_link_ptr(node: &mut Node) -> *mut utils::list::intrusive::slist::Link {
     let base = node as *mut Node as *mut u8;
     unsafe { base.add(node_offset()) as *mut utils::list::intrusive::slist::Link }
 }
 
+// Same provenance reason as `node_link_ptr`: keep whole-`WeirdOffsetNode`
+// provenance so SList's `.sub(offset)` container recovery stays sound.
 fn weird_link_ptr(node: &mut WeirdOffsetNode) -> *mut utils::list::intrusive::slist::Link {
     let base = node as *mut WeirdOffsetNode as *mut u8;
     unsafe { base.add(weird_offset()) as *mut utils::list::intrusive::slist::Link }

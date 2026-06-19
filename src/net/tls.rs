@@ -453,6 +453,9 @@ impl TlsClientStream {
     }
 
     /// Returns `true` while the TLS handshake is still in progress.
+    ///
+    /// This is a handshake-status/control-plane query, not a steady-state
+    /// data-path call.
     pub fn is_handshaking(&self) -> bool {
         self.connection.is_handshaking()
     }

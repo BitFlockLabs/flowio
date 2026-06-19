@@ -736,6 +736,9 @@ impl<B: IoBuffReadOnly, const N: usize> IntoIterator for IoBuffReadOnlyVec<B, N>
     type IntoIter = IoBuffReadOnlyVecIntoIter<B, N>;
 
     fn into_iter(mut self) -> Self::IntoIter {
+        // Move the initialized segments into the iterator by bit-copying the
+        // array out, then zero `count` so this chain's Drop does not also drop
+        // the segments the iterator now owns.
         let buffers = unsafe { std::ptr::read(&self.buffers) };
         let count = self.count;
         self.count = 0;
