@@ -19,6 +19,18 @@
 //! `utils` module. They remain public for source compatibility during the
 //! alpha period, but they are not a supported user-facing API.
 //!
+//! # API Stability
+//!
+//! This is a `0.1.1-alpha` crate. The supported user-facing surface is the
+//! documented [`runtime`] and [`net`] API plus the buffer helpers they expose.
+//! Source compatibility is not guaranteed during the alpha series, but public
+//! API changes are tracked through `public-api.txt` and should be deliberate.
+//!
+//! Items hidden from generated docs, including `utils` and fuzzing-only
+//! parser hooks, are reserved implementation infrastructure. They may remain
+//! `pub` for crate-internal wiring or temporary source compatibility, but they
+//! are not part of the supported API contract.
+//!
 //! The buffer facility supports:
 //! - heap-owned mutable buffers via [`runtime::buffer::IoBuffMut`]
 //! - frozen shared buffers via [`runtime::buffer::IoBuff`]
@@ -113,3 +125,10 @@ pub mod net;
 pub mod runtime;
 #[doc(hidden)]
 pub mod utils;
+
+/// Fuzzing-only re-exports of internal parsers. Enabled by the dev-only
+/// `fuzzing` feature and consumed exclusively by the out-of-source `fuzz/`
+/// crate; not part of the supported public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;

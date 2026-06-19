@@ -348,6 +348,25 @@ async fn wait_for_drop_count(drops: &Rc<Cell<usize>>, expected: usize) {
     );
 }
 
+async fn wait_for_live_slots(pool: &IoBuffPool, expected: usize) {
+    // Wait for the original CQE to retire and release pool-backed read
+    // destinations that were retained after future cancellation.
+    for _ in 0..100 {
+        if pool.live_slots_for_test() == expected {
+            return;
+        }
+        sleep(Duration::from_millis(5))
+            .await
+            .expect("pool live-slot wait sleep failed");
+    }
+
+    assert_eq!(
+        pool.live_slots_for_test(),
+        expected,
+        "retained pool-backed buffers were not released after CQE retirement"
+    );
+}
+
 fn tracked_chain<const N: usize>(
     segments: [Vec<u8>; N],
     drops: &Rc<Cell<usize>>,
@@ -2352,6 +2371,50 @@ fn runtime_cancel_read_exact_append_mid_flight() {
         .expect("executor run failed");
 }
 
+/// read_exact_append cancelled after partial progress must keep its
+/// pool-backed destination checked out until the cancelled read CQE retires.
+#[test]
+fn runtime_cancel_read_exact_append_retains_pool_buffer_until_cqe() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+            let release_writer = spawn_stalling_writer(writer, 4096);
+
+            let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 1024 * 1024,
+                tailroom: 0,
+                objs_per_slab: 1,
+            })
+            .expect("pool config invalid");
+            pool.init();
+
+            sleep(Duration::from_millis(1)).await.unwrap();
+
+            let recv = pool.alloc().expect("recv pool alloc failed");
+            assert_eq!(pool.live_slots_for_test(), 1);
+
+            let result = timeout(Duration::from_millis(50), async {
+                let (res, _buf) = reader.read_exact_append(recv, 1024 * 1024).await;
+                res
+            })
+            .await;
+
+            assert!(result.is_err(), "read_exact_append should have timed out");
+            assert_eq!(
+                pool.live_slots_for_test(),
+                1,
+                "read_exact_append buffer was released before the original CQE retired"
+            );
+
+            release_writer.set(true);
+            wait_for_live_slots(&pool, 0).await;
+        })
+        .expect("executor run failed");
+}
+
 /// readv cancellation must cancel the outstanding SQE cleanly; releasing the
 /// stalled writer retires the original CQE.
 #[test]
@@ -2432,7 +2495,8 @@ fn runtime_drop_polled_readv_cleans_up_after_original_cqe() {
 }
 
 /// readv_exact cancelled after partial progress must cancel the outstanding
-/// SQE cleanly and keep the executor usable after peer release.
+/// SQE cleanly and keep pool-backed segments checked out until the original
+/// CQE retires after peer release.
 #[test]
 fn runtime_cancel_readv_exact_mid_flight() {
     let mut executor = new_executor();
@@ -2441,10 +2505,23 @@ fn runtime_cancel_readv_exact_mid_flight() {
         .run(async move {
             let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
             let release_writer = spawn_stalling_writer(writer, 4096);
+            let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 512 * 1024,
+                tailroom: 0,
+                objs_per_slab: 2,
+            })
+            .expect("pool config invalid");
+            pool.init();
 
             sleep(Duration::from_millis(1)).await.unwrap();
 
-            let recv = read_chain([512 * 1024, 512 * 1024]);
+            let recv = IoBuffVecMut::<2>::from_array([
+                pool.alloc().expect("first pool alloc failed"),
+                pool.alloc().expect("second pool alloc failed"),
+            ]);
+            assert_eq!(pool.live_slots_for_test(), 2);
+
             let result = timeout(Duration::from_millis(50), async {
                 let (res, _chain) = reader.readv_exact(recv, 1024 * 1024).await;
                 res
@@ -2452,11 +2529,14 @@ fn runtime_cancel_readv_exact_mid_flight() {
             .await;
 
             assert!(result.is_err(), "readv_exact should have timed out");
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "readv_exact buffers were released before the original CQE retired"
+            );
 
             release_writer.set(true);
-            sleep(Duration::from_millis(10))
-                .await
-                .expect("post-cancel readv_exact sleep failed");
+            wait_for_live_slots(&pool, 0).await;
         })
         .expect("executor run failed");
 }

@@ -1007,8 +1007,10 @@ impl Drop for Executor {
                 self.ready_queue.unlink_all_for_drop();
                 ManuallyDrop::drop(&mut self.ready_queue);
                 ManuallyDrop::drop(&mut self.task_pool);
-                ManuallyDrop::drop(&mut self.timers);
             }
+        }
+        unsafe {
+            ManuallyDrop::drop(&mut self.timers);
         }
     }
 }
@@ -1514,6 +1516,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
     fn executor_with_one_task_slab() -> Executor {
         let mut executor = Executor::new().expect("failed to construct executor");
         executor.provider.max_request_count = Some(1);
@@ -1521,6 +1524,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn executor_drop_unlinks_residual_ready_queue_entries() {
         let mut executor = Executor::new().expect("failed to construct executor");
         executor.init().expect("executor init failed");
@@ -1541,6 +1545,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn try_spawn_at_capacity_returns_future_without_drop() {
         let mut executor = executor_with_one_task_slab();
         let release = Rc::new(Cell::new(false));
@@ -1608,6 +1613,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn spawn_at_capacity_returns_io_error() {
         let mut executor = executor_with_one_task_slab();
         let release = Rc::new(Cell::new(false));

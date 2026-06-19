@@ -235,19 +235,19 @@ impl TimerWheel {
             (*entry).state = TimerState::Armed;
             match level {
                 0 => {
-                    self.lvl0[index].push_back(&mut (*entry).link as *mut _);
+                    self.lvl0[index].push_back(std::ptr::addr_of_mut!((*entry).link));
                     self.set_bucket_occupied(0, index);
                 }
                 1 => {
-                    self.lvl1[index].push_back(&mut (*entry).link as *mut _);
+                    self.lvl1[index].push_back(std::ptr::addr_of_mut!((*entry).link));
                     self.set_bucket_occupied(1, index);
                 }
                 2 => {
-                    self.lvl2[index].push_back(&mut (*entry).link as *mut _);
+                    self.lvl2[index].push_back(std::ptr::addr_of_mut!((*entry).link));
                     self.set_bucket_occupied(2, index);
                 }
                 _ => {
-                    self.lvl3[index].push_back(&mut (*entry).link as *mut _);
+                    self.lvl3[index].push_back(std::ptr::addr_of_mut!((*entry).link));
                     self.set_bucket_occupied(3, index);
                 }
             }
@@ -269,11 +269,12 @@ impl TimerWheel {
         }
         let index = unsafe { (*entry).bucket_index as usize };
         unsafe {
+            let link = std::ptr::addr_of_mut!((*entry).link);
             match level {
-                0 => self.lvl0[index].remove(&mut (*entry).link as *mut _),
-                1 => self.lvl1[index].remove(&mut (*entry).link as *mut _),
-                2 => self.lvl2[index].remove(&mut (*entry).link as *mut _),
-                3 => self.lvl3[index].remove(&mut (*entry).link as *mut _),
+                0 => self.lvl0[index].remove(link),
+                1 => self.lvl1[index].remove(link),
+                2 => self.lvl2[index].remove(link),
+                3 => self.lvl3[index].remove(link),
                 _ => {}
             }
             self.clear_bucket_if_empty(level, index);
@@ -763,7 +764,8 @@ impl TimerRuntime {
                 self.wheel.clear_bucket_if_empty(0, idx);
                 if remaining_budget == 0 {
                     unsafe {
-                        self.wheel.lvl0[idx].push_front_unchecked(&mut (*entry_ptr).link as *mut _);
+                        self.wheel.lvl0[idx]
+                            .push_front_unchecked(std::ptr::addr_of_mut!((*entry_ptr).link));
                     }
                     self.wheel.set_bucket_occupied(0, idx);
                     self.wheel.next_deadline_dirty = true;
@@ -1216,6 +1218,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn timer_runtime_drop_unlinks_armed_timer_entries() {
         let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
         runtime.init().expect("timer runtime init failed");

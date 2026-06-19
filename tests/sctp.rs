@@ -98,6 +98,36 @@ fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -
     buf
 }
 
+fn test_cmsg_align(len: usize) -> usize {
+    let align = std::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+/// Writes an SCTP_RCVINFO control message into a byte slice that may be
+/// intentionally unaligned.
+fn write_rcvinfo_cmsg(control: &mut [u8], info: libc::sctp_rcvinfo) -> usize {
+    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+    let data_offset = test_cmsg_align(hdr_len);
+    let data_len = std::mem::size_of::<libc::sctp_rcvinfo>();
+    let needed = data_offset + data_len;
+    assert!(control.len() >= needed);
+
+    let hdr = libc::cmsghdr {
+        cmsg_len: hdr_len + data_len,
+        cmsg_level: libc::IPPROTO_SCTP,
+        cmsg_type: libc::SCTP_RCVINFO,
+    };
+    unsafe {
+        std::ptr::write_unaligned(control.as_mut_ptr() as *mut libc::cmsghdr, hdr);
+        std::ptr::write_unaligned(
+            control.as_mut_ptr().add(data_offset) as *mut libc::sctp_rcvinfo,
+            info,
+        );
+    }
+
+    needed
+}
+
 /// Builds raw 127.0.0.1:port sockaddr_storage for notification fixtures.
 fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -288,6 +318,41 @@ fn parse_recv_meta_rejects_truncated_payload_and_control() {
     assert!(
         control_err.to_string().contains("control"),
         "control truncation error should name control truncation: {control_err}"
+    );
+}
+
+#[test]
+fn parse_recv_meta_accepts_unaligned_rcvinfo_cmsg() {
+    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+    let needed = test_cmsg_align(hdr_len) + std::mem::size_of::<libc::sctp_rcvinfo>();
+    let mut storage = vec![0u8; needed + 1];
+    let control = &mut storage[1..];
+    let info = libc::sctp_rcvinfo {
+        rcv_sid: 3,
+        rcv_ssn: 4,
+        rcv_flags: 5,
+        rcv_ppid: (0x0607_0809u32).to_be(),
+        rcv_tsn: 10,
+        rcv_cumtsn: 11,
+        rcv_context: 12,
+        rcv_assoc_id: 13,
+    };
+    let controllen = write_rcvinfo_cmsg(control, info);
+
+    let parsed =
+        test_parse_recv_meta(control, controllen, 0, b"ping").expect("rcvinfo parse failed");
+    assert_eq!(
+        parsed,
+        SctpRecvMeta::Data(flowio::net::sctp::SctpRecvInfo {
+            stream_id: 3,
+            ssn: 4,
+            flags: 5,
+            ppid: 0x0607_0809,
+            tsn: 10,
+            cumtsn: 11,
+            context: 12,
+            assoc_id: 13,
+        })
     );
 }
 

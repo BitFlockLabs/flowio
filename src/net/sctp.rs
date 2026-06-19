@@ -3996,7 +3996,7 @@ fn storage_to_option_socket_addr(
     }
 }
 
-fn parse_assoc_addrs(
+pub(crate) fn parse_assoc_addrs(
     payload: &[u8],
     addr_count: usize,
     storage_len: usize,
@@ -4165,35 +4165,47 @@ const fn cmsg_space(data_len: usize) -> usize {
 }
 
 fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
-    let hdr = unsafe { &mut *(control.as_mut_ptr() as *mut libc::cmsghdr) };
-    hdr.cmsg_level = libc::IPPROTO_SCTP;
-    hdr.cmsg_type = libc::SCTP_SNDINFO;
-    hdr.cmsg_len =
-        (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<libc::sctp_sndinfo>()) as _;
+    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+    let data_offset = cmsg_align(hdr_len);
+    let data_len = std::mem::size_of::<libc::sctp_sndinfo>();
+    let needed = data_offset + data_len;
+    debug_assert!(control.len() >= needed);
+    if control.len() < needed {
+        return;
+    }
 
-    let data_ptr = unsafe {
-        control
-            .as_mut_ptr()
-            .add(cmsg_align(std::mem::size_of::<libc::cmsghdr>()))
+    let hdr = libc::cmsghdr {
+        cmsg_len: (hdr_len + data_len) as _,
+        cmsg_level: libc::IPPROTO_SCTP,
+        cmsg_type: libc::SCTP_SNDINFO,
     };
     unsafe {
+        std::ptr::write_unaligned(control.as_mut_ptr() as *mut libc::cmsghdr, hdr);
+        let data_ptr = control.as_mut_ptr().add(data_offset);
         std::ptr::write_unaligned(data_ptr as *mut libc::sctp_sndinfo, sndinfo);
     }
 }
 
 fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo> {
     let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    if controllen < hdr_len {
+    let available = controllen.min(control.len());
+    if available < hdr_len {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
-    let hdr = unsafe { &*(control.as_ptr() as *const libc::cmsghdr) };
+    let hdr = unsafe { std::ptr::read_unaligned(control.as_ptr() as *const libc::cmsghdr) };
     if hdr.cmsg_level != libc::IPPROTO_SCTP || hdr.cmsg_type != libc::SCTP_RCVINFO {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
-    let needed = cmsg_align(hdr_len) + std::mem::size_of::<libc::sctp_rcvinfo>();
-    if controllen < needed {
+    let data_len = std::mem::size_of::<libc::sctp_rcvinfo>();
+    let cmsg_len = hdr.cmsg_len;
+    if cmsg_len < hdr_len + data_len || cmsg_len > available {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+
+    let needed = cmsg_align(hdr_len) + data_len;
+    if available < needed {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
@@ -4211,7 +4223,7 @@ fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo> 
     })
 }
 
-fn parse_recv_meta(
+pub(crate) fn parse_recv_meta(
     control: &[u8],
     controllen: usize,
     msg_flags: libc::c_int,
@@ -4328,7 +4340,7 @@ fn parse_send_failed_event_notification(buffer: &[u8]) -> io::Result<SctpNotific
     ))
 }
 
-fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
+pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
     if buffer.len() < 8 {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }

@@ -4,7 +4,7 @@
 use std::marker::PhantomData;
 use std::ptr;
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(miri)))]
 macro_rules! debug_assert_list_inited {
         ($list:expr) => {{
             let h: *mut Link = &($list).head as *const Link as *mut Link;
@@ -19,7 +19,7 @@ macro_rules! debug_assert_list_inited {
         }};
     }
 
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), miri))]
 macro_rules! debug_assert_list_inited {
     ($list:expr) => {};
 }
@@ -89,15 +89,22 @@ impl<T> DList<T> {
     #[inline(always)]
     /// # Safety
     ///
-    /// The caller must ensure `new_link`, `prev`, and `next` are valid pointers.
-    unsafe fn __list_add(&mut self, new_link: *mut Link, prev: *mut Link, next: *mut Link) {
-        debug_assert_list_inited!(self);
+    /// The caller must ensure `new_link`, `prev`, `next`, and `head` are valid
+    /// pointers from the same initialized list.
+    unsafe fn __list_add(new_link: *mut Link, prev: *mut Link, next: *mut Link, head: *mut Link) {
+        let prev = Self::normalize_head_ptr(prev, head);
+        let next = Self::normalize_head_ptr(next, head);
         unsafe {
             (*next).prev = new_link;
             (*new_link).next = next;
             (*new_link).prev = prev;
             (*prev).next = new_link;
         }
+    }
+
+    #[inline(always)]
+    fn normalize_head_ptr(link: *mut Link, head: *mut Link) -> *mut Link {
+        if link == head { head } else { link }
     }
 
     #[cfg(debug_assertions)]
@@ -141,7 +148,7 @@ impl<T> DList<T> {
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            self.__list_add(node_link, (*head_ptr).prev, head_ptr);
+            Self::__list_add(node_link, (*head_ptr).prev, head_ptr, head_ptr);
         }
     }
 
@@ -161,7 +168,7 @@ impl<T> DList<T> {
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            self.__list_add(node_link, (*head_ptr).prev, head_ptr);
+            Self::__list_add(node_link, (*head_ptr).prev, head_ptr, head_ptr);
         }
     }
 
@@ -182,7 +189,7 @@ impl<T> DList<T> {
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            self.__list_add(node_link, head_ptr, (*head_ptr).next);
+            Self::__list_add(node_link, head_ptr, (*head_ptr).next, head_ptr);
         }
     }
 
@@ -205,7 +212,7 @@ impl<T> DList<T> {
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            self.__list_add(node_link, head_ptr, (*head_ptr).next);
+            Self::__list_add(node_link, head_ptr, (*head_ptr).next, head_ptr);
         }
     }
 
@@ -235,7 +242,7 @@ impl<T> DList<T> {
         unsafe {
             let first = (*other_head).next;
             let last = (*other_head).prev;
-            let self_last = (*self_head).prev;
+            let self_last = Self::normalize_head_ptr((*self_head).prev, self_head);
 
             (*self_last).next = first;
             (*first).prev = self_last;
@@ -266,10 +273,10 @@ impl<T> DList<T> {
         }
 
         let head_ptr = &mut self.head as *mut Link;
-        let mut current = self.head.next;
+        let mut current = Self::normalize_head_ptr(self.head.next, head_ptr);
         while current != head_ptr {
             unsafe {
-                let next = (*current).next;
+                let next = Self::normalize_head_ptr((*current).next, head_ptr);
                 (*current).next = ptr::null_mut();
                 (*current).prev = ptr::null_mut();
                 if next.is_null() {
@@ -296,14 +303,14 @@ impl<T> DList<T> {
 
         debug_assert_list_inited!(self);
 
-        let head_ptr = &self.head as *const Link as *mut Link;
+        let head_ptr = &mut self.head as *mut Link;
         if node_link == head_ptr {
             return;
         }
 
         unsafe {
-            let next = (*node_link).next;
-            let prev = (*node_link).prev;
+            let next = Self::normalize_head_ptr((*node_link).next, head_ptr);
+            let prev = Self::normalize_head_ptr((*node_link).prev, head_ptr);
 
             if next.is_null() || prev.is_null() {
                 return;
@@ -365,8 +372,9 @@ impl<T> DList<T> {
             let node_ptr = self.head.next;
             let container_ptr = (node_ptr as *mut u8).sub(offset) as *mut T;
 
-            let next = (*node_ptr).next;
-            let prev = (*node_ptr).prev;
+            let head_ptr = &mut self.head as *mut Link;
+            let next = Self::normalize_head_ptr((*node_ptr).next, head_ptr);
+            let prev = Self::normalize_head_ptr((*node_ptr).prev, head_ptr);
 
             (*next).prev = prev;
             (*prev).next = next;
@@ -384,7 +392,7 @@ impl<T> DList<T> {
 
         let head_ptr = &mut self.head as *mut Link;
         CursorMut {
-            current: unsafe { (*head_ptr).next },
+            current: unsafe { Self::normalize_head_ptr((*head_ptr).next, head_ptr) },
             head: head_ptr,
             list: self,
         }
@@ -396,7 +404,7 @@ impl<T> DList<T> {
 
         let head_ptr = &mut self.head as *mut Link;
         CursorBackMut {
-            current: unsafe { (*head_ptr).prev },
+            current: unsafe { Self::normalize_head_ptr((*head_ptr).prev, head_ptr) },
             head: head_ptr,
             _list: self,
         }
@@ -520,6 +528,11 @@ mod tests {
         link: Link,
     }
 
+    fn node_link_ptr(node: &mut Node) -> *mut Link {
+        let base = node as *mut Node as *mut u8;
+        unsafe { base.add(offset_of!(Node, link)) as *mut Link }
+    }
+
     #[test]
     fn unlink_all_for_drop_handles_empty_list() {
         let mut list = DList::<Node>::new_uninit();
@@ -540,7 +553,7 @@ mod tests {
         };
 
         unsafe {
-            list.push_back(&mut node.link);
+            list.push_back(node_link_ptr(&mut node));
         }
 
         list.unlink_all_for_drop();
@@ -570,7 +583,7 @@ mod tests {
 
         unsafe {
             for node in &mut nodes {
-                list.push_back(&mut node.link);
+                list.push_back(node_link_ptr(node));
             }
         }
 
@@ -579,7 +592,7 @@ mod tests {
         assert!(nodes.iter().all(|node| node.link.is_unlinked()));
 
         unsafe {
-            list.push_back(&mut nodes[1].link);
+            list.push_back(node_link_ptr(&mut nodes[1]));
             let popped = list
                 .pop_front(offset_of!(Node, link))
                 .expect("reused list should pop inserted node");

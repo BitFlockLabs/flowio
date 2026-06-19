@@ -272,13 +272,9 @@ impl IoBuffHeader {
         self.headroom_capacity + self.payload_capacity + self.tailroom_capacity
     }
 
-    /// Returns a pointer to the first byte of the trailing data region
-    /// (the start of the headroom area).
     #[inline(always)]
-    pub(crate) fn headroom_ptr(&self) -> *mut u8 {
-        // SAFETY: the allocation includes total_capacity() bytes after
-        // this header.
-        unsafe { (self as *const Self as *mut u8).add(std::mem::size_of::<Self>()) }
+    unsafe fn headroom_ptr_from_raw(header: *mut Self) -> *mut u8 {
+        unsafe { (header as *mut u8).add(std::mem::size_of::<Self>()) }
     }
 
     fn try_layout(total_data_capacity: usize) -> Result<std::alloc::Layout, IoBuffError> {
@@ -475,7 +471,7 @@ impl IoBuffMut {
         }
         self.offset -= data.len();
         unsafe {
-            let dst = self.header.as_ref().headroom_ptr().add(self.offset);
+            let dst = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         Ok(())
@@ -520,9 +516,9 @@ impl IoBuffMut {
     /// Returns the written payload as a read-only byte slice.
     #[inline(always)]
     pub fn payload_bytes(&self) -> &[u8] {
-        let hdr = unsafe { self.header.as_ref() };
         unsafe {
-            let ptr = hdr.headroom_ptr().add(hdr.headroom_capacity);
+            let hdr = self.header.as_ptr();
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr).add((*hdr).headroom_capacity);
             std::slice::from_raw_parts(ptr, self.payload_len)
         }
     }
@@ -530,9 +526,9 @@ impl IoBuffMut {
     /// Returns the written payload as a mutable byte slice.
     #[inline(always)]
     pub fn payload_bytes_mut(&mut self) -> &mut [u8] {
-        let hdr = unsafe { self.header.as_ref() };
         unsafe {
-            let ptr = hdr.headroom_ptr().add(hdr.headroom_capacity);
+            let hdr = self.header.as_ptr();
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr).add((*hdr).headroom_capacity);
             std::slice::from_raw_parts_mut(ptr, self.payload_len)
         }
     }
@@ -554,11 +550,10 @@ impl IoBuffMut {
     /// ```
     #[inline(always)]
     pub fn payload_unwritten_mut(&mut self) -> &mut [u8] {
-        let hdr = unsafe { self.header.as_ref() };
         unsafe {
-            let ptr = hdr
-                .headroom_ptr()
-                .add(hdr.headroom_capacity + self.payload_len);
+            let hdr = self.header.as_ptr();
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr)
+                .add((*hdr).headroom_capacity + self.payload_len);
             std::slice::from_raw_parts_mut(ptr, self.payload_remaining())
         }
     }
@@ -575,11 +570,10 @@ impl IoBuffMut {
         if data.len() > self.payload_remaining() {
             return Err(IoBuffError::PayloadFull);
         }
-        let hdr = unsafe { self.header.as_ref() };
         unsafe {
-            let dst = hdr
-                .headroom_ptr()
-                .add(hdr.headroom_capacity + self.payload_len);
+            let hdr = self.header.as_ptr();
+            let dst = IoBuffHeader::headroom_ptr_from_raw(hdr)
+                .add((*hdr).headroom_capacity + self.payload_len);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         self.payload_len += data.len();
@@ -648,13 +642,12 @@ impl IoBuffMut {
         if data.len() > self.tailroom_remaining() {
             return Err(IoBuffError::TailroomFull);
         }
-        let hdr = unsafe { self.header.as_ref() };
         // Tailroom is written right after the last payload byte to keep the
         // active window (headroom + payload + tailroom) contiguous.
         unsafe {
-            let dst = hdr
-                .headroom_ptr()
-                .add(hdr.headroom_capacity + self.payload_len + self.tailroom_len);
+            let hdr = self.header.as_ptr();
+            let dst = IoBuffHeader::headroom_ptr_from_raw(hdr)
+                .add((*hdr).headroom_capacity + self.payload_len + self.tailroom_len);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         self.tailroom_len += data.len();
@@ -672,7 +665,7 @@ impl IoBuffMut {
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
-            let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset);
             std::slice::from_raw_parts(ptr, self.active_len())
         }
     }
@@ -681,7 +674,7 @@ impl IoBuffMut {
     #[inline(always)]
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
-            let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset);
             std::slice::from_raw_parts_mut(ptr, self.active_len())
         }
     }
@@ -909,7 +902,7 @@ impl IoBuff {
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
-            let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset);
             std::slice::from_raw_parts(ptr, self.len())
         }
     }
@@ -917,9 +910,9 @@ impl IoBuff {
     /// Returns the written payload as a read-only slice.
     #[inline(always)]
     pub fn payload_bytes(&self) -> &[u8] {
-        let hdr = unsafe { self.header.as_ref() };
         unsafe {
-            let ptr = hdr.headroom_ptr().add(hdr.headroom_capacity);
+            let hdr = self.header.as_ptr();
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr).add((*hdr).headroom_capacity);
             std::slice::from_raw_parts(ptr, self.payload_len)
         }
     }
@@ -1161,7 +1154,8 @@ impl IoBuffOwnedView {
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
-            let ptr = self.buffer.header.as_ref().headroom_ptr().add(self.offset);
+            let ptr =
+                IoBuffHeader::headroom_ptr_from_raw(self.buffer.header.as_ptr()).add(self.offset);
             std::slice::from_raw_parts(ptr, self.len)
         }
     }
@@ -1254,7 +1248,7 @@ impl IoBuffView {
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
-            let ptr = self.header.as_ref().headroom_ptr().add(self.offset);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset);
             std::slice::from_raw_parts(ptr, self.len)
         }
     }
@@ -1328,7 +1322,7 @@ impl std::ops::Deref for IoBuffView {
 unsafe impl IoBuffReadOnly for IoBuff {
     #[inline(always)]
     fn as_ptr(&self) -> *const u8 {
-        unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
+        unsafe { IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset) }
     }
 
     #[inline(always)]
@@ -1343,7 +1337,7 @@ unsafe impl IoBuffReadOnly for IoBuff {
 unsafe impl IoBuffReadOnly for IoBuffView {
     #[inline(always)]
     fn as_ptr(&self) -> *const u8 {
-        unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
+        unsafe { IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset) }
     }
 
     #[inline(always)]
@@ -1359,7 +1353,7 @@ unsafe impl IoBuffReadOnly for IoBuffView {
 unsafe impl IoBuffReadOnly for IoBuffOwnedView {
     #[inline(always)]
     fn as_ptr(&self) -> *const u8 {
-        unsafe { self.buffer.header.as_ref().headroom_ptr().add(self.offset) }
+        unsafe { IoBuffHeader::headroom_ptr_from_raw(self.buffer.header.as_ptr()).add(self.offset) }
     }
 
     #[inline(always)]
@@ -1374,7 +1368,7 @@ unsafe impl IoBuffReadOnly for IoBuffOwnedView {
 unsafe impl IoBuffReadOnly for IoBuffMut {
     #[inline(always)]
     fn as_ptr(&self) -> *const u8 {
-        unsafe { self.header.as_ref().headroom_ptr().add(self.offset) }
+        unsafe { IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr()).add(self.offset) }
     }
 
     #[inline(always)]
@@ -1387,10 +1381,10 @@ unsafe impl IoBuffReadOnly for IoBuffMut {
 unsafe impl IoBuffReadWrite for IoBuffMut {
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut u8 {
-        let hdr = unsafe { self.header.as_ref() };
         unsafe {
-            hdr.headroom_ptr()
-                .add(hdr.headroom_capacity + self.payload_len())
+            let hdr = self.header.as_ptr();
+            IoBuffHeader::headroom_ptr_from_raw(hdr)
+                .add((*hdr).headroom_capacity + self.payload_len())
         }
     }
 

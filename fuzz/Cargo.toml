@@ -1,0 +1,57 @@
+# Out-of-source libFuzzer crate (cargo-fuzz). Detached from the parent
+# workspace via the empty [workspace] table below so the stable build/test of
+# the main workspace ignores it. Build/run with nightly:
+#   cargo +nightly fuzz run <target>   (or: make fuzz-smoke)
+[package]
+name = "flowio-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.flowio]
+path = ".."
+features = ["fuzzing"]
+
+[[bin]]
+name = "sctp_parse_notification"
+path = "fuzz_targets/sctp_parse_notification.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_decode_name"
+path = "fuzz_targets/dns_decode_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_parse_response_packet"
+path = "fuzz_targets/dns_parse_response_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sctp_parse_recv_meta"
+path = "fuzz_targets/sctp_parse_recv_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sctp_parse_assoc_addrs"
+path = "fuzz_targets/sctp_parse_assoc_addrs.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]

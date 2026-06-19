@@ -310,7 +310,7 @@ impl Drop for Reactor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use crate::runtime::fd::{distinctive_closeable_test_fd, raw_fd_is_closed};
 

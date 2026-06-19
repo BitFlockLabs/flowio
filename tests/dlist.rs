@@ -8,6 +8,11 @@ pub struct Task {
     pub link: utils::list::intrusive::dlist::Link,
 }
 
+fn task_link_ptr(task: &mut Task) -> *mut utils::list::intrusive::dlist::Link {
+    let base = task as *mut Task as *mut u8;
+    unsafe { base.add(offset_of!(Task, link)) as *mut utils::list::intrusive::dlist::Link }
+}
+
 #[test]
 fn test_verbose_pointer_audit() {
     let offset = offset_of!(Task, link);
@@ -31,7 +36,7 @@ fn test_verbose_pointer_audit() {
         println!("\n--- PHASE 1: SEQUENTIAL INSERTION (FIFO) ---");
         for task in slab.iter_mut() {
             let link_addr = &task.link as *const _ as usize;
-            list.push_back(&mut task.link);
+            list.push_back(task_link_ptr(task));
             println!(
                 "INSERT: ID {:<2} | Link: 0x{:x} | (Prev: 0x{:x}, Next: 0x{:x})",
                 task.id, link_addr, task.link.prev as usize, task.link.next as usize
@@ -56,7 +61,7 @@ fn test_verbose_pointer_audit() {
         let targets = [0, 5, 9];
         for &idx in &targets {
             println!("REMOVING ID: {}", idx);
-            list.remove(&mut slab[idx].link);
+            list.remove(task_link_ptr(&mut slab[idx]));
         }
 
         println!("\n--- PHASE 4: BACKWARD WALK (Post-Deletion) ---");
@@ -79,7 +84,7 @@ fn test_verbose_pointer_audit() {
 
         // We reuse Task 0 (which was removed in Phase 3)
         println!("RE-INSERTING: ID 0 to Front");
-        list.push_front(&mut slab[0].link);
+        list.push_front(task_link_ptr(&mut slab[0]));
 
         println!("\n--- FINAL LIST STATE ---");
         let mut cur = list.cursor_mut();
@@ -102,7 +107,7 @@ fn remove_unlinked_node_is_noop() {
     };
 
     unsafe {
-        list.remove(&mut task.link);
+        list.remove(task_link_ptr(&mut task));
     }
 
     assert!(list.is_empty());
@@ -121,9 +126,9 @@ fn remove_cross_list_node_panics_in_debug() {
     };
 
     unsafe {
-        right.push_back(&mut task.link);
+        right.push_back(task_link_ptr(&mut task));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            left.remove(&mut task.link);
+            left.remove(task_link_ptr(&mut task));
         }));
         assert!(result.is_err());
         while right.pop_front(offset_of!(Task, link)).is_some() {}
@@ -145,11 +150,11 @@ fn append_back_moves_nodes_and_empties_source() {
         .collect();
 
     unsafe {
-        left.push_back(&mut tasks[0].link);
-        left.push_back(&mut tasks[1].link);
-        right.push_back(&mut tasks[2].link);
-        right.push_back(&mut tasks[3].link);
-        right.push_back(&mut tasks[4].link);
+        left.push_back(task_link_ptr(&mut tasks[0]));
+        left.push_back(task_link_ptr(&mut tasks[1]));
+        right.push_back(task_link_ptr(&mut tasks[2]));
+        right.push_back(task_link_ptr(&mut tasks[3]));
+        right.push_back(task_link_ptr(&mut tasks[4]));
 
         left.append_back(&mut right);
         assert!(right.is_empty());
@@ -198,7 +203,7 @@ fn test_broken_list_detection() {
     };
 
     unsafe {
-        list.push_back(&mut t1.link);
+        list.push_back(task_link_ptr(&mut t1));
 
         // Corrupt t1.next so the sentinel's prev.next no longer points back
         // to head.
@@ -245,10 +250,10 @@ fn test_verbose_append_logic() {
         // Initial state
         println!("\n[PHASE 1] Initializing Queues");
         for task in tasks.iter_mut().take(3) {
-            running_queue.push_back(&mut task.link);
+            running_queue.push_back(task_link_ptr(task));
         }
         for task in tasks.iter_mut().take(6).skip(3) {
-            ready_queue.push_back(&mut task.link);
+            ready_queue.push_back(task_link_ptr(task));
         }
 
         println!("Running Queue: ");
@@ -316,7 +321,8 @@ fn link_offset() -> usize {
 }
 
 fn link_ptr(n: &mut Node) -> *mut utils::list::intrusive::dlist::Link {
-    &mut n.link as *mut utils::list::intrusive::dlist::Link
+    let base = n as *mut Node as *mut u8;
+    unsafe { base.add(offset_of!(Node, link)) as *mut utils::list::intrusive::dlist::Link }
 }
 
 #[test]

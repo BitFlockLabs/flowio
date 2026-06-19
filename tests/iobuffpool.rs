@@ -245,13 +245,14 @@ fn pool_grows_across_slabs() {
     pool.init();
 
     let mut ptrs = Vec::new();
+    let mut buffers = Vec::new();
     for i in 0..20 {
         let buf = pool.alloc().unwrap();
         ptrs.push(IoBuffReadOnly::as_ptr(&buf));
         println!("  alloc #{}: ptr={:?}", i, ptrs.last().unwrap());
         // Keep every slot occupied so the next alloc cannot reuse a freed
         // slot; this forces new slab pages.
-        std::mem::forget(buf);
+        buffers.push(buf);
     }
 
     // All pointers should be unique
@@ -266,6 +267,7 @@ fn pool_grows_across_slabs() {
         "all allocations must be at unique addresses"
     );
     println!("  20 unique allocations across multiple slabs: OK");
+    drop(buffers);
 }
 
 // ============================================================================

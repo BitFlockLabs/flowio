@@ -21,6 +21,16 @@ const fn weird_offset() -> usize {
     std::mem::offset_of!(WeirdOffsetNode, link)
 }
 
+fn node_link_ptr(node: &mut Node) -> *mut utils::list::intrusive::slist::Link {
+    let base = node as *mut Node as *mut u8;
+    unsafe { base.add(node_offset()) as *mut utils::list::intrusive::slist::Link }
+}
+
+fn weird_link_ptr(node: &mut WeirdOffsetNode) -> *mut utils::list::intrusive::slist::Link {
+    let base = node as *mut WeirdOffsetNode as *mut u8;
+    unsafe { base.add(weird_offset()) as *mut utils::list::intrusive::slist::Link }
+}
+
 #[test]
 fn test_empty_list() {
     let mut list: utils::list::intrusive::slist::SList<Node> =
@@ -54,9 +64,9 @@ fn test_push_pop_lifo() {
     };
 
     unsafe {
-        list.push_front(&mut n1.link);
-        list.push_front(&mut n2.link);
-        list.push_front(&mut n3.link);
+        list.push_front(node_link_ptr(&mut n1));
+        list.push_front(node_link_ptr(&mut n2));
+        list.push_front(node_link_ptr(&mut n3));
     }
 
     assert!(
@@ -100,7 +110,7 @@ fn test_push_front_unchecked_edge_case() {
 
     unsafe {
         // This should succeed and ignore the dirty link state
-        list.push_front_unchecked(&mut n1.link);
+        list.push_front_unchecked(node_link_ptr(&mut n1));
     }
 
     assert!(!list.is_empty());
@@ -127,7 +137,7 @@ fn test_weird_offset() {
     };
 
     unsafe {
-        list.push_front(&mut n1.link);
+        list.push_front(weird_link_ptr(&mut n1));
         let popped = list.pop_front(weird_offset()).unwrap();
         assert_eq!((*popped).value, 777);
     }
@@ -143,17 +153,17 @@ fn test_node_reuse() {
     };
 
     unsafe {
-        list.push_front(&mut n1.link);
+        list.push_front(node_link_ptr(&mut n1));
         let _ = list.pop_front(node_offset()).unwrap();
 
         // Because pop_front unlinks the node, we can immediately push it back in without panicking.
-        list.push_front(&mut n1.link);
+        list.push_front(node_link_ptr(&mut n1));
         let popped = list.pop_front(node_offset()).unwrap();
         assert_eq!((*popped).value, 1);
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(miri)))]
 mod debug_only {
     use super::*;
 
@@ -172,10 +182,10 @@ mod debug_only {
         };
 
         unsafe {
-            list.push_front(&mut n1.link);
-            list.push_front(&mut n2.link);
+            list.push_front(node_link_ptr(&mut n1));
+            list.push_front(node_link_ptr(&mut n2));
             // n2 is still linked (next -> n1), so double-insert assert fires.
-            list.push_front(&mut n2.link);
+            list.push_front(node_link_ptr(&mut n2));
         }
     }
 
@@ -190,13 +200,14 @@ mod debug_only {
         };
 
         unsafe {
-            list.push_front(&mut n1.link);
+            list.push_front(node_link_ptr(&mut n1));
             // This should panic because n1 is already the head, and push_front_unchecked forbids pushing the head onto itself.
-            list.push_front_unchecked(&mut n1.link);
+            list.push_front_unchecked(node_link_ptr(&mut n1));
         }
     }
 
     #[test]
+    #[cfg(not(miri))]
     #[should_panic(expected = "singly linked list cycle detected")]
     fn test_cycle_detection_panics() {
         let mut list: utils::list::intrusive::slist::SList<Node> =
@@ -211,11 +222,11 @@ mod debug_only {
         };
 
         unsafe {
-            list.push_front(&mut n1.link);
-            list.push_front(&mut n2.link);
+            list.push_front(node_link_ptr(&mut n1));
+            list.push_front(node_link_ptr(&mut n2));
 
             // Manually introduce a cycle: n1 -> n2 -> n1
-            n1.link.next = &mut n2.link;
+            n1.link.next = node_link_ptr(&mut n2);
             std::hint::black_box(&n1.link.next);
 
             // Any list operation that triggers `debug_assert_slist_sanity!` will now traverse and detect the cycle.

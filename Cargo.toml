@@ -8,8 +8,13 @@ description = "Single-threaded async runtime and TCP/UDP/SCTP/TLS transport libr
 readme = "README.md"
 keywords = ["async", "io-uring", "runtime", "networking"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["tests/"]
+exclude = ["tests/", "public-api.txt"]
 repository = "https://github.com/BitFlockLabs/flowio"
+
+[features]
+# Dev-only: re-exports internal parsers for the out-of-source `fuzz/` crate.
+# Off by default; does not change the real public API.
+fuzzing = []
 
 [dependencies]
 io-uring = "0.7.11"
@@ -20,3 +25,6 @@ sha2 = "0.10"
 [dev-dependencies]
 rcgen = "0.14"
 static_assertions = "1.1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)'] }

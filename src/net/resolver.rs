@@ -233,7 +233,7 @@ pub async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> 
 
 /// One logical DNS lookup result before the final socket-address port is
 /// applied.
-struct LookupResult {
+pub(crate) struct LookupResult {
     /// Addresses returned directly for the requested record type.
     addresses: Vec<IpAddr>,
     /// Last in-chain CNAME target reached while answering the current query.
@@ -437,7 +437,7 @@ fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<
     Ok(packet)
 }
 
-fn parse_response_packet(
+pub(crate) fn parse_response_packet(
     packet: &[u8],
     query_id: u16,
     query_host: &str,
@@ -639,7 +639,11 @@ fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
     })
 }
 
-fn decode_name(packet: &[u8], offset: usize, depth: usize) -> io::Result<(String, usize)> {
+pub(crate) fn decode_name(
+    packet: &[u8],
+    offset: usize,
+    depth: usize,
+) -> io::Result<(String, usize)> {
     if depth > MAX_CNAME_DEPTH + 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
