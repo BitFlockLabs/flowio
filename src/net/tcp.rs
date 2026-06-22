@@ -529,6 +529,20 @@ impl TcpStream {
         current_local_addr(self.fd.as_raw_fd())
     }
 
+    /// Duplicates this connected stream descriptor for explicit read/write split ownership.
+    ///
+    /// The duplicate is a separate runtime-owned descriptor referring to the
+    /// same underlying socket. Use this during connection setup when one task
+    /// needs to own reads while another owns writes. This is control-plane
+    /// setup work, not a per-message fast-path operation.
+    pub fn try_clone_for_split(&self) -> io::Result<Self> {
+        let fd = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self::from_raw_fd(fd))
+    }
+
     /// Returns the peer address of this socket.
     ///
     /// This is socket status/control-plane lookup, not the per-message data
