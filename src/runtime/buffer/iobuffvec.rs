@@ -143,6 +143,71 @@ impl<T> std::fmt::Debug for PushError<T> {
     }
 }
 
+#[inline(always)]
+fn uninit_inline_storage<T, const N: usize>() -> [MaybeUninit<T>; N] {
+    unsafe { MaybeUninit::uninit().assume_init() }
+}
+
+fn inline_storage_from_array<T, const N: usize>(values: [T; N]) -> [MaybeUninit<T>; N] {
+    let mut storage = uninit_inline_storage();
+    for (i, value) in values.into_iter().enumerate() {
+        storage[i] = MaybeUninit::new(value);
+    }
+    storage
+}
+
+#[inline(always)]
+fn try_push_inline<T, const N: usize>(
+    storage: &mut [MaybeUninit<T>; N],
+    count: &mut usize,
+    value: T,
+) -> Result<(), PushError<T>> {
+    if *count >= N {
+        return Err(PushError::new(IoBuffError::ChainFull, value));
+    }
+
+    storage[*count] = MaybeUninit::new(value);
+    *count += 1;
+    Ok(())
+}
+
+#[inline(always)]
+fn get_inline<T, const N: usize>(
+    storage: &[MaybeUninit<T>; N],
+    count: usize,
+    index: usize,
+) -> Result<&T, IoBuffError> {
+    if index >= count {
+        return Err(IoBuffError::IndexOutOfBounds);
+    }
+    Ok(unsafe { storage[index].assume_init_ref() })
+}
+
+#[inline(always)]
+fn get_inline_mut<T, const N: usize>(
+    storage: &mut [MaybeUninit<T>; N],
+    count: usize,
+    index: usize,
+) -> Result<&mut T, IoBuffError> {
+    if index >= count {
+        return Err(IoBuffError::IndexOutOfBounds);
+    }
+    Ok(unsafe { storage[index].assume_init_mut() })
+}
+
+fn iter_inline<T, const N: usize>(
+    storage: &[MaybeUninit<T>; N],
+    count: usize,
+) -> impl Iterator<Item = &T> {
+    (0..count).map(move |i| unsafe { storage[i].assume_init_ref() })
+}
+
+unsafe fn drop_initialized_inline<T>(storage: &mut [MaybeUninit<T>], count: usize) {
+    for slot in storage.iter_mut().take(count) {
+        unsafe { slot.assume_init_drop() };
+    }
+}
+
 // ============================================================================
 // IoBuffVecMut — mutable vectored buffer chain (const generic, inline)
 // ============================================================================
@@ -192,19 +257,17 @@ impl<const N: usize> IoBuffVecMut<N> {
     /// Creates an empty vectored buffer chain.
     pub fn new() -> Self {
         Self {
-            buffers: unsafe { MaybeUninit::uninit().assume_init() },
+            buffers: uninit_inline_storage(),
             count: 0,
         }
     }
 
     /// Creates a fully-initialized chain from an array of mutable segments.
     pub fn from_array(buffers: [IoBuffMut; N]) -> Self {
-        let mut out = Self::new();
-        for (i, buf) in buffers.into_iter().enumerate() {
-            out.buffers[i] = MaybeUninit::new(buf);
+        Self {
+            buffers: inline_storage_from_array(buffers),
+            count: N,
         }
-        out.count = N;
-        out
     }
 
     /// Returns the number of segments currently in the chain.
@@ -231,41 +294,27 @@ impl<const N: usize> IoBuffVecMut<N> {
     /// Returns [`PushError`] containing the original buffer if the chain is at
     /// capacity.
     pub fn try_push(&mut self, buf: IoBuffMut) -> Result<(), PushError<IoBuffMut>> {
-        if self.count >= N {
-            return Err(PushError::new(IoBuffError::ChainFull, buf));
-        }
-
-        self.buffers[self.count] = MaybeUninit::new(buf);
-        self.count += 1;
-        Ok(())
+        try_push_inline(&mut self.buffers, &mut self.count, buf)
     }
 
     /// Returns a reference to the buffer segment at the given index.
     #[inline(always)]
     pub fn get(&self, index: usize) -> Result<&IoBuffMut, IoBuffError> {
-        if index >= self.count {
-            return Err(IoBuffError::IndexOutOfBounds);
-        }
-        Ok(unsafe { self.buffers[index].assume_init_ref() })
+        get_inline(&self.buffers, self.count, index)
     }
 
     /// Returns a mutable reference to the buffer segment at the given index.
     #[inline(always)]
     pub fn get_mut(&mut self, index: usize) -> Result<&mut IoBuffMut, IoBuffError> {
-        if index >= self.count {
-            return Err(IoBuffError::IndexOutOfBounds);
-        }
-        Ok(unsafe { self.buffers[index].assume_init_mut() })
+        get_inline_mut(&mut self.buffers, self.count, index)
     }
 
     /// Returns the total number of active bytes across all segments.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        let mut total = 0;
-        for i in 0..self.count {
-            total += unsafe { self.buffers[i].assume_init_ref() }.len();
-        }
-        total
+        iter_inline(&self.buffers, self.count)
+            .map(|buf| buf.len())
+            .sum()
     }
 
     /// Returns `true` if the chain has no segments or all segments are empty.
@@ -277,11 +326,9 @@ impl<const N: usize> IoBuffVecMut<N> {
     /// Returns the total writable capacity across all segments.
     #[inline(always)]
     pub fn writable_len(&self) -> usize {
-        let mut total = 0;
-        for i in 0..self.count {
-            total += unsafe { self.buffers[i].assume_init_ref() }.payload_remaining();
-        }
-        total
+        iter_inline(&self.buffers, self.count)
+            .map(|buf| buf.payload_remaining())
+            .sum()
     }
 
     /// Fills caller-provided `iovec` scratch for `readv`/`recvmsg`.
@@ -344,8 +391,7 @@ impl<const N: usize> IoBuffVecMut<N> {
     /// Freezes all buffer segments and returns an [`IoBuffVec`].
     /// Zero-copy.
     pub fn freeze(mut self) -> IoBuffVec<N> {
-        let mut frozen_buffers: [MaybeUninit<IoBuff>; N] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut frozen_buffers = uninit_inline_storage();
         let count = self.count;
 
         for (i, slot) in frozen_buffers.iter_mut().enumerate().take(count) {
@@ -364,9 +410,7 @@ impl<const N: usize> IoBuffVecMut<N> {
 
 impl<const N: usize> Drop for IoBuffVecMut<N> {
     fn drop(&mut self) {
-        for i in 0..self.count {
-            unsafe { self.buffers[i].assume_init_drop() };
-        }
+        unsafe { drop_initialized_inline(&mut self.buffers, self.count) };
     }
 }
 
@@ -423,19 +467,17 @@ impl<const N: usize> IoBuffVec<N> {
     /// Creates an empty frozen vectored buffer chain.
     pub fn new() -> Self {
         Self {
-            buffers: unsafe { MaybeUninit::uninit().assume_init() },
+            buffers: uninit_inline_storage(),
             count: 0,
         }
     }
 
     /// Creates a fully-initialized chain from an array of frozen segments.
     pub fn from_array(buffers: [IoBuff; N]) -> Self {
-        let mut out = Self::new();
-        for (i, buf) in buffers.into_iter().enumerate() {
-            out.buffers[i] = MaybeUninit::new(buf);
+        Self {
+            buffers: inline_storage_from_array(buffers),
+            count: N,
         }
-        out.count = N;
-        out
     }
 
     /// Returns the number of segments in the chain.
@@ -453,11 +495,9 @@ impl<const N: usize> IoBuffVec<N> {
     /// Returns the total number of readable bytes across all segments.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        let mut total = 0;
-        for i in 0..self.count {
-            total += unsafe { self.buffers[i].assume_init_ref() }.len();
-        }
-        total
+        iter_inline(&self.buffers, self.count)
+            .map(|buf| buf.len())
+            .sum()
     }
 
     /// Returns `true` if the chain has no segments or all segments are empty.
@@ -469,10 +509,7 @@ impl<const N: usize> IoBuffVec<N> {
     /// Returns a reference to the frozen buffer segment at the given index.
     #[inline(always)]
     pub fn get(&self, index: usize) -> Result<&IoBuff, IoBuffError> {
-        if index >= self.count {
-            return Err(IoBuffError::IndexOutOfBounds);
-        }
-        Ok(unsafe { self.buffers[index].assume_init_ref() })
+        get_inline(&self.buffers, self.count, index)
     }
 
     /// Adds a frozen buffer segment to the chain.
@@ -487,18 +524,12 @@ impl<const N: usize> IoBuffVec<N> {
     /// Returns [`PushError`] containing the original buffer if the chain is at
     /// capacity.
     pub fn try_push(&mut self, buf: IoBuff) -> Result<(), PushError<IoBuff>> {
-        if self.count >= N {
-            return Err(PushError::new(IoBuffError::ChainFull, buf));
-        }
-
-        self.buffers[self.count] = MaybeUninit::new(buf);
-        self.count += 1;
-        Ok(())
+        try_push_inline(&mut self.buffers, &mut self.count, buf)
     }
 
     /// Returns an iterator over the frozen buffer segments.
     pub fn iter(&self) -> impl Iterator<Item = &IoBuff> {
-        (0..self.count).map(move |i| unsafe { self.buffers[i].assume_init_ref() })
+        iter_inline(&self.buffers, self.count)
     }
 
     /// Fills a caller-provided `iovec` scratch array for `writev`/`sendmsg`.
@@ -534,15 +565,13 @@ impl<const N: usize> IoBuffVec<N> {
     /// Returns `Err((IoBuffError::SharedBuffer, self))` with `self` intact
     /// if any segment is shared.
     pub fn try_mut_all(mut self) -> Result<IoBuffVecMut<N>, (IoBuffError, Self)> {
-        for i in 0..self.count {
-            let buf = unsafe { self.buffers[i].assume_init_ref() };
-            if buf.ref_count() > 1 {
-                return Err((IoBuffError::SharedBuffer, self));
-            }
+        let has_shared_segment =
+            iter_inline(&self.buffers, self.count).any(|buf| buf.ref_count() > 1);
+        if has_shared_segment {
+            return Err((IoBuffError::SharedBuffer, self));
         }
 
-        let mut mut_buffers: [MaybeUninit<IoBuffMut>; N] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut mut_buffers = uninit_inline_storage();
         let count = self.count;
 
         for (i, slot) in mut_buffers.iter_mut().enumerate().take(count) {
@@ -562,7 +591,7 @@ impl<const N: usize> IoBuffVec<N> {
 
 impl<const N: usize> Clone for IoBuffVec<N> {
     fn clone(&self) -> Self {
-        let mut buffers: [MaybeUninit<IoBuff>; N] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut buffers = uninit_inline_storage();
 
         for (i, slot) in buffers.iter_mut().enumerate().take(self.count) {
             *slot = MaybeUninit::new(unsafe { self.buffers[i].assume_init_ref() }.clone());
@@ -577,9 +606,7 @@ impl<const N: usize> Clone for IoBuffVec<N> {
 
 impl<const N: usize> Drop for IoBuffVec<N> {
     fn drop(&mut self) {
-        for i in 0..self.count {
-            unsafe { self.buffers[i].assume_init_drop() };
-        }
+        unsafe { drop_initialized_inline(&mut self.buffers, self.count) };
     }
 }
 
@@ -631,19 +658,17 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
     /// Creates an empty generic read-only vectored chain.
     pub fn new() -> Self {
         Self {
-            buffers: unsafe { MaybeUninit::uninit().assume_init() },
+            buffers: uninit_inline_storage(),
             count: 0,
         }
     }
 
     /// Creates a fully-initialized chain from an array of read-only buffers.
     pub fn from_array(buffers: [B; N]) -> Self {
-        let mut out = Self::new();
-        for (i, buf) in buffers.into_iter().enumerate() {
-            out.buffers[i] = MaybeUninit::new(buf);
+        Self {
+            buffers: inline_storage_from_array(buffers),
+            count: N,
         }
-        out.count = N;
-        out
     }
 
     /// Returns the number of segments currently in the chain.
@@ -670,22 +695,13 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
     /// Returns [`PushError`] containing the original buffer if the chain is at
     /// capacity.
     pub fn try_push(&mut self, buf: B) -> Result<(), PushError<B>> {
-        if self.count >= N {
-            return Err(PushError::new(IoBuffError::ChainFull, buf));
-        }
-
-        self.buffers[self.count] = MaybeUninit::new(buf);
-        self.count += 1;
-        Ok(())
+        try_push_inline(&mut self.buffers, &mut self.count, buf)
     }
 
     /// Returns a reference to the buffer segment at the given index.
     #[inline(always)]
     pub fn get(&self, index: usize) -> Result<&B, IoBuffError> {
-        if index >= self.count {
-            return Err(IoBuffError::IndexOutOfBounds);
-        }
-        Ok(unsafe { self.buffers[index].assume_init_ref() })
+        get_inline(&self.buffers, self.count, index)
     }
 
     /// Returns a mutable reference to the buffer segment at the given index.
@@ -695,20 +711,15 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
     /// callers cannot access the segments.
     #[inline(always)]
     pub fn get_mut(&mut self, index: usize) -> Result<&mut B, IoBuffError> {
-        if index >= self.count {
-            return Err(IoBuffError::IndexOutOfBounds);
-        }
-        Ok(unsafe { self.buffers[index].assume_init_mut() })
+        get_inline_mut(&mut self.buffers, self.count, index)
     }
 
     /// Returns the total number of readable bytes across all segments.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        let mut total = 0;
-        for i in 0..self.count {
-            total += unsafe { self.buffers[i].assume_init_ref() }.len();
-        }
-        total
+        iter_inline(&self.buffers, self.count)
+            .map(|buf| buf.len())
+            .sum()
     }
 
     /// Returns `true` if the chain has no segments or all segments are empty.
@@ -719,15 +730,13 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
 
     /// Returns an iterator over the read-only buffer segments.
     pub fn iter(&self) -> impl Iterator<Item = &B> {
-        (0..self.count).map(move |i| unsafe { self.buffers[i].assume_init_ref() })
+        iter_inline(&self.buffers, self.count)
     }
 }
 
 impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVec<B, N> {
     fn drop(&mut self) {
-        for i in 0..self.count {
-            unsafe { self.buffers[i].assume_init_drop() };
-        }
+        unsafe { drop_initialized_inline(&mut self.buffers, self.count) };
     }
 }
 
@@ -795,8 +804,8 @@ impl<B: IoBuffReadOnly, const N: usize> ExactSizeIterator for IoBuffReadOnlyVecI
 
 impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVecIntoIter<B, N> {
     fn drop(&mut self) {
-        for i in self.index..self.count {
-            unsafe { self.buffers[i].assume_init_drop() };
-        }
+        unsafe {
+            drop_initialized_inline(&mut self.buffers[self.index..], self.count - self.index)
+        };
     }
 }

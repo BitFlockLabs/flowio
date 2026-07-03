@@ -1,8 +1,15 @@
 use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
+use flowio::runtime::buffer::pool::IoBuffPool;
+use flowio::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::Executor;
-use std::future::Future;
+use flowio::runtime::timer::sleep;
+use std::cell::Cell;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::rc::Rc;
+use std::task::Poll;
+use std::time::Duration;
 
 /// Runs one integration-test future on a fresh executor.
 #[allow(dead_code)]
@@ -12,6 +19,25 @@ where
 {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
     executor.run(future).expect("executor run failed");
+}
+
+#[allow(dead_code)]
+pub async fn assert_poll_after_ready_parks<F>(future: F)
+where
+    F: Future,
+{
+    let mut future = Box::pin(future);
+    poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(_) => Poll::Ready(()),
+        Poll::Pending => Poll::Pending,
+    })
+    .await;
+
+    poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("rental future completed again after Ready"),
+    })
+    .await;
 }
 
 /// Shared test-only helpers for `flowio` integration tests.
@@ -60,6 +86,153 @@ pub fn make_read_chain<const N: usize>(capacities: [usize; N]) -> IoBuffVecMut<N
         chain.push(TestIoBuffMut::new(0, capacity, 0)).unwrap();
     }
     chain
+}
+
+/// Fake read-only buffer reporting a length above `u32::MAX` to exercise
+/// oversize-send rejection without allocating that much memory.
+#[allow(dead_code)]
+pub struct HugeReadOnly;
+
+// SAFETY: this fixture is only used on validation paths that must reject the
+// oversized length before submitting kernel I/O or dereferencing the pointer.
+unsafe impl IoBuffReadOnly for HugeReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        b"x".as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        u32::MAX as usize + 1
+    }
+}
+
+/// Drop-tracking read-only buffer used by retained-payload tests.
+#[allow(dead_code)]
+pub struct DropTrackedReadOnly {
+    /// Payload bytes exposed through `IoBuffReadOnly`.
+    bytes: Vec<u8>,
+    /// Shared drop counter bumped exactly once by `Drop`.
+    drops: Rc<Cell<usize>>,
+}
+
+impl DropTrackedReadOnly {
+    #[allow(dead_code)]
+    pub fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
+        Self {
+            bytes,
+            drops: Rc::clone(drops),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for DropTrackedReadOnly {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+// SAFETY: `bytes` is a heap-allocated Vec, so `as_ptr()` stays valid for
+// `len()` bytes for the lifetime of the value and is not invalidated by moves.
+unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Drop-tracking writable buffer used by retained read tests.
+#[allow(dead_code)]
+pub struct DropTrackedReadWrite {
+    /// Writable backing bytes.
+    bytes: Vec<u8>,
+    /// Shared drop counter bumped exactly once by `Drop`.
+    drops: Rc<Cell<usize>>,
+}
+
+impl DropTrackedReadWrite {
+    #[allow(dead_code)]
+    pub fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
+        Self {
+            bytes,
+            drops: Rc::clone(drops),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn zeroed(len: usize, drops: &Rc<Cell<usize>>) -> Self {
+        Self::new(vec![0; len], drops)
+    }
+}
+
+impl Drop for DropTrackedReadWrite {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+// SAFETY: `bytes` is a heap-allocated Vec, so `as_mut_ptr()` stays valid and
+// writable for `writable_len()` bytes across moves. The runtime only calls
+// `set_written_len(len)` with `len <= writable_len()`, so `set_len` stays
+// within the allocation.
+unsafe impl IoBuffReadWrite for DropTrackedReadWrite {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    fn writable_len(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    unsafe fn set_written_len(&mut self, len: usize) {
+        unsafe { self.bytes.set_len(len) };
+    }
+}
+
+/// Waits until the original CQE retires and frees a retained payload exactly
+/// `expected` times, bounded to roughly 500 ms.
+#[allow(dead_code)]
+pub async fn wait_for_drop_count(drops: &Rc<Cell<usize>>, expected: usize) {
+    for _ in 0..100 {
+        if drops.get() == expected {
+            return;
+        }
+        sleep(Duration::from_millis(5))
+            .await
+            .expect("drop wait sleep failed");
+    }
+
+    assert_eq!(
+        drops.get(),
+        expected,
+        "retained payload was not dropped exactly once after CQE retirement"
+    );
+}
+
+/// Waits until pool-backed retained buffers are released after their original
+/// CQEs retire.
+#[allow(dead_code)]
+pub async fn wait_for_live_slots(pool: &IoBuffPool, expected: usize) {
+    for _ in 0..100 {
+        if pool.live_slots_for_test() == expected {
+            return;
+        }
+        sleep(Duration::from_millis(5))
+            .await
+            .expect("pool live-slot wait sleep failed");
+    }
+
+    assert_eq!(
+        pool.live_slots_for_test(),
+        expected,
+        "retained pool-backed buffers were not released after CQE retirement"
+    );
 }
 
 /// Compact projected write source for stream integration tests.

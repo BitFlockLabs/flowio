@@ -131,6 +131,31 @@ fn resolve_slice_bounds(
     Ok((start, end))
 }
 
+#[inline(always)]
+fn payload_front_consumed(
+    headroom_capacity: usize,
+    payload_capacity: usize,
+    offset: usize,
+) -> usize {
+    offset
+        .saturating_sub(headroom_capacity)
+        .min(payload_capacity)
+}
+
+#[inline(always)]
+fn payload_start_offset(headroom_capacity: usize, payload_capacity: usize, offset: usize) -> usize {
+    headroom_capacity + payload_front_consumed(headroom_capacity, payload_capacity, offset)
+}
+
+#[inline(always)]
+fn payload_capacity_after_advance(
+    headroom_capacity: usize,
+    payload_capacity: usize,
+    offset: usize,
+) -> usize {
+    payload_capacity - payload_front_consumed(headroom_capacity, payload_capacity, offset)
+}
+
 // ============================================================================
 // Traits
 // ============================================================================
@@ -179,8 +204,9 @@ pub unsafe trait IoBuffReadOnly: Unpin + 'static {
 ///
 /// Implementations choose what their writable region means. [`IoBuffMut`]
 /// writes into its unwritten payload region and updates structured payload
-/// length. `Vec<u8>` writes into spare capacity and updates its length with
-/// `set_written_len()`. `Box<[u8]>` exposes its fixed slice and ignores
+/// length. `Vec<u8>` exposes its full allocation starting at index 0 and
+/// `set_written_len()` replaces its logical length with the number of bytes
+/// written there. `Box<[u8]>` exposes its fixed slice and ignores
 /// `set_written_len()` because there is no separate logical length to update.
 ///
 /// # Safety
@@ -212,10 +238,11 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     /// buffer.
     ///
     /// Structured buffers use this to set the total payload length (absolute,
-    /// not additive). `Vec<u8>` uses this as a length update for bytes written
-    /// into spare capacity. Fixed-size flat buffers such as `Box<[u8]>` may
-    /// treat this as a no-op because their exposed slice length is not
-    /// adjusted by FlowIO.
+    /// not additive). `Vec<u8>` uses this as a replacement length for bytes
+    /// written from index 0; existing contents beyond `len` are logically
+    /// discarded. Fixed-size flat buffers such as `Box<[u8]>` may treat this
+    /// as a no-op because their exposed slice length is not adjusted by
+    /// FlowIO.
     ///
     /// # Safety
     ///
@@ -470,9 +497,30 @@ impl IoBuffMut {
 
     /// Returns the configured pre-payload slack still available for
     /// prepending before the active window.
+    ///
+    /// After [`advance()`](Self::advance) consumes bytes into the payload
+    /// region, the active window can no longer represent newly-prepended
+    /// bytes in the consumed payload prefix as headroom, so this returns `0`.
     #[inline(always)]
     pub fn headroom_remaining(&self) -> usize {
-        self.offset
+        let headroom_capacity = unsafe { self.header.as_ref().headroom_capacity };
+        if self.offset <= headroom_capacity {
+            self.offset
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    fn payload_start_offset(&self) -> usize {
+        let hdr = unsafe { self.header.as_ref() };
+        payload_start_offset(hdr.headroom_capacity, hdr.payload_capacity, self.offset)
+    }
+
+    #[inline(always)]
+    fn payload_capacity_after_advance(&self) -> usize {
+        let hdr = unsafe { self.header.as_ref() };
+        payload_capacity_after_advance(hdr.headroom_capacity, hdr.payload_capacity, self.offset)
     }
 
     /// Prepends bytes into the headroom region before the current active
@@ -518,7 +566,8 @@ impl IoBuffMut {
         if self.tailroom_len != 0 {
             return 0;
         }
-        self.payload_capacity() - self.payload_len
+        self.payload_capacity_after_advance()
+            .saturating_sub(self.payload_len)
     }
 
     /// Returns `true` if no bytes have been written to the payload region.
@@ -531,8 +580,8 @@ impl IoBuffMut {
     #[inline(always)]
     pub fn payload_bytes(&self) -> &[u8] {
         unsafe {
-            let hdr = self.header.as_ptr();
-            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr).add((*hdr).headroom_capacity);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset());
             std::slice::from_raw_parts(ptr, self.payload_len)
         }
     }
@@ -541,8 +590,8 @@ impl IoBuffMut {
     #[inline(always)]
     pub fn payload_bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
-            let hdr = self.header.as_ptr();
-            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr).add((*hdr).headroom_capacity);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset());
             std::slice::from_raw_parts_mut(ptr, self.payload_len)
         }
     }
@@ -565,9 +614,8 @@ impl IoBuffMut {
     #[inline(always)]
     pub fn payload_unwritten_mut(&mut self) -> &mut [u8] {
         unsafe {
-            let hdr = self.header.as_ptr();
-            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr)
-                .add((*hdr).headroom_capacity + self.payload_len);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset() + self.payload_len);
             std::slice::from_raw_parts_mut(ptr, self.payload_remaining())
         }
     }
@@ -585,9 +633,8 @@ impl IoBuffMut {
             return Err(IoBuffError::PayloadFull);
         }
         unsafe {
-            let hdr = self.header.as_ptr();
-            let dst = IoBuffHeader::headroom_ptr_from_raw(hdr)
-                .add((*hdr).headroom_capacity + self.payload_len);
+            let dst = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset() + self.payload_len);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         self.payload_len += data.len();
@@ -608,7 +655,7 @@ impl IoBuffMut {
         if self.tailroom_len != 0 && new_len != self.payload_len {
             return Err(IoBuffError::PayloadSealed);
         }
-        if new_len > self.payload_capacity() {
+        if new_len > self.payload_capacity_after_advance() {
             return Err(IoBuffError::PayloadFull);
         }
         self.payload_len = new_len;
@@ -659,9 +706,8 @@ impl IoBuffMut {
         // Tailroom is written right after the last payload byte to keep the
         // active window (headroom + payload + tailroom) contiguous.
         unsafe {
-            let hdr = self.header.as_ptr();
-            let dst = IoBuffHeader::headroom_ptr_from_raw(hdr)
-                .add((*hdr).headroom_capacity + self.payload_len + self.tailroom_len);
+            let dst = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset() + self.payload_len + self.tailroom_len);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         self.tailroom_len += data.len();
@@ -881,6 +927,12 @@ impl std::fmt::Debug for IoBuff {
 }
 
 impl IoBuff {
+    #[inline(always)]
+    fn payload_start_offset(&self) -> usize {
+        let hdr = unsafe { self.header.as_ref() };
+        payload_start_offset(hdr.headroom_capacity, hdr.payload_capacity, self.offset)
+    }
+
     /// Returns the number of headroom bytes in the active window.
     #[inline(always)]
     pub fn headroom_len(&self) -> usize {
@@ -925,8 +977,8 @@ impl IoBuff {
     #[inline(always)]
     pub fn payload_bytes(&self) -> &[u8] {
         unsafe {
-            let hdr = self.header.as_ptr();
-            let ptr = IoBuffHeader::headroom_ptr_from_raw(hdr).add((*hdr).headroom_capacity);
+            let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset());
             std::slice::from_raw_parts(ptr, self.payload_len)
         }
     }
@@ -1396,9 +1448,8 @@ unsafe impl IoBuffReadWrite for IoBuffMut {
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut u8 {
         unsafe {
-            let hdr = self.header.as_ptr();
-            IoBuffHeader::headroom_ptr_from_raw(hdr)
-                .add((*hdr).headroom_capacity + self.payload_len())
+            IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
+                .add(self.payload_start_offset() + self.payload_len())
         }
     }
 
@@ -1409,7 +1460,7 @@ unsafe impl IoBuffReadWrite for IoBuffMut {
 
     #[inline(always)]
     unsafe fn set_written_len(&mut self, len: usize) {
-        let capacity = self.payload_capacity();
+        let capacity = self.payload_capacity_after_advance();
         debug_assert!(
             len <= capacity,
             "set_written_len({}) exceeds payload capacity {}",

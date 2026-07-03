@@ -30,6 +30,7 @@ use std::mem::MaybeUninit;
 /// pool for common payload sizes. Oversized or over-aligned payloads use the
 /// documented heap fallback carried by the same erased vtable.
 #[doc(hidden)]
+#[repr(C, align(64))]
 pub struct CompletionState {
     /// CQE result value, stored exactly as returned by the kernel.
     pub result: i32,
@@ -39,6 +40,8 @@ pub struct CompletionState {
     pub state_flags: u32,
     /// Task waiting on this operation, or null when no waiter is registered.
     pub waiter: *mut TaskHeader,
+    /// Reactor-owned pending-cancel queue link.
+    pub(crate) cancel_next: *mut CompletionState,
     /// Erased retained payload whose memory may be referenced by the in-flight
     /// SQE associated with this completion state, or null when no payload is
     /// attached.
@@ -57,6 +60,8 @@ impl CompletionState {
     /// Orphaned operation returns an owned file descriptor in a non-negative
     /// CQE result; the reactor must close it before reclaiming the op.
     pub const FLAG_CLOSE_RESULT_FD_ON_ORPHAN: u32 = 1 << 3;
+    /// `ASYNC_CANCEL` submission failed and the reactor must retry it.
+    pub const FLAG_CANCEL_PENDING: u32 = 1 << 4;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -65,6 +70,7 @@ impl CompletionState {
             cqe_flags: 0,
             state_flags: 0,
             waiter: std::ptr::null_mut(),
+            cancel_next: std::ptr::null_mut(),
             retained_payload: std::ptr::null_mut(),
             retained_payload_vtable: None,
         }
@@ -91,6 +97,11 @@ impl CompletionState {
     }
 
     #[inline(always)]
+    pub(crate) fn is_cancel_pending(&self) -> bool {
+        self.state_flags & Self::FLAG_CANCEL_PENDING != 0
+    }
+
+    #[inline(always)]
     pub fn set_completed(&mut self) {
         self.state_flags |= Self::FLAG_COMPLETED;
     }
@@ -108,6 +119,16 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn set_close_result_fd_on_orphan(&mut self) {
         self.state_flags |= Self::FLAG_CLOSE_RESULT_FD_ON_ORPHAN;
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_cancel_pending(&mut self) {
+        self.state_flags |= Self::FLAG_CANCEL_PENDING;
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear_cancel_pending(&mut self) {
+        self.state_flags &= !Self::FLAG_CANCEL_PENDING;
     }
 
     #[inline(always)]
@@ -199,6 +220,35 @@ impl CompletionState {
         unsafe { RetainedPayload::from_raw_parts(ptr, vtable).take(pool) }
     }
 
+    /// Detaches the retained payload, extracts selected data from it in place,
+    /// and releases only the retained backing storage.
+    ///
+    /// # Safety
+    ///
+    /// The caller must request the exact concrete payload type that was
+    /// attached to this completion state and provide the reactor-owned pool
+    /// that allocated the retained storage. `extract` must move or drop every
+    /// initialized field that requires destruction.
+    #[inline(always)]
+    pub(crate) unsafe fn take_retained_payload_with<T: 'static, R>(
+        &mut self,
+        pool: &mut RetainedPayloadPool,
+        extract: impl FnOnce(*mut T) -> R,
+    ) -> R {
+        debug_assert!(
+            !self.retained_payload.is_null(),
+            "CompletionState retained payload missing"
+        );
+        let ptr = self.retained_payload as *mut T;
+        self.retained_payload = std::ptr::null_mut();
+        debug_assert!(
+            self.retained_payload_vtable.is_some(),
+            "retained payload missing vtable"
+        );
+        let vtable = unsafe { self.retained_payload_vtable.take().unwrap_unchecked() };
+        unsafe { RetainedPayload::from_raw_parts(ptr, vtable).take_with(pool, extract) }
+    }
+
     /// Drops any retained payload still attached to this completion state.
     #[inline(always)]
     pub(crate) unsafe fn drop_retained_payload(&mut self, pool: &mut RetainedPayloadPool) {
@@ -228,10 +278,15 @@ impl CompletionState {
     /// retrying read/write submissions that reuse a completion slot.
     #[inline(always)]
     pub fn reset_for_resubmit(&mut self) {
+        debug_assert!(
+            !self.is_cancel_pending(),
+            "cannot resubmit a completion state queued for cancel retry"
+        );
         self.result = 0;
         self.cqe_flags = 0;
         self.state_flags = 0;
         self.waiter = std::ptr::null_mut();
+        self.cancel_next = std::ptr::null_mut();
     }
 }
 

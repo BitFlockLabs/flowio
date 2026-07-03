@@ -13,6 +13,7 @@ use std::time::Duration;
 #[derive(Clone, Copy)]
 enum TestAnswer {
     A(Ipv4Addr),
+    Aaaa(Ipv6Addr),
     AFor(&'static str, Ipv4Addr),
     Cname(&'static str),
     CnameWithA(&'static str, Ipv4Addr),
@@ -98,6 +99,154 @@ fn resolve_host_queries_custom_nameserver() {
             assert_eq!(
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 42), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_keeps_a_answer_when_aaaa_is_nxdomain() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 43)),
+            ("db.example.test", 28) => TestAnswer::NxDomain,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("A answer should survive AAAA NXDOMAIN");
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 43), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_merges_direct_a_and_aaaa_answers() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 46)),
+            ("db.example.test", 28) => {
+                TestAnswer::Aaaa(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x46))
+            }
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("direct A and AAAA answers should resolve together");
+            assert_eq!(
+                addrs,
+                vec![
+                    SocketAddr::from((Ipv4Addr::new(192, 0, 2, 46), 5432)),
+                    SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x46), 5432,)),
+                ]
+            );
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_falls_back_after_malformed_first_nameserver() {
+    let bad_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind malformed dns socket");
+    let bad_nameserver = bad_server
+        .local_addr()
+        .expect("failed to read malformed dns socket addr");
+    let bad_thread = thread::spawn(move || {
+        serve_dns_queries(bad_server, 2, |_name, _qtype| {
+            TestAnswer::MalformedCnamePointer
+        })
+    });
+
+    let good_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind good dns socket");
+    let good_nameserver = good_server
+        .local_addr()
+        .expect("failed to read good dns socket addr");
+    let good_thread = thread::spawn(move || {
+        serve_dns_queries(good_server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 44)),
+            ("db.example.test", 28) => TestAnswer::Empty,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![bad_nameserver, good_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("resolver should fall back after malformed first response");
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    bad_thread.join().expect("bad dns thread panicked");
+    good_thread.join().expect("good dns thread panicked");
+}
+
+#[test]
+fn resolve_host_drains_stale_response_before_matching_query() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries_with_stale_first_response(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 45)),
+            ("db.example.test", 28) => TestAnswer::Empty,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("resolver should drain stale response and use matching response");
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 45), 5432))]
             );
         })
         .expect("executor run failed");
@@ -584,6 +733,38 @@ where
     }
 }
 
+fn serve_dns_queries_with_stale_first_response<F>(
+    socket: StdUdpSocket,
+    expected_queries: usize,
+    answer: F,
+) where
+    F: Fn(&str, u16) -> TestAnswer,
+{
+    socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("failed to set test dns timeout");
+
+    for _ in 0..expected_queries {
+        let mut buffer = [0u8; 512];
+        let (len, peer) = socket.recv_from(&mut buffer).expect("dns recv_from failed");
+        let query = &buffer[..len];
+        let qname = parse_qname(query).expect("failed to parse dns qname");
+        let qtype = parse_qtype(query).expect("failed to parse dns qtype");
+        let response = build_response(query, answer(&qname, qtype));
+        let mut stale = response.clone();
+        let query_id = read_u16_be_at(&stale, 0).expect("test response query ID should exist");
+        stale
+            .write_u16_be_at(0, query_id.wrapping_add(1))
+            .expect("test stale query ID rewrite should fit");
+        socket
+            .send_to(&stale, peer)
+            .expect("dns send_to stale response failed");
+        socket
+            .send_to(&response, peer)
+            .expect("dns send_to response failed");
+    }
+}
+
 fn parse_qname(packet: &[u8]) -> io::Result<String> {
     let mut offset = 12usize;
     let mut labels = Vec::new();
@@ -672,6 +853,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         TestAnswer::MultiHopCnameWithA(_, _, _) => 3u16,
         TestAnswer::CyclicCname(_) => 2u16,
         TestAnswer::A(_)
+        | TestAnswer::Aaaa(_)
         | TestAnswer::AFor(_, _)
         | TestAnswer::Cname(_)
         | TestAnswer::MalformedCnamePointer
@@ -718,6 +900,14 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             push_u16_be(&mut response, 1);
             push_u32_be(&mut response, 60);
             push_u16_be(&mut response, 4);
+            response.extend_from_slice(&ip.octets());
+        }
+        TestAnswer::Aaaa(ip) => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 28);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 16);
             response.extend_from_slice(&ip.octets());
         }
         TestAnswer::AFor(owner, ip) => {

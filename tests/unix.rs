@@ -1,13 +1,15 @@
 mod common;
 
 use common::{
-    TestIoBuffMut as IoBuffMut, TestProjected, make_payload_chain, make_read_chain,
-    make_read_only_chain, run_test,
+    HugeReadOnly, TestIoBuffMut as IoBuffMut, TestProjected, assert_poll_after_ready_parks,
+    make_payload_chain, make_read_chain, make_read_only_chain, run_test,
 };
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
+use std::io;
+use std::os::fd::AsRawFd;
 
 /// Basic ping-pong with Vec<u8> buffers and a spawned async peer.
 #[test]
@@ -130,6 +132,29 @@ fn runtime_unix_write_all_empty() {
         .expect("executor run failed");
 }
 
+#[test]
+fn runtime_unix_pair_sets_nonblocking_and_cloexec() {
+    let (left, right) = UnixStream::pair().expect("socketpair failed");
+
+    for fd in [left.as_raw_fd(), right.as_raw_fd()] {
+        let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(fd_flags >= 0, "F_GETFD failed for fd {fd}");
+        assert_ne!(
+            fd_flags & libc::FD_CLOEXEC,
+            0,
+            "socketpair fd {fd} missing FD_CLOEXEC"
+        );
+
+        let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(status_flags >= 0, "F_GETFL failed for fd {fd}");
+        assert_ne!(
+            status_flags & libc::O_NONBLOCK,
+            0,
+            "socketpair fd {fd} missing O_NONBLOCK"
+        );
+    }
+}
+
 /// Socket buffer options on UnixStream.
 #[test]
 fn runtime_unix_socket_options() {
@@ -142,6 +167,17 @@ fn runtime_unix_socket_options() {
     left.set_recv_buffer_size(65536)
         .expect("set_recv_buffer_size failed");
     assert!(left.recv_buffer_size().expect("recv_buffer_size failed") > 0);
+
+    let oversized = libc::c_int::MAX as usize + 1;
+    let send_err = left
+        .set_send_buffer_size(oversized)
+        .expect_err("oversize send buffer should fail");
+    assert_eq!(send_err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let recv_err = left
+        .set_recv_buffer_size(oversized)
+        .expect_err("oversize recv buffer should fail");
+    assert_eq!(recv_err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 /// Shutdown write half — peer sees EOF on read.
@@ -259,6 +295,21 @@ fn runtime_unix_readv_exact_rejects_oversize_chain() {
             );
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn runtime_unix_write_rejects_oversize_iobuff() {
+    run_test(async move {
+        let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+
+        let (res, _buf) = writer.write(HugeReadOnly).await;
+        let err = res.expect_err("oversize write should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let (res, _buf) = writer.write_all(HugeReadOnly).await;
+        let err = res.expect_err("oversize write_all should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    });
 }
 
 // ============================================================================
@@ -614,6 +665,31 @@ fn runtime_unix_writev_all_readv_exact() {
         .expect("executor run failed");
 }
 
+#[test]
+fn runtime_unix_readv_exact_clamps_target_below_chain_capacity() {
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        Executor::spawn(async move {
+            let payload = b"abcdefghijklmnopqrstuvwx".to_vec();
+            let (res, payload) = writer.write_all(payload).await;
+            assert_eq!(res.expect("write_all failed"), payload.len());
+        })
+        .expect("spawn writer failed");
+
+        let read_chain = make_read_chain([8, 8, 8]);
+        let (res, chain) = reader.readv_exact(read_chain, 10).await;
+        assert_eq!(res.expect("readv_exact failed"), 10);
+        assert_eq!(chain.get(0).expect("seg0").payload_bytes(), b"abcdefgh");
+        assert_eq!(chain.get(1).expect("seg1").payload_bytes(), b"ij");
+        assert_eq!(chain.get(2).expect("seg2").payload_len(), 0);
+
+        let (res, tail) = reader.read_exact(vec![0u8; 14], 14).await;
+        assert_eq!(res.expect("tail read_exact failed"), 14);
+        assert_eq!(&tail[..], b"klmnopqrstuvwx");
+    });
+}
+
 /// Large writev_all + readv_exact forcing partial kernel transfers.
 #[test]
 fn runtime_unix_writev_all_readv_exact_large() {
@@ -720,12 +796,36 @@ fn runtime_unix_vectored_zero_length_operations() {
         assert!(write_chain.is_empty());
 
         let (res, read_chain) = reader.readv(make_read_chain::<0>([])).await;
-        assert_eq!(res.expect("readv empty failed"), 0);
+        let err = res.expect_err("readv empty should reject ambiguous EOF result");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(read_chain.is_empty());
 
         let (res, read_chain) = reader.readv_exact(make_read_chain::<0>([]), 0).await;
         assert_eq!(res.expect("readv_exact zero failed"), 0);
         assert!(read_chain.is_empty());
+    });
+}
+
+#[test]
+fn runtime_unix_rental_futures_poll_after_ready_parks() {
+    run_test(async move {
+        let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+        assert_poll_after_ready_parks(writer.write(Vec::<u8>::new())).await;
+        assert_poll_after_ready_parks(reader.read(Vec::<u8>::new(), 0)).await;
+        assert_poll_after_ready_parks(writer.write_all(Vec::<u8>::new())).await;
+        assert_poll_after_ready_parks(reader.read_exact(Vec::<u8>::new(), 0)).await;
+        assert_poll_after_ready_parks(reader.read_exact_append(IoBuffMut::new(0, 16, 0), 0)).await;
+        assert_poll_after_ready_parks(writer.writev(make_payload_chain::<0>([]))).await;
+        assert_poll_after_ready_parks(writer.writev_all(make_payload_chain::<0>([]))).await;
+        assert_poll_after_ready_parks(reader.readv(make_read_chain::<0>([]))).await;
+        assert_poll_after_ready_parks(reader.readv_exact(make_read_chain::<0>([]), 0)).await;
+        assert_poll_after_ready_parks(writer.writev_read_only(make_read_only_chain::<0>([]))).await;
+        assert_poll_after_ready_parks(writer.writev_all_read_only(make_read_only_chain::<0>([])))
+            .await;
+        assert_poll_after_ready_parks(writer.writev_projected(TestProjected::<0>::new([]))).await;
+        assert_poll_after_ready_parks(writer.writev_all_projected(TestProjected::<0>::new([])))
+            .await;
     });
 }
 

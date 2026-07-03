@@ -1,44 +1,10 @@
 mod common;
 
-use common::TestIoBuffMut as IoBuffMut;
+use common::{DropTrackedReadOnly, TestIoBuffMut as IoBuffMut};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut, PushError};
 use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly};
 use std::cell::Cell;
 use std::rc::Rc;
-
-/// Read-only payload fixture over a static byte slice that counts drops.
-/// Used to verify IoBuffReadOnlyVec drops each initialized segment once.
-struct DropTrackedReadOnly {
-    /// Borrowed payload bytes exposed through IoBuffReadOnly.
-    bytes: &'static [u8],
-    /// Shared drop counter bumped by Drop.
-    drops: Rc<Cell<usize>>,
-}
-
-impl DropTrackedReadOnly {
-    fn new(bytes: &'static [u8], drops: &Rc<Cell<usize>>) -> Self {
-        Self {
-            bytes,
-            drops: Rc::clone(drops),
-        }
-    }
-}
-
-impl Drop for DropTrackedReadOnly {
-    fn drop(&mut self) {
-        self.drops.set(self.drops.get() + 1);
-    }
-}
-
-unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
-    fn as_ptr(&self) -> *const u8 {
-        self.bytes.as_ptr()
-    }
-
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-}
 
 macro_rules! seg {
     ($chain:expr, $index:expr) => {
@@ -331,16 +297,16 @@ fn vec_read_only_failed_push_does_not_drop_value() {
     let drops = Rc::new(Cell::new(0));
     let mut chain = IoBuffReadOnlyVec::<DropTrackedReadOnly, 1>::new();
     chain
-        .push(DropTrackedReadOnly::new(b"stored", &drops))
+        .push(DropTrackedReadOnly::new(b"stored".to_vec(), &drops))
         .unwrap();
 
-    let result = chain.push(DropTrackedReadOnly::new(b"returned", &drops));
+    let result = chain.push(DropTrackedReadOnly::new(b"returned".to_vec(), &drops));
     // ChainFull returns the rejected value without dropping it; the stored
     // segment is still owned by the chain.
     assert_eq!(drops.get(), 0);
 
     let returned = expect_chain_full(result);
-    assert_eq!(returned.bytes, b"returned");
+    assert_eq!(returned.bytes(), b"returned");
     assert_eq!(drops.get(), 0);
 
     drop(returned);
@@ -369,6 +335,26 @@ fn vec_read_only_iter_and_into_iter_recover_segments() {
 }
 
 #[test]
+fn vec_read_only_into_iter_drops_unconsumed_tail_once() {
+    let drops = Rc::new(Cell::new(0));
+    let chain = IoBuffReadOnlyVec::<DropTrackedReadOnly, 3>::from_array([
+        DropTrackedReadOnly::new(b"first".to_vec(), &drops),
+        DropTrackedReadOnly::new(b"second".to_vec(), &drops),
+        DropTrackedReadOnly::new(b"third".to_vec(), &drops),
+    ]);
+
+    let mut iter = chain.into_iter();
+    let first = iter.next().expect("first segment should be yielded");
+    assert_eq!(drops.get(), 0);
+
+    drop(first);
+    assert_eq!(drops.get(), 1);
+
+    drop(iter);
+    assert_eq!(drops.get(), 3);
+}
+
+#[test]
 fn vec_read_only_drop_only_initialized_segments() {
     let drops = Rc::new(Cell::new(0));
 
@@ -377,10 +363,10 @@ fn vec_read_only_drop_only_initialized_segments() {
         // Capacity is 4, but only 2 segments are initialized; Drop must never
         // touch the uninitialized slots.
         chain
-            .push(DropTrackedReadOnly::new(b"first", &drops))
+            .push(DropTrackedReadOnly::new(b"first".to_vec(), &drops))
             .unwrap();
         chain
-            .push(DropTrackedReadOnly::new(b"second", &drops))
+            .push(DropTrackedReadOnly::new(b"second".to_vec(), &drops))
             .unwrap();
         assert_eq!(drops.get(), 0);
     }

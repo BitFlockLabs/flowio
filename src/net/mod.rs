@@ -25,6 +25,22 @@
 //! UDP remains single-datagram and therefore uses single-buffer sends and
 //! receives only.
 //!
+//! # Error Semantics
+//!
+//! Async transport operations return `io::Error` through their futures. For
+//! rental I/O methods, the caller-owned buffer or chain is returned alongside
+//! the result, including on recoverable errors.
+//!
+//! [`io::ErrorKind::WouldBlock`] can report internal FlowIO pressure rather
+//! than socket readiness: completion-state capacity exhaustion capped by the
+//! executor's `ReactorConfig::ring_entries`, io_uring submission-queue
+//! pressure, retained `iovec` scratch allocation pressure, or a reusable
+//! listener/connector slot that is still occupied by an active or intentionally
+//! forgotten future. The first three cases may become available after the
+//! executor makes progress; a busy reusable slot becomes available only when
+//! the previous future completes or is dropped, or when the owning
+//! listener/connector is dropped.
+//!
 //! # Fast-Path Guidance
 //!
 //! Best fast-path choices:
@@ -299,20 +315,27 @@ pub(crate) unsafe fn opt_mut<T>(opt: &mut Option<T>) -> &mut T {
     unsafe { opt.as_mut().unwrap_unchecked() }
 }
 
+const READ_LEN_EXCEEDS_WRITABLE: &str = "length exceeds writable buffer capacity";
+const LEN_EXCEEDS_U32: &str = "length exceeds io_uring u32 byte-count limit";
+
+#[inline(always)]
+pub(crate) fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[inline(always)]
+pub(crate) fn invalid_input_kind() -> io::Error {
+    io::Error::from(io::ErrorKind::InvalidInput)
+}
+
 /// Validates a caller-supplied read length against the writable capacity that
 /// the buffer actually exposes to the kernel.
-pub(crate) fn checked_read_len(op: &str, requested: usize, writable: usize) -> io::Result<u32> {
+pub(crate) fn checked_read_len(_op: &str, requested: usize, writable: usize) -> io::Result<u32> {
     if requested > writable {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{op} length exceeds writable buffer capacity"),
-        ));
+        return Err(invalid_input(READ_LEN_EXCEEDS_WRITABLE));
     }
     if requested > u32::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{op} length exceeds io_uring u32 byte-count limit"),
-        ));
+        return Err(invalid_input(LEN_EXCEEDS_U32));
     }
 
     Ok(requested as u32)
@@ -320,12 +343,9 @@ pub(crate) fn checked_read_len(op: &str, requested: usize, writable: usize) -> i
 
 /// Validates a contiguous send length against io_uring opcodes that accept a
 /// 32-bit byte count.
-pub(crate) fn checked_send_len(op: &str, requested: usize) -> io::Result<u32> {
+pub(crate) fn checked_send_len(_op: &str, requested: usize) -> io::Result<u32> {
     if requested > u32::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{op} length exceeds io_uring u32 byte-count limit"),
-        ));
+        return Err(invalid_input(LEN_EXCEEDS_U32));
     }
 
     Ok(requested as u32)
@@ -449,6 +469,28 @@ fn current_peer_addr(fd: RawFd) -> io::Result<SocketAddr> {
     socket_addr_from_c(&storage, len)
 }
 
+pub(super) struct MsgHdrInit {
+    pub(super) name: *mut libc::c_void,
+    pub(super) namelen: libc::socklen_t,
+    pub(super) iov: *mut libc::iovec,
+    pub(super) iovlen: usize,
+    pub(super) control: *mut libc::c_void,
+    pub(super) controllen: usize,
+}
+
+#[inline(always)]
+pub(super) fn write_msghdr(dst: &mut MaybeUninit<libc::msghdr>, init: MsgHdrInit) {
+    dst.write(libc::msghdr {
+        msg_name: init.name,
+        msg_namelen: init.namelen,
+        msg_iov: init.iov,
+        msg_iovlen: init.iovlen,
+        msg_control: init.control,
+        msg_controllen: init.controllen,
+        msg_flags: 0,
+    });
+}
+
 fn set_reuse_port(fd: RawFd) -> io::Result<()> {
     set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)
 }
@@ -461,12 +503,8 @@ fn sock_send_buffer_size(fd: RawFd) -> io::Result<usize> {
 }
 
 fn set_sock_send_buffer_size(fd: RawFd, size: usize) -> io::Result<()> {
-    set_sock_opt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_SNDBUF,
-        &(size as libc::c_int),
-    )
+    let size = socket_buffer_size_to_c_int(size)?;
+    set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &size)
 }
 
 fn sock_recv_buffer_size(fd: RawFd) -> io::Result<usize> {
@@ -475,12 +513,16 @@ fn sock_recv_buffer_size(fd: RawFd) -> io::Result<usize> {
 }
 
 fn set_sock_recv_buffer_size(fd: RawFd, size: usize) -> io::Result<()> {
-    set_sock_opt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_RCVBUF,
-        &(size as libc::c_int),
-    )
+    let size = socket_buffer_size_to_c_int(size)?;
+    set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &size)
+}
+
+fn socket_buffer_size_to_c_int(size: usize) -> io::Result<libc::c_int> {
+    if size > libc::c_int::MAX as usize {
+        return Err(invalid_input("socket buffer size exceeds c_int::MAX"));
+    }
+
+    Ok(size as libc::c_int)
 }
 
 fn set_sock_opt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {
@@ -515,4 +557,81 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
         return Err(io::Error::last_os_error());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_buffer_size_conversion_accepts_c_int_max() {
+        assert_eq!(
+            socket_buffer_size_to_c_int(libc::c_int::MAX as usize).expect("conversion failed"),
+            libc::c_int::MAX
+        );
+    }
+
+    #[test]
+    fn socket_buffer_size_conversion_rejects_overflow() {
+        let err = socket_buffer_size_to_c_int(libc::c_int::MAX as usize + 1)
+            .expect_err("oversize socket buffer should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn checked_read_len_rejects_over_writable_with_static_message() {
+        let err = checked_read_len("read", 2, 1).expect_err("oversize read should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), READ_LEN_EXCEEDS_WRITABLE);
+    }
+
+    #[test]
+    fn checked_lengths_reject_u32_overflow_with_static_message() {
+        let oversized = u32::MAX as usize + 1;
+
+        let read_err =
+            checked_read_len("read", oversized, usize::MAX).expect_err("oversize read should fail");
+        assert_eq!(read_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(read_err.to_string(), LEN_EXCEEDS_U32);
+
+        let send_err = checked_send_len("write", oversized).expect_err("oversize send should fail");
+        assert_eq!(send_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(send_err.to_string(), LEN_EXCEEDS_U32);
+    }
+
+    #[test]
+    fn msghdr_init_writes_all_kernel_fields() {
+        let mut hdr = MaybeUninit::uninit();
+        let mut name = 0u8;
+        let mut byte = 0u8;
+        let mut iovec = libc::iovec {
+            iov_base: &mut byte as *mut u8 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let mut control = [0u8; 8];
+        let name_ptr = &mut name as *mut u8 as *mut libc::c_void;
+        let iov_ptr = &mut iovec as *mut libc::iovec;
+        let control_ptr = control.as_mut_ptr() as *mut libc::c_void;
+
+        write_msghdr(
+            &mut hdr,
+            MsgHdrInit {
+                name: name_ptr,
+                namelen: 7,
+                iov: iov_ptr,
+                iovlen: 1,
+                control: control_ptr,
+                controllen: control.len(),
+            },
+        );
+
+        let hdr = unsafe { hdr.assume_init() };
+        assert_eq!(hdr.msg_name, name_ptr);
+        assert_eq!(hdr.msg_namelen, 7);
+        assert_eq!(hdr.msg_iov, iov_ptr);
+        assert_eq!(hdr.msg_iovlen, 1);
+        assert_eq!(hdr.msg_control, control_ptr);
+        assert_eq!(hdr.msg_controllen, control.len());
+        assert_eq!(hdr.msg_flags, 0);
+    }
 }

@@ -108,6 +108,9 @@ pub fn sctp_parse_recv_meta(data: &[u8]) {
     if flag_byte & 0x04 != 0 {
         msg_flags |= libc::MSG_CTRUNC;
     }
+    if flag_byte & 0x08 != 0 {
+        msg_flags |= libc::MSG_EOR;
+    }
 
     let split = rest
         .first()
@@ -118,7 +121,7 @@ pub fn sctp_parse_recv_meta(data: &[u8]) {
     let controllen = if control.is_empty() {
         0
     } else {
-        ((flag_byte >> 3) as usize).min(control.len())
+        ((flag_byte >> 4) as usize).min(control.len())
     };
 
     let _ = crate::net::sctp::parse_recv_meta(control, controllen, msg_flags, data_slice);

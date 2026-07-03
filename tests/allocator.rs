@@ -1,5 +1,7 @@
 use flowio::utils::memory::owned::{OwnedBuffer, OwnedBufferPool};
 use flowio::utils::memory::pool::*;
+use flowio::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
+use flowio::utils::memory::slab::{Slab, SlabAllocator};
 use static_assertions::assert_not_impl_any;
 use std::mem::MaybeUninit;
 
@@ -20,7 +22,7 @@ impl VerboseProvider {
     }
 }
 
-impl flowio::utils::memory::provider::MemoryProvider for VerboseProvider {
+impl MemoryProvider for VerboseProvider {
     fn init(&mut self, required_align: usize) {
         // Escalation: The provider adapts to the stricter requirement
         self.alignment = core::cmp::max(self.alignment, required_align);
@@ -167,6 +169,70 @@ fn owned_buffer_free_raw_returns_slot_to_pool() {
 }
 
 #[test]
+fn slab_allocator_aligns_header_even_for_byte_slots() {
+    let mut provider = VerboseProvider::new(1024, 1);
+    let mut allocator =
+        SlabAllocator::new_uninit(&mut provider, 1, 1, 1).expect("slab allocator init");
+
+    assert!(
+        allocator.get_slab_alignment() >= std::mem::align_of::<Slab>(),
+        "slab alignment must satisfy the Slab header alignment"
+    );
+
+    allocator.init();
+    let slab = allocator
+        .provide_slab()
+        .expect("byte-slot slab should allocate");
+    assert_eq!(
+        (slab as usize) % std::mem::align_of::<Slab>(),
+        0,
+        "slab header pointer must be properly aligned"
+    );
+    unsafe { allocator.free_slab(slab.cast::<u8>()) };
+}
+
+#[test]
+fn basic_provider_frees_with_alloc_time_alignment_after_reinit() {
+    let mut provider = BasicMemoryProvider::new();
+    provider.init(8);
+    let first = provider
+        .request_memory(32)
+        .expect("first provider allocation failed");
+    assert_eq!((first as usize) % 8, 0);
+
+    provider.init(128);
+    let second = provider
+        .request_memory(32)
+        .expect("second provider allocation failed");
+    assert_eq!((second as usize) % 128, 0);
+
+    unsafe {
+        provider.free_memory(first, 32);
+        provider.free_memory(second, 32);
+    }
+}
+
+#[test]
+fn pool_drop_allows_balanced_raw_slots() {
+    let mut provider = VerboseProvider::new(4096, 64);
+    let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
+    pool.init();
+
+    let task = unsafe { pool.alloc(900).expect("task allocation failed") };
+    unsafe { pool.free(task) };
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "Pool dropped with 1 live slots still outstanding")]
+fn pool_drop_debug_asserts_on_live_raw_slots() {
+    let mut provider = VerboseProvider::new(4096, 64);
+    let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
+    pool.init();
+    let _task = unsafe { pool.alloc(901).expect("task allocation failed") };
+}
+
+#[test]
 fn test_verbose_pool_logic() {
     println!("\n=== TEST CASE: Lifecycle & Alignment Verification ===");
 
@@ -225,6 +291,11 @@ fn test_verbose_pool_logic() {
     );
 
     println!("\n=== TEST COMPLETED SUCCESSFULLY ===");
+    unsafe {
+        pool.free(t2);
+        pool.free(t3);
+        pool.free(t4);
+    }
 }
 
 #[test]
@@ -252,6 +323,7 @@ fn test_strict_alignment_64() {
     );
 
     println!("\n=== TEST COMPLETED SUCCESSFULLY ===");
+    unsafe { pool.free(t1) };
 }
 
 #[test]
@@ -272,6 +344,10 @@ fn slab_does_not_allocate_from_alignment_padding() {
         second_addr.abs_diff(first_addr) >= 4096,
         "second allocation reused alignment padding instead of requesting a new slab"
     );
+    unsafe {
+        pool.free(first);
+        pool.free(second);
+    }
 }
 
 #[test]
@@ -301,4 +377,5 @@ fn test_alignment_conflict_resolution() {
 
     assert_eq!(addr % 64, 0, "Failed to resolve alignment conflict!");
     println!("=== TEST COMPLETED SUCCESSFULLY ===");
+    unsafe { pool.free(t1) };
 }

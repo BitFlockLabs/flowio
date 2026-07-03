@@ -71,8 +71,6 @@ enum TimerState {
     Armed,
     /// Entry has expired and its waiter has already been scheduled.
     Fired,
-    /// Entry was cancelled before expiry and should report interruption.
-    Cancelled,
 }
 
 #[repr(C)]
@@ -294,11 +292,13 @@ impl TimerWheel {
 
     #[inline(always)]
     fn is_bucket_empty(&self, level: u8, index: usize) -> bool {
-        match level {
-            0 => self.lvl0[index].front(TimerEntry::LINK_OFFSET).is_none(),
-            1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET).is_none(),
-            2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET).is_none(),
-            _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET).is_none(),
+        unsafe {
+            match level {
+                0 => self.lvl0[index].front(TimerEntry::LINK_OFFSET).is_none(),
+                1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET).is_none(),
+                2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET).is_none(),
+                _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET).is_none(),
+            }
         }
     }
 
@@ -363,8 +363,130 @@ impl TimerWheel {
         Self::next_set_bit(bits, start).or_else(|| Self::next_set_bit(bits, 0))
     }
 
+    #[inline(always)]
+    fn lvl0_bucket_occupied(&self, index: usize) -> bool {
+        (self.lvl0_bits[index / 64] & (1u64 << (index % 64))) != 0
+    }
+
+    #[inline(always)]
+    fn current_tick_has_occupied_cascade_bucket(&self) -> bool {
+        if (self.current_tick & ((LVL0_SLOTS as u64) - 1)) != 0 {
+            return false;
+        }
+
+        let idx1 = ((self.current_tick >> 8) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        if (self.lvl1_bits & (1u64 << idx1)) != 0 {
+            return true;
+        }
+
+        if (self.current_tick & ((1u64 << 14) - 1)) != 0 {
+            return false;
+        }
+
+        let idx2 = ((self.current_tick >> 14) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        if (self.lvl2_bits & (1u64 << idx2)) != 0 {
+            return true;
+        }
+
+        if (self.current_tick & ((1u64 << 20) - 1)) != 0 {
+            return false;
+        }
+
+        let idx3 = ((self.current_tick >> 20) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        (self.lvl3_bits & (1u64 << idx3)) != 0
+    }
+
+    #[inline(always)]
+    fn round_up_to_tick_unit(tick: u64, shift: u32) -> Option<u64> {
+        let mask = (1u64 << shift) - 1;
+        if (tick & mask) == 0 {
+            Some(tick)
+        } else {
+            tick.checked_add(mask).map(|value| value & !mask)
+        }
+    }
+
+    fn next_occupied_cascade_tick(bits: u64, current_tick: u64, shift: u32) -> Option<u64> {
+        if bits == 0 {
+            return None;
+        }
+
+        let first_boundary = Self::round_up_to_tick_unit(current_tick, shift)?;
+        let cycle = 1u64 << (shift + 6);
+        let cycle_base = first_boundary & !(cycle - 1);
+        let start = ((first_boundary >> shift) & ((LVLN_SLOTS as u64) - 1)) as usize;
+
+        if let Some(index) = Self::next_set_bit(bits, start) {
+            return cycle_base.checked_add((index as u64) << shift);
+        }
+
+        let index = Self::next_set_bit(bits, 0)?;
+        cycle_base
+            .checked_add(cycle)?
+            .checked_add((index as u64) << shift)
+    }
+
+    fn next_upper_cascade_tick(&self) -> Option<u64> {
+        Self::next_occupied_cascade_tick(self.lvl1_bits, self.current_tick, 8)
+            .into_iter()
+            .chain(Self::next_occupied_cascade_tick(
+                self.lvl2_bits,
+                self.current_tick,
+                14,
+            ))
+            .chain(Self::next_occupied_cascade_tick(
+                self.lvl3_bits,
+                self.current_tick,
+                20,
+            ))
+            .min()
+    }
+
+    fn next_collect_work_tick(&self, target_tick: u64) -> Option<u64> {
+        self.candidate_deadline(0)
+            .map(|deadline| deadline.max(self.current_tick))
+            .into_iter()
+            .chain(self.next_upper_cascade_tick())
+            .filter(|tick| *tick <= target_tick)
+            .min()
+    }
+
+    fn skip_empty_ticks_until_next_work(&mut self, target_tick: u64) -> bool {
+        if self.current_tick > target_tick
+            || self.has_pending_cascade()
+            || self.current_tick_has_occupied_cascade_bucket()
+        {
+            return false;
+        }
+
+        let idx = (self.current_tick & ((LVL0_SLOTS as u64) - 1)) as usize;
+        if self.lvl0_bucket_occupied(idx) {
+            return false;
+        }
+
+        let next_tick = self
+            .next_collect_work_tick(target_tick)
+            .or_else(|| target_tick.checked_add(1))
+            .unwrap_or(target_tick);
+        if next_tick <= self.current_tick {
+            return false;
+        }
+
+        self.current_tick = next_tick;
+        true
+    }
+
     fn has_pending_cascade(&self) -> bool {
         self.cascade_pos < self.cascade_count
+    }
+
+    #[inline(always)]
+    fn has_pending_entries(&self) -> bool {
+        self.has_pending_cascade()
+            || self.lvl0_bits.iter().any(|bits| *bits != 0)
+            || self.lvl1_bits != 0
+            || self.lvl2_bits != 0
+            || self.lvl3_bits != 0
     }
 
     fn begin_tick_cascade(&mut self) {
@@ -428,10 +550,12 @@ impl TimerWheel {
             let pos = self.cascade_pos as usize;
             let level = self.cascade_levels[pos];
             let index = self.cascade_indices[pos];
-            let has_more = match level {
-                1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET).is_some(),
-                2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET).is_some(),
-                _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET).is_some(),
+            let has_more = unsafe {
+                match level {
+                    1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET).is_some(),
+                    2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET).is_some(),
+                    _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET).is_some(),
+                }
             };
             if has_more {
                 break;
@@ -477,11 +601,13 @@ impl TimerWheel {
             )?,
         };
 
-        let entry = match level {
-            0 => self.lvl0[index].front(TimerEntry::LINK_OFFSET)?,
-            1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET)?,
-            2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET)?,
-            _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET)?,
+        let entry = unsafe {
+            match level {
+                0 => self.lvl0[index].front(TimerEntry::LINK_OFFSET)?,
+                1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET)?,
+                2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET)?,
+                _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET)?,
+            }
         };
         Some(unsafe { (*entry).deadline_tick })
     }
@@ -697,7 +823,7 @@ impl TimerRuntime {
             }
         }
         unsafe {
-            (*entry).state = TimerState::Cancelled;
+            (*entry).state = TimerState::Idle;
             (*entry).clear_waiter();
             self.timer_pool.free(entry);
         }
@@ -717,11 +843,7 @@ impl TimerRuntime {
 
     /// Returns `true` if any timer is currently armed.
     pub fn has_pending(&mut self) -> bool {
-        if self.wheel.next_deadline_dirty {
-            self.wheel.recompute_next_deadline();
-            self.wheel.next_deadline_dirty = false;
-        }
-        self.wheel.next_deadline_tick.is_some()
+        self.wheel.has_pending_entries()
     }
 
     /// Returns the duration until the next timer deadline, if any.
@@ -742,6 +864,10 @@ impl TimerRuntime {
         let wake_epoch = unsafe { next_timer_wake_epoch_unchecked(schedule_ctx) };
         let mut remaining_budget = budget;
         while self.wheel.current_tick <= target_tick {
+            if self.wheel.skip_empty_ticks_until_next_work(target_tick) {
+                continue;
+            }
+
             self.wheel.begin_tick_cascade();
             if self.wheel.has_pending_cascade() {
                 if remaining_budget == 0 {
@@ -791,30 +917,80 @@ impl TimerRuntime {
                 }
                 remaining_budget -= 1;
             }
+            if self.wheel.current_tick == u64::MAX {
+                break;
+            }
             self.wheel.current_tick = self.wheel.current_tick.saturating_add(1);
         }
         self.wheel.next_deadline_dirty = true;
         false
+    }
+
+    fn free_wheel_entries_for_drop(&mut self) {
+        let timer_pool = &mut *self.timer_pool;
+        for index in 0..LVL0_SLOTS {
+            if (self.wheel.lvl0_bits[index / 64] & (1u64 << (index % 64))) != 0 {
+                free_timer_bucket_entries(&mut self.wheel.lvl0[index], timer_pool);
+            }
+        }
+        for index in 0..LVLN_SLOTS {
+            if (self.wheel.lvl1_bits & (1u64 << index)) != 0 {
+                free_timer_bucket_entries(&mut self.wheel.lvl1[index], timer_pool);
+            }
+        }
+        for index in 0..LVLN_SLOTS {
+            if (self.wheel.lvl2_bits & (1u64 << index)) != 0 {
+                free_timer_bucket_entries(&mut self.wheel.lvl2[index], timer_pool);
+            }
+        }
+        for index in 0..LVLN_SLOTS {
+            if (self.wheel.lvl3_bits & (1u64 << index)) != 0 {
+                free_timer_bucket_entries(&mut self.wheel.lvl3[index], timer_pool);
+            }
+        }
     }
 }
 
 impl Drop for TimerRuntime {
     fn drop(&mut self) {
         unsafe {
+            self.free_wheel_entries_for_drop();
             self.wheel.unlink_all_for_drop();
             ManuallyDrop::drop(&mut self.timer_pool);
         }
     }
 }
 
+fn free_timer_bucket_entries(
+    bucket: &mut DList<TimerEntry>,
+    timer_pool: &mut Pool<'static, TimerEntry, BasicMemoryProvider>,
+) {
+    unsafe {
+        bucket.drain_all_for_drop(TimerEntry::LINK_OFFSET, |entry| {
+            (*entry).state = TimerState::Idle;
+            (*entry).bucket_level = INVALID_BUCKET_LEVEL;
+            (*entry).bucket_index = 0;
+            (*entry).clear_waiter();
+            timer_pool.free(entry);
+        });
+    }
+}
+
 fn duration_to_ticks(duration: Duration) -> u64 {
-    let nanos = duration.as_nanos() as u64;
-    let ticks = nanos / TIMER_TICK_NS;
-    let remainder = nanos % TIMER_TICK_NS;
-    if ticks == 0 || remainder != 0 {
-        ticks + 1
-    } else {
+    let nanos = duration.as_nanos();
+    let tick_ns = TIMER_TICK_NS as u128;
+    let ticks = nanos / tick_ns;
+    let remainder = nanos % tick_ns;
+    let rounded = if remainder == 0 {
         ticks
+    } else {
+        ticks.saturating_add(1)
+    };
+
+    if rounded > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        rounded as u64
     }
 }
 
@@ -838,6 +1014,20 @@ fn now_tick() -> io::Result<u64> {
     }
 
     Ok(((ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)) / TIMER_TICK_NS)
+}
+
+#[inline(always)]
+unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry) {
+    debug_assert!(
+        !entry.is_null(),
+        "cannot refresh waiter for a missing timer entry"
+    );
+    if entry.is_null() {
+        return;
+    }
+    unsafe {
+        (*entry).waiter = current_poll_owner_task_unchecked();
+    }
 }
 
 /// One-shot sleep future scheduled by the runtime timer wheel.
@@ -928,14 +1118,15 @@ impl Future for Sleep {
                 this.entry = std::ptr::null_mut();
                 return Poll::Ready(Ok(()));
             }
-            if state == TimerState::Cancelled {
-                this.entry = std::ptr::null_mut();
-                return Poll::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)));
-            }
+            unsafe { refresh_sleep_waiter(this.entry) };
             return Poll::Pending;
         }
 
         if let Some(duration) = this.duration.take() {
+            if duration == Duration::ZERO {
+                return Poll::Ready(Ok(()));
+            }
+
             let entry = unsafe { &mut *timers }.submit_current_sleep_duration(duration)?;
             this.entry = entry;
             return Poll::Pending;
@@ -971,6 +1162,8 @@ impl Drop for Sleep {
 }
 
 /// Sleeps for at least the provided duration.
+///
+/// A zero duration completes immediately without arming the timer wheel.
 ///
 /// This is a control-path primitive rather than a transport data-path API.
 ///
@@ -1142,6 +1335,18 @@ mod tests {
     }
 
     #[test]
+    fn duration_to_ticks_rounds_up_without_wrapping() {
+        assert_eq!(duration_to_ticks(Duration::ZERO), 0);
+        assert_eq!(duration_to_ticks(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_to_ticks(Duration::from_nanos(TIMER_TICK_NS)), 1);
+        assert_eq!(
+            duration_to_ticks(Duration::from_nanos(TIMER_TICK_NS + 1)),
+            2
+        );
+        assert_eq!(duration_to_ticks(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
     fn timer_wheel_remove_clears_bucket_ownership_and_deadline_cache() {
         let mut wheel = TimerWheel::new_uninit();
         init_wheel_at(&mut wheel, 100);
@@ -1192,6 +1397,32 @@ mod tests {
     }
 
     #[test]
+    fn timer_wheel_pending_entries_uses_occupancy_not_deadline_cache() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 100);
+        let mut removed_entry = timer_entry_at(105);
+        let removed_ptr = &mut removed_entry as *mut TimerEntry;
+        let mut remaining_entry = timer_entry_at(120);
+        let remaining_ptr = &mut remaining_entry as *mut TimerEntry;
+
+        wheel.insert(removed_ptr);
+        wheel.insert(remaining_ptr);
+        assert!(wheel.has_pending_entries());
+        assert_eq!(wheel.next_deadline_tick, Some(105));
+
+        wheel.remove(removed_ptr);
+        wheel.next_deadline_dirty = true;
+        assert!(wheel.has_pending_entries());
+        assert_eq!(wheel.next_deadline_tick, Some(105));
+        assert!(wheel.next_deadline_dirty);
+
+        wheel.remove(remaining_ptr);
+        assert!(!wheel.has_pending_entries());
+        assert_eq!(wheel.next_deadline_tick, Some(105));
+        assert!(wheel.next_deadline_dirty);
+    }
+
+    #[test]
     fn timer_wheel_cascade_budget_preserves_pending_work() {
         let mut wheel = TimerWheel::new_uninit();
         init_wheel_at(&mut wheel, 0);
@@ -1212,7 +1443,57 @@ mod tests {
         assert!(!wheel.has_pending_cascade());
         assert_eq!(entry.bucket_level, 0);
         assert_eq!(entry.bucket_index, 0);
-        assert!(wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some());
+        assert!(unsafe { wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some() });
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_skip_empty_ticks_past_empty_target_range() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 1_000);
+
+        assert!(wheel.skip_empty_ticks_until_next_work(2_000));
+        assert_eq!(wheel.current_tick, 2_001);
+    }
+
+    #[test]
+    fn timer_wheel_skip_empty_ticks_stops_at_due_lvl0_bucket() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 100);
+        let mut entry = timer_entry_at(117);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+
+        assert!(wheel.skip_empty_ticks_until_next_work(200));
+        assert_eq!(wheel.current_tick, 117);
+        assert_eq!(entry.bucket_level, 0);
+        assert_eq!(entry.bucket_index, 117);
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_skip_empty_ticks_stops_at_occupied_cascade_boundary() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let deadline = LVL0_SLOTS as u64;
+        let mut entry = timer_entry_at(deadline);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+        assert_eq!(entry.bucket_level, 1);
+
+        assert!(wheel.skip_empty_ticks_until_next_work(deadline));
+        assert_eq!(wheel.current_tick, deadline);
+        assert!(!wheel.skip_empty_ticks_until_next_work(deadline));
+
+        wheel.begin_tick_cascade();
+        assert!(wheel.has_pending_cascade());
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert_eq!(entry.bucket_level, 0);
+        assert_eq!(entry.bucket_index, 0);
 
         wheel.remove(entry_ptr);
     }

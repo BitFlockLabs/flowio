@@ -25,6 +25,10 @@
 //! documented [`runtime`] and [`net`] API plus the buffer helpers they expose.
 //! Source compatibility is not guaranteed during the alpha series, but public
 //! API changes are tracked through `public-api.txt` and should be deliberate.
+//! FlowIO requires Linux kernel 5.11 or newer because timed `io_uring` waits
+//! use `IORING_ENTER_EXT_ARG`; executor construction reports
+//! [`std::io::ErrorKind::Unsupported`] when the running kernel lacks that
+//! feature.
 //!
 //! Items hidden from generated docs, including `utils` and fuzzing-only
 //! parser hooks, are reserved implementation infrastructure. They may remain
@@ -48,6 +52,9 @@
 //!   [`runtime::buffer::pool::IoBuffPool`] plus
 //!   [`runtime::buffer::IoBuffMut`]. After warmup, that avoids heap
 //!   allocation and deallocation on the hot path.
+//! - The zero-allocation steady-state expectation applies after runtime,
+//!   timer, buffer, and transport paths are warmed. DNS resolution and TLS
+//!   handshakes are setup/control-plane work and may allocate.
 //! - Prefer [`net::tcp::TcpConnector`] and [`net::sctp::SctpConnector`] for
 //!   repeated outbound connects because they reuse stable connector state
 //!   across attempts.

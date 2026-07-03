@@ -402,6 +402,65 @@ fn buffer_mut_advance_payload() {
 }
 
 #[test]
+fn buffer_mut_advance_payload_accessors_follow_active_payload() {
+    let mut buf = IoBuffMut::new(0, 10, 0);
+    buf.payload_append(b"abcdef").unwrap();
+
+    buf.advance(2).unwrap();
+    assert_eq!(buf.bytes(), b"cdef");
+    assert_eq!(buf.payload_bytes(), b"cdef");
+    assert_eq!(buf.payload_remaining(), 4);
+
+    buf.payload_bytes_mut()[0] = b'C';
+    assert_eq!(buf.payload_bytes(), b"Cdef");
+
+    let spare = buf.payload_unwritten_mut();
+    assert_eq!(spare.len(), 4);
+    spare[..2].copy_from_slice(b"gh");
+    buf.payload_set_len(6).unwrap();
+    assert_eq!(buf.payload_bytes(), b"Cdefgh");
+    assert_eq!(buf.bytes(), b"Cdefgh");
+
+    let ptr = IoBuffReadWrite::as_mut_ptr(&mut buf);
+    unsafe {
+        std::ptr::copy_nonoverlapping(b"ij".as_ptr(), ptr, 2);
+        IoBuffReadWrite::set_written_len(&mut buf, 8);
+    }
+    assert_eq!(buf.payload_bytes(), b"Cdefghij");
+    assert_eq!(buf.payload_remaining(), 0);
+    assert_eq!(buf.payload_append(b"k"), Err(IoBuffError::PayloadFull));
+
+    let frozen = buf.freeze();
+    assert_eq!(frozen.payload_bytes(), b"Cdefghij");
+}
+
+#[test]
+fn buffer_mut_advance_into_payload_closes_headroom_prepend() {
+    let mut buf = IoBuffMut::new(2, 8, 0);
+    buf.payload_append(b"abc").unwrap();
+    buf.headroom_prepend(b"H").unwrap();
+
+    buf.advance(2).unwrap();
+
+    assert_eq!(buf.bytes(), b"bc");
+    assert_eq!(buf.payload_bytes(), b"bc");
+    assert_eq!(buf.headroom_remaining(), 0);
+    assert_eq!(buf.headroom_prepend(b"!"), Err(IoBuffError::HeadroomFull));
+}
+
+#[test]
+fn buffer_mut_tailroom_append_after_advance_stays_after_payload() {
+    let mut buf = IoBuffMut::new(0, 8, 4);
+    buf.payload_append(b"abcd").unwrap();
+
+    buf.advance(2).unwrap();
+    buf.tailroom_append(b":t").unwrap();
+
+    assert_eq!(buf.payload_bytes(), b"cd");
+    assert_eq!(buf.bytes(), b"cd:t");
+}
+
+#[test]
 fn buffer_mut_advance_through_headroom_into_payload() {
     println!("--- Advance through headroom into payload ---");
     let mut buf = IoBuffMut::new(8, 64, 0);
@@ -1155,6 +1214,23 @@ fn trait_vec_u8_read_write() {
     }
     assert_eq!(&v[..], b"kernel");
     println!("  After set_written_len(6): {:?}", &v[..]);
+}
+
+#[test]
+fn trait_vec_u8_read_write_prefilled_vec_is_fixed_scratch_from_zero() {
+    let mut v = b"prefix".to_vec();
+    v.reserve(8);
+
+    let writable = IoBuffReadWrite::writable_len(&v);
+    assert_eq!(writable, v.capacity());
+
+    let ptr = IoBuffReadWrite::as_mut_ptr(&mut v);
+    unsafe {
+        std::ptr::copy_nonoverlapping(b"io".as_ptr(), ptr, 2);
+        IoBuffReadWrite::set_written_len(&mut v, 2);
+    }
+
+    assert_eq!(&v[..], b"io");
 }
 
 #[test]

@@ -1,5 +1,21 @@
 //! Pluggable raw-memory providers used by slab- and pool-backed allocators.
 
+use std::alloc::{Layout, alloc, dealloc};
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BasicAllocationHeader {
+    /// Byte distance from the returned payload pointer back to the allocated
+    /// base pointer.
+    base_offset: usize,
+    /// Total allocation size passed to the global allocator.
+    total_size: usize,
+    /// Allocation alignment passed to the global allocator.
+    total_align: usize,
+    /// User-requested payload size for debug validation on free.
+    requested_size: usize,
+}
+
 /// Raw memory source used by the slab/pool allocators.
 ///
 /// This keeps allocator policy separate from the global heap so callers can
@@ -54,14 +70,49 @@ impl MemoryProvider for BasicMemoryProvider {
     }
 
     fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
-        let layout = std::alloc::Layout::from_size_align(size, self.alignment).ok()?;
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        if ptr.is_null() { None } else { Some(ptr) }
+        let header_size = std::mem::size_of::<BasicAllocationHeader>();
+        let header_align = std::mem::align_of::<BasicAllocationHeader>();
+        let total_align = std::cmp::max(self.alignment, header_align);
+        let align_mask = total_align.checked_sub(1)?;
+        let payload_offset = header_size.checked_add(align_mask)? & !align_mask;
+        let total_size = payload_offset.checked_add(size)?;
+        let layout = Layout::from_size_align(total_size, total_align).ok()?;
+        let base = unsafe { alloc(layout) };
+        if base.is_null() {
+            return None;
+        }
+
+        let payload = unsafe { base.add(payload_offset) };
+        let header_ptr = unsafe { payload.sub(header_size) as *mut BasicAllocationHeader };
+        unsafe {
+            std::ptr::write(
+                header_ptr,
+                BasicAllocationHeader {
+                    base_offset: payload_offset,
+                    total_size,
+                    total_align,
+                    requested_size: size,
+                },
+            );
+        }
+        Some(payload)
     }
 
     unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize) {
-        if let Ok(layout) = std::alloc::Layout::from_size_align(size, self.alignment) {
-            unsafe { std::alloc::dealloc(ptr, layout) };
+        if ptr.is_null() {
+            return;
+        }
+
+        let header_size = std::mem::size_of::<BasicAllocationHeader>();
+        let header_ptr = unsafe { ptr.sub(header_size) as *const BasicAllocationHeader };
+        let header = unsafe { std::ptr::read(header_ptr) };
+        debug_assert_eq!(
+            header.requested_size, size,
+            "BasicMemoryProvider free size did not match allocation size"
+        );
+        if let Ok(layout) = Layout::from_size_align(header.total_size, header.total_align) {
+            let base = unsafe { ptr.sub(header.base_offset) };
+            unsafe { dealloc(base, layout) };
         }
     }
 }

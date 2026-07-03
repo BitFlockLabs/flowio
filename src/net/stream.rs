@@ -1,13 +1,14 @@
 //! Shared io_uring futures for byte-stream transports and FlowIO's TLS wrapper.
 //!
-//! These futures use `IORING_OP_READ` / `IORING_OP_WRITE` and handle partial
+//! These futures use `IORING_OP_READ` for reads and `IORING_OP_SEND` /
+//! `IORING_OP_SENDMSG` with `MSG_NOSIGNAL` for writes, then handle partial
 //! completion internally for the `_all` / `_exact` variants.  The stream type
 //! parameter `S` is carried only in `PhantomData` to borrow the parent stream
 //! for the duration of the operation.
 //!
 //! Vectored operations materialize `iovec` arrays into scratch storage.
 //! Partial progress advances that scratch in place, and the retry path can
-//! downgrade to `IORING_OP_READ` / `IORING_OP_WRITE` when only one segment
+//! downgrade to `IORING_OP_READ` / `IORING_OP_SEND` when only one segment
 //! remains.
 //!
 //! `CompletionState` is allocated from the reactor's pool for each active
@@ -28,12 +29,14 @@
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, submit_retained_sqe, submit_tracked_sqe,
+    PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
+    submit_retained_sqe, submit_tracked_sqe,
 };
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::RetainedIovecScratch;
 use io_uring::{opcode, squeue, types};
+use std::cell::RefCell;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -68,10 +71,94 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
 }
 
 #[inline(always)]
+/// Returns a completed result plus data extracted from the retained payload,
+/// then retires the completion-state slot.
+unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+    extract: impl FnOnce(*mut T) -> R,
+) -> Option<(i32, R)> {
+    if state_ptr.is_null() {
+        return None;
+    }
+
+    let state = unsafe { &mut **state_ptr };
+    if !state.is_completed() {
+        return None;
+    }
+
+    let result = state.result;
+    let pctx = unsafe { poll_ctx_from_waker(cx) };
+    let value =
+        unsafe { (*pctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
+    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+    *state_ptr = std::ptr::null_mut();
+    Some((result, value))
+}
+
+#[inline(always)]
 /// Frees a completed retry slot before the next sequential submission.
 unsafe fn free_retry_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
     unsafe { (*pctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryCqeResult {
+    KernelError(i32),
+    Zero,
+    Bytes(usize),
+}
+
+#[inline(always)]
+fn classify_retry_cqe_result(result: i32) -> RetryCqeResult {
+    if result < 0 {
+        return RetryCqeResult::KernelError(-result);
+    }
+    if result == 0 {
+        return RetryCqeResult::Zero;
+    }
+    RetryCqeResult::Bytes(result as usize)
+}
+
+#[inline(always)]
+unsafe fn retry_state_is_in_flight(cx: &mut Context<'_>, state_ptr: *mut CompletionState) -> bool {
+    if state_ptr.is_null() {
+        return false;
+    }
+
+    let state = unsafe { &*state_ptr };
+    if state.is_completed() {
+        return false;
+    }
+
+    unsafe { refresh_op_waiter_from_waker(cx, state_ptr) };
+    true
+}
+
+#[inline(always)]
+unsafe fn take_retained_payload_and_free_state<T: 'static>(
+    pctx: &PollCtx,
+    state_ptr: &mut *mut CompletionState,
+) -> T {
+    debug_assert!(!(*state_ptr).is_null(), "missing retained operation state");
+    let op = *state_ptr;
+    let payload = unsafe { (*pctx.reactor()).take_retained_payload::<T>(op) };
+    unsafe { free_retry_state(pctx, state_ptr) };
+    payload
+}
+
+#[inline(always)]
+unsafe fn take_retained_payload_with_and_free_state<T: 'static, R>(
+    pctx: &PollCtx,
+    state_ptr: &mut *mut CompletionState,
+    extract: impl FnOnce(*mut T) -> R,
+) -> R {
+    debug_assert!(!(*state_ptr).is_null(), "missing retained operation state");
+    let op = *state_ptr;
+    let value = unsafe { (*pctx.reactor()).take_retained_payload_with::<T, R>(op, extract) };
+    unsafe { free_retry_state(pctx, state_ptr) };
+    value
 }
 
 #[inline(always)]
@@ -94,7 +181,7 @@ unsafe fn prepare_retry_state(
     Ok(())
 }
 
-use super::{WritevPieces, WritevProjection, opt_ref, opt_take};
+use super::{WritevPieces, WritevProjection, invalid_input, invalid_input_kind, opt_ref, opt_take};
 
 /// Returns an uninitialized inline `iovec` scratch array.
 ///
@@ -236,10 +323,19 @@ struct RetainedWritevPayload<C> {
     buffer: C,
     /// Kernel-facing `iovec` array pointing into `buffer` segments.
     scratch: RetainedIovecScratch,
+    /// Kernel-facing sendmsg header pointing at the active scratch window.
+    msg: libc::msghdr,
     /// Bytes confirmed by completed SQEs for `_all` retry futures.
     written: usize,
     /// First active `iovec` entry after partial write progress.
     skip: usize,
+}
+
+struct RetainedWritevCompletion<C> {
+    /// Caller-owned source chain returned to the completed future.
+    buffer: C,
+    /// Bytes confirmed by completed SQEs for `_all` retry futures.
+    written: usize,
 }
 
 struct RetainedProjectedWritevPayload<T> {
@@ -247,10 +343,31 @@ struct RetainedProjectedWritevPayload<T> {
     source: T,
     /// Kernel-facing `iovec` array pointing into `source` projections.
     scratch: RetainedIovecScratch,
+    /// Kernel-facing sendmsg header pointing at the active scratch window.
+    msg: libc::msghdr,
     /// Bytes confirmed by completed SQEs for projected `_all` retries.
     written: usize,
     /// First active projected `iovec` entry after partial write progress.
     skip: usize,
+}
+
+#[inline(always)]
+unsafe fn take_readv_buffer_from_retained<const N: usize>(
+    payload: *mut RetainedReadvPayload<N>,
+) -> IoBuffVecMut<N> {
+    let buffer = unsafe { std::ptr::read(std::ptr::addr_of!((*payload).buffer)) };
+    unsafe { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*payload).scratch)) };
+    buffer
+}
+
+#[inline(always)]
+unsafe fn take_writev_completion_from_retained<C>(
+    payload: *mut RetainedWritevPayload<C>,
+) -> RetainedWritevCompletion<C> {
+    let buffer = unsafe { std::ptr::read(std::ptr::addr_of!((*payload).buffer)) };
+    let written = unsafe { std::ptr::read(std::ptr::addr_of!((*payload).written)) };
+    unsafe { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*payload).scratch)) };
+    RetainedWritevCompletion { buffer, written }
 }
 
 struct UnsubmittedOpGuard {
@@ -323,16 +440,60 @@ fn build_read_vectored_entry(
     .user_data(user_data)
 }
 
+const STREAM_SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
+const STREAM_SENDMSG_FLAGS: u32 = libc::MSG_NOSIGNAL as u32;
+
+#[inline(always)]
+fn empty_sendmsg_header() -> libc::msghdr {
+    libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: std::ptr::null_mut(),
+        msg_iovlen: 0,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    }
+}
+
+#[inline(always)]
+fn build_write_entry(fd: RawFd, ptr: *const u8, len: u32, user_data: u64) -> squeue::Entry {
+    opcode::Send::new(types::Fd(fd), ptr, len)
+        .flags(STREAM_SEND_FLAGS)
+        .build()
+        .user_data(user_data)
+}
+
+#[inline(always)]
+fn prepare_sendmsg_header(
+    msg: &mut libc::msghdr,
+    iovecs: &[MaybeUninit<libc::iovec>],
+    skip: usize,
+    count: usize,
+) -> *const libc::msghdr {
+    *msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: unsafe { iovec_slice_ptr(iovecs, skip) as *mut libc::iovec },
+        msg_iovlen: count,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+    msg as *const libc::msghdr
+}
+
 #[inline(always)]
 /// Builds the next write-style SQE from the current vectored scratch window.
 ///
 /// When only one segment remains and its length fits in `u32`, this downgrades
-/// to `IORING_OP_WRITE` to avoid an unnecessary `writev`.
+/// to `IORING_OP_SEND` to avoid an unnecessary `sendmsg`.
 fn build_write_vectored_entry(
     fd: RawFd,
     iovecs: &[MaybeUninit<libc::iovec>],
     skip: usize,
     count: usize,
+    msg: &mut libc::msghdr,
     user_data: u64,
 ) -> squeue::Entry {
     debug_assert!(count > 0, "writev submission requires at least one iovec");
@@ -340,19 +501,15 @@ fn build_write_vectored_entry(
     if count == 1 {
         let iov = unsafe { iovec_slice_ref(iovecs, skip) };
         if let Ok(len) = u32::try_from(iov.iov_len) {
-            return opcode::Write::new(types::Fd(fd), iov.iov_base as *const u8, len)
-                .build()
-                .user_data(user_data);
+            return build_write_entry(fd, iov.iov_base as *const u8, len, user_data);
         }
     }
 
-    opcode::Writev::new(
-        types::Fd(fd),
-        unsafe { iovec_slice_ptr(iovecs, skip) },
-        count as u32,
-    )
-    .build()
-    .user_data(user_data)
+    let msg = prepare_sendmsg_header(msg, iovecs, skip, count);
+    opcode::SendMsg::new(types::Fd(fd), msg)
+        .flags(STREAM_SENDMSG_FLAGS)
+        .build()
+        .user_data(user_data)
 }
 
 /// Advance past `bytes` consumed/filled bytes in an iovec array by mutating
@@ -380,6 +537,31 @@ fn advance_iovecs_in_place(iovecs: &mut [libc::iovec], skip: &mut usize, bytes: 
     );
 }
 
+/// Truncates the submitted readv window so it exposes at most `max_bytes`
+/// bytes starting at `skip`. Returns the number of iovecs to submit from
+/// `skip`.
+#[inline]
+fn clamp_iovecs_to_read_limit(iovecs: &mut [libc::iovec], skip: usize, max_bytes: usize) -> usize {
+    debug_assert!(max_bytes > 0, "readv_exact should not submit zero bytes");
+    debug_assert!(skip <= iovecs.len(), "readv_exact skip beyond scratch");
+
+    let mut remaining = max_bytes;
+    for (index, iov) in iovecs.iter_mut().enumerate().skip(skip) {
+        let len = iov.iov_len;
+        if len >= remaining {
+            iov.iov_len = remaining;
+            return index + 1 - skip;
+        }
+        remaining -= len;
+    }
+
+    debug_assert!(
+        remaining == 0,
+        "readv_exact clamp exceeded materialized writable iovecs"
+    );
+    iovecs.len() - skip
+}
+
 #[inline(always)]
 fn retained_iovecs(scratch: &RetainedIovecScratch) -> &[MaybeUninit<libc::iovec>] {
     scratch.as_uninit_slice()
@@ -393,16 +575,6 @@ fn retained_iovecs_mut(scratch: &mut RetainedIovecScratch) -> &mut [libc::iovec]
 #[inline(always)]
 fn remaining_iovec_count(scratch: &RetainedIovecScratch, skip: usize) -> usize {
     scratch.len() - skip
-}
-
-#[inline(always)]
-fn invalid_input(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-#[inline(always)]
-fn invalid_input_kind() -> io::Error {
-    io::Error::from(io::ErrorKind::InvalidInput)
 }
 
 #[inline(always)]
@@ -473,7 +645,7 @@ fn one_shot_syscall_result(result: libc::ssize_t) -> io::Result<usize> {
 #[inline(always)]
 fn checked_try_write_len(len: usize) -> io::Result<usize> {
     if len > u32::MAX as usize {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        return Err(invalid_input_kind());
     }
     Ok(len)
 }
@@ -559,6 +731,11 @@ pub(crate) fn try_write_once<B: IoBuffReadOnly>(fd: RawFd, buffer: B) -> (io::Re
 const TRY_WRITEV_INLINE_IOVECS: usize = 16;
 const TRY_WRITEV_MAX_IOVECS: usize = 1024;
 
+thread_local! {
+    static TRY_WRITEV_PROJECTED_SCRATCH: RefCell<Vec<MaybeUninit<libc::iovec>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 #[inline]
 fn try_writev_projected_with_scratch<T: WritevProjection>(
     fd: RawFd,
@@ -598,6 +775,72 @@ fn try_writev_projected_with_scratch<T: WritevProjection>(
     (one_shot_syscall_result(result), source)
 }
 
+#[inline]
+fn try_writev_projected_with_dynamic_scratch<T: WritevProjection>(
+    fd: RawFd,
+    source: T,
+    expected_count: usize,
+    expected_total: usize,
+) -> (io::Result<usize>, T) {
+    let tls_result = TRY_WRITEV_PROJECTED_SCRATCH.with(|cell| {
+        let Ok(mut scratch) = cell.try_borrow_mut() else {
+            return Err(source);
+        };
+        Ok(try_writev_projected_with_vec_scratch(
+            fd,
+            source,
+            expected_count,
+            expected_total,
+            &mut scratch,
+        ))
+    });
+
+    match tls_result {
+        Ok(result) => result,
+        Err(source) => {
+            let mut scratch = Vec::new();
+            try_writev_projected_with_vec_scratch(
+                fd,
+                source,
+                expected_count,
+                expected_total,
+                &mut scratch,
+            )
+        }
+    }
+}
+
+#[inline]
+fn try_writev_projected_with_vec_scratch<T: WritevProjection>(
+    fd: RawFd,
+    source: T,
+    expected_count: usize,
+    expected_total: usize,
+    scratch: &mut Vec<MaybeUninit<libc::iovec>>,
+) -> (io::Result<usize>, T) {
+    if scratch.capacity() < expected_count
+        && scratch
+            .try_reserve_exact(expected_count - scratch.capacity())
+            .is_err()
+    {
+        return (Err(io::Error::from(io::ErrorKind::WouldBlock)), source);
+    }
+
+    if scratch.len() < expected_count {
+        scratch.resize_with(expected_count, MaybeUninit::uninit);
+    }
+
+    let result = try_writev_projected_with_scratch(
+        fd,
+        source,
+        expected_count,
+        expected_total,
+        &mut scratch[..expected_count],
+    );
+    scratch.clear();
+    result
+}
+
 /// Attempts one nonblocking gather-write syscall from a projected source.
 #[inline]
 pub(crate) fn try_writev_projected_once<T: WritevProjection>(
@@ -620,8 +863,7 @@ pub(crate) fn try_writev_projected_once<T: WritevProjection>(
         return try_writev_projected_with_scratch(fd, source, iov_count, total, &mut scratch);
     }
 
-    let mut scratch = uninit_iovecs::<TRY_WRITEV_MAX_IOVECS>();
-    try_writev_projected_with_scratch(fd, source, iov_count, total, &mut scratch)
+    try_writev_projected_with_dynamic_scratch(fd, source, iov_count, total)
 }
 
 #[inline]
@@ -652,6 +894,7 @@ fn submit_initial_projected_writev<T: WritevProjection>(
     let payload = RetainedProjectedWritevPayload {
         source: unsafe { opt_take(source) },
         scratch,
+        msg: empty_sendmsg_header(),
         written: 0,
         skip: 0,
     };
@@ -664,6 +907,7 @@ fn submit_initial_projected_writev<T: WritevProjection>(
                 retained_iovecs(&payload.scratch),
                 0,
                 payload.scratch.len(),
+                &mut payload.msg,
                 state_ptr as u64,
             ))
         }) {
@@ -729,6 +973,9 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if let Some((result, payload)) = unsafe {
             take_completed_result_and_payload::<RetainedReadPayload<B>>(cx, &mut this.state_ptr)
@@ -772,6 +1019,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -795,16 +1043,30 @@ pub struct WriteFuture<'a, B: IoBuffReadOnly, S> {
     buffer: Option<B>,
     /// Stream descriptor written by this future.
     fd: RawFd,
+    /// Validated byte count submitted to the kernel.
+    len: u32,
+    /// Deferred validation error returned before any SQE submission.
+    input_error: Option<io::Error>,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, B: IoBuffReadOnly, S> WriteFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B) -> Self {
+        let mut input_error = None;
+        let len = match super::checked_send_len("write", buffer.len()) {
+            Ok(len) => len,
+            Err(err) => {
+                input_error = Some(err);
+                0
+            }
+        };
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             fd,
+            len,
+            input_error,
             _marker: PhantomData,
         }
     }
@@ -815,6 +1077,16 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if this.state_ptr.is_null()
+            && let Some(err) = this.input_error.take()
+        {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
+        }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if let Some((result, payload)) = unsafe {
             take_completed_result_and_payload::<RetainedWritePayload<B>>(cx, &mut this.state_ptr)
@@ -844,10 +1116,7 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
                         let ptr = payload.buffer.as_ptr();
-                        let len = payload.buffer.len() as u32;
-                        Ok(opcode::Write::new(types::Fd(this.fd), ptr, len)
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_write_entry(this.fd, ptr, this.len, state_ptr as u64))
                     })
                 {
                     (*pctx.reactor()).free_op(state_ptr);
@@ -857,6 +1126,7 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -891,13 +1161,22 @@ pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
     offset: u32,
     /// Total number of bytes that must be written before completion.
     total: u32,
+    /// Deferred validation error returned before any SQE submission.
+    input_error: Option<io::Error>,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, B: IoBuffReadOnly, S> WriteAllFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B) -> Self {
-        let total = buffer.len() as u32;
+        let mut input_error = None;
+        let total = match super::checked_send_len("write_all", buffer.len()) {
+            Ok(total) => total,
+            Err(err) => {
+                input_error = Some(err);
+                0
+            }
+        };
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
@@ -905,6 +1184,7 @@ impl<'a, B: IoBuffReadOnly, S> WriteAllFuture<'a, B, S> {
             fd,
             offset: 0,
             total,
+            input_error,
             _marker: PhantomData,
         }
     }
@@ -916,12 +1196,19 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if this.state_ptr.is_null()
+            && let Some(err) = this.input_error.take()
+        {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
+        }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
+
         // Fast path: still in flight — return without any context extraction.
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if !state.is_completed() {
-                return Poll::Pending;
-            }
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
+            return Poll::Pending;
         }
 
         // Zero-length write completes immediately.
@@ -936,39 +1223,42 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
         // Process completed state if any. Sequential retries reuse the same
         // completion slot once the previous CQE has been fully consumed.
         if !this.state_ptr.is_null() {
-            let result = unsafe { (*this.state_ptr).result };
-
-            if result < 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritePayload<B>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), payload.buffer));
-            }
-
-            let n = result as u32;
-            if n == 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritePayload<B>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((
-                    Err(io::Error::from(io::ErrorKind::WriteZero)),
-                    payload.buffer,
-                ));
-            }
-
-            debug_assert!(n <= this.total - this.offset);
-            this.offset += n;
-            if this.offset >= this.total {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritePayload<B>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Ok(this.offset as usize), payload.buffer));
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
+                RetryCqeResult::KernelError(errno) => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), payload.buffer));
+                }
+                RetryCqeResult::Zero => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::WriteZero)),
+                        payload.buffer,
+                    ));
+                }
+                RetryCqeResult::Bytes(n) => {
+                    let n = n as u32;
+                    debug_assert!(n <= this.total - this.offset);
+                    this.offset += n;
+                    if this.offset >= this.total {
+                        let payload = unsafe {
+                            take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
+                                &pctx,
+                                &mut this.state_ptr,
+                            )
+                        };
+                        return Poll::Ready((Ok(this.offset as usize), payload.buffer));
+                    }
+                }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
@@ -986,9 +1276,12 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
                         this.base_ptr = payload.buffer.as_ptr();
                         let ptr = this.base_ptr;
                         let remaining = this.total - this.offset;
-                        Ok(opcode::Write::new(types::Fd(this.fd), ptr, remaining)
-                            .build()
-                            .user_data(this.state_ptr as u64))
+                        Ok(build_write_entry(
+                            this.fd,
+                            ptr,
+                            remaining,
+                            this.state_ptr as u64,
+                        ))
                     })
                 {
                     (*pctx.reactor()).free_op(this.state_ptr);
@@ -996,26 +1289,26 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
             return Poll::Pending;
         }
 
         let ptr = unsafe { this.base_ptr.add(this.offset as usize) };
         let remaining = this.total - this.offset;
 
-        let sqe = opcode::Write::new(types::Fd(this.fd), ptr, remaining)
-            .build()
-            .user_data(this.state_ptr as u64);
+        let sqe = build_write_entry(this.fd, ptr, remaining, this.state_ptr as u64);
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedWritePayload<B>>(this.state_ptr);
-                (*pctx.reactor()).free_op(this.state_ptr);
-                this.state_ptr = std::ptr::null_mut();
+                let payload = take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
+                    &pctx,
+                    &mut this.state_ptr,
+                );
                 return Poll::Ready((Err(e), payload.buffer));
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -1091,13 +1384,13 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         // Fast path: still in flight — return without any context extraction.
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if !state.is_completed() {
-                return Poll::Pending;
-            }
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
+            return Poll::Pending;
         }
 
         // Zero-length read completes immediately.
@@ -1113,42 +1406,48 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
         // Process completed state if any. Sequential retries reuse the same
         // completion slot once the previous CQE has been fully consumed.
         if !this.state_ptr.is_null() {
-            let result = unsafe { (*this.state_ptr).result };
-
-            if result < 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadPayload<B>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let mut buffer = payload.buffer;
-                unsafe { buffer.set_written_len(this.filled as usize) };
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-
-            let n = result as u32;
-            if n == 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadPayload<B>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let mut buffer = payload.buffer;
-                unsafe { buffer.set_written_len(this.filled as usize) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::UnexpectedEof)), buffer));
-            }
-
-            debug_assert!(n <= this.target - this.filled);
-            this.filled += n;
-            if this.filled >= this.target {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadPayload<B>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let mut buffer = payload.buffer;
-                unsafe { buffer.set_written_len(this.target as usize) };
-                return Poll::Ready((Ok(this.target as usize), buffer));
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
+                RetryCqeResult::KernelError(errno) => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedReadPayload<B>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    let mut buffer = payload.buffer;
+                    unsafe { buffer.set_written_len(this.filled as usize) };
+                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), buffer));
+                }
+                RetryCqeResult::Zero => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedReadPayload<B>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    let mut buffer = payload.buffer;
+                    unsafe { buffer.set_written_len(this.filled as usize) };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        buffer,
+                    ));
+                }
+                RetryCqeResult::Bytes(n) => {
+                    let n = n as u32;
+                    debug_assert!(n <= this.target - this.filled);
+                    this.filled += n;
+                    if this.filled >= this.target {
+                        let payload = unsafe {
+                            take_retained_payload_and_free_state::<RetainedReadPayload<B>>(
+                                &pctx,
+                                &mut this.state_ptr,
+                            )
+                        };
+                        let mut buffer = payload.buffer;
+                        unsafe { buffer.set_written_len(this.target as usize) };
+                        return Poll::Ready((Ok(this.target as usize), buffer));
+                    }
+                }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
@@ -1179,6 +1478,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                     return Poll::Ready((Err(e), buffer));
                 }
             }
+            unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
             return Poll::Pending;
         }
 
@@ -1191,16 +1491,17 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedReadPayload<B>>(this.state_ptr);
-                (*pctx.reactor()).free_op(this.state_ptr);
-                this.state_ptr = std::ptr::null_mut();
+                let payload = take_retained_payload_and_free_state::<RetainedReadPayload<B>>(
+                    &pctx,
+                    &mut this.state_ptr,
+                );
                 let mut buffer = payload.buffer;
                 buffer.set_written_len(this.filled as usize);
                 return Poll::Ready((Err(e), buffer));
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -1287,13 +1588,13 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         // Fast path: still in flight — return without any context extraction.
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if !state.is_completed() {
-                return Poll::Pending;
-            }
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
+            return Poll::Pending;
         }
 
         // Zero-length append completes immediately and preserves the payload.
@@ -1309,42 +1610,51 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
         // Process completed state if any. Sequential retries reuse the same
         // completion slot once the previous CQE has been fully consumed.
         if !this.state_ptr.is_null() {
-            let result = unsafe { (*this.state_ptr).result };
-
-            if result < 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadPayload<IoBuffMut>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let buffer =
-                    unsafe { Self::set_appended_len(payload.buffer, this.start_len, this.filled) };
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-
-            let n = result as u32;
-            if n == 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadPayload<IoBuffMut>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let buffer =
-                    unsafe { Self::set_appended_len(payload.buffer, this.start_len, this.filled) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::UnexpectedEof)), buffer));
-            }
-
-            debug_assert!(n <= this.target - this.filled);
-            this.filled += n;
-            if this.filled >= this.target {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadPayload<IoBuffMut>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let buffer =
-                    unsafe { Self::set_appended_len(payload.buffer, this.start_len, this.target) };
-                return Poll::Ready((Ok(this.target as usize), buffer));
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
+                RetryCqeResult::KernelError(errno) => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedReadPayload<IoBuffMut>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    let buffer = unsafe {
+                        Self::set_appended_len(payload.buffer, this.start_len, this.filled)
+                    };
+                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), buffer));
+                }
+                RetryCqeResult::Zero => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedReadPayload<IoBuffMut>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    let buffer = unsafe {
+                        Self::set_appended_len(payload.buffer, this.start_len, this.filled)
+                    };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        buffer,
+                    ));
+                }
+                RetryCqeResult::Bytes(n) => {
+                    let n = n as u32;
+                    debug_assert!(n <= this.target - this.filled);
+                    this.filled += n;
+                    if this.filled >= this.target {
+                        let payload = unsafe {
+                            take_retained_payload_and_free_state::<RetainedReadPayload<IoBuffMut>>(
+                                &pctx,
+                                &mut this.state_ptr,
+                            )
+                        };
+                        let buffer = unsafe {
+                            Self::set_appended_len(payload.buffer, this.start_len, this.target)
+                        };
+                        return Poll::Ready((Ok(this.target as usize), buffer));
+                    }
+                }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
@@ -1376,6 +1686,7 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
                     return Poll::Ready((Err(e), buffer));
                 }
             }
+            unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
             return Poll::Pending;
         }
 
@@ -1388,15 +1699,16 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedReadPayload<IoBuffMut>>(this.state_ptr);
-                (*pctx.reactor()).free_op(this.state_ptr);
-                this.state_ptr = std::ptr::null_mut();
+                let payload = take_retained_payload_and_free_state::<RetainedReadPayload<IoBuffMut>>(
+                    &pctx,
+                    &mut this.state_ptr,
+                );
                 let buffer = Self::set_appended_len(payload.buffer, this.start_len, this.filled);
                 return Poll::Ready((Err(e), buffer));
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -1451,10 +1763,13 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, payload)) = unsafe {
-            take_completed_result_and_payload::<RetainedReadvPayload<N>>(cx, &mut this.state_ptr)
+        if let Some((result, mut buffer)) = unsafe {
+            take_completed_result_and_payload_with::<RetainedReadvPayload<N>, _>(
+                cx,
+                &mut this.state_ptr,
+                |payload| take_readv_buffer_from_retained(payload),
+            )
         } {
-            let mut buffer = payload.buffer;
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
@@ -1462,11 +1777,16 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
             unsafe { buffer.distribute_written(actual) };
             return Poll::Ready((Ok(actual), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if this.writable == 0 {
-            let mut buffer = unsafe { opt_take(&mut this.buffer) };
-            unsafe { buffer.distribute_written(0) };
-            return Poll::Ready((Ok(0), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((
+                Err(super::invalid_input("empty vectored receive chain")),
+                buffer,
+            ));
         }
 
         if this.state_ptr.is_null() {
@@ -1519,6 +1839,7 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -1573,14 +1894,21 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, payload)) = unsafe {
-            take_completed_result_and_payload::<RetainedWritevPayload<C>>(cx, &mut this.state_ptr)
+        if let Some((result, completion)) = unsafe {
+            take_completed_result_and_payload_with::<RetainedWritevPayload<C>, _>(
+                cx,
+                &mut this.state_ptr,
+                |payload| take_writev_completion_from_retained(payload),
+            )
         } {
-            let buffer = payload.buffer;
+            let buffer = completion.buffer;
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
             return Poll::Ready((Ok(result as usize), buffer));
+        }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
         }
 
         if this.total == 0 {
@@ -1613,6 +1941,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
             let payload = RetainedWritevPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
                 scratch,
+                msg: empty_sendmsg_header(),
                 written: 0,
                 skip: 0,
             };
@@ -1624,6 +1953,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
                             retained_iovecs(&payload.scratch),
                             0,
                             payload.scratch.len(),
+                            &mut payload.msg,
                             state_ptr as u64,
                         ))
                     })
@@ -1635,6 +1965,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -1739,11 +2070,12 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if !state.is_completed() {
-                return Poll::Pending;
-            }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
+
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
+            return Poll::Pending;
         }
 
         if this.state_ptr.is_null() && this.total == 0 {
@@ -1754,51 +2086,64 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
         let pctx = unsafe { poll_ctx_from_waker(cx) };
 
         if !this.state_ptr.is_null() {
-            let result = unsafe { (*this.state_ptr).result };
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
+                RetryCqeResult::KernelError(errno) => {
+                    let completion = unsafe {
+                        take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
+                            &pctx,
+                            &mut this.state_ptr,
+                            |payload| take_writev_completion_from_retained(payload),
+                        )
+                    };
+                    return Poll::Ready((
+                        Err(io::Error::from_raw_os_error(errno)),
+                        completion.buffer,
+                    ));
+                }
+                RetryCqeResult::Zero => {
+                    let completion = unsafe {
+                        take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
+                            &pctx,
+                            &mut this.state_ptr,
+                            |payload| take_writev_completion_from_retained(payload),
+                        )
+                    };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::WriteZero)),
+                        completion.buffer,
+                    ));
+                }
+                RetryCqeResult::Bytes(n) => {
+                    let completed = unsafe {
+                        let payload =
+                            (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
+                        debug_assert!(n <= this.total - payload.written);
+                        payload.written += n;
+                        payload.written >= this.total
+                    };
+                    if completed {
+                        let completion = unsafe {
+                            take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
+                                &pctx,
+                                &mut this.state_ptr,
+                                |payload| take_writev_completion_from_retained(payload),
+                            )
+                        };
+                        return Poll::Ready((Ok(completion.written), completion.buffer));
+                    }
 
-            if result < 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), payload.buffer));
-            }
-
-            let n = result as usize;
-            if n == 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((
-                    Err(io::Error::from(io::ErrorKind::WriteZero)),
-                    payload.buffer,
-                ));
-            }
-
-            let completed = unsafe {
-                let payload = (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
-                debug_assert!(n <= this.total - payload.written);
-                payload.written += n;
-                payload.written >= this.total
-            };
-            if completed {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr)
-                };
-                let written = payload.written;
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Ok(written), payload.buffer));
-            }
-
-            unsafe {
-                let payload = (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
-                let mut skip = payload.skip;
-                advance_iovecs_in_place(retained_iovecs_mut(&mut payload.scratch), &mut skip, n);
-                payload.skip = skip;
+                    unsafe {
+                        let payload =
+                            (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
+                        let mut skip = payload.skip;
+                        advance_iovecs_in_place(
+                            retained_iovecs_mut(&mut payload.scratch),
+                            &mut skip,
+                            n,
+                        );
+                        payload.skip = skip;
+                    }
+                }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
@@ -1821,6 +2166,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
             let payload = RetainedWritevPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
                 scratch,
+                msg: empty_sendmsg_header(),
                 written: 0,
                 skip: 0,
             };
@@ -1834,6 +2180,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
                             retained_iovecs(&payload.scratch),
                             payload.skip,
                             remaining_iovs,
+                            &mut payload.msg,
                             this.state_ptr as u64,
                         ))
                     })
@@ -1844,29 +2191,33 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
                 }
             }
 
+            unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
             return Poll::Pending;
         }
 
-        let payload = unsafe { (*this.state_ptr).retained_payload::<RetainedWritevPayload<C>>() };
+        let payload =
+            unsafe { (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>() };
         let remaining_iovs = remaining_iovec_count(&payload.scratch, payload.skip);
         let sqe = build_write_vectored_entry(
             this.fd,
             retained_iovecs(&payload.scratch),
             payload.skip,
             remaining_iovs,
+            &mut payload.msg,
             this.state_ptr as u64,
         );
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedWritevPayload<C>>(this.state_ptr);
-                (*pctx.reactor()).free_op(this.state_ptr);
-                this.state_ptr = std::ptr::null_mut();
+                let payload = take_retained_payload_and_free_state::<RetainedWritevPayload<C>>(
+                    &pctx,
+                    &mut this.state_ptr,
+                );
                 return Poll::Ready((Err(e), payload.buffer));
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -1982,6 +2333,9 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
             }
             return Poll::Ready((Ok(result as usize), source));
         }
+        if this.state_ptr.is_null() && this.source.is_none() {
+            return Poll::Pending;
+        }
 
         if let Err(err) = validate_projected_count_and_len(this.iov_count, this.total) {
             let source = unsafe { opt_take(&mut this.source) };
@@ -2009,6 +2363,7 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -2060,11 +2415,12 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if !state.is_completed() {
-                return Poll::Pending;
-            }
+        if this.state_ptr.is_null() && this.source.is_none() {
+            return Poll::Pending;
+        }
+
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
+            return Poll::Pending;
         }
 
         if this.source.is_some() {
@@ -2081,53 +2437,59 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
         let pctx = unsafe { poll_ctx_from_waker(cx) };
 
         if !this.state_ptr.is_null() {
-            let result = unsafe { (*this.state_ptr).result };
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
+                RetryCqeResult::KernelError(errno) => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedProjectedWritevPayload<T>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), payload.source));
+                }
+                RetryCqeResult::Zero => {
+                    let payload = unsafe {
+                        take_retained_payload_and_free_state::<RetainedProjectedWritevPayload<T>>(
+                            &pctx,
+                            &mut this.state_ptr,
+                        )
+                    };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::WriteZero)),
+                        payload.source,
+                    ));
+                }
+                RetryCqeResult::Bytes(n) => {
+                    let completed = unsafe {
+                        let payload = (*this.state_ptr)
+                            .retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+                        debug_assert!(n <= this.total - payload.written);
+                        payload.written += n;
+                        payload.written >= this.total
+                    };
+                    if completed {
+                        let payload = unsafe {
+                            take_retained_payload_and_free_state::<RetainedProjectedWritevPayload<T>>(
+                                &pctx,
+                                &mut this.state_ptr,
+                            )
+                        };
+                        let written = payload.written;
+                        return Poll::Ready((Ok(written), payload.source));
+                    }
 
-            if result < 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), payload.source));
-            }
-
-            let n = result as usize;
-            if n == 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((
-                    Err(io::Error::from(io::ErrorKind::WriteZero)),
-                    payload.source,
-                ));
-            }
-
-            let completed = unsafe {
-                let payload =
-                    (*this.state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                debug_assert!(n <= this.total - payload.written);
-                payload.written += n;
-                payload.written >= this.total
-            };
-            if completed {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr)
-                };
-                let written = payload.written;
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                return Poll::Ready((Ok(written), payload.source));
-            }
-
-            unsafe {
-                let payload =
-                    (*this.state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                let mut skip = payload.skip;
-                advance_iovecs_in_place(retained_iovecs_mut(&mut payload.scratch), &mut skip, n);
-                payload.skip = skip;
+                    unsafe {
+                        let payload = (*this.state_ptr)
+                            .retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
+                        let mut skip = payload.skip;
+                        advance_iovecs_in_place(
+                            retained_iovecs_mut(&mut payload.scratch),
+                            &mut skip,
+                            n,
+                        );
+                        payload.skip = skip;
+                    }
+                }
             }
         }
 
@@ -2141,6 +2503,7 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
             ) {
                 Ok(state_ptr) => {
                     this.state_ptr = state_ptr;
+                    unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
                     return Poll::Pending;
                 }
                 Err((err, source)) => return Poll::Ready((Err(err), source)),
@@ -2159,27 +2522,29 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
             (*this.state_ptr).register_waiter(pctx.owner_task());
         }
 
-        let payload =
-            unsafe { (*this.state_ptr).retained_payload::<RetainedProjectedWritevPayload<T>>() };
+        let payload = unsafe {
+            (*this.state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>()
+        };
         let remaining_iovs = remaining_iovec_count(&payload.scratch, payload.skip);
         let sqe = build_write_vectored_entry(
             this.fd,
             retained_iovecs(&payload.scratch),
             payload.skip,
             remaining_iovs,
+            &mut payload.msg,
             this.state_ptr as u64,
         );
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedProjectedWritevPayload<T>>(this.state_ptr);
-                (*pctx.reactor()).free_op(this.state_ptr);
-                this.state_ptr = std::ptr::null_mut();
+                let payload = take_retained_payload_and_free_state::<
+                    RetainedProjectedWritevPayload<T>,
+                >(&pctx, &mut this.state_ptr);
                 return Poll::Ready((Err(e), payload.source));
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -2217,6 +2582,8 @@ pub struct ReadvExactFuture<'a, const N: usize, S> {
     filled: usize,
     /// Index of the first still-active `iovec` entry after partial progress.
     skip: usize,
+    /// Number of initialized `iovec` entries in the clamped target window.
+    window_iov_count: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
     /// Borrows the parent stream for the future lifetime.
@@ -2245,6 +2612,7 @@ impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
             target,
             filled: 0,
             skip: 0,
+            window_iov_count: 0,
             input_error,
             _marker: PhantomData,
         }
@@ -2263,12 +2631,12 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if !state.is_completed() {
-                return Poll::Pending;
-            }
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
+            return Poll::Pending;
         }
 
         if this.state_ptr.is_null() && this.target == 0 {
@@ -2280,51 +2648,57 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
         let pctx = unsafe { poll_ctx_from_waker(cx) };
 
         if !this.state_ptr.is_null() {
-            let result = unsafe { (*this.state_ptr).result };
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
+                RetryCqeResult::KernelError(errno) => {
+                    let mut buffer = unsafe {
+                        take_retained_payload_with_and_free_state::<RetainedReadvPayload<N>, _>(
+                            &pctx,
+                            &mut this.state_ptr,
+                            |payload| take_readv_buffer_from_retained(payload),
+                        )
+                    };
+                    unsafe { buffer.distribute_written(this.filled) };
+                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), buffer));
+                }
+                RetryCqeResult::Zero => {
+                    let mut buffer = unsafe {
+                        take_retained_payload_with_and_free_state::<RetainedReadvPayload<N>, _>(
+                            &pctx,
+                            &mut this.state_ptr,
+                            |payload| take_readv_buffer_from_retained(payload),
+                        )
+                    };
+                    unsafe { buffer.distribute_written(this.filled) };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        buffer,
+                    ));
+                }
+                RetryCqeResult::Bytes(n) => {
+                    debug_assert!(n <= this.target - this.filled);
+                    this.filled += n;
+                    if this.filled >= this.target {
+                        let mut buffer = unsafe {
+                            take_retained_payload_with_and_free_state::<RetainedReadvPayload<N>, _>(
+                                &pctx,
+                                &mut this.state_ptr,
+                                |payload| take_readv_buffer_from_retained(payload),
+                            )
+                        };
+                        unsafe { buffer.distribute_written(this.target) };
+                        return Poll::Ready((Ok(this.target), buffer));
+                    }
 
-            if result < 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadvPayload<N>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let mut buffer = payload.buffer;
-                unsafe { buffer.distribute_written(this.filled) };
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-
-            let n = result as usize;
-            if n == 0 {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadvPayload<N>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let mut buffer = payload.buffer;
-                unsafe { buffer.distribute_written(this.filled) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::UnexpectedEof)), buffer));
-            }
-
-            debug_assert!(n <= this.target - this.filled);
-            this.filled += n;
-            if this.filled >= this.target {
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedReadvPayload<N>>(this.state_ptr)
-                };
-                unsafe { free_retry_state(&pctx, &mut this.state_ptr) };
-                let mut buffer = payload.buffer;
-                unsafe { buffer.distribute_written(this.target) };
-                return Poll::Ready((Ok(this.target), buffer));
-            }
-
-            unsafe {
-                let payload = (*this.state_ptr).retained_payload_mut::<RetainedReadvPayload<N>>();
-                advance_iovecs_in_place(
-                    retained_iovecs_mut(&mut payload.scratch),
-                    &mut this.skip,
-                    n,
-                );
+                    unsafe {
+                        let payload =
+                            (*this.state_ptr).retained_payload_mut::<RetainedReadvPayload<N>>();
+                        advance_iovecs_in_place(
+                            retained_iovecs_mut(&mut payload.scratch),
+                            &mut this.skip,
+                            n,
+                        );
+                    }
+                }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
@@ -2357,12 +2731,17 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
                             );
                         debug_assert_eq!(iov_count, this.iov_count);
                         debug_assert_eq!(writable, this.writable);
-                        let remaining_iovs = remaining_iovec_count(&payload.scratch, this.skip);
+                        let remaining = this.target - this.filled;
+                        this.window_iov_count = clamp_iovecs_to_read_limit(
+                            retained_iovecs_mut(&mut payload.scratch),
+                            this.skip,
+                            remaining,
+                        );
                         Ok(build_read_vectored_entry(
                             this.fd,
                             retained_iovecs(&payload.scratch),
                             this.skip,
-                            remaining_iovs,
+                            this.window_iov_count,
                             this.state_ptr as u64,
                         ))
                     })
@@ -2375,11 +2754,12 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
                 }
             }
 
+            unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
             return Poll::Pending;
         }
 
         let payload = unsafe { (*this.state_ptr).retained_payload::<RetainedReadvPayload<N>>() };
-        let remaining_iovs = remaining_iovec_count(&payload.scratch, this.skip);
+        let remaining_iovs = this.window_iov_count - this.skip;
         let sqe = build_read_vectored_entry(
             this.fd,
             retained_iovecs(&payload.scratch),
@@ -2390,16 +2770,17 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                let payload = (*pctx.reactor())
-                    .take_retained_payload::<RetainedReadvPayload<N>>(this.state_ptr);
-                (*pctx.reactor()).free_op(this.state_ptr);
-                this.state_ptr = std::ptr::null_mut();
+                let payload = take_retained_payload_and_free_state::<RetainedReadvPayload<N>>(
+                    &pctx,
+                    &mut this.state_ptr,
+                );
                 let mut buffer = payload.buffer;
                 buffer.distribute_written(this.filled);
                 return Poll::Ready((Err(e), buffer));
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -2407,5 +2788,92 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
 impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
     fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    struct SqePrefix {
+        opcode: u8,
+        flags: u8,
+        ioprio: u16,
+        fd: i32,
+        off_or_addr2: u64,
+        addr: u64,
+        len: u32,
+        msg_flags: u32,
+        user_data: u64,
+    }
+
+    fn sqe_prefix(entry: &squeue::Entry) -> &SqePrefix {
+        unsafe { &*(entry as *const squeue::Entry as *const SqePrefix) }
+    }
+
+    fn initialized_iovec(base: *const u8, len: usize) -> MaybeUninit<libc::iovec> {
+        MaybeUninit::new(libc::iovec {
+            iov_base: base as *mut libc::c_void,
+            iov_len: len,
+        })
+    }
+
+    #[test]
+    fn stream_retry_cqe_result_classifies_error_zero_and_progress() {
+        assert_eq!(
+            classify_retry_cqe_result(-libc::EPIPE),
+            RetryCqeResult::KernelError(libc::EPIPE)
+        );
+        assert_eq!(classify_retry_cqe_result(0), RetryCqeResult::Zero);
+        assert_eq!(classify_retry_cqe_result(7), RetryCqeResult::Bytes(7));
+    }
+
+    #[test]
+    fn stream_write_entry_uses_send_with_nosignal() {
+        let bytes = [1u8, 2, 3, 4];
+        let entry = build_write_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
+        let sqe = sqe_prefix(&entry);
+
+        assert_eq!(sqe.opcode, opcode::Send::CODE);
+        assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
+        assert_eq!(sqe.user_data, 99);
+    }
+
+    #[test]
+    fn stream_write_vectored_single_entry_uses_send_with_nosignal() {
+        let bytes = [1u8, 2, 3, 4];
+        let iovecs = [initialized_iovec(bytes.as_ptr(), bytes.len())];
+        let mut msg = empty_sendmsg_header();
+
+        let entry = build_write_vectored_entry(7, &iovecs, 0, 1, &mut msg, 99);
+        let sqe = sqe_prefix(&entry);
+
+        assert_eq!(sqe.opcode, opcode::Send::CODE);
+        assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
+        assert_eq!(sqe.user_data, 99);
+    }
+
+    #[test]
+    fn stream_write_vectored_multi_entry_uses_sendmsg_with_nosignal() {
+        let first = [1u8, 2];
+        let second = [3u8, 4, 5];
+        let iovecs = [
+            initialized_iovec(first.as_ptr(), first.len()),
+            initialized_iovec(second.as_ptr(), second.len()),
+        ];
+        let mut msg = empty_sendmsg_header();
+
+        let entry = build_write_vectored_entry(7, &iovecs, 0, 2, &mut msg, 99);
+        let sqe = sqe_prefix(&entry);
+
+        assert_eq!(sqe.opcode, opcode::SendMsg::CODE);
+        assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
+        assert_eq!(sqe.addr, (&msg as *const libc::msghdr) as u64);
+        assert_eq!(sqe.user_data, 99);
+        assert_eq!(msg.msg_iov, iovecs.as_ptr() as *mut libc::iovec);
+        assert_eq!(msg.msg_iovlen, 2);
+        assert!(msg.msg_name.is_null());
+        assert!(msg.msg_control.is_null());
     }
 }

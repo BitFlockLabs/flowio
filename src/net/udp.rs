@@ -75,11 +75,14 @@
 //! ```
 
 use super::{
-    checked_read_len, close_fd, current_local_addr, get_sock_opt, new_nonblocking_socket,
-    set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    MsgHdrInit, checked_read_len, checked_send_len, close_fd, current_local_addr, get_sock_opt,
+    new_nonblocking_socket, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
+    socket_domain, write_msghdr,
 };
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
-use crate::runtime::executor::{drop_op_ptr_unchecked, poll_ctx_from_waker, submit_retained_sqe};
+use crate::runtime::executor::{
+    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_retained_sqe,
+};
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
 use io_uring::{opcode, types};
@@ -310,10 +313,20 @@ impl UdpSocket {
     ///
     /// This is the preferred send API on the fixed-peer UDP fast path.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B> {
+        let mut input_error = None;
+        let len = match checked_send_len("udp send", buffer.len()) {
+            Ok(len) => len,
+            Err(err) => {
+                input_error = Some(err);
+                0
+            }
+        };
         SendFuture {
             fd: self.fd.as_raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
+            len,
+            input_error,
             _marker: PhantomData,
         }
     }
@@ -426,6 +439,10 @@ struct RetainedSendToPayload<B: IoBuffReadOnly> {
     msghdr: MaybeUninit<libc::msghdr>,
 }
 
+fn zeroed_sockaddr_storage() -> MaybeUninit<libc::sockaddr_storage> {
+    MaybeUninit::zeroed()
+}
+
 // ---------------------------------------------------------------------------
 // RecvFuture (connected recv via IORING_OP_RECV)
 // ---------------------------------------------------------------------------
@@ -457,6 +474,9 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
         {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
+        }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
         }
 
         if !this.state_ptr.is_null() {
@@ -511,6 +531,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -553,6 +574,9 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
@@ -575,6 +599,8 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                 // `msg_control` is null, so MSG_CTRUNC is not expected here;
                 // keep the check defensive in case a kernel reports
                 // inconsistent recvmsg flags.
+                let actual = result as usize;
+                unsafe { buffer.set_written_len(actual) };
                 if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
                     return Poll::Ready((
                         Err(io::Error::new(
@@ -585,8 +611,6 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                     ));
                 }
 
-                let actual = result as usize;
-                unsafe { buffer.set_written_len(actual) };
                 return Poll::Ready((Ok(actual), buffer));
             }
         }
@@ -616,15 +640,17 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                             iov_base: buffer_ptr as *mut libc::c_void,
                             iov_len: this.len as usize,
                         });
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: std::ptr::null_mut(),
-                            msg_namelen: 0,
-                            msg_iov: payload.iovec.as_mut_ptr(),
-                            msg_iovlen: 1,
-                            msg_control: std::ptr::null_mut(),
-                            msg_controllen: 0,
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: std::ptr::null_mut(),
+                                namelen: 0,
+                                iov: payload.iovec.as_mut_ptr(),
+                                iovlen: 1,
+                                control: std::ptr::null_mut(),
+                                controllen: 0,
+                            },
+                        );
 
                         Ok(
                             opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
@@ -640,6 +666,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -662,6 +689,10 @@ pub struct SendFuture<'a, B: IoBuffReadOnly> {
     state_ptr: *mut CompletionState,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
+    /// Validated datagram byte count submitted to the kernel.
+    len: u32,
+    /// Deferred validation error returned before any SQE submission.
+    input_error: Option<io::Error>,
     /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
@@ -671,6 +702,16 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if this.state_ptr.is_null()
+            && let Some(err) = this.input_error.take()
+        {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
+        }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
@@ -710,8 +751,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
                         let ptr = payload.buffer.as_ptr();
-                        let len = payload.buffer.len() as u32;
-                        Ok(opcode::Send::new(types::Fd(this.fd), ptr, len)
+                        Ok(opcode::Send::new(types::Fd(this.fd), ptr, this.len)
                             .build()
                             .user_data(state_ptr as u64))
                     })
@@ -723,6 +763,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -767,6 +808,9 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
@@ -791,6 +835,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                 // `msg_control` is null, so MSG_CTRUNC is not expected here;
                 // keep the check defensive in case a kernel reports
                 // inconsistent recvmsg flags.
+                unsafe { buffer.set_written_len(actual) };
                 if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
                     return Poll::Ready((
                         Err(io::Error::new(
@@ -800,7 +845,6 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                         buffer,
                     ));
                 }
-                unsafe { buffer.set_written_len(actual) };
                 let addr = match unsafe {
                     socket_addr_from_c(payload.addr.assume_init_ref(), msg.msg_namelen)
                 } {
@@ -824,7 +868,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
 
             let payload = RetainedRecvFromPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
-                addr: MaybeUninit::uninit(),
+                addr: zeroed_sockaddr_storage(),
                 addrlen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
                 iovec: MaybeUninit::uninit(),
                 msghdr: MaybeUninit::uninit(),
@@ -837,15 +881,17 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                             iov_base: buffer_ptr as *mut libc::c_void,
                             iov_len: this.len as usize,
                         });
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: payload.addr.as_mut_ptr() as *mut libc::c_void,
-                            msg_namelen: payload.addrlen,
-                            msg_iov: payload.iovec.as_mut_ptr(),
-                            msg_iovlen: 1,
-                            msg_control: std::ptr::null_mut(),
-                            msg_controllen: 0,
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: payload.addr.as_mut_ptr() as *mut libc::c_void,
+                                namelen: payload.addrlen,
+                                iov: payload.iovec.as_mut_ptr(),
+                                iovlen: 1,
+                                control: std::ptr::null_mut(),
+                                controllen: 0,
+                            },
+                        );
 
                         Ok(
                             opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
@@ -861,6 +907,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -898,6 +945,10 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if !this.state_ptr.is_null() {
             let state = unsafe { &*this.state_ptr };
@@ -948,16 +999,18 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                             iov_base: buffer_ptr as *mut libc::c_void,
                             iov_len: len,
                         });
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: &mut payload.addr as *mut libc::sockaddr_storage
-                                as *mut libc::c_void,
-                            msg_namelen: payload.addrlen,
-                            msg_iov: payload.iovec.as_mut_ptr(),
-                            msg_iovlen: 1,
-                            msg_control: std::ptr::null_mut(),
-                            msg_controllen: 0,
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: &mut payload.addr as *mut libc::sockaddr_storage
+                                    as *mut libc::c_void,
+                                namelen: payload.addrlen,
+                                iov: payload.iovec.as_mut_ptr(),
+                                iovlen: 1,
+                                control: std::ptr::null_mut(),
+                                controllen: 0,
+                            },
+                        );
 
                         Ok(
                             opcode::SendMsg::new(types::Fd(this.fd), payload.msghdr.as_ptr())
@@ -973,6 +1026,7 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -980,5 +1034,16 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
 impl<B: IoBuffReadOnly> Drop for SendToFuture<'_, B> {
     fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_from_addr_storage_starts_zeroed() {
+        let addr = unsafe { zeroed_sockaddr_storage().assume_init() };
+        assert_eq!(addr.ss_family, 0);
     }
 }

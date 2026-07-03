@@ -11,8 +11,10 @@ without notice. It is not recommended for production yet.
 
 ## Install
 
-Requires Linux and Rust 1.88 or newer. The runtime is built on `io_uring`; the
-crate does not build or run on non-Linux targets.
+Requires Linux kernel 5.11 or newer and Rust 1.88 or newer. The runtime is
+built on `io_uring` and requires `IORING_ENTER_EXT_ARG`; executor construction
+fails with `Unsupported` when the running kernel does not report that feature.
+The crate does not build or run on non-Linux targets.
 
 ```toml
 [dependencies]

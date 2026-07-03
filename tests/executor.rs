@@ -1,20 +1,29 @@
+mod common;
+
+use common::{DropTrackedReadOnly, DropTrackedReadWrite, wait_for_drop_count, wait_for_live_slots};
 use flowio::net::unix::UnixStream;
 use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
-use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
+use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly};
 use flowio::runtime::executor::{Executor, ExecutorConfig, TrySpawnError};
 use flowio::runtime::io::{Nop, NopSlot};
 use flowio::runtime::op::CompletionState;
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::task::TaskHeader;
+#[cfg(debug_assertions)]
+use flowio::runtime::test_hooks;
 use flowio::runtime::timer::{sleep, sleep_until, timeout, timeout_at};
 use std::cell::{Cell, RefCell};
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -31,81 +40,119 @@ fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Execu
     .expect("failed to construct runtime executor")
 }
 
-/// Drop-tracking read-only buffer used by retained-payload tests.
-/// The counter proves the payload outlives the original CQE.
-struct DropTrackedReadOnly {
-    /// Payload bytes exposed through IoBuffReadOnly.
-    bytes: Vec<u8>,
-    /// Shared drop counter bumped exactly once by Drop.
-    drops: Rc<Cell<usize>>,
+struct CrossTaskRepollShared<F> {
+    future: RefCell<F>,
+    first_poll_pending: Cell<bool>,
+    completed_by_second: Cell<bool>,
 }
 
-impl DropTrackedReadOnly {
-    fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
-        Self {
-            bytes,
-            drops: Rc::clone(drops),
+struct FirstPollSharedFuture<F> {
+    shared: Rc<CrossTaskRepollShared<F>>,
+}
+
+struct SecondPollSharedFuture<F> {
+    shared: Rc<CrossTaskRepollShared<F>>,
+}
+
+impl<F: Future + Unpin> Future for FirstPollSharedFuture<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut future = this.shared.future.borrow_mut();
+        match Pin::new(&mut *future).poll(cx) {
+            Poll::Pending => {
+                this.shared.first_poll_pending.set(true);
+                Poll::Ready(())
+            }
+            Poll::Ready(_) => panic!("shared future completed during first poll"),
         }
     }
 }
 
-impl Drop for DropTrackedReadOnly {
-    fn drop(&mut self) {
-        self.drops.set(self.drops.get() + 1);
-    }
-}
+impl<F: Future + Unpin> Future for SecondPollSharedFuture<F> {
+    type Output = ();
 
-unsafe impl IoBuffReadOnly for DropTrackedReadOnly {
-    fn as_ptr(&self) -> *const u8 {
-        self.bytes.as_ptr()
-    }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.shared.first_poll_pending.get() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
 
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-}
-
-/// Drop-tracking writable buffer used by retained read tests.
-///
-/// `written` mirrors the kernel-reported length through set_written_len so the
-/// test fixture still follows the buffer contract even when tests only assert
-/// drop timing.
-struct DropTrackedReadWrite {
-    /// Writable backing bytes.
-    bytes: Vec<u8>,
-    /// Last length reported through set_written_len.
-    written: usize,
-    /// Shared drop counter bumped exactly once by Drop.
-    drops: Rc<Cell<usize>>,
-}
-
-impl DropTrackedReadWrite {
-    fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
-        Self {
-            bytes,
-            written: 0,
-            drops: Rc::clone(drops),
+        let mut future = this.shared.future.borrow_mut();
+        match Pin::new(&mut *future).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => {
+                this.shared.completed_by_second.set(true);
+                Poll::Ready(())
+            }
         }
     }
 }
 
-impl Drop for DropTrackedReadWrite {
-    fn drop(&mut self) {
-        self.drops.set(self.drops.get() + 1);
+fn run_cross_task_repoll<F>(future: F)
+where
+    F: Future + Unpin + 'static,
+    F::Output: 'static,
+{
+    let shared = Rc::new(CrossTaskRepollShared {
+        future: RefCell::new(future),
+        first_poll_pending: Cell::new(false),
+        completed_by_second: Cell::new(false),
+    });
+    let observed = Rc::clone(&shared);
+
+    let mut executor = new_executor();
+    executor
+        .run(async move {
+            let first = Executor::spawn(FirstPollSharedFuture {
+                shared: Rc::clone(&shared),
+            })
+            .expect("spawn first shared-poll task");
+            let second = Executor::spawn(SecondPollSharedFuture { shared })
+                .expect("spawn second shared-poll task");
+
+            first.await;
+            second.await;
+        })
+        .expect("cross-task repoll should complete");
+
+    assert!(observed.first_poll_pending.get());
+    assert!(observed.completed_by_second.get());
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn handle_executor_signal(_signal: libc::c_int) {}
+
+#[cfg(target_os = "linux")]
+struct SignalHandlerGuard {
+    signal: libc::c_int,
+    old_action: libc::sigaction,
+}
+
+#[cfg(target_os = "linux")]
+impl SignalHandlerGuard {
+    fn install(signal: libc::c_int) -> Self {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = handle_executor_signal as *const () as usize;
+        action.sa_flags = 0;
+        let rc = unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        assert_eq!(rc, 0, "sigemptyset failed");
+
+        let mut old_action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        let rc = unsafe { libc::sigaction(signal, &action, &mut old_action) };
+        assert_eq!(rc, 0, "sigaction install failed");
+
+        Self { signal, old_action }
     }
 }
 
-unsafe impl IoBuffReadWrite for DropTrackedReadWrite {
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.bytes.as_mut_ptr()
-    }
-
-    fn writable_len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    unsafe fn set_written_len(&mut self, len: usize) {
-        self.written = len;
+#[cfg(target_os = "linux")]
+impl Drop for SignalHandlerGuard {
+    fn drop(&mut self) {
+        let rc = unsafe { libc::sigaction(self.signal, &self.old_action, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "sigaction restore failed");
     }
 }
 
@@ -205,6 +252,9 @@ impl<const PAD: usize> Drop for RecoverableSpawnFuture<PAD> {
 }
 
 static PROJECTED_SOURCE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Test WritevProjection source with independently controlled reported and
 /// projected lengths so rejection tests can fabricate mismatches.
@@ -334,43 +384,6 @@ async fn fill_unix_send_buffer(writer: &mut UnixStream) {
     }
 }
 
-async fn wait_for_drop_count(drops: &Rc<Cell<usize>>, expected: usize) {
-    // Wait for the original CQE to retire and free the retained payload.
-    for _ in 0..100 {
-        if drops.get() == expected {
-            return;
-        }
-        sleep(Duration::from_millis(5))
-            .await
-            .expect("drop wait sleep failed");
-    }
-
-    assert_eq!(
-        drops.get(),
-        expected,
-        "retained payload was not dropped exactly once after CQE retirement"
-    );
-}
-
-async fn wait_for_live_slots(pool: &IoBuffPool, expected: usize) {
-    // Wait for the original CQE to retire and release pool-backed read
-    // destinations that were retained after future cancellation.
-    for _ in 0..100 {
-        if pool.live_slots_for_test() == expected {
-            return;
-        }
-        sleep(Duration::from_millis(5))
-            .await
-            .expect("pool live-slot wait sleep failed");
-    }
-
-    assert_eq!(
-        pool.live_slots_for_test(),
-        expected,
-        "retained pool-backed buffers were not released after CQE retirement"
-    );
-}
-
 fn tracked_chain<const N: usize>(
     segments: [Vec<u8>; N],
     drops: &Rc<Cell<usize>>,
@@ -445,6 +458,21 @@ fn static_read_only_chain<const N: usize>() -> IoBuffReadOnlyVec<StaticReadOnly,
             .expect("static chain has enough capacity");
     }
     chain
+}
+
+fn assert_kernel_write_error(err: &io::Error) {
+    assert!(
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EPIPE | libc::ECONNRESET | libc::ESHUTDOWN | libc::ENOTCONN)
+        ) || matches!(
+            err.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotConnected
+        ),
+        "unexpected kernel write error: {err}"
+    );
 }
 
 #[test]
@@ -568,6 +596,131 @@ fn runtime_executor_runs_nop_future() {
 }
 
 #[test]
+fn runtime_executor_drains_multiple_nop_completions() {
+    const NOPS: usize = 8;
+
+    let mut executor = new_executor_with(16, None);
+
+    executor
+        .run(async move {
+            let mut handles = Vec::with_capacity(NOPS);
+            for _ in 0..NOPS {
+                handles.push(
+                    Executor::spawn(async { Nop::new().await.expect("nop failed") })
+                        .expect("spawn nop failed"),
+                );
+            }
+
+            for handle in handles {
+                assert_eq!(handle.await, 0);
+            }
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.cqe_completions >= NOPS,
+            "not all NOP completions were observed"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = executor;
+    }
+}
+
+#[test]
+fn runtime_nop_repoll_registers_latest_waiter() {
+    run_cross_task_repoll(Nop::new());
+}
+
+#[test]
+fn runtime_nop_slot_op_pool_pressure_releases_slot() {
+    let mut executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor");
+
+    executor
+        .run(async move {
+            let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+            let mut pending_read = Box::pin(reader.read(vec![0u8; 1], 1));
+
+            poll_fn(|cx| match pending_read.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(other) => panic!("one-byte read unexpectedly completed: {other:?}"),
+            })
+            .await;
+
+            let mut slot = NopSlot::new();
+            let err = slot
+                .nop()
+                .expect("slot future should be created")
+                .await
+                .expect_err("op-pool pressure should reject NOP");
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+            let retry = slot
+                .nop()
+                .expect("slot should be reusable after op-pool pressure");
+            drop(retry);
+
+            let byte = b"n";
+            let rc = unsafe {
+                libc::send(
+                    writer.as_raw_fd(),
+                    byte.as_ptr() as *const libc::c_void,
+                    byte.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            assert_eq!(rc, 1, "raw send failed: {}", io::Error::last_os_error());
+
+            let (read_res, recv) = pending_read.await;
+            assert_eq!(read_res.expect("held read failed"), 1);
+            assert_eq!(&recv[..1], byte);
+
+            let value = slot
+                .nop()
+                .expect("slot should be reusable after held read completes")
+                .await
+                .expect("retry nop failed");
+            assert_eq!(value, 0);
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_nop_slot_submit_failure_releases_slot() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let mut slot = NopSlot::new();
+
+            test_hooks::fail_next_sqe_submit();
+            let err = slot
+                .nop()
+                .expect("slot future should be created")
+                .await
+                .expect_err("forced submit failure should reject NOP");
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+            let value = slot
+                .nop()
+                .expect("slot should be reusable after submit failure")
+                .await
+                .expect("retry nop failed");
+            assert_eq!(value, 0);
+        })
+        .expect("executor run failed");
+}
+
+#[test]
 fn runtime_executor_runs_spawned_task_and_drains() {
     let mut executor = new_executor();
     let completed = Rc::new(Cell::new(0usize));
@@ -586,6 +739,161 @@ fn runtime_executor_runs_spawned_task_and_drains() {
         .expect("executor run failed");
 
     assert_eq!(completed.get(), 2, "did not drain both tasks");
+}
+
+#[test]
+fn runtime_run_stalled_task_returns_would_block_and_executor_drops() {
+    let mut executor = new_executor();
+
+    let err = executor
+        .run(async move {
+            Executor::spawn(std::future::pending::<()>()).expect("spawn pending task failed");
+        })
+        .expect_err("stalled live task should make run return WouldBlock");
+
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    drop(executor);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_write_alloc_op_failure_returns_payload() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"alloc-op".to_vec(), &drops);
+
+            test_hooks::fail_next_op_alloc();
+            let (res, returned) = writer.write(tracked).await;
+            let err = res.expect_err("forced alloc_op failure should return WouldBlock");
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(drops.get(), 0, "payload dropped before caller return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_write_submit_failure_returns_retained_payload() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"submit".to_vec(), &drops);
+
+            test_hooks::fail_next_sqe_submit();
+            let (res, returned) = writer.write(tracked).await;
+            let err = res.expect_err("forced SQE submit failure should return WouldBlock");
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(drops.get(), 0, "payload dropped before caller return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_op_pool_capacity_returns_would_block_and_payload() {
+    let mut executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor");
+
+    executor
+        .run(async move {
+            let (mut reader, mut writer) = UnixStream::pair().expect("socketpair failed");
+            let mut pending_read = Box::pin(reader.read(vec![0u8; 1], 1));
+
+            poll_fn(|cx| match pending_read.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(other) => panic!("one-byte read unexpectedly completed: {other:?}"),
+            })
+            .await;
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"cap".to_vec(), &drops);
+            let (res, returned) = writer.write(tracked).await;
+            let err = res.expect_err("op-pool capacity should reject second operation");
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(drops.get(), 0, "payload dropped before caller return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
+
+            let byte = b"x";
+            let rc = unsafe {
+                libc::send(
+                    writer.as_raw_fd(),
+                    byte.as_ptr() as *const libc::c_void,
+                    byte.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            assert_eq!(rc, 1, "raw send failed: {}", io::Error::last_os_error());
+
+            let (read_res, recv) = pending_read.await;
+            assert_eq!(read_res.expect("held read failed"), 1);
+            assert_eq!(&recv[..1], byte);
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_kernel_error_write_completions_return_payloads_once() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            reader
+                .shutdown(Shutdown::Read)
+                .expect("reader shutdown read failed");
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(vec![0xA1; 64], &drops);
+            let (res, returned) = writer.write(tracked).await;
+            let err = res.expect_err("write to closed peer should fail");
+            assert_kernel_write_error(&err);
+            assert_eq!(drops.get(), 0, "write payload dropped before return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "write payload dropped exactly once");
+
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            reader
+                .shutdown(Shutdown::Read)
+                .expect("reader shutdown read failed");
+
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(vec![0xA2; 64], &drops);
+            let (res, returned) = writer.write_all(tracked).await;
+            let err = res.expect_err("write_all to closed peer should fail");
+            assert_kernel_write_error(&err);
+            assert_eq!(drops.get(), 0, "write_all payload dropped before return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "write_all payload dropped exactly once");
+
+            let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+            reader
+                .shutdown(Shutdown::Read)
+                .expect("reader shutdown read failed");
+
+            let drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([vec![0xA3; 32], vec![0xA4; 32]], &drops);
+            let (res, returned) = writer.writev_read_only(chain).await;
+            let err = res.expect_err("writev to closed peer should fail");
+            assert_kernel_write_error(&err);
+            assert_eq!(drops.get(), 0, "writev chain dropped before return");
+            drop(returned);
+            assert_eq!(drops.get(), 2, "writev chain dropped exactly once");
+        })
+        .expect("executor run failed");
 }
 
 #[test]
@@ -747,6 +1055,100 @@ fn runtime_sleep_completes() {
 }
 
 #[test]
+fn runtime_sleep_repoll_registers_latest_waiter() {
+    run_cross_task_repoll(sleep(Duration::from_millis(5)));
+}
+
+#[test]
+fn runtime_sleep_zero_completes_without_timer_wake() {
+    let mut executor = new_executor();
+    let completed = Rc::new(Cell::new(false));
+    let completed_flag = completed.clone();
+
+    executor
+        .run(async move {
+            sleep(Duration::ZERO).await.expect("zero sleep failed");
+            completed_flag.set(true);
+        })
+        .expect("executor run failed");
+
+    assert!(completed.get(), "zero sleep did not complete");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.timer_expired, 0, "zero sleep armed the timer wheel");
+        assert_eq!(stats.waiter_wakes, 0, "zero sleep needed a timer wake");
+    }
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn runtime_signal_interrupt_does_not_abort_wait() {
+    let _signal_lock = SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _signal_guard = SignalHandlerGuard::install(libc::SIGUSR1);
+
+    let target_thread = unsafe { libc::pthread_self() };
+    let armed = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let sender_armed = Arc::clone(&armed);
+    let sender_done = Arc::clone(&done);
+    let sender_sent = Arc::clone(&sent);
+
+    let sender = std::thread::spawn(move || {
+        while !sender_armed.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        std::thread::sleep(Duration::from_millis(2));
+        while !sender_done.load(Ordering::Acquire) && sender_sent.load(Ordering::Relaxed) < 32 {
+            let rc = unsafe { libc::pthread_kill(target_thread, libc::SIGUSR1) };
+            assert_eq!(rc, 0, "pthread_kill failed");
+            sender_sent.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let mut executor = new_executor();
+    let observed = Rc::new(RefCell::new(None));
+    let observed_flag = Rc::clone(&observed);
+    let start = Instant::now();
+    let run_result = executor.run({
+        let armed = Arc::clone(&armed);
+        async move {
+            armed.store(true, Ordering::Release);
+            sleep(Duration::from_millis(40))
+                .await
+                .expect("sleep interrupted by signal");
+            *observed_flag.borrow_mut() = Some(start.elapsed());
+        }
+    });
+
+    done.store(true, Ordering::Release);
+    sender.join().expect("signal sender panicked");
+    run_result.expect("executor run should absorb signal interruptions");
+
+    assert!(
+        sent.load(Ordering::Relaxed) > 0,
+        "test did not deliver a signal"
+    );
+    let elapsed = observed
+        .borrow()
+        .expect("sleep did not record completion duration");
+    assert!(
+        elapsed >= Duration::from_millis(20),
+        "sleep completed implausibly early after signal: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "signal interruptions stretched sleep too far: {elapsed:?}"
+    );
+}
+
+#[test]
 fn runtime_sleep_ordering() {
     let mut executor = new_executor();
     let order = Rc::new(RefCell::new(Vec::new()));
@@ -876,6 +1278,46 @@ fn runtime_sleep_can_be_cancelled_by_drop() {
         .expect("executor run failed");
 
     assert!(completed.get(), "follow-up sleep did not complete");
+}
+
+#[test]
+fn runtime_sleep_drop_after_fire_before_poll_reclaims_timer() {
+    let mut executor = new_executor();
+    let completed = Rc::new(Cell::new(false));
+    let completed_flag = completed.clone();
+
+    executor
+        .run(async move {
+            let mut sleeper = Box::pin(sleep(Duration::from_millis(1)));
+            let first_poll =
+                std::future::poll_fn(|cx| Poll::Ready(Future::poll(sleeper.as_mut(), cx))).await;
+            assert!(
+                matches!(first_poll, Poll::Pending),
+                "sleep should arm before completing"
+            );
+
+            sleep(Duration::from_millis(20))
+                .await
+                .expect("driver sleep failed");
+            drop(sleeper);
+
+            sleep(Duration::from_millis(1))
+                .await
+                .expect("follow-up sleep failed");
+            completed_flag.set(true);
+        })
+        .expect("executor run failed");
+
+    assert!(
+        completed.get(),
+        "follow-up sleep did not complete after dropping fired sleep"
+    );
+
+    #[cfg(debug_assertions)]
+    assert!(
+        executor.last_stats().timer_expired >= 3,
+        "fired sleep was not observed by the timer wheel before drop"
+    );
 }
 
 #[test]

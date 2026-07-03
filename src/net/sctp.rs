@@ -172,15 +172,19 @@
 //! ```
 
 use super::{
-    checked_read_len, checked_send_len, close_fd, close_if_valid, current_local_addr,
+    MsgHdrInit, checked_read_len, checked_send_len, close_fd, close_if_valid, current_local_addr,
     set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    write_msghdr,
 };
 use crate::runtime::buffer::bytes::{
     BufferRangeError, read_i32_at, read_u16_at, read_u16_be_at, read_u32_at,
 };
 use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
-use crate::runtime::executor::{drop_op_ptr_unchecked, poll_ctx_from_waker, submit_retained_sqe};
+use crate::runtime::executor::{
+    PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
+    submit_retained_sqe,
+};
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Elapsed, Timeout, timeout};
@@ -237,7 +241,7 @@ impl SctpEventSubscribe {
             sctp_data_io_event: recv_rcvinfo as u8,
             sctp_association_event: mask.association as u8,
             sctp_address_event: mask.address as u8,
-            sctp_send_failure_event: mask.send_failure as u8,
+            sctp_send_failure_event: 0,
             sctp_peer_error_event: mask.peer_error as u8,
             sctp_shutdown_event: mask.shutdown as u8,
             sctp_partial_delivery_event: mask.partial_delivery as u8,
@@ -348,6 +352,11 @@ pub struct SctpRecvInfo {
     pub context: u32,
     /// Association ID.
     pub assoc_id: libc::sctp_assoc_t,
+    /// Whether the kernel reported this receive as the end of an SCTP record.
+    ///
+    /// FlowIO rejects non-empty partial records from `recv_msg` APIs with
+    /// `InvalidData`; successful data receives normally carry `true`.
+    pub end_of_record: bool,
 }
 
 /// Per-peer-address SCTP parameters used by `SCTP_PEER_ADDR_PARAMS`.
@@ -1116,6 +1125,54 @@ const fn align_sockopt_len(len: usize) -> usize {
 const SCTP_PADDR_PARAMS_RAW_OPT_LEN: usize =
     align_sockopt_len(std::mem::size_of::<SctpPaddrParamsRaw>());
 
+struct SctpPaddrParamsFields {
+    assoc_id: libc::sctp_assoc_t,
+    address: libc::sockaddr_storage,
+    heartbeat_interval_ms: u32,
+    path_max_retransmits: u16,
+    path_mtu: u32,
+    sack_delay_ms: u32,
+    flags: u32,
+    ipv6_flow_label: u32,
+    dscp: u8,
+}
+
+impl SctpPaddrParamsFields {
+    fn from_public(params: SctpPeerAddrParams) -> Self {
+        Self {
+            assoc_id: params.assoc_id,
+            address: option_socket_addr_to_storage(params.address),
+            heartbeat_interval_ms: params.heartbeat_interval_ms,
+            path_max_retransmits: params.path_max_retransmits,
+            path_mtu: params.path_mtu,
+            sack_delay_ms: params.sack_delay_ms,
+            flags: params.flags,
+            ipv6_flow_label: params.ipv6_flow_label,
+            dscp: params.dscp,
+        }
+    }
+
+    fn to_public(&self) -> io::Result<SctpPeerAddrParams> {
+        Ok(SctpPeerAddrParams {
+            assoc_id: self.assoc_id,
+            address: storage_to_option_socket_addr(self.address)?,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
+            path_max_retransmits: self.path_max_retransmits,
+            path_mtu: self.path_mtu,
+            sack_delay_ms: self.sack_delay_ms,
+            flags: self.flags,
+            ipv6_flow_label: self.ipv6_flow_label,
+            dscp: self.dscp,
+        })
+    }
+
+    fn requires_modern_sockopt(&self) -> bool {
+        self.ipv6_flow_label != 0
+            || self.dscp != 0
+            || (self.flags & (SPP_IPV6_FLOWLABEL | SPP_DSCP)) != 0
+    }
+}
+
 #[repr(C)]
 struct SctpAssocValueRaw {
     assoc_id: libc::sctp_assoc_t,
@@ -1220,24 +1277,24 @@ macro_rules! read_unaligned_field {
 }
 
 impl SctpPaddrParamsRaw {
-    fn from_public(params: SctpPeerAddrParams) -> Self {
+    fn from_fields(fields: SctpPaddrParamsFields) -> Self {
         Self {
-            assoc_id: params.assoc_id,
-            address: option_socket_addr_to_storage(params.address),
-            heartbeat_interval_ms: params.heartbeat_interval_ms,
-            path_max_retransmits: params.path_max_retransmits,
-            path_mtu: params.path_mtu,
-            sack_delay_ms: params.sack_delay_ms,
-            flags: params.flags,
-            ipv6_flow_label: params.ipv6_flow_label,
-            dscp: params.dscp,
+            assoc_id: fields.assoc_id,
+            address: fields.address,
+            heartbeat_interval_ms: fields.heartbeat_interval_ms,
+            path_max_retransmits: fields.path_max_retransmits,
+            path_mtu: fields.path_mtu,
+            sack_delay_ms: fields.sack_delay_ms,
+            flags: fields.flags,
+            ipv6_flow_label: fields.ipv6_flow_label,
+            dscp: fields.dscp,
         }
     }
 
-    fn to_public(&self) -> io::Result<SctpPeerAddrParams> {
-        Ok(SctpPeerAddrParams {
+    fn to_fields(&self) -> SctpPaddrParamsFields {
+        SctpPaddrParamsFields {
             assoc_id: read_unaligned_field!(self, assoc_id),
-            address: storage_to_option_socket_addr(read_unaligned_field!(self, address))?,
+            address: read_unaligned_field!(self, address),
             heartbeat_interval_ms: read_unaligned_field!(self, heartbeat_interval_ms),
             path_max_retransmits: read_unaligned_field!(self, path_max_retransmits),
             path_mtu: read_unaligned_field!(self, path_mtu),
@@ -1245,7 +1302,7 @@ impl SctpPaddrParamsRaw {
             flags: read_unaligned_field!(self, flags),
             ipv6_flow_label: read_unaligned_field!(self, ipv6_flow_label),
             dscp: read_unaligned_field!(self, dscp),
-        })
+        }
     }
 }
 
@@ -1353,22 +1410,22 @@ const SCTP_PADDR_PARAMS_LEGACY_OPT_LEN: usize =
     align_sockopt_len(std::mem::size_of::<SctpPaddrParamsRawLegacy>());
 
 impl SctpPaddrParamsRawLegacy {
-    fn from_public(params: SctpPeerAddrParams) -> Self {
+    fn from_fields(fields: SctpPaddrParamsFields) -> Self {
         Self {
-            assoc_id: params.assoc_id,
-            address: option_socket_addr_to_storage(params.address),
-            heartbeat_interval_ms: params.heartbeat_interval_ms,
-            path_max_retransmits: params.path_max_retransmits,
-            path_mtu: params.path_mtu,
-            sack_delay_ms: params.sack_delay_ms,
-            flags: params.flags,
+            assoc_id: fields.assoc_id,
+            address: fields.address,
+            heartbeat_interval_ms: fields.heartbeat_interval_ms,
+            path_max_retransmits: fields.path_max_retransmits,
+            path_mtu: fields.path_mtu,
+            sack_delay_ms: fields.sack_delay_ms,
+            flags: fields.flags,
         }
     }
 
-    fn to_public(&self) -> io::Result<SctpPeerAddrParams> {
-        Ok(SctpPeerAddrParams {
+    fn to_fields(&self) -> SctpPaddrParamsFields {
+        SctpPaddrParamsFields {
             assoc_id: read_unaligned_field!(self, assoc_id),
-            address: storage_to_option_socket_addr(read_unaligned_field!(self, address))?,
+            address: read_unaligned_field!(self, address),
             heartbeat_interval_ms: read_unaligned_field!(self, heartbeat_interval_ms),
             path_max_retransmits: read_unaligned_field!(self, path_max_retransmits),
             path_mtu: read_unaligned_field!(self, path_mtu),
@@ -1376,7 +1433,7 @@ impl SctpPaddrParamsRawLegacy {
             flags: read_unaligned_field!(self, flags),
             ipv6_flow_label: 0,
             dscp: 0,
-        })
+        }
     }
 }
 
@@ -1387,7 +1444,7 @@ fn decode_peer_addr_params_sockopt(
     if (std::mem::size_of::<SctpPaddrParamsRaw>()..=SCTP_PADDR_PARAMS_RAW_OPT_LEN).contains(&optlen)
     {
         let raw = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRaw) };
-        return raw.to_public();
+        return raw.to_fields().to_public();
     }
 
     if (std::mem::size_of::<SctpPaddrParamsRawLegacy>()..=SCTP_PADDR_PARAMS_LEGACY_OPT_LEN)
@@ -1395,7 +1452,7 @@ fn decode_peer_addr_params_sockopt(
     {
         let raw =
             unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRawLegacy) };
-        return raw.to_public();
+        return raw.to_fields().to_public();
     }
 
     Err(io::Error::new(
@@ -2392,10 +2449,12 @@ impl SctpStream {
     /// fast path.
     pub fn peer_addr_params(&self, address: Option<SocketAddr>) -> io::Result<SctpPeerAddrParams> {
         let mut buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
-        let request = SctpPaddrParamsRaw::from_public(SctpPeerAddrParams {
-            address,
-            ..SctpPeerAddrParams::association_default()
-        });
+        let request = SctpPaddrParamsRaw::from_fields(SctpPaddrParamsFields::from_public(
+            SctpPeerAddrParams {
+                address,
+                ..SctpPeerAddrParams::association_default()
+            },
+        ));
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &request as *const SctpPaddrParamsRaw as *const u8,
@@ -2577,6 +2636,13 @@ impl SctpStream {
     /// associations where ancillary metadata and notifications are disabled,
     /// prefer [`SctpStream::recv`].
     ///
+    /// # Errors
+    /// Returns `InvalidInput` if `len` exceeds `buffer.writable_len()`.
+    /// Returns `InvalidData` when the kernel reports a truncated receive or a
+    /// non-empty receive that has not reached SCTP end-of-record. Kernel
+    /// receive errors are returned as `io::Error` values from the completed
+    /// operation.
+    ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let mut input_error = None;
@@ -2641,8 +2707,8 @@ impl SctpStream {
     /// # Errors
     /// Returns `InvalidInput` if the chain has no writable segments. Returns
     /// `InvalidData` when a received SCTP message or notification is
-    /// truncated. Kernel receive errors are returned as `io::Error` values
-    /// from the completed operation.
+    /// truncated or not complete through SCTP end-of-record. Kernel receive
+    /// errors are returned as `io::Error` values from the completed operation.
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv_msg_vectored<const N: usize>(
@@ -2666,7 +2732,8 @@ impl SctpStream {
     /// Gather-send from a vectored buffer chain with SCTP metadata.
     ///
     /// The chain is consumed and returned alongside the result (rental
-    /// pattern).  The total number of bytes sent is returned in `Ok`.
+    /// pattern).  The total number of bytes sent is returned in `Ok`. Empty
+    /// chains complete with `Ok(0)` without submitting kernel I/O.
     /// Use this when both segmentation and explicit SCTP metadata matter. For
     /// a single contiguous data-only send, prefer [`SctpStream::send`].
     ///
@@ -2761,6 +2828,61 @@ struct RetainedSctpSendVectoredPayload<const N: usize> {
     msghdr: MaybeUninit<libc::msghdr>,
 }
 
+#[inline(always)]
+fn sctp_cqe_result(result: i32) -> io::Result<usize> {
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    Ok(result as usize)
+}
+
+#[inline(always)]
+unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
+    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+    *state_ptr = std::ptr::null_mut();
+}
+
+#[inline(always)]
+unsafe fn take_completed_sctp_payload<T: 'static>(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+) -> Option<(io::Result<usize>, T)> {
+    if (*state_ptr).is_null() {
+        return None;
+    }
+
+    let state = unsafe { &**state_ptr };
+    if !state.is_completed() {
+        return None;
+    }
+
+    let result = sctp_cqe_result(state.result);
+    let pctx = unsafe { poll_ctx_from_waker(cx) };
+    let payload = unsafe { (*pctx.reactor()).take_retained_payload::<T>(*state_ptr) };
+    unsafe { free_sctp_state(&pctx, state_ptr) };
+    Some((result, payload))
+}
+
+#[inline(always)]
+unsafe fn prepare_initial_sctp_state(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+) -> io::Result<PollCtx> {
+    debug_assert!(
+        (*state_ptr).is_null(),
+        "SCTP operation state already allocated"
+    );
+    let pctx = unsafe { poll_ctx_from_waker(cx) };
+    let new_state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+    if new_state_ptr.is_null() {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+
+    *state_ptr = new_state_ptr;
+    unsafe { (*new_state_ptr).register_waiter(pctx.owner_task()) };
+    Ok(pctx)
+}
+
 #[doc(hidden)]
 pub struct DataRecvFuture<'a, B: IoBuffReadWrite> {
     /// SCTP association socket descriptor used for this data-only receive.
@@ -2789,40 +2911,32 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedDataRecvPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let mut buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+        if let Some((result, payload)) = unsafe {
+            take_completed_sctp_payload::<RetainedDataRecvPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let mut buffer = payload.buffer;
+            match result {
+                Err(err) => return Poll::Ready((Err(err), buffer)),
+                Ok(actual) => {
+                    unsafe { buffer.set_written_len(actual) };
+                    return Poll::Ready((Ok(actual), buffer));
                 }
-
-                let actual = result as usize;
-                unsafe { buffer.set_written_len(actual) };
-                return Poll::Ready((Ok(actual), buffer));
             }
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            let state_ptr = this.state_ptr;
 
             let payload = RetainedDataRecvPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -2836,13 +2950,13 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
                             .user_data(state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    free_sctp_state(&pctx, &mut this.state_ptr);
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -2881,37 +2995,26 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedDataSendPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-                return Poll::Ready((Ok(result as usize), buffer));
-            }
+        if let Some((result, payload)) = unsafe {
+            take_completed_sctp_payload::<RetainedDataSendPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let buffer = payload.buffer;
+            return Poll::Ready((result, buffer));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            let state_ptr = this.state_ptr;
 
             let payload = RetainedDataSendPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -2925,13 +3028,13 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
                             .user_data(state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    free_sctp_state(&pctx, &mut this.state_ptr);
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -2970,64 +3073,53 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let mut payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedSctpRecvPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
+        if let Some((result, payload)) = unsafe {
+            take_completed_sctp_payload::<RetainedSctpRecvPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let mut payload = payload;
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), payload.buffer)),
+            };
 
-                if result < 0 {
-                    return Poll::Ready((
-                        Err(io::Error::from_raw_os_error(-result)),
-                        payload.buffer,
-                    ));
-                }
+            // Parse metadata before taking the buffer — notification parsing
+            // needs to read the received bytes via the stable pointer.
+            let msg = unsafe { payload.msghdr.assume_init_ref() };
+            let data_slice = unsafe {
+                let ptr = payload.buffer.as_mut_ptr();
+                std::slice::from_raw_parts(ptr, actual)
+            };
+            let meta = parse_recv_meta(
+                &payload.control[..],
+                msg.msg_controllen,
+                msg.msg_flags,
+                data_slice,
+            );
 
-                let actual = result as usize;
-
-                // Parse metadata before taking the buffer — notification parsing
-                // needs to read the received bytes via the stable pointer.
-                let msg = unsafe { payload.msghdr.assume_init_ref() };
-                let data_slice = unsafe {
-                    let ptr = payload.buffer.as_mut_ptr();
-                    std::slice::from_raw_parts(ptr, actual)
-                };
-                let meta = parse_recv_meta(
-                    &payload.control[..],
-                    msg.msg_controllen,
-                    msg.msg_flags,
-                    data_slice,
-                );
-
-                let mut buffer = payload.buffer;
-                unsafe {
-                    buffer.set_written_len(actual);
-                }
-
-                return match meta {
-                    Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
-                    Err(err) => Poll::Ready((Err(err), buffer)),
-                };
+            let mut buffer = payload.buffer;
+            unsafe {
+                buffer.set_written_len(actual);
             }
+
+            return match meta {
+                Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
+                Err(err) => Poll::Ready((Err(err), buffer)),
+            };
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            let state_ptr = this.state_ptr;
 
             let payload = RetainedSctpRecvPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -3045,15 +3137,17 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                             iov_base: ptr as *mut libc::c_void,
                             iov_len: this.len as usize,
                         });
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: payload.addr.as_mut_ptr() as *mut libc::c_void,
-                            msg_namelen: payload.addrlen,
-                            msg_iov: payload.iovec.as_mut_ptr(),
-                            msg_iovlen: 1,
-                            msg_control: payload.control.as_mut_ptr() as *mut libc::c_void,
-                            msg_controllen: payload.control.len(),
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: payload.addr.as_mut_ptr() as *mut libc::c_void,
+                                namelen: payload.addrlen,
+                                iov: payload.iovec.as_mut_ptr(),
+                                iovlen: 1,
+                                control: payload.control.as_mut_ptr() as *mut libc::c_void,
+                                controllen: payload.control.len(),
+                            },
+                        );
 
                         Ok(
                             opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
@@ -3062,13 +3156,13 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                         )
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    free_sctp_state(&pctx, &mut this.state_ptr);
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -3109,37 +3203,26 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
         }
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedSctpSendPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-                return Poll::Ready((Ok(result as usize), buffer));
-            }
+        if let Some((result, payload)) = unsafe {
+            take_completed_sctp_payload::<RetainedSctpSendPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let buffer = payload.buffer;
+            return Poll::Ready((result, buffer));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            let state_ptr = this.state_ptr;
 
             let payload = RetainedSctpSendPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -3155,15 +3238,17 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                             iov_base: ptr as *mut libc::c_void,
                             iov_len: this.len as usize,
                         });
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: std::ptr::null_mut(),
-                            msg_namelen: 0,
-                            msg_iov: payload.iovec.as_mut_ptr(),
-                            msg_iovlen: 1,
-                            msg_control: payload.control.as_mut_ptr() as *mut libc::c_void,
-                            msg_controllen: payload.control.len(),
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: std::ptr::null_mut(),
+                                namelen: 0,
+                                iov: payload.iovec.as_mut_ptr(),
+                                iovlen: 1,
+                                control: payload.control.as_mut_ptr() as *mut libc::c_void,
+                                controllen: payload.control.len(),
+                            },
+                        );
                         write_cmsg_sndinfo(&mut payload.control[..], this.sndinfo);
 
                         Ok(
@@ -3173,13 +3258,13 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                         )
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    free_sctp_state(&pctx, &mut this.state_ptr);
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -3216,52 +3301,45 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedSctpRecvVectoredPayload<N>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-                if result < 0 {
-                    return Poll::Ready((
-                        Err(io::Error::from_raw_os_error(-result)),
-                        payload.buffer,
-                    ));
-                }
+        if let Some((result, payload)) = unsafe {
+            take_completed_sctp_payload::<RetainedSctpRecvVectoredPayload<N>>(
+                cx,
+                &mut this.state_ptr,
+            )
+        } {
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), payload.buffer)),
+            };
+            let msg = unsafe { payload.msghdr.assume_init_ref() };
+            let data_slice = if this.iov_count == 0 {
+                &[]
+            } else {
+                let first_iov = unsafe { &*(payload.iovecs.as_ptr() as *const libc::iovec) };
+                let safe_len = std::cmp::min(actual, first_iov.iov_len);
+                unsafe { std::slice::from_raw_parts(first_iov.iov_base as *const u8, safe_len) }
+            };
 
-                let actual = result as usize;
-                let msg = unsafe { payload.msghdr.assume_init_ref() };
-                let data_slice = if this.iov_count == 0 {
-                    &[]
-                } else {
-                    let first_iov = unsafe { &*(payload.iovecs.as_ptr() as *const libc::iovec) };
-                    let safe_len = std::cmp::min(actual, first_iov.iov_len);
-                    unsafe { std::slice::from_raw_parts(first_iov.iov_base as *const u8, safe_len) }
-                };
+            let meta = parse_recv_meta(
+                &payload.control[..],
+                msg.msg_controllen,
+                msg.msg_flags,
+                data_slice,
+            );
 
-                let meta = parse_recv_meta(
-                    &payload.control[..],
-                    msg.msg_controllen,
-                    msg.msg_flags,
-                    data_slice,
-                );
-
-                let mut buffer = payload.buffer;
-                unsafe {
-                    buffer.distribute_written(actual);
-                }
-
-                return match meta {
-                    Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
-                    Err(err) => Poll::Ready((Err(err), buffer)),
-                };
+            let mut buffer = payload.buffer;
+            unsafe {
+                buffer.distribute_written(actual);
             }
+
+            return match meta {
+                Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
+                Err(err) => Poll::Ready((Err(err), buffer)),
+            };
         }
 
         if this.iov_count == 0 {
@@ -3270,15 +3348,14 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            let state_ptr = this.state_ptr;
 
             let empty_iovecs = unsafe { MaybeUninit::uninit().assume_init() };
             let iovecs = std::mem::replace(&mut this.iovecs, empty_iovecs);
@@ -3293,15 +3370,17 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: payload.addr.as_mut_ptr() as *mut libc::c_void,
-                            msg_namelen: payload.addrlen,
-                            msg_iov: payload.iovecs.as_mut_ptr() as *mut libc::iovec,
-                            msg_iovlen: this.iov_count,
-                            msg_control: payload.control.as_mut_ptr() as *mut libc::c_void,
-                            msg_controllen: payload.control.len(),
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: payload.addr.as_mut_ptr() as *mut libc::c_void,
+                                namelen: payload.addrlen,
+                                iov: payload.iovecs.as_mut_ptr() as *mut libc::iovec,
+                                iovlen: this.iov_count,
+                                control: payload.control.as_mut_ptr() as *mut libc::c_void,
+                                controllen: payload.control.len(),
+                            },
+                        );
 
                         Ok(
                             opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
@@ -3310,13 +3389,13 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                         )
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    free_sctp_state(&pctx, &mut this.state_ptr);
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -3355,24 +3434,18 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedSctpSendVectoredPayload<N>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
-                let buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-                return Poll::Ready((Ok(result as usize), buffer));
-            }
+        if let Some((result, payload)) = unsafe {
+            take_completed_sctp_payload::<RetainedSctpSendVectoredPayload<N>>(
+                cx,
+                &mut this.state_ptr,
+            )
+        } {
+            let buffer = payload.buffer;
+            return Poll::Ready((result, buffer));
         }
 
         if this.iov_count == 0 {
@@ -3381,15 +3454,14 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
+            let state_ptr = this.state_ptr;
 
             let empty_iovecs = unsafe { MaybeUninit::uninit().assume_init() };
             let iovecs = std::mem::replace(&mut this.iovecs, empty_iovecs);
@@ -3402,15 +3474,17 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        payload.msghdr.write(libc::msghdr {
-                            msg_name: std::ptr::null_mut(),
-                            msg_namelen: 0,
-                            msg_iov: payload.iovecs.as_mut_ptr() as *mut libc::iovec,
-                            msg_iovlen: this.iov_count,
-                            msg_control: payload.control.as_mut_ptr() as *mut libc::c_void,
-                            msg_controllen: payload.control.len(),
-                            msg_flags: 0,
-                        });
+                        write_msghdr(
+                            &mut payload.msghdr,
+                            MsgHdrInit {
+                                name: std::ptr::null_mut(),
+                                namelen: 0,
+                                iov: payload.iovecs.as_mut_ptr() as *mut libc::iovec,
+                                iovlen: this.iov_count,
+                                control: payload.control.as_mut_ptr() as *mut libc::c_void,
+                                controllen: payload.control.len(),
+                            },
+                        );
                         write_cmsg_sndinfo(&mut payload.control[..], this.sndinfo);
 
                         Ok(
@@ -3420,13 +3494,13 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
                         )
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    free_sctp_state(&pctx, &mut this.state_ptr);
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }
@@ -3532,6 +3606,7 @@ impl Future for AcceptFuture<'_> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.slot.state_ptr) };
         Poll::Pending
     }
 }
@@ -3628,6 +3703,7 @@ impl Future for ConnectFuture<'_> {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.slot.state_ptr) };
         Poll::Pending
     }
 }
@@ -3844,43 +3920,28 @@ fn set_sctp_sock_opt_bytes(fd: RawFd, name: libc::c_int, value: &[u8]) -> io::Re
     Ok(())
 }
 
-fn paddr_params_raw_bytes(raw: &SctpPaddrParamsRaw) -> [u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN] {
-    let mut buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
+fn paddr_params_bytes<T, const N: usize>(raw: &T) -> [u8; N] {
+    debug_assert!(std::mem::size_of::<T>() <= N);
+    let mut buffer = [0u8; N];
     unsafe {
         std::ptr::copy_nonoverlapping(
-            raw as *const SctpPaddrParamsRaw as *const u8,
+            raw as *const T as *const u8,
             buffer.as_mut_ptr(),
-            std::mem::size_of::<SctpPaddrParamsRaw>(),
-        );
-    }
-    buffer
-}
-
-fn paddr_params_legacy_bytes(
-    raw: &SctpPaddrParamsRawLegacy,
-) -> [u8; SCTP_PADDR_PARAMS_LEGACY_OPT_LEN] {
-    let mut buffer = [0u8; SCTP_PADDR_PARAMS_LEGACY_OPT_LEN];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            raw as *const SctpPaddrParamsRawLegacy as *const u8,
-            buffer.as_mut_ptr(),
-            std::mem::size_of::<SctpPaddrParamsRawLegacy>(),
+            std::mem::size_of::<T>(),
         );
     }
     buffer
 }
 
 fn apply_peer_addr_params_raw(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()> {
-    if params.ipv6_flow_label != 0
-        || params.dscp != 0
-        || (params.flags & (SPP_IPV6_FLOWLABEL | SPP_DSCP)) != 0
-    {
-        let raw = SctpPaddrParamsRaw::from_public(params);
-        let bytes = paddr_params_raw_bytes(&raw);
+    let fields = SctpPaddrParamsFields::from_public(params);
+    if fields.requires_modern_sockopt() {
+        let raw = SctpPaddrParamsRaw::from_fields(fields);
+        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
         set_sctp_sock_opt_bytes(fd, libc::SCTP_PEER_ADDR_PARAMS, &bytes)
     } else {
-        let raw = SctpPaddrParamsRawLegacy::from_public(params);
-        let bytes = paddr_params_legacy_bytes(&raw);
+        let raw = SctpPaddrParamsRawLegacy::from_fields(fields);
+        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN>(&raw);
         set_sctp_sock_opt_bytes(fd, libc::SCTP_PEER_ADDR_PARAMS, &bytes)
     }
 }
@@ -3919,6 +3980,37 @@ struct SctpGetAddrsHeader {
     addr_num: u32,
 }
 
+const MAX_SCTP_ASSOC_ADDRS: usize = 1024;
+
+fn checked_assoc_addr_count(addr_count: usize) -> io::Result<usize> {
+    if addr_count > MAX_SCTP_ASSOC_ADDRS {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(addr_count)
+}
+
+fn assoc_addrs_buffer_len(
+    capacity: usize,
+    header_len: usize,
+    storage_len: usize,
+) -> io::Result<usize> {
+    if capacity > MAX_SCTP_ASSOC_ADDRS {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+
+    let storage_bytes = capacity
+        .checked_mul(storage_len)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    let total_len = header_len
+        .checked_add(storage_bytes)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    if total_len > libc::socklen_t::MAX as usize {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+
+    Ok(total_len)
+}
+
 fn get_assoc_addrs(
     fd: RawFd,
     optname: libc::c_int,
@@ -3930,7 +4022,7 @@ fn get_assoc_addrs(
     loop {
         let header_len = std::mem::size_of::<SctpGetAddrsHeader>();
         let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
-        let total_len = header_len + capacity * storage_len;
+        let total_len = assoc_addrs_buffer_len(capacity, header_len, storage_len)?;
         let mut buffer = vec![0u8; total_len];
 
         let header = SctpGetAddrsHeader {
@@ -3961,7 +4053,7 @@ fn get_assoc_addrs(
 
         let header =
             unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpGetAddrsHeader) };
-        let addr_count = header.addr_num as usize;
+        let addr_count = checked_assoc_addr_count(header.addr_num as usize)?;
         if addr_count > capacity {
             capacity = addr_count;
             continue;
@@ -4023,7 +4115,7 @@ pub(crate) fn parse_assoc_addrs(
     storage_len: usize,
 ) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(addr_count);
-    if parse_assoc_addrs_inner(payload, addr_count, storage_len, &mut addrs) {
+    if parse_assoc_addrs_iter(payload, addr_count, storage_len, &mut addrs) {
         return Ok(addrs);
     }
 
@@ -4034,40 +4126,122 @@ fn byte_range_invalid_data(err: BufferRangeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
 }
 
-fn parse_assoc_addrs_inner(
+#[derive(Clone, Copy)]
+struct AssocAddrParseFrame {
+    offset: usize,
+    remaining: usize,
+    next_candidate: usize,
+}
+
+fn pop_assoc_addr_parse_frame(
+    frames: &mut Vec<AssocAddrParseFrame>,
+    addrs: &mut Vec<SocketAddr>,
+    failed_states: &mut Vec<(usize, usize)>,
+) -> bool {
+    if let Some(frame) = frames.pop()
+        && !assoc_addr_parse_state_failed(failed_states, frame.offset, frame.remaining)
+    {
+        failed_states.push((frame.offset, frame.remaining));
+    }
+    if frames.len() <= addrs.len() {
+        let _ = addrs.pop();
+    }
+    !frames.is_empty()
+}
+
+fn assoc_addr_parse_state_failed(
+    failed_states: &[(usize, usize)],
+    offset: usize,
+    remaining: usize,
+) -> bool {
+    failed_states
+        .iter()
+        .any(|&(failed_offset, failed_remaining)| {
+            failed_offset == offset && failed_remaining == remaining
+        })
+}
+
+fn assoc_addr_remaining_min_len(remaining: usize) -> usize {
+    const MIN_ASSOC_ADDR_ENTRY_LEN: usize = 8;
+
+    remaining.saturating_mul(MIN_ASSOC_ADDR_ENTRY_LEN)
+}
+
+fn parse_assoc_addrs_iter(
     payload: &[u8],
     remaining: usize,
     storage_len: usize,
     addrs: &mut Vec<SocketAddr>,
 ) -> bool {
-    if remaining == 0 {
-        return payload.is_empty();
-    }
+    let mut frames = Vec::with_capacity(remaining.saturating_add(1));
+    let mut failed_states = Vec::with_capacity(remaining.saturating_add(1));
+    frames.push(AssocAddrParseFrame {
+        offset: 0,
+        remaining,
+        next_candidate: 0,
+    });
 
-    if payload.len() < std::mem::size_of::<libc::sa_family_t>() {
-        return false;
-    }
-
-    let Ok(family) = read_u16_at(payload, 0) else {
-        return false;
-    };
-    let family = family as libc::sa_family_t as libc::c_int;
-    for candidate in assoc_addr_candidates(family, storage_len) {
-        if payload.len() < candidate.entry_len {
+    while !frames.is_empty() {
+        let frame_index = frames.len() - 1;
+        let frame = frames[frame_index];
+        if frame.remaining == 0 {
+            if frame.offset == payload.len() {
+                return true;
+            }
+            if !pop_assoc_addr_parse_frame(&mut frames, addrs, &mut failed_states) {
+                return false;
+            }
             continue;
         }
 
-        if let Ok(addr) = parse_assoc_addr_entry(&payload[..candidate.addr_len], family) {
-            addrs.push(addr);
-            if parse_assoc_addrs_inner(
-                &payload[candidate.entry_len..],
-                remaining - 1,
-                storage_len,
-                addrs,
-            ) {
-                return true;
+        let current = &payload[frame.offset..];
+        if current.len() < std::mem::size_of::<libc::sa_family_t>() {
+            if !pop_assoc_addr_parse_frame(&mut frames, addrs, &mut failed_states) {
+                return false;
             }
-            let _ = addrs.pop();
+            continue;
+        }
+
+        let Ok(family) = read_u16_at(current, 0) else {
+            if !pop_assoc_addr_parse_frame(&mut frames, addrs, &mut failed_states) {
+                return false;
+            }
+            continue;
+        };
+        let family = family as libc::sa_family_t as libc::c_int;
+        let candidates = assoc_addr_candidates(family, storage_len);
+        let mut advanced = false;
+
+        while frames[frame_index].next_candidate < candidates.len() {
+            let candidate = candidates[frames[frame_index].next_candidate];
+            frames[frame_index].next_candidate += 1;
+            if current.len() < candidate.entry_len {
+                continue;
+            }
+            let next_offset = frame.offset + candidate.entry_len;
+            let next_remaining = frame.remaining - 1;
+            if payload.len() - next_offset < assoc_addr_remaining_min_len(next_remaining) {
+                continue;
+            }
+            if assoc_addr_parse_state_failed(&failed_states, next_offset, next_remaining) {
+                continue;
+            }
+
+            let Ok(addr) = parse_assoc_addr_entry(&current[..candidate.addr_len], family) else {
+                continue;
+            };
+            addrs.push(addr);
+            frames.push(AssocAddrParseFrame {
+                offset: next_offset,
+                remaining: next_remaining,
+                next_candidate: 0,
+            });
+            advanced = true;
+            break;
+        }
+
+        if !advanced && !pop_assoc_addr_parse_frame(&mut frames, addrs, &mut failed_states) {
+            return false;
         }
     }
 
@@ -4210,7 +4384,11 @@ fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
     }
 }
 
-fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo> {
+fn parse_rcvinfo(
+    control: &[u8],
+    controllen: usize,
+    end_of_record: bool,
+) -> io::Result<SctpRecvInfo> {
     let hdr_len = std::mem::size_of::<libc::cmsghdr>();
     let available = controllen.min(control.len());
     if available < hdr_len {
@@ -4244,6 +4422,7 @@ fn parse_rcvinfo(control: &[u8], controllen: usize) -> io::Result<SctpRecvInfo> 
         cumtsn: info.rcv_cumtsn,
         context: info.rcv_context,
         assoc_id: info.rcv_assoc_id,
+        end_of_record,
     })
 }
 
@@ -4260,11 +4439,19 @@ pub(crate) fn parse_recv_meta(
         ));
     }
 
+    let end_of_record = (msg_flags & libc::MSG_EOR) != 0;
+    if !end_of_record && !data_slice.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP recvmsg payload was partial before end-of-record",
+        ));
+    }
+
     if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
         return parse_notification(data_slice);
     }
 
-    match parse_rcvinfo(control, controllen) {
+    match parse_rcvinfo(control, controllen, end_of_record) {
         Ok(info) => {
             // The subscribed SCTP_RCVINFO cmsg was intact. Linux may still set
             // MSG_CTRUNC for extra control records beyond the single metadata
@@ -4639,4 +4826,283 @@ pub const fn test_stream_change_event_type() -> libc::c_int {
 #[doc(hidden)]
 pub const fn test_send_failed_event_type() -> libc::c_int {
     local_sctp_send_failed_event()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sctp_cqe_result_maps_error_zero_and_progress() {
+        let err = sctp_cqe_result(-libc::EPIPE).expect_err("negative CQE should map to errno");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+        assert_eq!(sctp_cqe_result(0).expect("zero CQE should succeed"), 0);
+        assert_eq!(sctp_cqe_result(9).expect("positive CQE should succeed"), 9);
+    }
+
+    fn write_u16_ne(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn write_u16_be(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_u32_ne(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn assoc_ipv4_entry(ip: [u8; 4], port: u16, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        write_u16_ne(&mut bytes, 0, libc::AF_INET as u16);
+        write_u16_be(&mut bytes, 2, port);
+        bytes[4..8].copy_from_slice(&ip);
+        bytes
+    }
+
+    fn assoc_ipv6_entry(
+        ip: [u8; 16],
+        port: u16,
+        flowinfo: u32,
+        scope_id: u32,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        write_u16_ne(&mut bytes, 0, libc::AF_INET6 as u16);
+        write_u16_be(&mut bytes, 2, port);
+        write_u32_ne(&mut bytes, 4, flowinfo);
+        bytes[8..24].copy_from_slice(&ip);
+        write_u32_ne(&mut bytes, 24, scope_id);
+        bytes
+    }
+
+    #[test]
+    fn assoc_addrs_buffer_len_accepts_bounded_capacity() {
+        let header_len = std::mem::size_of::<SctpGetAddrsHeader>();
+        let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
+        assert_eq!(
+            assoc_addrs_buffer_len(8, header_len, storage_len).expect("bounded len failed"),
+            header_len + 8 * storage_len
+        );
+    }
+
+    #[test]
+    fn assoc_addr_count_rejects_kernel_over_cap() {
+        let err = checked_assoc_addr_count(MAX_SCTP_ASSOC_ADDRS + 1)
+            .expect_err("over-cap addr count should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn assoc_addrs_buffer_len_rejects_over_cap_and_overflow() {
+        let over_cap = assoc_addrs_buffer_len(
+            MAX_SCTP_ASSOC_ADDRS + 1,
+            std::mem::size_of::<SctpGetAddrsHeader>(),
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        )
+        .expect_err("over-cap buffer should fail");
+        assert_eq!(over_cap.kind(), io::ErrorKind::InvalidData);
+
+        let overflow = assoc_addrs_buffer_len(
+            MAX_SCTP_ASSOC_ADDRS,
+            1,
+            usize::MAX / MAX_SCTP_ASSOC_ADDRS + 1,
+        )
+        .expect_err("overflowing buffer should fail");
+        assert_eq!(overflow.kind(), io::ErrorKind::InvalidData);
+
+        let over_socklen = assoc_addrs_buffer_len(1, libc::socklen_t::MAX as usize, 1)
+            .expect_err("socklen_t overflow should fail");
+        assert_eq!(over_socklen.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn notification_mask_enables_modern_send_failure_event_only() {
+        let subscribed = SctpEventSubscribe::from_mask(SctpNotificationMask::all(), true);
+        assert_eq!(subscribed.sctp_data_io_event, 1);
+        assert_eq!(subscribed.sctp_send_failure_event, 0);
+        assert_eq!(subscribed.sctp_send_failure_event_event, 1);
+
+        let unsubscribed = SctpEventSubscribe::from_mask(SctpNotificationMask::none(), false);
+        assert_eq!(unsubscribed.sctp_data_io_event, 0);
+        assert_eq!(unsubscribed.sctp_send_failure_event, 0);
+        assert_eq!(unsubscribed.sctp_send_failure_event_event, 0);
+    }
+
+    #[test]
+    fn paddr_params_modern_sockopt_round_trips_extended_fields() {
+        let params = SctpPeerAddrParams {
+            assoc_id: 17,
+            heartbeat_interval_ms: 30_000,
+            path_max_retransmits: 4,
+            path_mtu: 1400,
+            sack_delay_ms: 200,
+            flags: SctpPeerAddrParams::HEARTBEAT_ENABLE
+                | SctpPeerAddrParams::IPV6_FLOWLABEL
+                | SctpPeerAddrParams::DSCP,
+            ipv6_flow_label: 0xabcde,
+            dscp: 46,
+            ..SctpPeerAddrParams::for_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)))
+        };
+        let fields = SctpPaddrParamsFields::from_public(params);
+        assert!(fields.requires_modern_sockopt());
+
+        let raw = SctpPaddrParamsRaw::from_fields(fields);
+        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
+        let decoded = decode_peer_addr_params_sockopt(&bytes, SCTP_PADDR_PARAMS_RAW_OPT_LEN)
+            .expect("modern paddr params should decode");
+
+        assert_eq!(decoded, params);
+    }
+
+    #[test]
+    fn paddr_params_legacy_sockopt_round_trips_common_fields() {
+        let params = SctpPeerAddrParams {
+            assoc_id: 23,
+            heartbeat_interval_ms: 15_000,
+            path_max_retransmits: 3,
+            path_mtu: 1200,
+            sack_delay_ms: 120,
+            flags: SctpPeerAddrParams::HEARTBEAT_ENABLE | SctpPeerAddrParams::PMTUD_ENABLE,
+            ..SctpPeerAddrParams::for_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 3869)))
+        };
+        let fields = SctpPaddrParamsFields::from_public(params);
+        assert!(!fields.requires_modern_sockopt());
+
+        let raw = SctpPaddrParamsRawLegacy::from_fields(fields);
+        let legacy_bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN>(&raw);
+        let mut bytes = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
+        bytes[..legacy_bytes.len()].copy_from_slice(&legacy_bytes);
+        let decoded = decode_peer_addr_params_sockopt(&bytes, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN)
+            .expect("legacy paddr params should decode");
+
+        assert_eq!(decoded, params);
+        assert_eq!(decoded.ipv6_flow_label, 0);
+        assert_eq!(decoded.dscp, 0);
+    }
+
+    #[test]
+    fn paddr_params_extended_fields_force_modern_sockopt() {
+        let common = SctpPeerAddrParams {
+            flags: SctpPeerAddrParams::HEARTBEAT_ENABLE,
+            ..SctpPeerAddrParams::association_default()
+        };
+        assert!(!SctpPaddrParamsFields::from_public(common).requires_modern_sockopt());
+
+        let by_flow_label = SctpPeerAddrParams {
+            ipv6_flow_label: 1,
+            ..common
+        };
+        assert!(SctpPaddrParamsFields::from_public(by_flow_label).requires_modern_sockopt());
+
+        let by_dscp = SctpPeerAddrParams { dscp: 1, ..common };
+        assert!(SctpPaddrParamsFields::from_public(by_dscp).requires_modern_sockopt());
+
+        let by_flow_flag = SctpPeerAddrParams {
+            flags: SctpPeerAddrParams::IPV6_FLOWLABEL,
+            ..common
+        };
+        assert!(SctpPaddrParamsFields::from_public(by_flow_flag).requires_modern_sockopt());
+
+        let by_dscp_flag = SctpPeerAddrParams {
+            flags: SctpPeerAddrParams::DSCP,
+            ..common
+        };
+        assert!(SctpPaddrParamsFields::from_public(by_dscp_flag).requires_modern_sockopt());
+    }
+
+    #[test]
+    fn parse_assoc_addrs_accepts_empty_zero_count_payload() {
+        let parsed = parse_assoc_addrs(&[], 0, std::mem::size_of::<libc::sockaddr_storage>())
+            .expect("zero-count parse should succeed");
+
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_assoc_addrs_backtracks_from_dense_to_compact_ipv4() {
+        let compact_len = 8;
+        let dense_len = std::mem::size_of::<libc::sockaddr_in>();
+        let mut payload = assoc_ipv4_entry([1, 2, 3, 4], 1111, compact_len);
+        payload.extend_from_slice(&assoc_ipv4_entry([5, 6, 7, 8], 2222, dense_len));
+
+        let parsed = parse_assoc_addrs(&payload, 2, dense_len).expect("IPv4 parse failed");
+
+        assert_eq!(
+            parsed,
+            vec![
+                SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 1111)),
+                SocketAddr::from((Ipv4Addr::new(5, 6, 7, 8), 2222)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_assoc_addrs_accepts_storage_padded_ipv4_and_ipv6() {
+        let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
+        let ipv6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut payload = assoc_ipv4_entry([192, 0, 2, 10], 1234, storage_len);
+        payload.extend_from_slice(&assoc_ipv6_entry(ipv6, 4321, 7, 9, storage_len));
+
+        let parsed =
+            parse_assoc_addrs(&payload, 2, storage_len).expect("padded address parse failed");
+
+        assert_eq!(
+            parsed,
+            vec![
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 1234)),
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ipv6), 4321, 7, 9)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_assoc_addrs_rejects_count_payload_mismatch() {
+        let payload = assoc_ipv4_entry([10, 0, 0, 1], 80, 8);
+
+        let missing_second = parse_assoc_addrs(&payload, 2, 8)
+            .expect_err("short payload for declared count should fail");
+        assert_eq!(missing_second.kind(), io::ErrorKind::InvalidData);
+
+        let extra_payload = parse_assoc_addrs(&payload, 0, 8)
+            .expect_err("non-empty payload with zero count should fail");
+        assert_eq!(extra_payload.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_assoc_addrs_rejects_unsupported_family_and_truncation() {
+        let mut unsupported = vec![0u8; 8];
+        write_u16_ne(&mut unsupported, 0, libc::AF_UNIX as u16);
+        let err =
+            parse_assoc_addrs(&unsupported, 1, 8).expect_err("unsupported family should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let truncated = parse_assoc_addrs(&[0], 1, 8).expect_err("truncated family should fail");
+        assert_eq!(truncated.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_assoc_addrs_handles_max_count_without_recursion() {
+        let mut payload = Vec::with_capacity(MAX_SCTP_ASSOC_ADDRS * 8);
+        for index in 0..MAX_SCTP_ASSOC_ADDRS {
+            payload.extend_from_slice(&assoc_ipv4_entry(
+                [10, 0, (index / 256) as u8, index as u8],
+                1000 + (index % 1000) as u16,
+                8,
+            ));
+        }
+
+        let parsed =
+            parse_assoc_addrs(&payload, MAX_SCTP_ASSOC_ADDRS, 8).expect("max-count parse failed");
+
+        assert_eq!(parsed.len(), MAX_SCTP_ASSOC_ADDRS);
+        assert_eq!(
+            parsed[0],
+            SocketAddr::from((Ipv4Addr::new(10, 0, 0, 0), 1000))
+        );
+        assert_eq!(
+            parsed[MAX_SCTP_ASSOC_ADDRS - 1],
+            SocketAddr::from((Ipv4Addr::new(10, 0, 3, 255), 1023))
+        );
+    }
 }

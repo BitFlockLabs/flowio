@@ -28,7 +28,8 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-use crate::runtime::reactor::{Reactor, ReactorConfig};
+use crate::runtime::op::CompletionState;
+use crate::runtime::reactor::{Reactor, ReactorConfig, ReactorSubmitStatus};
 use crate::runtime::task::{
     Task, TaskHeader, TaskVTable, cached_waker_ref, init_cached_waker, release_task,
 };
@@ -327,6 +328,23 @@ thread_local! {
     static EXECUTOR_CTX: Cell<*mut ThreadCtx> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+struct ExecutorCtxGuard;
+
+impl ExecutorCtxGuard {
+    #[inline(always)]
+    fn set(ctx_ptr: *mut ThreadCtx) -> Self {
+        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(ctx_ptr));
+        Self
+    }
+}
+
+impl Drop for ExecutorCtxGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
+    }
+}
+
 /// Thin handle to the executor's thread-local context, extracted from the
 /// waker without any TLS reads.  Stores a single pointer (8 bytes) instead
 /// of copying individual fields.
@@ -371,6 +389,24 @@ pub(crate) unsafe fn poll_ctx_from_waker(cx: &std::task::Context) -> PollCtx {
     PollCtx {
         ctx: raw_ctx as *const ThreadCtx,
     }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub(crate) unsafe fn refresh_op_waiter_from_waker(
+    cx: &std::task::Context<'_>,
+    state_ptr: *mut CompletionState,
+) {
+    debug_assert!(
+        !state_ptr.is_null(),
+        "cannot refresh waiter for a missing completion state"
+    );
+    if state_ptr.is_null() {
+        return;
+    }
+
+    let pctx = unsafe { poll_ctx_from_waker(cx) };
+    unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 }
 
 // Compile-time check: `Waker` must stay as two pointers (vtable + data) for
@@ -534,7 +570,12 @@ impl<T: 'static> Future for JoinHandle<T> {
         }
 
         let waker_slot = unsafe { &mut *this.waker_ptr };
-        *waker_slot = Some(cx.waker().clone());
+        if !waker_slot
+            .as_ref()
+            .is_some_and(|stored| stored.will_wake(cx.waker()))
+        {
+            *waker_slot = Some(cx.waker().clone());
+        }
         Poll::Pending
     }
 }
@@ -593,6 +634,10 @@ impl Executor {
     /// executor per runtime thread and keep it alive rather than recreating it
     /// in the steady-state fast path.
     ///
+    /// # Errors
+    /// Returns `Unsupported` when the running Linux kernel does not provide
+    /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
+    ///
     /// # Example
     /// ```no_run
     /// use flowio::runtime::executor::Executor;
@@ -609,6 +654,10 @@ impl Executor {
     ///
     /// This is also a setup/control-plane API rather than a per-operation
     /// fast-path primitive.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` when the running Linux kernel does not provide
+    /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
     ///
     /// # Example
     /// ```no_run
@@ -778,7 +827,10 @@ impl Executor {
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] if live runtime work remains but
     /// there are no ready tasks, in-flight I/O operations, or timers that can
-    /// make progress. Reactor and timer I/O errors are propagated.
+    /// make progress. Reactor and timer I/O errors are propagated. Signal
+    /// interruptions of the `io_uring` wait are retried internally; use a
+    /// runtime-visible fd such as `signalfd` or `eventfd` for signal-driven
+    /// shutdown instead of relying on `EINTR`.
     ///
     /// # Example
     /// ```no_run
@@ -806,17 +858,16 @@ impl Executor {
             owner_task: std::ptr::null_mut(),
         };
         let ctx_ptr = &mut thread_ctx as *mut ThreadCtx;
-        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(ctx_ptr));
+        let _ctx_guard = ExecutorCtxGuard::set(ctx_ptr);
 
         match Self::spawn(initial_task) {
             Ok(_handle) => { /* drop JoinHandle — root task is detached */ }
             Err(err) => {
-                EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
                 return Err(err);
             }
         }
 
-        loop {
+        'run_loop: loop {
             self.timers.begin_executor_pass();
             let mut polled = 0usize;
             while polled < self.process_quota {
@@ -873,7 +924,20 @@ impl Executor {
                 polled += 1;
             }
 
-            self.reactor.flush_sqes()?;
+            if self.reactor.flush_sqes()? == ReactorSubmitStatus::Busy {
+                let _ = self.reactor.poll_io(
+                    self.process_quota,
+                    &mut runtime_state as *mut RuntimeState,
+                    &mut *self.ready_queue as *mut DList<TaskHeader>,
+                )?;
+                if self.timers.has_pending() {
+                    let now_tick = self.timers.now_tick()?;
+                    let _ = self
+                        .timers
+                        .process_at_with_budget(now_tick, self.process_quota)?;
+                }
+                continue;
+            }
             let completed = self.reactor.poll_io(
                 self.process_quota,
                 &mut runtime_state as *mut RuntimeState,
@@ -900,7 +964,6 @@ impl Executor {
                 {
                     self.snapshot_stats(&mut runtime_state);
                 }
-                EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
                 return Ok(());
             }
 
@@ -918,7 +981,6 @@ impl Executor {
                 {
                     self.snapshot_stats(&mut runtime_state);
                 }
-                EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
                 return Err(io::Error::from(ErrorKind::WouldBlock));
             }
 
@@ -934,7 +996,20 @@ impl Executor {
                 continue;
             }
 
-            self.reactor.wait_for_events(timer_wait)?;
+            if self.reactor.wait_for_events(timer_wait)? == ReactorSubmitStatus::Busy {
+                let _ = self.reactor.poll_io(
+                    self.process_quota,
+                    &mut runtime_state as *mut RuntimeState,
+                    &mut *self.ready_queue as *mut DList<TaskHeader>,
+                )?;
+                if self.timers.has_pending() {
+                    let now_tick = self.timers.now_tick()?;
+                    let _ = self
+                        .timers
+                        .process_at_with_budget(now_tick, self.process_quota)?;
+                }
+                continue 'run_loop;
+            }
             let _ = self.reactor.poll_io(
                 self.process_quota,
                 &mut runtime_state as *mut RuntimeState,
@@ -1015,6 +1090,8 @@ impl Drop for Executor {
             unsafe {
                 self.ready_queue.unlink_all_for_drop();
                 ManuallyDrop::drop(&mut self.ready_queue);
+                #[cfg(debug_assertions)]
+                self.task_pool.abandon_live_slots_for_drop();
                 ManuallyDrop::drop(&mut self.task_pool);
             }
         }
@@ -1095,6 +1172,11 @@ pub(crate) unsafe fn submit_tracked_sqe(
     pctx: &PollCtx,
     sqe: io_uring::squeue::Entry,
 ) -> io::Result<()> {
+    #[cfg(debug_assertions)]
+    if let Some(err) = crate::runtime::test_hooks::take_sqe_submit_failure() {
+        return Err(err);
+    }
+
     unsafe { (*pctx.reactor()).submit_sqe(sqe)? };
     unsafe {
         (*pctx.runtime_state()).inflight_ops += 1;
@@ -1409,6 +1491,24 @@ unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
     });
 }
 
+const TASK_READY_BLOCKING_FLAGS: u64 =
+    TaskHeader::FLAG_COMPLETED | TaskHeader::FLAG_RUNNING | TaskHeader::FLAG_QUEUED;
+
+#[inline(always)]
+fn task_is_notified(flags: u64) -> bool {
+    (flags & TaskHeader::FLAG_NOTIFIED) != 0
+}
+
+#[inline(always)]
+fn task_is_completed(flags: u64) -> bool {
+    (flags & TaskHeader::FLAG_COMPLETED) != 0
+}
+
+#[inline(always)]
+fn task_can_enter_ready_queue(flags: u64) -> bool {
+    (flags & TASK_READY_BLOCKING_FLAGS) == 0
+}
+
 #[inline(always)]
 pub(crate) unsafe fn notify_task_into_list_unchecked(
     task_ptr: *mut TaskHeader,
@@ -1417,17 +1517,16 @@ pub(crate) unsafe fn notify_task_into_list_unchecked(
 ) -> bool {
     let header = unsafe { &mut *task_ptr };
     let flags = header.flags();
-    if (flags & TaskHeader::FLAG_COMPLETED) != 0 {
+    if task_is_completed(flags) {
         return false;
     }
 
-    if (flags & TaskHeader::FLAG_NOTIFIED) != 0 {
+    if task_is_notified(flags) {
         return false;
     }
-
     header.set_flag(TaskHeader::FLAG_NOTIFIED);
 
-    if (flags & (TaskHeader::FLAG_RUNNING | TaskHeader::FLAG_QUEUED)) == 0 {
+    if task_can_enter_ready_queue(flags) {
         return unsafe { enqueue_ready_task_unchecked(task_ptr, ready_list, runtime_state) };
     }
 
@@ -1442,13 +1541,10 @@ unsafe fn enqueue_notified_task_unchecked(
 ) -> bool {
     let header = unsafe { &mut *task_ptr };
     let flags = header.flags();
-    if (flags & TaskHeader::FLAG_COMPLETED) != 0 {
+    if !task_is_notified(flags) {
         return false;
     }
-    if (flags & TaskHeader::FLAG_NOTIFIED) == 0 {
-        return false;
-    }
-    if (flags & (TaskHeader::FLAG_RUNNING | TaskHeader::FLAG_QUEUED)) != 0 {
+    if !task_can_enter_ready_queue(flags) {
         return false;
     }
 
@@ -1465,6 +1561,10 @@ unsafe fn enqueue_ready_task_unchecked(
     debug_assert!(
         header.ready_link.is_unlinked(),
         "enqueue_ready_task attempted to enqueue an already-linked task"
+    );
+    debug_assert!(
+        task_can_enter_ready_queue(header.flags()),
+        "enqueue_ready_task attempted to enqueue a completed, running, or already queued task"
     );
     header.set_flag(TaskHeader::FLAG_QUEUED);
     #[cfg(debug_assertions)]
@@ -1499,7 +1599,52 @@ pub unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::mem::ManuallyDrop;
     use std::rc::Rc;
+    use std::task::{RawWaker, RawWakerVTable};
+
+    #[derive(Default)]
+    struct CountedWakerStats {
+        clones: Cell<usize>,
+        drops: Cell<usize>,
+        wakes: Cell<usize>,
+    }
+
+    unsafe fn counted_waker_clone(data: *const ()) -> RawWaker {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.clones.set(stats.clones.get() + 1);
+        let cloned = Rc::clone(&stats);
+        let _ = Rc::into_raw(stats);
+        RawWaker::new(Rc::into_raw(cloned).cast(), &COUNTED_WAKER_VTABLE)
+    }
+
+    unsafe fn counted_waker_wake(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.wakes.set(stats.wakes.get() + 1);
+    }
+
+    unsafe fn counted_waker_wake_by_ref(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.wakes.set(stats.wakes.get() + 1);
+        let _ = Rc::into_raw(stats);
+    }
+
+    unsafe fn counted_waker_drop(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.drops.set(stats.drops.get() + 1);
+    }
+
+    static COUNTED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        counted_waker_clone,
+        counted_waker_wake,
+        counted_waker_wake_by_ref,
+        counted_waker_drop,
+    );
+
+    fn counted_waker(stats: &Rc<CountedWakerStats>) -> Waker {
+        let data = Rc::into_raw(Rc::clone(stats)).cast();
+        unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
+    }
 
     struct GateFuture {
         id: usize,
@@ -1544,11 +1689,196 @@ mod tests {
         }
     }
 
+    #[test]
+    fn join_handle_pending_poll_reuses_same_waker() {
+        let mut result = None::<usize>;
+        let mut waker_slot = None::<Waker>;
+        let mut handle = ManuallyDrop::new(JoinHandle {
+            task_ptr: std::ptr::null_mut(),
+            result_ptr: &mut result,
+            waker_ptr: &mut waker_slot,
+        });
+
+        let first_stats = Rc::new(CountedWakerStats::default());
+        let first_waker = counted_waker(&first_stats);
+        let mut first_cx = Context::from_waker(&first_waker);
+
+        assert!(
+            unsafe { Pin::new_unchecked(&mut *handle) }
+                .poll(&mut first_cx)
+                .is_pending()
+        );
+        assert_eq!(first_stats.clones.get(), 1);
+        assert_eq!(first_stats.drops.get(), 0);
+
+        assert!(
+            unsafe { Pin::new_unchecked(&mut *handle) }
+                .poll(&mut first_cx)
+                .is_pending()
+        );
+        assert_eq!(
+            first_stats.clones.get(),
+            1,
+            "same waiter should not be cloned again"
+        );
+        assert_eq!(
+            first_stats.drops.get(),
+            0,
+            "same waiter should not replace the stored waker"
+        );
+
+        let second_stats = Rc::new(CountedWakerStats::default());
+        let second_waker = counted_waker(&second_stats);
+        let mut second_cx = Context::from_waker(&second_waker);
+
+        assert!(
+            unsafe { Pin::new_unchecked(&mut *handle) }
+                .poll(&mut second_cx)
+                .is_pending()
+        );
+        assert_eq!(
+            first_stats.drops.get(),
+            1,
+            "different waiter should replace the previous stored waker"
+        );
+        assert_eq!(second_stats.clones.get(), 1);
+        assert!(
+            waker_slot
+                .as_ref()
+                .expect("join waker should be stored")
+                .will_wake(&second_waker)
+        );
+
+        drop(waker_slot.take());
+    }
+
     #[cfg(not(miri))]
     fn executor_with_one_task_slab() -> Executor {
         let mut executor = Executor::new().expect("failed to construct executor");
         executor.provider.max_request_count = Some(1);
         executor
+    }
+
+    #[test]
+    fn task_ready_gate_matrix_blocks_only_terminal_or_active_queue_states() {
+        assert!(task_can_enter_ready_queue(0));
+        assert!(task_can_enter_ready_queue(TaskHeader::FLAG_NOTIFIED));
+        assert!(!task_can_enter_ready_queue(TaskHeader::FLAG_COMPLETED));
+        assert!(!task_can_enter_ready_queue(TaskHeader::FLAG_RUNNING));
+        assert!(!task_can_enter_ready_queue(TaskHeader::FLAG_QUEUED));
+        assert!(!task_can_enter_ready_queue(
+            TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_RUNNING
+        ));
+        assert!(!task_can_enter_ready_queue(
+            TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED
+        ));
+    }
+
+    #[test]
+    fn notify_task_gate_enqueues_idle_task_once() {
+        let mut ready_queue = DList::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState::new();
+        let mut header = TaskHeader::new();
+        let task_ptr = &mut header as *mut TaskHeader;
+
+        assert!(unsafe {
+            notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(header.has_flag(TaskHeader::FLAG_NOTIFIED));
+        assert!(header.has_flag(TaskHeader::FLAG_QUEUED));
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.task_schedules, 1);
+
+        assert!(!unsafe {
+            notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.task_schedules, 1);
+
+        let popped = unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
+        assert_eq!(popped, Some(task_ptr));
+        assert!(ready_queue.is_empty());
+    }
+
+    #[test]
+    fn notify_task_gate_defers_running_task_until_poll_finishes() {
+        let mut ready_queue = DList::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState::new();
+        let mut header = TaskHeader::new();
+        header.set_flag(TaskHeader::FLAG_RUNNING);
+        let task_ptr = &mut header as *mut TaskHeader;
+
+        assert!(!unsafe {
+            notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(header.has_flag(TaskHeader::FLAG_NOTIFIED));
+        assert!(!header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(ready_queue.is_empty());
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.task_schedules, 0);
+
+        header.clear_flag(TaskHeader::FLAG_RUNNING);
+        assert!(unsafe {
+            enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(header.has_flag(TaskHeader::FLAG_QUEUED));
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.task_schedules, 1);
+
+        let popped = unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
+        assert_eq!(popped, Some(task_ptr));
+        assert!(ready_queue.is_empty());
+    }
+
+    #[test]
+    fn notify_task_gate_ignores_completed_tasks() {
+        let mut ready_queue = DList::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState::new();
+        let mut header = TaskHeader::new();
+        header.set_flag(TaskHeader::FLAG_COMPLETED);
+        let task_ptr = &mut header as *mut TaskHeader;
+
+        assert!(!unsafe {
+            notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(!header.has_flag(TaskHeader::FLAG_NOTIFIED));
+        assert!(!header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(ready_queue.is_empty());
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.task_schedules, 0);
+    }
+
+    #[test]
+    fn enqueue_notified_gate_requires_notified_idle_task() {
+        let mut ready_queue = DList::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState::new();
+        let mut header = TaskHeader::new();
+        let task_ptr = &mut header as *mut TaskHeader;
+
+        assert!(!unsafe {
+            enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(ready_queue.is_empty());
+
+        header.set_flag(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED);
+        assert!(!unsafe {
+            enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(ready_queue.is_empty());
+
+        header.clear_flag(TaskHeader::FLAG_QUEUED);
+        assert!(unsafe {
+            enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert!(header.has_flag(TaskHeader::FLAG_QUEUED));
+
+        let popped = unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
+        assert_eq!(popped, Some(task_ptr));
+        assert!(ready_queue.is_empty());
     }
 
     #[test]

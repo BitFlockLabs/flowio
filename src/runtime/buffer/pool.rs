@@ -29,7 +29,7 @@ use super::IoBuffError;
 use super::iobuff::{IoBuffHeader, IoBuffMut};
 use crate::utils::list::intrusive::slist::{Link as SListLink, SList};
 use crate::utils::memory::provider::BasicMemoryProvider;
-use crate::utils::memory::slab::{self, SlabAllocator};
+use crate::utils::memory::slab::{SlabAllocator, SlabPageChain};
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -144,21 +144,19 @@ pub(crate) struct IoBuffPoolInner {
     /// into fixed-size buffer slots and is destroyed with the leaked inner.
     /// Each slot holds one `IoBuffHeader` + data region.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
-    /// Heap-allocated memory provider backing the slab allocator.  Boxed
-    /// for a stable address that outlives the slab factory's reference.
-    _provider: Box<BasicMemoryProvider>,
+    /// Heap-allocated memory provider backing the slab allocator. Stored as a
+    /// raw pointer so constructing the self-owning pool does not move a `Box`
+    /// after `slab_factory` captures the provider address.
+    provider: NonNull<BasicMemoryProvider>,
+    /// Stable raw pointer to this inner allocation, stored in pool-backed
+    /// buffer headers for final-slot release.
+    pool_ptr: *mut IoBuffPoolInner,
     /// Intrusive free list of available buffer slots.  When a buffer is
     /// returned to the pool, its slot is pushed onto this list.  Alloc
     /// pops from here first (O(1)) before bump-allocating from a slab.
     free_list: SList<u8>,
-    /// Head of the singly-linked list of all allocated slab pages.
-    /// Chained through each Slab header's link.next pointer. No
-    /// self-referential sentinel, so the page list itself imposes no move
-    /// constraint; the inner is otherwise heap-pinned for buffer back-pointers.
-    slab_page_head: *mut slab::Slab,
-    /// The slab currently being bump-allocated from.  When exhausted,
-    /// a new slab page is requested from the slab factory.
-    current_slab: *mut slab::Slab,
+    /// Move-safe chain of all allocated slab pages.
+    slab_pages: SlabPageChain,
     /// Size of each slot in bytes: `sizeof(IoBuffHeader) + headroom +
     /// payload + tailroom`, rounded up for alignment.
     slot_size: usize,
@@ -200,26 +198,35 @@ impl IoBuffPoolInner {
         let slot_size = crate::utils::size_up(slot_min, slot_align)
             .map_err(|_| IoBuffPoolConfigError::LayoutOverflow)?;
 
-        let mut provider = Box::new(BasicMemoryProvider::new());
-        let provider_ptr = &mut *provider as *mut BasicMemoryProvider;
+        let provider_ptr = Box::into_raw(Box::new(BasicMemoryProvider::new()));
 
-        let slab_factory = ManuallyDrop::new(
-            SlabAllocator::new_uninit(
-                // SAFETY: provider_ptr is stable (Box) and outlives the slab factory.
-                unsafe { &mut *provider_ptr },
-                slot_size,
-                slot_align,
-                config.objs_per_slab,
-            )
-            .map_err(|_| IoBuffPoolConfigError::LayoutOverflow)?,
-        );
+        let slab_factory = match SlabAllocator::new_uninit(
+            // SAFETY: provider_ptr comes from Box::into_raw and is not
+            // reconstructed as a Box until after slab_factory is no longer
+            // used. SlabAllocator stores only a raw pointer internally.
+            unsafe { &mut *provider_ptr },
+            slot_size,
+            slot_align,
+            config.objs_per_slab,
+        ) {
+            Ok(slab_factory) => ManuallyDrop::new(slab_factory),
+            Err(_) => {
+                unsafe { drop(Box::from_raw(provider_ptr)) };
+                return Err(IoBuffPoolConfigError::LayoutOverflow);
+            }
+        };
+
+        let provider = unsafe {
+            // SAFETY: Box::into_raw never returns null.
+            NonNull::new_unchecked(provider_ptr)
+        };
 
         Ok(Box::new(Self {
             slab_factory,
-            _provider: provider,
+            provider,
+            pool_ptr: std::ptr::null_mut(),
             free_list: SList::new_uninit(),
-            slab_page_head: std::ptr::null_mut(),
-            current_slab: std::ptr::null_mut(),
+            slab_pages: SlabPageChain::new(),
             slot_size,
             headroom: config.headroom,
             payload: config.payload,
@@ -236,56 +243,55 @@ impl IoBuffPoolInner {
         self.initialized = true;
     }
 
-    fn alloc(&mut self) -> Result<IoBuffMut, IoBuffError> {
-        if !self.initialized {
+    unsafe fn alloc(pool_ptr: *mut Self) -> Result<IoBuffMut, IoBuffError> {
+        debug_assert!(!pool_ptr.is_null());
+
+        if unsafe { !(*pool_ptr).initialized } {
             return Err(IoBuffError::PoolNotInitialized);
         }
 
-        let slot_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front(0) } {
+        let free_list = unsafe { std::ptr::addr_of_mut!((*pool_ptr).free_list) };
+        let slot_ptr = if let Some(link_ptr) = unsafe { (*free_list).pop_front(0) } {
             link_ptr
         } else {
-            // Try bump-alloc from current slab.
-            let mut ptr = if !self.current_slab.is_null() {
-                unsafe { (*self.current_slab).try_alloc(self.slot_size) }
-            } else {
-                None
-            };
+            let slot_size = unsafe { (*pool_ptr).slot_size };
+            let slab_pages = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_pages) };
+            let mut ptr = unsafe { (*slab_pages).try_alloc_current(slot_size) };
 
             // Request new slab page if needed.
             if ptr.is_none() {
-                let slab_ptr = self
-                    .slab_factory
-                    .provide_slab()
-                    .ok_or(IoBuffError::AllocFailed)?;
-                // Link new slab into the singly-linked page list via
-                // the Slab header's link.next pointer.
-                unsafe {
-                    (*slab_ptr).link.next =
-                        self.slab_page_head as *mut crate::utils::list::intrusive::slist::Link;
+                #[cfg(debug_assertions)]
+                if crate::runtime::test_hooks::take_iobuff_pool_slab_alloc_failure() {
+                    return Err(IoBuffError::AllocFailed);
                 }
-                self.slab_page_head = slab_ptr;
-                self.current_slab = slab_ptr;
-                ptr = unsafe { (*slab_ptr).try_alloc(self.slot_size) };
+
+                let slab_factory = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_factory) };
+                let new_ptr =
+                    unsafe { (*slab_pages).alloc_from_new_slab(&mut *slab_factory, slot_size) }
+                        .ok_or(IoBuffError::AllocFailed)?;
+                ptr = Some(new_ptr);
             }
 
             ptr.ok_or(IoBuffError::AllocFailed)?
         };
 
-        self.live_slots += 1;
+        unsafe {
+            (*pool_ptr).live_slots += 1;
+        }
 
         // Initialize the header in the slot.
         let header = slot_ptr as *mut IoBuffHeader;
         unsafe {
             (*header).refcount = Cell::new(1);
-            (*header).headroom_capacity = self.headroom;
-            (*header).payload_capacity = self.payload;
-            (*header).tailroom_capacity = self.tailroom;
-            (*header).pool = self as *mut Self;
+            (*header).headroom_capacity = (*pool_ptr).headroom;
+            (*header).payload_capacity = (*pool_ptr).payload;
+            (*header).tailroom_capacity = (*pool_ptr).tailroom;
+            (*header).pool = (*pool_ptr).pool_ptr;
         }
 
         Ok(IoBuffMut {
             header: unsafe { NonNull::new_unchecked(header) },
-            offset: self.headroom,
+            offset: unsafe { (*pool_ptr).headroom },
             payload_len: 0,
             tailroom_len: 0,
         })
@@ -302,19 +308,22 @@ impl IoBuffPoolInner {
         debug_assert!(!pool_ptr.is_null());
         debug_assert!(!slot_ptr.is_null());
 
-        let pool = unsafe { &mut *pool_ptr };
-        debug_assert!(pool.live_slots > 0, "IoBuffPoolInner live_slots underflow");
-        pool.live_slots -= 1;
+        let live_slots = unsafe { (*pool_ptr).live_slots };
+        debug_assert!(live_slots > 0, "IoBuffPoolInner live_slots underflow");
+        unsafe {
+            (*pool_ptr).live_slots = live_slots - 1;
+        }
 
-        if pool.owner_dropped {
-            if pool.live_slots == 0 {
+        if unsafe { (*pool_ptr).owner_dropped } {
+            if live_slots == 1 {
                 unsafe { Self::destroy(pool_ptr) };
             }
             return;
         }
 
         let link_ptr = slot_ptr as *mut SListLink;
-        unsafe { pool.free_list.push_front_unchecked(link_ptr) };
+        let free_list = unsafe { std::ptr::addr_of_mut!((*pool_ptr).free_list) };
+        unsafe { (*free_list).push_front_unchecked(link_ptr) };
     }
 
     /// Tears the pool down and frees every slab page.
@@ -331,17 +340,10 @@ impl IoBuffPoolInner {
             inner.live_slots
         );
 
-        if inner.initialized {
-            // Walk the singly-linked slab page list and free each page.
-            let mut current = inner.slab_page_head;
-            while !current.is_null() {
-                let next = unsafe { (*current).link.next as *mut slab::Slab };
-                unsafe { inner.slab_factory.free_slab(current as *mut u8) };
-                current = next;
-            }
+        unsafe { inner.slab_pages.free_all(&mut inner.slab_factory) };
 
-            unsafe { ManuallyDrop::drop(&mut inner.slab_factory) };
-        }
+        unsafe { ManuallyDrop::drop(&mut inner.slab_factory) };
+        unsafe { drop(Box::from_raw(inner.provider.as_ptr())) };
     }
 }
 
@@ -355,8 +357,15 @@ impl IoBuffPool {
     /// Returns an error if the configuration is invalid.
     pub fn new(config: IoBuffPoolConfig) -> Result<Self, IoBuffPoolConfigError> {
         let inner = IoBuffPoolInner::new(config)?;
+        let inner_ptr = Box::into_raw(inner);
+        unsafe {
+            (*inner_ptr).pool_ptr = inner_ptr;
+        }
         Ok(Self {
-            inner: NonNull::from(Box::leak(inner)),
+            inner: unsafe {
+                // SAFETY: Box::into_raw never returns null.
+                NonNull::new_unchecked(inner_ptr)
+            },
         })
     }
 
@@ -379,23 +388,61 @@ impl IoBuffPool {
     /// Returns `IoBuffError::AllocFailed` if the memory provider cannot
     /// supply more slab pages.
     pub fn alloc(&mut self) -> Result<IoBuffMut, IoBuffError> {
-        unsafe { self.inner.as_mut() }.alloc()
+        unsafe { IoBuffPoolInner::alloc(self.inner.as_ptr()) }
     }
 
     #[doc(hidden)]
     /// Test-only live-slot counter; not a stable public API.
     pub fn live_slots_for_test(&self) -> usize {
-        unsafe { self.inner.as_ref() }.live_slots
+        unsafe { (*self.inner.as_ptr()).live_slots }
     }
 }
 
 impl Drop for IoBuffPool {
     fn drop(&mut self) {
         let inner_ptr = self.inner.as_ptr();
-        let inner = unsafe { &mut *inner_ptr };
-        inner.owner_dropped = true;
-        if inner.live_slots == 0 {
+        unsafe {
+            (*inner_ptr).owner_dropped = true;
+        }
+        if unsafe { (*inner_ptr).live_slots == 0 } {
             unsafe { IoBuffPoolInner::destroy(inner_ptr) };
         }
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iobuff_pool_alloc_failed_seam_returns_alloc_failed_without_live_slot() {
+        let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+            headroom: 4,
+            payload: 16,
+            tailroom: 4,
+            objs_per_slab: 1,
+        })
+        .expect("pool config should be valid");
+        pool.init();
+
+        crate::runtime::test_hooks::fail_next_iobuff_pool_slab_alloc();
+        let err = match pool.alloc() {
+            Ok(_) => panic!("forced slab allocation failure unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err, IoBuffError::AllocFailed);
+        assert_eq!(
+            pool.live_slots_for_test(),
+            0,
+            "failed allocation must not check out a live slot"
+        );
+
+        let buf = pool
+            .alloc()
+            .expect("forced failure should not poison later allocation");
+        assert_eq!(pool.live_slots_for_test(), 1);
+        drop(buf);
+        assert_eq!(pool.live_slots_for_test(), 0);
     }
 }

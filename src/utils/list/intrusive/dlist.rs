@@ -300,6 +300,54 @@ impl<T> DList<T> {
         self.head.prev = head_ptr;
     }
 
+    /// Drains every payload node for owner teardown, passing each container
+    /// pointer to `f` after unlinking its node.
+    ///
+    /// This is for drop paths that must return node storage to an owner before
+    /// the list itself is discarded. It tolerates a sentinel that was moved
+    /// after initialization by treating the first node's `prev` pointer as the
+    /// original sentinel address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `offset` is the byte distance from `T` to its
+    /// embedded [`Link`], and that the list is known to contain payload nodes.
+    pub(crate) unsafe fn drain_all_for_drop<F>(&mut self, offset: usize, mut f: F)
+    where
+        F: FnMut(*mut T),
+    {
+        let next_null = self.head.next.is_null();
+        let prev_null = self.head.prev.is_null();
+        debug_assert_eq!(
+            next_null, prev_null,
+            "DList teardown saw a partially initialized sentinel"
+        );
+        if next_null || prev_null {
+            return;
+        }
+
+        let head_ptr = &mut self.head as *mut Link;
+        let mut current = self.head.next;
+        if current == head_ptr {
+            return;
+        }
+
+        let original_head = unsafe { (*current).prev };
+        while !current.is_null() && current != head_ptr && current != original_head {
+            unsafe {
+                let next = (*current).next;
+                let container_ptr = (current as *mut u8).sub(offset) as *mut T;
+                (*current).next = ptr::null_mut();
+                (*current).prev = ptr::null_mut();
+                f(container_ptr);
+                current = next;
+            }
+        }
+
+        self.head.next = head_ptr;
+        self.head.prev = head_ptr;
+    }
+
     /// Removes a specific node from the list.
     #[inline(always)]
     /// # Safety
@@ -345,10 +393,13 @@ impl<T> DList<T> {
 
     /// Returns the first element without unlinking it.
     ///
-    /// `offset` must be the byte distance from the start of `T` to the
-    /// embedded [`Link`] field used by this list.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `offset` correctly represents the byte
+    /// distance from the start of the container `T` to the [`Link`] field used
+    /// by this list.
     #[inline(always)]
-    pub fn front(&self, offset: usize) -> Option<*mut T> {
+    pub unsafe fn front(&self, offset: usize) -> Option<*mut T> {
         debug_assert_list_inited!(self);
 
         if self.is_empty() {

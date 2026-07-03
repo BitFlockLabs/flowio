@@ -55,13 +55,13 @@ pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider> {
     slab_factory: super::slab::SlabAllocator<'a, P>,
     /// Free-list of returned object slots ready for reuse.
     free_list: utils::list::intrusive::slist::SList<T>,
-    /// Head of the singly-linked list of allocated slab pages, chained
-    /// through each Slab header's `link.next` pointer.
-    slab_page_head: *mut super::slab::Slab,
-    /// Slab currently being bump-allocated from.
-    current_slab: *mut super::slab::Slab,
+    /// Move-safe chain of allocated slab pages.
+    slab_pages: super::slab::SlabPageChain,
     /// Size of each object slot after alignment and link accommodation.
     obj_size: usize,
+    #[cfg(debug_assertions)]
+    /// Number of slots allocated from this pool that have not been freed.
+    live_slots: usize,
 }
 
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
@@ -101,9 +101,10 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         Ok(Self {
             slab_factory,
             free_list: utils::list::intrusive::slist::SList::new_uninit(),
-            slab_page_head: std::ptr::null_mut(),
-            current_slab: std::ptr::null_mut(),
+            slab_pages: super::slab::SlabPageChain::new(),
             obj_size,
+            #[cfg(debug_assertions)]
+            live_slots: 0,
         })
     }
 
@@ -127,34 +128,25 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front(0) } {
             link_ptr
         } else {
-            // First try to bump-allocate from the current slab page.
-            let mut ptr = if !self.current_slab.is_null() {
-                unsafe { (*self.current_slab).try_alloc(self.obj_size) }
-            } else {
-                None
-            };
-
-            // If the current page is exhausted, request a new slab page and
-            // make it the current bump-allocation source.
-            if ptr.is_none() {
-                let slab_ptr = self.slab_factory.provide_slab()?;
-                // Link new slab into the singly-linked page list.
-                unsafe {
-                    (*slab_ptr).link.next =
-                        self.slab_page_head as *mut utils::list::intrusive::slist::Link;
-                }
-                self.slab_page_head = slab_ptr;
-                self.current_slab = slab_ptr;
-                ptr = unsafe { (*slab_ptr).try_alloc(self.obj_size) };
+            unsafe {
+                self.slab_pages
+                    .alloc_or_grow(&mut self.slab_factory, self.obj_size)?
+                    .ptr as *mut T
             }
-
-            ptr? as *mut T
         };
 
         unsafe {
             let slot = &mut *(raw_ptr as *mut MaybeUninit<T>);
             T::init_at(slot, args)
         };
+
+        #[cfg(debug_assertions)]
+        {
+            self.live_slots = self
+                .live_slots
+                .checked_add(1)
+                .expect("Pool live-slot count overflowed");
+        }
 
         Some(raw_ptr)
     }
@@ -175,24 +167,46 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         unsafe {
             std::ptr::drop_in_place(obj);
 
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    self.live_slots > 0,
+                    "Pool freed more slots than it allocated"
+                );
+                self.live_slots = self.live_slots.saturating_sub(1);
+            }
+
             let link_ptr = obj as *mut utils::list::intrusive::slist::Link;
             self.free_list.push_front_unchecked(link_ptr);
         }
+    }
+
+    /// Marks all currently live slots as intentionally abandoned for owner
+    /// teardown.
+    ///
+    /// This is debug-only and reserved for owners that deliberately discard
+    /// pooled object storage without running object destructors during a
+    /// terminal shutdown path.
+    #[cfg(debug_assertions)]
+    pub(crate) fn abandon_live_slots_for_drop(&mut self) {
+        self.live_slots = 0;
     }
 }
 
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T, P> {
     fn drop(&mut self) {
-        // Walk the singly linked slab-page chain and return each page to the
-        // backing memory provider. Live objects are intentionally not dropped:
-        // executor teardown may abandon task futures whose destructors require
-        // runtime TLS or pools that are already being torn down.
-        let mut current = self.slab_page_head;
-        while !current.is_null() {
-            let next = unsafe { (*current).link.next as *mut super::slab::Slab };
-            let slab_ptr = current as *mut u8;
-            unsafe { self.slab_factory.free_slab(slab_ptr) };
-            current = next;
+        #[cfg(debug_assertions)]
+        if !std::thread::panicking() {
+            debug_assert_eq!(
+                self.live_slots, 0,
+                "Pool dropped with {} live slots still outstanding",
+                self.live_slots
+            );
         }
+
+        // Live objects are intentionally not dropped: executor teardown may
+        // abandon task futures whose destructors require runtime TLS or pools
+        // that are already being torn down.
+        unsafe { self.slab_pages.free_all(&mut self.slab_factory) };
     }
 }

@@ -208,6 +208,11 @@ pub struct TlsClientOptions {
 /// read/write remains owned by the stream and will be resumed or retired by
 /// the next TLS operation. This keeps TLS record handling correct without
 /// introducing background threads or a broader transport abstraction.
+///
+/// If a raw transport write fails after rustls has emitted TLS records, the
+/// stream is marked failed. Retrying the same plaintext on that stream could
+/// duplicate records that the kernel already accepted, so later TLS operations
+/// return `BrokenPipe`.
 pub struct TlsClientStream {
     /// Underlying connected TCP transport owned by this TLS wrapper.
     stream: TcpStream,
@@ -228,6 +233,12 @@ pub struct TlsClientStream {
     /// In-flight raw transport write, if emitted TLS records are still being
     /// flushed.
     pending_write_tls: Option<PendingTlsWrite>,
+    /// True after the TCP read side has returned EOF and rustls has been
+    /// notified.
+    transport_read_eof: bool,
+    /// True after a raw transport write failure made queued TLS records
+    /// non-retryable without risking record duplication.
+    transport_write_failed: bool,
     /// True after rustls has started TLS-level close-notify shutdown.
     write_shutdown: bool,
     /// True after the underlying TCP stream has been shutdown for writes.
@@ -447,6 +458,8 @@ impl TlsClientStream {
             write_tls_buffer: Some(Vec::with_capacity(options.transport_write_buffer_size)),
             pending_read_tls: None,
             pending_write_tls: None,
+            transport_read_eof: false,
+            transport_write_failed: false,
             write_shutdown: false,
             transport_write_shutdown: false,
         })
@@ -573,6 +586,12 @@ impl TlsClientStream {
     }
 
     fn ensure_writable(&self) -> io::Result<()> {
+        if self.transport_write_failed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls transport write failed",
+            ));
+        }
         if self.write_shutdown {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -632,6 +651,7 @@ impl TlsClientStream {
     }
 
     fn feed_transport_eof(&mut self) -> io::Result<()> {
+        self.transport_read_eof = true;
         let mut eof = io::empty();
         let _ = self.connection.read_tls(&mut eof)?;
         self.connection
@@ -644,14 +664,29 @@ impl TlsClientStream {
     // place where staged raw write futures are resumed after a caller drops a
     // higher-level TLS operation future.
     fn poll_flush_pending_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.transport_write_failed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls transport write failed",
+            )));
+        }
+
         loop {
             if let Some(future) = self.pending_write_tls.as_mut() {
                 match Pin::new(future).poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready((result, buffer)) => {
                         self.pending_write_tls = None;
-                        self.restore_write_tls_buffer(buffer);
-                        result?;
+                        match result {
+                            Ok(_) => {
+                                self.restore_write_tls_buffer(buffer);
+                            }
+                            Err(err) => {
+                                self.transport_write_failed = true;
+                                self.restore_write_tls_buffer(buffer);
+                                return Poll::Ready(Err(err));
+                            }
+                        }
                         continue;
                     }
                 }
@@ -659,10 +694,6 @@ impl TlsClientStream {
 
             if !self.connection.wants_write() {
                 return Poll::Ready(Ok(()));
-            }
-
-            if self.pending_read_tls.is_some() {
-                return Poll::Ready(Err(tls_internal_error("tls transport read/write overlap")));
             }
 
             let mut buffer = self.take_write_tls_buffer();
@@ -697,19 +728,29 @@ impl TlsClientStream {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready((result, buffer)) => {
                         self.pending_read_tls = None;
-                        let read = result?;
-                        if read == 0 {
-                            self.feed_transport_eof()?;
-                        } else {
-                            self.feed_transport_bytes(&buffer[..read])?;
-                        }
+                        let result = match result {
+                            Ok(0) => self.feed_transport_eof(),
+                            Ok(read) => self.feed_transport_bytes(&buffer[..read]),
+                            Err(err) => Err(err),
+                        };
                         self.restore_read_tls_buffer(buffer);
-                        return Poll::Ready(Ok(()));
+                        if let Err(err) = result {
+                            return Poll::Ready(Err(err));
+                        } else {
+                            return Poll::Ready(Ok(()));
+                        }
                     }
                 }
             }
 
             if !self.connection.wants_read() {
+                return Poll::Ready(Ok(()));
+            }
+
+            if self.transport_read_eof {
+                if self.connection.is_handshaking() {
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                }
                 return Poll::Ready(Ok(()));
             }
 
@@ -853,6 +894,10 @@ impl<B: IoBuffReadWrite> Future for TlsReadFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if this.buffer.is_none() {
+            return Poll::Pending;
+        }
+
         if let Some(err) = this.input_error.take() {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
@@ -933,6 +978,10 @@ impl<B: IoBuffReadWrite> Future for TlsReadExactFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if this.buffer.is_none() {
+            return Poll::Pending;
+        }
+
         if let Some(err) = this.input_error.take() {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
@@ -1009,6 +1058,10 @@ impl<B: IoBuffReadOnly> Future for TlsWriteFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if this.written.is_none() {
             if let Err(err) = this.stream.ensure_handshake_complete() {
@@ -1099,6 +1152,10 @@ impl<B: IoBuffReadOnly> Future for TlsWriteAllFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if this.buffer.is_none() {
+            return Poll::Pending;
+        }
 
         if let Err(err) = this.stream.ensure_handshake_complete() {
             let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -1197,5 +1254,120 @@ impl Future for TlsShutdownFuture<'_> {
         }
 
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::executor::Executor;
+    use rustls::RootCertStore;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    fn force_reset_on_drop(tcp: &std::net::TcpStream) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                tcp.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt SO_LINGER failed");
+    }
+
+    fn drain_client_hello_then_reset(mut tcp: std::net::TcpStream) {
+        force_reset_on_drop(&tcp);
+        tcp.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set_read_timeout failed");
+
+        let mut saw_bytes = false;
+        let mut buf = [0u8; 4096];
+        loop {
+            match tcp.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => saw_bytes = true,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(err) => panic!("server client-hello drain failed: {err}"),
+            }
+        }
+        assert!(
+            saw_bytes,
+            "server did not receive a ClientHello before reset"
+        );
+    }
+
+    #[test]
+    fn handshake_read_error_restores_transport_read_scratch() {
+        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("std bind failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("std accept failed");
+            drain_client_hello_then_reset(tcp);
+        });
+
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let options = TlsClientOptions {
+            rustls_buffer_limit: Some(1024),
+            transport_read_buffer_size: 128,
+            transport_write_buffer_size: 128,
+        };
+
+        let mut executor = Executor::new().expect("failed to construct runtime executor");
+        executor
+            .run(async move {
+                let tcp = TcpStream::connect(addr)
+                    .expect("connect init failed")
+                    .await
+                    .expect("connect failed");
+                let mut tls = TlsClientStream::new(
+                    tcp,
+                    config,
+                    ServerName::try_from("localhost").expect("invalid test server name"),
+                    options,
+                )
+                .expect("tls stream init failed");
+
+                let err = tls
+                    .handshake()
+                    .await
+                    .expect_err("handshake should fail after server reset");
+                assert!(
+                    matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::InvalidData
+                    ),
+                    "unexpected handshake reset error: {err}"
+                );
+
+                let scratch = tls
+                    .read_tls_buffer
+                    .as_ref()
+                    .expect("read scratch not restored after handshake error");
+                assert_eq!(scratch.len(), 0);
+                assert_eq!(scratch.capacity(), 128);
+            })
+            .expect("executor run failed");
+
+        server.join().expect("server thread panicked");
     }
 }

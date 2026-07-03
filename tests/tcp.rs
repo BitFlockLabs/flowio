@@ -314,6 +314,24 @@ fn runtime_tcp_try_writev_projected_immediate_success() {
 }
 
 #[test]
+fn runtime_tcp_try_writev_projected_large_piece_count_immediate_success() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+
+    let source = TestProjected::new([&b"x"[..]; 17]);
+    let expected = source.expected();
+    let (res, source) = stream.try_writev_projected(source);
+    assert_eq!(
+        res.expect("17-piece try_writev_projected failed"),
+        expected.len()
+    );
+    assert_eq!(source.expected(), expected);
+
+    let mut got = vec![0u8; expected.len()];
+    peer.read_exact(&mut got).expect("std read failed");
+    assert_eq!(got, expected);
+}
+
+#[test]
 fn runtime_tcp_try_writev_projected_invalid_projection_returns_source() {
     let (mut stream, _peer) = connected_try_tcp_stream();
 
@@ -383,6 +401,22 @@ fn runtime_tcp_cancelled_accept_closes_orphan_fd_and_reaccepts() {
 #[test]
 fn tcp_accept_slot_drop_cached_state_closes_completed_fd() {
     test_accept_slot_drop_cached_state_closes_completed_fd().unwrap();
+}
+
+#[test]
+fn tcp_accept_forgotten_future_reports_busy_slot_would_block() {
+    let mut listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128)
+        .expect("listener bind failed");
+    let first_accept = listener.accept();
+    std::mem::forget(first_accept);
+
+    run_test(async move {
+        let err = match listener.accept().await {
+            Ok(_) => panic!("forgotten accept future should keep listener slot busy"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    });
 }
 
 #[test]
@@ -1014,6 +1048,44 @@ fn runtime_tcp_writev_readv() {
         .expect("executor run failed");
 
     peer.join().expect("peer panicked");
+}
+
+#[test]
+fn runtime_tcp_vectored_empty_chain_semantics() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+
+    run_test(async move {
+        let (res, chain) = stream.writev(make_payload_chain::<0>([])).await;
+        assert_eq!(res.expect("writev empty failed"), 0);
+        assert!(chain.is_empty());
+
+        let (res, chain) = stream.writev_all(make_payload_chain::<0>([])).await;
+        assert_eq!(res.expect("writev_all empty failed"), 0);
+        assert!(chain.is_empty());
+
+        let (res, chain) = stream.writev_read_only(make_read_only_chain::<0>([])).await;
+        assert_eq!(res.expect("writev_read_only empty failed"), 0);
+        assert!(chain.is_empty());
+
+        let (res, source) = stream.writev_projected(TestProjected::<0>::new([])).await;
+        assert_eq!(res.expect("writev_projected empty failed"), 0);
+        assert!(source.expected().is_empty());
+
+        let (res, source) = stream
+            .writev_all_projected(TestProjected::<0>::new([]))
+            .await;
+        assert_eq!(res.expect("writev_all_projected empty failed"), 0);
+        assert!(source.expected().is_empty());
+
+        let (res, chain) = stream.readv(make_read_chain::<0>([])).await;
+        let err = res.expect_err("readv empty should reject ambiguous EOF result");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(chain.is_empty());
+
+        let (res, chain) = stream.readv_exact(make_read_chain::<0>([]), 0).await;
+        assert_eq!(res.expect("readv_exact zero failed"), 0);
+        assert!(chain.is_empty());
+    });
 }
 
 #[test]

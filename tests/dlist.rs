@@ -349,7 +349,7 @@ fn empty_uninit_then_init_verbose() {
     list.init();
     eprintln!("after init: is_empty={}", list.is_empty());
     assert!(list.is_empty());
-    assert!(list.front(off).is_none());
+    assert!(unsafe { list.front(off).is_none() });
 
     eprintln!("PASS");
 }
@@ -372,12 +372,12 @@ fn front_peek_does_not_remove_verbose() {
     }
 
     // front() should not remove
-    let f1 = list.front(off).unwrap();
+    let f1 = unsafe { list.front(off).unwrap() };
     eprintln!("front -> {}", unsafe { (*f1).value });
     assert_eq!(unsafe { (*f1).value }, 111);
     assert!(!list.is_empty());
 
-    let f2 = list.front(off).unwrap();
+    let f2 = unsafe { list.front(off).unwrap() };
     eprintln!("front again -> {}", unsafe { (*f2).value });
     assert_eq!(unsafe { (*f2).value }, 111);
     assert!(!list.is_empty());

@@ -1,5 +1,64 @@
+mod provider {
+    pub use flowio::utils::memory::provider::*;
+}
+
+#[path = "../src/utils/memory/slab.rs"]
+#[allow(dead_code)]
+mod slab_for_retained_test;
+
 mod utils {
-    pub use flowio::utils::*;
+    pub mod list {
+        pub use flowio::utils::list::*;
+    }
+
+    pub mod memory {
+        pub mod provider {
+            pub use flowio::utils::memory::provider::*;
+        }
+
+        pub mod slab {
+            pub(crate) use crate::slab_for_retained_test::*;
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SizeUpError {
+        InvalidAlign,
+        SizeOverflow,
+    }
+
+    impl std::fmt::Display for SizeUpError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InvalidAlign => f.write_str("alignment must be a non-zero power of two"),
+                Self::SizeOverflow => f.write_str("rounded size overflowed usize"),
+            }
+        }
+    }
+
+    impl std::error::Error for SizeUpError {}
+
+    #[inline(always)]
+    const fn is_pow2(x: usize) -> bool {
+        x != 0 && (x & (x - 1)) == 0
+    }
+
+    #[inline(always)]
+    fn align_up(addr: usize, align: usize) -> Result<usize, SizeUpError> {
+        if !is_pow2(align) {
+            return Err(SizeUpError::InvalidAlign);
+        }
+
+        let rounded = addr
+            .checked_add(align - 1)
+            .ok_or(SizeUpError::SizeOverflow)?;
+        Ok(rounded & !(align - 1))
+    }
+
+    #[inline(always)]
+    pub(crate) fn size_up(size: usize, align: usize) -> Result<usize, SizeUpError> {
+        align_up(size, align)
+    }
 }
 
 #[allow(dead_code)]
@@ -95,6 +154,55 @@ fn retained_payload_take_moves_value_without_dropping_it() {
     let stats = pool.stats();
     println!("take pooled stats: {stats:?}");
     assert_eq!(stats.pooled_frees, 1);
+}
+
+/// take_with() lets completion paths move back only the field returned to the
+/// caller, drop retained-only fields in place, and still return the block.
+#[test]
+fn retained_payload_take_with_extracts_field_and_reuses_block() {
+    struct PartialExtractPayload {
+        returned: DropTracked,
+        retained_only: DropTracked,
+    }
+
+    let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+    let returned_drops = Rc::new(Cell::new(0));
+    let retained_only_drops = Rc::new(Cell::new(0));
+    let payload = pool.alloc(PartialExtractPayload {
+        returned: DropTracked::new(11, &returned_drops),
+        retained_only: DropTracked::new(22, &retained_only_drops),
+    });
+    let first_ptr = payload.as_ptr();
+
+    let returned = unsafe {
+        payload.take_with(&mut pool, |payload| {
+            let returned = std::ptr::read(std::ptr::addr_of!((*payload).returned));
+            std::ptr::drop_in_place(std::ptr::addr_of_mut!((*payload).retained_only));
+            returned
+        })
+    };
+
+    assert_eq!(returned.value, 11);
+    assert_eq!(returned_drops.get(), 0);
+    assert_eq!(retained_only_drops.get(), 1);
+
+    drop(returned);
+    assert_eq!(returned_drops.get(), 1);
+
+    let second = pool.alloc(PartialExtractPayload {
+        returned: DropTracked::new(33, &returned_drops),
+        retained_only: DropTracked::new(44, &retained_only_drops),
+    });
+    assert_eq!(second.as_ptr(), first_ptr);
+    unsafe { second.drop_and_free(&mut pool) };
+
+    let stats = pool.stats();
+    println!("take_with pooled stats: {stats:?}");
+    assert_eq!(stats.pooled_allocs, 2);
+    assert_eq!(stats.pooled_reuses, 1);
+    assert_eq!(stats.pooled_frees, 2);
+    assert_eq!(returned_drops.get(), 2);
+    assert_eq!(retained_only_drops.get(), 2);
 }
 
 /// drop_and_free() runs the payload's Drop exactly once and returns the block

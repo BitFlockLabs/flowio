@@ -47,11 +47,12 @@ use crate::runtime::buffer::bytes::{
     BufferCursorMut, BufferRangeError, read_u16_be_at, write_u16_be_at,
 };
 use crate::runtime::timer::{Elapsed, timeout};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DNS_PORT: u16 = 53;
 const DNS_CLASS_IN: u16 = 1;
@@ -68,7 +69,7 @@ const MAX_CNAME_DEPTH: usize = 4;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const HOSTS_PATH: &str = "/etc/hosts";
 
-static NEXT_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
 
 /// Reusable DNS resolver built on FlowIO UDP sockets.
 ///
@@ -148,37 +149,13 @@ impl DnsResolver {
 
         let mut current = host.to_owned();
         for _ in 0..=MAX_CNAME_DEPTH {
-            let a = self.lookup_name(&current, DNS_TYPE_A).await?;
-            if a.nx_domain {
-                return Err(host_not_found(&current));
+            match self
+                .gather_dns_addresses(&current, port, &mut addrs)
+                .await?
+            {
+                ResolveHostStep::Resolved => return Ok(addrs),
+                ResolveHostStep::FollowCname(next) => current = next,
             }
-
-            extend_unique_socket_addrs(&mut addrs, &a.addresses, port);
-            if !addrs.is_empty() {
-                let aaaa = self.lookup_name(&current, DNS_TYPE_AAAA).await?;
-                if aaaa.nx_domain {
-                    return Err(host_not_found(&current));
-                }
-                extend_unique_socket_addrs(&mut addrs, &aaaa.addresses, port);
-                return Ok(addrs);
-            }
-
-            let aaaa = self.lookup_name(&current, DNS_TYPE_AAAA).await?;
-            if aaaa.nx_domain {
-                return Err(host_not_found(&current));
-            }
-
-            extend_unique_socket_addrs(&mut addrs, &aaaa.addresses, port);
-            if !addrs.is_empty() {
-                return Ok(addrs);
-            }
-
-            if let Some(next) = a.cname.or(aaaa.cname) {
-                current = next;
-                continue;
-            }
-
-            return Err(host_not_found(&current));
         }
 
         Err(io::Error::new(
@@ -193,8 +170,11 @@ impl DnsResolver {
         let mut last_err = None;
 
         for nameserver in self.nameservers.iter().copied() {
-            match self.query_nameserver(nameserver, &packet).await {
-                Ok(response) => return parse_response_packet(&response, query_id, host, qtype),
+            match self.query_nameserver(nameserver, &packet, query_id).await {
+                Ok(response) => match parse_response_packet(&response, query_id, host, qtype) {
+                    Ok(result) => return Ok(result),
+                    Err(err) => last_err = Some(err),
+                },
                 Err(err) => last_err = Some(err),
             }
         }
@@ -207,18 +187,62 @@ impl DnsResolver {
         }))
     }
 
-    async fn query_nameserver(&self, nameserver: SocketAddr, packet: &[u8]) -> io::Result<Vec<u8>> {
+    async fn query_nameserver(
+        &self,
+        nameserver: SocketAddr,
+        packet: &[u8],
+        query_id: u16,
+    ) -> io::Result<Vec<u8>> {
         let mut socket = UdpSocket::bind(unspecified_addr(nameserver))?;
         socket.connect(nameserver)?;
 
         let (send_result, _) = socket.send(packet.to_vec()).await;
         send_result?;
-        let recv = vec![0u8; 2048];
-        let (recv_result, recv) = timeout(self.query_timeout, socket.recv(recv, 2048))
-            .await
-            .map_err(timeout_error)?;
-        let recv_len = recv_result?;
-        Ok(recv[..recv_len].to_vec())
+        timeout(self.query_timeout, async {
+            loop {
+                let recv = vec![0u8; 2048];
+                let (recv_result, recv) = socket.recv(recv, 2048).await;
+                let recv_len = recv_result?;
+                let response = &recv[..recv_len];
+                if response_matches_query_id(response, query_id)? {
+                    return Ok(response.to_vec());
+                }
+            }
+        })
+        .await
+        .map_err(timeout_error)?
+    }
+
+    async fn gather_dns_addresses(
+        &self,
+        current: &str,
+        port: u16,
+        addrs: &mut Vec<SocketAddr>,
+    ) -> io::Result<ResolveHostStep> {
+        let a = self.lookup_name(current, DNS_TYPE_A).await?;
+        if a.nx_domain {
+            return Err(host_not_found(current));
+        }
+
+        extend_unique_socket_addrs(addrs, &a.addresses, port);
+        let aaaa = self.lookup_name(current, DNS_TYPE_AAAA).await?;
+        if aaaa.nx_domain {
+            if !addrs.is_empty() {
+                return Ok(ResolveHostStep::Resolved);
+            }
+            return Err(host_not_found(current));
+        }
+
+        extend_unique_socket_addrs(addrs, &aaaa.addresses, port);
+        if !addrs.is_empty() {
+            return Ok(ResolveHostStep::Resolved);
+        }
+
+        if let Some(next) = a.cname.or(aaaa.cname) {
+            Ok(ResolveHostStep::FollowCname(next))
+        } else {
+            Err(host_not_found(current))
+        }
     }
 }
 
@@ -242,6 +266,11 @@ pub(crate) struct LookupResult {
     nx_domain: bool,
 }
 
+enum ResolveHostStep {
+    Resolved,
+    FollowCname(String),
+}
+
 enum DnsRecord {
     Address {
         /// Owner name from the resource record.
@@ -260,7 +289,86 @@ enum DnsRecord {
 }
 
 fn next_query_id() -> u16 {
-    NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed)
+    os_random_query_id().unwrap_or_else(fallback_query_id)
+}
+
+fn os_random_query_id() -> Option<u16> {
+    let mut bytes = [0u8; 2];
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        let remaining = bytes.len() - filled;
+        let result = unsafe {
+            libc::getrandom(
+                bytes[filled..].as_mut_ptr().cast(),
+                remaining,
+                libc::GRND_NONBLOCK,
+            )
+        };
+        if result > 0 {
+            filled += result as usize;
+            continue;
+        }
+        if result == 0 {
+            return None;
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+
+    Some(u16::from_ne_bytes(bytes))
+}
+
+fn fallback_query_id() -> u16 {
+    let seed = fallback_query_seed();
+    let mut current = QUERY_ID_STATE.load(Ordering::Relaxed);
+
+    loop {
+        let next = next_fallback_query_state(current, seed);
+        match QUERY_ID_STATE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return query_id_from_state(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn fallback_query_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let state_addr = (&QUERY_ID_STATE as *const AtomicU64 as usize) as u64;
+    mix_query_id_state(nanos ^ pid.rotate_left(17) ^ state_addr.rotate_left(31))
+}
+
+fn next_fallback_query_state(current: u64, seed: u64) -> u64 {
+    let base = if current == 0 {
+        seed
+    } else {
+        current.wrapping_add(0x9E37_79B9_7F4A_7C15)
+    };
+    let mixed = mix_query_id_state(base);
+    if mixed == 0 { 1 } else { mixed }
+}
+
+fn mix_query_id_state(mut value: u64) -> u64 {
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^= value >> 27;
+    value.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn query_id_from_state(state: u64) -> u16 {
+    (state as u16) ^ ((state >> 16) as u16) ^ ((state >> 32) as u16) ^ ((state >> 48) as u16)
 }
 
 fn normalize_host(host: &str) -> io::Result<&str> {
@@ -277,16 +385,15 @@ fn normalize_host(host: &str) -> io::Result<&str> {
 
 fn resolve_local_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::new();
+    let mut deduper = SocketAddrDeduper::new();
 
     if host.eq_ignore_ascii_case("localhost") {
-        addrs.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-        addrs.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+        deduper.push_unique(&mut addrs, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        deduper.push_unique(&mut addrs, SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
     }
 
     for addr in read_hosts_file(HOSTS_PATH, host, port)? {
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
+        deduper.push_unique(&mut addrs, addr);
     }
 
     Ok(addrs)
@@ -300,6 +407,7 @@ fn read_hosts_file(path: &str, host: &str, port: u16) -> io::Result<Vec<SocketAd
     };
 
     let mut addrs = Vec::new();
+    let mut deduper = SocketAddrDeduper::new();
     for line in contents.lines() {
         let line = strip_comment(line);
         if line.is_empty() {
@@ -316,9 +424,7 @@ fn read_hosts_file(path: &str, host: &str, port: u16) -> io::Result<Vec<SocketAd
 
         if parts.any(|name| name.eq_ignore_ascii_case(host)) {
             let socket = SocketAddr::new(ip, port);
-            if !addrs.contains(&socket) {
-                addrs.push(socket);
-            }
+            deduper.push_unique(&mut addrs, socket);
         }
     }
 
@@ -328,6 +434,7 @@ fn read_hosts_file(path: &str, host: &str, port: u16) -> io::Result<Vec<SocketAd
 fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
     let contents = fs::read_to_string(path)?;
     let mut nameservers = Vec::new();
+    let mut deduper = SocketAddrDeduper::new();
 
     for line in contents.lines() {
         let line = strip_comment(line);
@@ -348,9 +455,7 @@ fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
         };
 
         let socket = SocketAddr::new(ip, DNS_PORT);
-        if !nameservers.contains(&socket) {
-            nameservers.push(socket);
-        }
+        deduper.push_unique(&mut nameservers, socket);
     }
 
     if nameservers.is_empty() {
@@ -388,10 +493,38 @@ fn byte_range_eof(err: BufferRangeError) -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, err)
 }
 
+fn response_matches_query_id(packet: &[u8], query_id: u16) -> io::Result<bool> {
+    let response_id = read_u16_be_at(packet, 0).map_err(byte_range_eof)?;
+    Ok(response_id == query_id)
+}
+
 fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port: u16) {
+    let mut deduper = SocketAddrDeduper::from_existing(addrs);
     for ip in ips {
         let addr = SocketAddr::new(*ip, port);
-        if !addrs.contains(&addr) {
+        deduper.push_unique(addrs, addr);
+    }
+}
+
+struct SocketAddrDeduper {
+    seen: HashSet<SocketAddr>,
+}
+
+impl SocketAddrDeduper {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+        }
+    }
+
+    fn from_existing(addrs: &[SocketAddr]) -> Self {
+        Self {
+            seen: addrs.iter().copied().collect(),
+        }
+    }
+
+    fn push_unique(&mut self, addrs: &mut Vec<SocketAddr>, addr: SocketAddr) {
+        if self.seen.insert(addr) {
             addrs.push(addr);
         }
     }
@@ -743,4 +876,65 @@ fn checked_add(base: usize, add: usize, limit: usize) -> io::Result<usize> {
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_query_id_mixer_is_not_sequential_counter() {
+        let seed = 0x1234_5678_9ABC_DEF0;
+        let mut state = 0u64;
+        let mut ids = [0u16; 4];
+        for id in &mut ids {
+            state = next_fallback_query_state(state, seed);
+            *id = query_id_from_state(state);
+        }
+
+        assert_ne!(ids, [1, 2, 3, 4]);
+        assert!(
+            ids.windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "fallback query IDs should not retain sequential AtomicU16 behavior"
+        );
+    }
+
+    #[test]
+    fn encoded_query_packet_carries_selected_query_id() {
+        let packet =
+            encode_query_packet(0xBEEF, "db.example.test", DNS_TYPE_A).expect("query encode");
+        assert_eq!(
+            read_u16_be_at(&packet, 0).expect("encoded query ID should fit"),
+            0xBEEF
+        );
+    }
+
+    #[test]
+    fn socket_addr_dedup_preserves_first_seen_order() {
+        let port = 5432;
+        let mut addrs = vec![
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), port)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10), port)),
+        ];
+        let ips = [
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 11)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
+        ];
+
+        extend_unique_socket_addrs(&mut addrs, &ips, port);
+
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), port)),
+                SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10), port)),
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 11), port)),
+                SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 11), port)),
+            ]
+        );
+    }
 }

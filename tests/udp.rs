@@ -1,112 +1,22 @@
 mod common;
 
-use common::TestIoBuffMut as IoBuffMut;
+use common::{
+    DropTrackedReadOnly, DropTrackedReadWrite, HugeReadOnly, TestIoBuffMut as IoBuffMut,
+    assert_poll_after_ready_parks, wait_for_drop_count,
+};
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::{sleep, timeout};
 use std::cell::Cell;
 use std::future::Future;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-/// Receive buffer whose Drop bumps a shared counter so retain-until-CQE tests
-/// can observe when kernel-facing memory is actually freed.
-struct DropTrackedReadWrite {
-    /// Writable backing bytes.
-    bytes: Vec<u8>,
-    /// Shared drop counter cloned from the test.
-    drops: Rc<Cell<usize>>,
-}
-
-impl DropTrackedReadWrite {
-    fn new(len: usize, drops: &Rc<Cell<usize>>) -> Self {
-        Self {
-            bytes: vec![0; len],
-            drops: Rc::clone(drops),
-        }
-    }
-}
-
-impl Drop for DropTrackedReadWrite {
-    fn drop(&mut self) {
-        self.drops.set(self.drops.get() + 1);
-    }
-}
-
-// SAFETY: `bytes` is a heap-allocated Vec, so `as_mut_ptr()` stays valid and
-// writable for `writable_len()` bytes across moves of the
-// DropTrackedReadWrite value. The runtime only calls `set_written_len(len)`
-// with `len <= writable_len()`, so `set_len` never exceeds the Vec allocation.
-unsafe impl flowio::runtime::buffer::IoBuffReadWrite for DropTrackedReadWrite {
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.bytes.as_mut_ptr()
-    }
-
-    fn writable_len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    unsafe fn set_written_len(&mut self, len: usize) {
-        unsafe { self.bytes.set_len(len) };
-    }
-}
-
-/// Read-only send payload whose Drop bumps a shared counter to detect
-/// premature frees in send retain-until-CQE tests.
-struct DropTrackedReadOnly {
-    /// Payload bytes exposed through IoBuffReadOnly.
-    bytes: Vec<u8>,
-    /// Shared drop counter cloned from the test.
-    drops: Rc<Cell<usize>>,
-}
-
-impl DropTrackedReadOnly {
-    fn new(bytes: Vec<u8>, drops: &Rc<Cell<usize>>) -> Self {
-        Self {
-            bytes,
-            drops: Rc::clone(drops),
-        }
-    }
-}
-
-impl Drop for DropTrackedReadOnly {
-    fn drop(&mut self) {
-        self.drops.set(self.drops.get() + 1);
-    }
-}
-
-// SAFETY: `bytes` is a heap-allocated Vec, so `as_ptr()` stays valid for
-// `len()` bytes for the lifetime of the DropTrackedReadOnly value and is not
-// invalidated when the value is moved.
-unsafe impl flowio::runtime::buffer::IoBuffReadOnly for DropTrackedReadOnly {
-    fn as_ptr(&self) -> *const u8 {
-        self.bytes.as_ptr()
-    }
-
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-}
-
-/// Waits until the original CQE retires and frees the retained buffer exactly
-/// `expected` times, bounded to roughly 500ms.
-async fn wait_for_drop_count(drops: &Rc<Cell<usize>>, expected: usize) {
-    for _ in 0..100 {
-        if drops.get() == expected {
-            return;
-        }
-        sleep(Duration::from_millis(5))
-            .await
-            .expect("drop wait sleep failed");
-    }
-
-    assert_eq!(
-        drops.get(),
-        expected,
-        "retained UDP payload was not dropped exactly once after CQE retirement"
-    );
+fn is_connection_refused(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ECONNREFUSED) || err.kind() == io::ErrorKind::ConnectionRefused
 }
 
 #[test]
@@ -148,6 +58,21 @@ fn runtime_udp_ping_pong() {
         .expect("executor run failed");
 
     peer_thread.join().expect("peer thread panicked");
+}
+
+#[test]
+fn runtime_udp_send_rejects_oversize_iobuff() {
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind udp socket");
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            let (res, _buf) = socket.send(HugeReadOnly).await;
+            let err = res.expect_err("oversize udp send should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        })
+        .expect("executor run failed");
 }
 
 #[test]
@@ -193,6 +118,25 @@ fn runtime_udp_send_to_recv_from_ping_pong() {
 }
 
 #[test]
+fn runtime_udp_rental_send_futures_poll_after_ready_parks() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime udp socket");
+    let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind std udp socket");
+    let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    socket.connect(peer_addr).expect("runtime connect failed");
+
+    executor
+        .run(async move {
+            assert_poll_after_ready_parks(socket.send(Vec::<u8>::new())).await;
+            assert_poll_after_ready_parks(socket.send_to(Vec::<u8>::new(), peer_addr)).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
 fn runtime_udp_recv_from_rejects_truncated_datagram() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
@@ -208,9 +152,10 @@ fn runtime_udp_recv_from_rejects_truncated_datagram() {
     executor
         .run(async move {
             let recv = vec![0u8; 4];
-            let (res, _buf) = socket.recv_from(recv, 4).await;
+            let (res, buf) = socket.recv_from(recv, 4).await;
             let err = res.expect_err("truncated datagram should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(&buf[..], b"over");
         })
         .expect("executor run failed");
 }
@@ -258,9 +203,10 @@ fn runtime_udp_recv_msg_rejects_truncated_datagram() {
     executor
         .run(async move {
             let recv = vec![0u8; 4];
-            let (res, _buf) = socket.recv_msg(recv, 4).await;
+            let (res, buf) = socket.recv_msg(recv, 4).await;
             let err = res.expect_err("truncated datagram should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(&buf[..], b"over");
         })
         .expect("executor run failed");
 }
@@ -306,7 +252,7 @@ fn runtime_udp_cancelled_recv_retains_buffer_until_cqe() {
     executor
         .run(async move {
             let drops = Rc::new(Cell::new(0));
-            let recv = DropTrackedReadWrite::new(64, &drops);
+            let recv = DropTrackedReadWrite::zeroed(64, &drops);
             let result = timeout(Duration::from_millis(10), async {
                 let (res, _buf) = socket.recv(recv, 64).await;
                 res
@@ -340,7 +286,7 @@ fn runtime_udp_cancelled_recv_from_retains_buffer_until_cqe() {
     executor
         .run(async move {
             let drops = Rc::new(Cell::new(0));
-            let recv = DropTrackedReadWrite::new(64, &drops);
+            let recv = DropTrackedReadWrite::zeroed(64, &drops);
             let result = timeout(Duration::from_millis(10), async {
                 let (res, _buf) = socket.recv_from(recv, 64).await;
                 res
@@ -380,7 +326,7 @@ fn runtime_udp_cancelled_recv_msg_retains_buffer_until_cqe() {
     executor
         .run(async move {
             let drops = Rc::new(Cell::new(0));
-            let recv = DropTrackedReadWrite::new(64, &drops);
+            let recv = DropTrackedReadWrite::zeroed(64, &drops);
             let result = timeout(Duration::from_millis(10), async {
                 let (res, _buf) = socket.recv_msg(recv, 64).await;
                 res
@@ -479,6 +425,64 @@ fn runtime_udp_cancelled_send_to_retains_buffer_until_cqe() {
                     assert_eq!(drops.get(), 1, "UDP send_to returned buffer dropped once");
                 }
             }
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_udp_kernel_error_send_returns_payload_once() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime udp socket");
+    let closed_peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind closed udp peer");
+    let closed_addr = closed_peer
+        .local_addr()
+        .expect("closed peer local_addr failed");
+    drop(closed_peer);
+    socket.connect(closed_addr).expect("runtime connect failed");
+
+    executor
+        .run(async move {
+            let (probe_res, _probe) = socket.send(b"probe".to_vec()).await;
+            if let Err(err) = probe_res
+                && !is_connection_refused(&err)
+            {
+                panic!("initial udp probe failed unexpectedly: {err}");
+            }
+
+            sleep(Duration::from_millis(20))
+                .await
+                .expect("udp refused wait sleep failed");
+
+            let drops = Rc::new(Cell::new(0));
+            let mut payload = DropTrackedReadOnly::new(b"kernel-error".to_vec(), &drops);
+            for _ in 0..16 {
+                let (res, returned) = socket.send(payload).await;
+                match res {
+                    Err(err) if is_connection_refused(&err) => {
+                        assert_eq!(drops.get(), 0, "udp payload dropped before return");
+                        drop(returned);
+                        assert_eq!(drops.get(), 1, "udp payload dropped exactly once");
+                        return;
+                    }
+                    Err(err) => panic!("udp send failed with unexpected error: {err}"),
+                    Ok(_) => {
+                        assert_eq!(
+                            drops.get(),
+                            0,
+                            "udp payload dropped after successful return"
+                        );
+                        payload = returned;
+                        sleep(Duration::from_millis(10))
+                            .await
+                            .expect("udp retry wait sleep failed");
+                    }
+                }
+            }
+
+            panic!("connected udp send did not observe ECONNREFUSED from closed peer");
         })
         .expect("executor run failed");
 }

@@ -167,7 +167,9 @@ use super::{
 };
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
-use crate::runtime::executor::{drop_op_ptr_unchecked, poll_ctx_from_waker, submit_retained_sqe};
+use crate::runtime::executor::{
+    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_retained_sqe,
+};
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Elapsed, Timeout, timeout};
@@ -297,6 +299,7 @@ impl AcceptSlot {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) };
         Poll::Pending
     }
 }
@@ -429,6 +432,7 @@ impl ConnectSlot {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) };
         Poll::Pending
     }
 }
@@ -861,6 +865,9 @@ impl TcpStream {
     ///
     /// Use this when the receive path is already naturally segmented. For a
     /// single contiguous destination buffer, prefer [`TcpStream::read`].
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if the chain has no writable segments.
     pub fn readv<const N: usize>(
         &mut self,
         buffer: IoBuffVecMut<N>,
@@ -872,6 +879,7 @@ impl TcpStream {
     ///
     /// The chain is consumed and returned alongside the result (rental
     /// pattern).  The total number of bytes written is returned in `Ok`.
+    /// Empty chains complete with `Ok(0)` without submitting kernel I/O.
     ///
     /// Use this when the send path is already naturally segmented. For one
     /// contiguous payload, prefer [`TcpStream::write`].
@@ -886,7 +894,8 @@ impl TcpStream {
     ///
     /// The chain owns buffers implementing [`IoBuffReadOnly`] and is returned
     /// alongside the result. This is the zero-copy send path for already
-    /// encoded non-FlowIO buffer segments.
+    /// encoded non-FlowIO buffer segments. Empty chains complete with `Ok(0)`
+    /// without submitting kernel I/O.
     ///
     /// Use this when the send path is already naturally segmented. For one
     /// contiguous payload, prefer [`TcpStream::write`].
@@ -902,7 +911,8 @@ impl TcpStream {
     /// FlowIO retains `source`, then projects borrowed byte slices from that
     /// retained source into retained kernel-facing `iovec` scratch. This is
     /// the zero-copy send path for protocols with one compact owner/carrier
-    /// and many already-encoded pieces.
+    /// and many already-encoded pieces. Empty projections complete with
+    /// `Ok(0)` without submitting kernel I/O.
     ///
     /// Use this when the send path is already naturally segmented inside the
     /// retained carrier. For one contiguous payload, prefer [`TcpStream::write`].
@@ -917,7 +927,8 @@ impl TcpStream {
     ///
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
     /// success.  On error the chain is returned with an unspecified amount
-    /// already written.
+    /// already written. Empty chains complete with `Ok(0)` without submitting
+    /// kernel I/O.
     ///
     /// This is the complete-buffer vectored convenience API, not the
     /// lowest-overhead vectored send fast path. Prefer [`TcpStream::writev`]
@@ -933,7 +944,8 @@ impl TcpStream {
     ///
     /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
     /// success. The future materializes `iovec` scratch once and advances it
-    /// in place across partial writes.
+    /// in place across partial writes. Empty chains complete with `Ok(0)`
+    /// without submitting kernel I/O.
     ///
     /// This is the complete-buffer convenience API. Prefer
     /// [`TcpStream::writev_read_only`] when the caller can handle partial
@@ -949,7 +961,8 @@ impl TcpStream {
     ///
     /// Returns `(Ok(n), source)` where `n` equals the projected total byte
     /// count on success. On error the source is returned with an unspecified
-    /// amount already written.
+    /// amount already written. Empty projections complete with `Ok(0)` without
+    /// submitting kernel I/O.
     ///
     /// This is the complete-buffer convenience API. Prefer
     /// [`TcpStream::writev_projected`] when the caller can handle partial
@@ -964,7 +977,8 @@ impl TcpStream {
     /// Scatter-read exactly `len` total bytes into a vectored chain.
     ///
     /// Returns `(Ok(len), chain)` on success.  Returns `UnexpectedEof` if
-    /// the peer closes before `len` bytes arrive.
+    /// the peer closes before `len` bytes arrive. A zero `len` completes with
+    /// `Ok(0)` without submitting kernel I/O.
     ///
     /// This is the complete-buffer vectored convenience API, not the
     /// lowest-overhead vectored receive fast path. Prefer [`TcpStream::readv`]
@@ -1206,6 +1220,12 @@ impl TcpListener {
     /// A concurrent accept on the same listener is reported as an error when
     /// the returned future is first polled; safe borrowing makes that path
     /// unreachable except through intentionally leaked/forgotten futures.
+    ///
+    /// # Errors
+    ///
+    /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
+    /// listener's reusable accept slot is still occupied by a previous future
+    /// or if runtime operation capacity cannot accept the submission.
     pub fn accept(&mut self) -> AcceptFuture<'_> {
         let input_error = self.accept_slot.prepare().err();
         let prepared = input_error.is_none();
@@ -1452,6 +1472,7 @@ impl Future for OwnedConnectFuture {
             }
         }
 
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
     }
 }

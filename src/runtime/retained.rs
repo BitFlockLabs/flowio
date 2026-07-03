@@ -20,7 +20,7 @@
 
 use crate::utils::list::intrusive::slist::{Link, SList};
 use crate::utils::memory::provider::BasicMemoryProvider;
-use crate::utils::memory::slab::{Slab, SlabAllocator, SlabAllocatorConfigError};
+use crate::utils::memory::slab::{SlabAllocator, SlabAllocatorConfigError, SlabPageChain};
 use std::alloc::Layout;
 use std::io;
 use std::marker::PhantomData;
@@ -432,6 +432,26 @@ impl<T: 'static> RetainedPayload<T> {
         value
     }
 
+    /// Extracts selected data from the retained payload in place and releases
+    /// only the backing storage.
+    ///
+    /// # Safety
+    ///
+    /// `pool` must be the same retained pool that created this handle.
+    /// `extract` receives a pointer to the initialized payload and must move or
+    /// drop every initialized field that requires destruction before returning.
+    #[inline(always)]
+    pub(crate) unsafe fn take_with<R>(
+        self,
+        pool: &mut RetainedPayloadPool,
+        extract: impl FnOnce(*mut T) -> R,
+    ) -> R {
+        let ptr = self.ptr.as_ptr();
+        let value = extract(ptr);
+        unsafe { (self.vtable.free_storage)(ptr as *mut (), pool) };
+        value
+    }
+
     /// Drops the payload value and releases the backing storage.
     ///
     /// # Safety
@@ -448,39 +468,45 @@ struct RetainedSizeClass {
     block_size: usize,
     /// Returned blocks ready for reuse.
     free_list: SList<u8>,
-    /// Head of the singly linked list of slab pages owned by this class.
-    slab_page_head: *mut Slab,
-    /// Slab page currently used for bump allocation.
-    current_slab: *mut Slab,
+    /// Move-safe chain of slab pages owned by this class.
+    slab_pages: SlabPageChain,
     /// Slab allocator that requests pages for this class.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
-    /// Stable provider backing `slab_factory`.
-    _provider: Box<BasicMemoryProvider>,
+    /// Stable provider backing `slab_factory` through its raw provider pointer.
+    provider: NonNull<BasicMemoryProvider>,
 }
 
 impl RetainedSizeClass {
     fn new(block_size: usize) -> io::Result<Self> {
         let blocks_per_slab = std::cmp::max(1, RETAINED_SLAB_TARGET_BYTES / block_size);
-        let mut provider = Box::new(BasicMemoryProvider::new());
-        let provider_ptr = &mut *provider as *mut BasicMemoryProvider;
-        let mut slab_factory = ManuallyDrop::new(
-            SlabAllocator::new_uninit(
-                unsafe { &mut *provider_ptr },
-                block_size,
-                RETAINED_BLOCK_ALIGN,
-                blocks_per_slab,
-            )
-            .map_err(slab_config_error_to_io)?,
-        );
+        let provider_ptr = Box::into_raw(Box::new(BasicMemoryProvider::new()));
+        let mut slab_factory = match SlabAllocator::new_uninit(
+            // SAFETY: provider_ptr comes from Box::into_raw and is not
+            // reconstructed as a Box until after slab_factory is no longer
+            // used. SlabAllocator stores only a raw pointer internally.
+            unsafe { &mut *provider_ptr },
+            block_size,
+            RETAINED_BLOCK_ALIGN,
+            blocks_per_slab,
+        ) {
+            Ok(slab_factory) => ManuallyDrop::new(slab_factory),
+            Err(err) => {
+                unsafe { drop(Box::from_raw(provider_ptr)) };
+                return Err(slab_config_error_to_io(err));
+            }
+        };
         slab_factory.init();
+        let provider = unsafe {
+            // SAFETY: Box::into_raw never returns null.
+            NonNull::new_unchecked(provider_ptr)
+        };
 
         Ok(Self {
             block_size,
             free_list: SList::new(),
-            slab_page_head: std::ptr::null_mut(),
-            current_slab: std::ptr::null_mut(),
+            slab_pages: SlabPageChain::new(),
             slab_factory,
-            _provider: provider,
+            provider,
         })
     }
 
@@ -494,28 +520,15 @@ impl RetainedSizeClass {
             });
         }
 
-        if !self.current_slab.is_null()
-            && let Some(ptr) = unsafe { (*self.current_slab).try_alloc(self.block_size) }
-        {
-            return Some(ClassAllocResult {
-                ptr,
-                reused: false,
-                new_slab: false,
-            });
-        }
-
-        let slab_ptr = self.slab_factory.provide_slab()?;
-        unsafe {
-            (*slab_ptr).link.next = self.slab_page_head as *mut Link;
-        }
-        self.slab_page_head = slab_ptr;
-        self.current_slab = slab_ptr;
-        let ptr = unsafe { (*slab_ptr).try_alloc(self.block_size) }?;
+        let result = unsafe {
+            self.slab_pages
+                .alloc_or_grow(&mut self.slab_factory, self.block_size)
+        }?;
 
         Some(ClassAllocResult {
-            ptr,
+            ptr: result.ptr,
             reused: false,
-            new_slab: true,
+            new_slab: result.new_slab,
         })
     }
 
@@ -532,14 +545,10 @@ impl RetainedSizeClass {
 
 impl Drop for RetainedSizeClass {
     fn drop(&mut self) {
-        let mut current = self.slab_page_head;
-        while !current.is_null() {
-            let next = unsafe { (*current).link.next as *mut Slab };
-            unsafe { self.slab_factory.free_slab(current as *mut u8) };
-            current = next;
-        }
+        unsafe { self.slab_pages.free_all(&mut self.slab_factory) };
 
         unsafe { ManuallyDrop::drop(&mut self.slab_factory) };
+        unsafe { drop(Box::from_raw(self.provider.as_ptr())) };
     }
 }
 

@@ -49,4 +49,7 @@ pub mod reactor;
 pub(crate) mod retained;
 #[doc(hidden)]
 pub mod task;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod test_hooks;
 pub mod timer;

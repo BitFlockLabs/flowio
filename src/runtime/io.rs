@@ -28,7 +28,9 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-use crate::runtime::executor::{drop_op_ptr_unchecked, poll_ctx_from_waker, submit_tracked_sqe};
+use crate::runtime::executor::{
+    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_tracked_sqe,
+};
 use crate::runtime::op::CompletionState;
 use io_uring::opcode;
 use std::future::Future;
@@ -36,8 +38,8 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-#[inline(always)]
 /// Completes and frees a finished `NOP` submission if one is ready.
+#[inline(always)]
 fn complete_nop_op(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
@@ -61,6 +63,41 @@ fn complete_nop_op(
     } else {
         Ok(result)
     })
+}
+
+/// Polls one `NOP` operation stored in `state_ptr`.
+#[inline(always)]
+fn poll_nop_op(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+) -> Poll<io::Result<i32>> {
+    if let Some(result) = complete_nop_op(cx, state_ptr) {
+        return Poll::Ready(result);
+    }
+
+    if state_ptr.is_null() {
+        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let new_state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+        if new_state_ptr.is_null() {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+        }
+        *state_ptr = new_state_ptr;
+
+        unsafe { (*new_state_ptr).register_waiter(pctx.owner_task()) };
+
+        let sqe = opcode::Nop::new().build().user_data(new_state_ptr as u64);
+
+        unsafe {
+            if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
+                (*pctx.reactor()).free_op(new_state_ptr);
+                *state_ptr = std::ptr::null_mut();
+                return Poll::Ready(Err(e));
+            }
+        }
+    }
+
+    unsafe { refresh_op_waiter_from_waker(cx, *state_ptr) };
+    Poll::Pending
 }
 
 /// Reusable slot metadata for a `NOP` operation.
@@ -173,33 +210,7 @@ impl Future for Nop {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        if let Some(result) = complete_nop_op(cx, &mut this.state_ptr) {
-            return Poll::Ready(result);
-        }
-
-        if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-            this.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
-
-            let sqe = opcode::Nop::new().build().user_data(state_ptr as u64);
-
-            unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
-                    return Poll::Ready(Err(e));
-                }
-            }
-        }
-
-        Poll::Pending
+        poll_nop_op(cx, &mut this.state_ptr)
     }
 }
 
@@ -216,35 +227,11 @@ impl Future for NopFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some(result) = complete_nop_op(cx, &mut this.slot.state_ptr) {
+        let poll = poll_nop_op(cx, &mut this.slot.state_ptr);
+        if poll.is_ready() {
             this.slot.in_use = false;
-            return Poll::Ready(result);
         }
-
-        if this.slot.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                this.slot.in_use = false;
-                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-            this.slot.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
-
-            let sqe = opcode::Nop::new().build().user_data(state_ptr as u64);
-
-            unsafe {
-                if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.slot.state_ptr = std::ptr::null_mut();
-                    this.slot.in_use = false;
-                    return Poll::Ready(Err(e));
-                }
-            }
-        }
-
-        Poll::Pending
+        poll
     }
 }
 
