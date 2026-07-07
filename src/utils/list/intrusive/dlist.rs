@@ -11,14 +11,19 @@ use std::ptr;
 macro_rules! debug_assert_list_inited {
         ($list:expr) => {{
             let h: *mut Link = &($list).head as *const Link as *mut Link;
-            // Must be initialized: next/prev not null
+            // Must be initialized: empty lists use null `next` and non-null
+            // `prev`; non-empty lists use circular payload links.
             debug_assert!(
-                unsafe { !(*h).next.is_null() && !(*h).prev.is_null() },
+                unsafe { !(*h).prev.is_null() },
                 "List not initialized: call init() after final placement"
             );
-            // Must be internally consistent (basic sentinel sanity)
-            debug_assert_eq!(unsafe { (*(*h).next).prev }, h, "broken list: next.prev != head - Maybe list not initialized or moved after initialization");
-            debug_assert_eq!(unsafe { (*(*h).prev).next }, h, "broken list: prev.next != head - Maybe list not initialized or moved after initialization");
+            if unsafe { (*h).next.is_null() } {
+                debug_assert_eq!(unsafe { (*h).prev }, h, "broken empty list: prev != head - Maybe list moved after initialization");
+            } else {
+                // Must be internally consistent (basic sentinel sanity)
+                debug_assert_eq!(unsafe { (*(*h).next).prev }, h, "broken list: next.prev != head - Maybe list not initialized or moved after initialization");
+                debug_assert_eq!(unsafe { (*(*h).prev).next }, h, "broken list: prev.next != head - Maybe list not initialized or moved after initialization");
+            }
         }};
     }
 
@@ -69,13 +74,10 @@ impl<T> DList<T> {
         }
     }
 
-    /// Initializes the sentinel so the list points to itself.
+    /// Initializes the sentinel so the list can accept payload links.
     pub fn init(&mut self) {
         let head_ptr = &mut self.head as *mut Link;
-        unsafe {
-            (*head_ptr).next = head_ptr;
-            (*head_ptr).prev = head_ptr;
-        }
+        self.set_empty(head_ptr);
     }
 
     /// Returns `true` when the list is uninitialized or has no payload nodes.
@@ -85,7 +87,7 @@ impl<T> DList<T> {
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         let head_ptr = &self.head as *const Link;
-        self.head.next.is_null() || std::ptr::eq(self.head.next, head_ptr)
+        self.head.next.is_null() || std::ptr::eq(self.head.next as *const Link, head_ptr)
     }
 
     /// Internal helper that links `new_link` between two adjacent nodes.
@@ -115,6 +117,15 @@ impl<T> DList<T> {
     #[inline(always)]
     fn normalize_head_ptr(link: *mut Link, head: *mut Link) -> *mut Link {
         if link == head { head } else { link }
+    }
+
+    /// Marks the list initialized and empty without a self-reference in
+    /// `next`, so moving an empty list after init does not leave a stale
+    /// pointer that teardown must dereference.
+    #[inline(always)]
+    fn set_empty(&mut self, head: *mut Link) {
+        self.head.next = ptr::null_mut();
+        self.head.prev = head;
     }
 
     #[cfg(debug_assertions)]
@@ -151,6 +162,11 @@ impl<T> DList<T> {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
+        let prev = if self.head.next.is_null() {
+            head_ptr
+        } else {
+            unsafe { Self::normalize_head_ptr((*head_ptr).prev, head_ptr) }
+        };
 
         debug_assert!(!node_link.is_null());
         debug_assert!(unsafe { (*node_link).is_unlinked() }, "double insert");
@@ -158,7 +174,7 @@ impl<T> DList<T> {
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            Self::__list_add(node_link, (*head_ptr).prev, head_ptr, head_ptr);
+            Self::__list_add(node_link, prev, head_ptr, head_ptr);
         }
     }
 
@@ -173,12 +189,17 @@ impl<T> DList<T> {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
+        let prev = if self.head.next.is_null() {
+            head_ptr
+        } else {
+            unsafe { Self::normalize_head_ptr((*head_ptr).prev, head_ptr) }
+        };
 
         debug_assert!(!node_link.is_null());
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            Self::__list_add(node_link, (*head_ptr).prev, head_ptr, head_ptr);
+            Self::__list_add(node_link, prev, head_ptr, head_ptr);
         }
     }
 
@@ -192,6 +213,11 @@ impl<T> DList<T> {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
+        let next = if self.head.next.is_null() {
+            head_ptr
+        } else {
+            unsafe { Self::normalize_head_ptr((*head_ptr).next, head_ptr) }
+        };
 
         debug_assert!(!node_link.is_null());
         debug_assert!(unsafe { (*node_link).is_unlinked() }, "double insert");
@@ -199,7 +225,7 @@ impl<T> DList<T> {
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            Self::__list_add(node_link, head_ptr, (*head_ptr).next, head_ptr);
+            Self::__list_add(node_link, head_ptr, next, head_ptr);
         }
     }
 
@@ -217,12 +243,17 @@ impl<T> DList<T> {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
+        let next = if self.head.next.is_null() {
+            head_ptr
+        } else {
+            unsafe { Self::normalize_head_ptr((*head_ptr).next, head_ptr) }
+        };
 
         debug_assert!(!node_link.is_null());
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
-            Self::__list_add(node_link, head_ptr, (*head_ptr).next, head_ptr);
+            Self::__list_add(node_link, head_ptr, next, head_ptr);
         }
     }
 
@@ -259,8 +290,7 @@ impl<T> DList<T> {
             (*last).next = self_head;
             (*self_head).prev = last;
 
-            (*other_head).next = other_head;
-            (*other_head).prev = other_head;
+            other.set_empty(other_head);
         }
     }
 
@@ -274,15 +304,23 @@ impl<T> DList<T> {
     pub(crate) fn unlink_all_for_drop(&mut self) {
         let next_null = self.head.next.is_null();
         let prev_null = self.head.prev.is_null();
-        debug_assert_eq!(
-            next_null, prev_null,
+        debug_assert!(
+            next_null || !prev_null,
             "DList teardown saw a partially initialized sentinel"
         );
-        if next_null || prev_null {
+        if next_null && prev_null {
             return;
         }
 
         let head_ptr = &mut self.head as *mut Link;
+        if next_null {
+            self.set_empty(head_ptr);
+            return;
+        }
+        if prev_null {
+            return;
+        }
+
         let mut current = Self::normalize_head_ptr(self.head.next, head_ptr);
         while current != head_ptr {
             unsafe {
@@ -296,8 +334,7 @@ impl<T> DList<T> {
             }
         }
 
-        self.head.next = head_ptr;
-        self.head.prev = head_ptr;
+        self.set_empty(head_ptr);
     }
 
     /// Drains every payload node for owner teardown, passing each container
@@ -318,15 +355,23 @@ impl<T> DList<T> {
     {
         let next_null = self.head.next.is_null();
         let prev_null = self.head.prev.is_null();
-        debug_assert_eq!(
-            next_null, prev_null,
+        debug_assert!(
+            next_null || !prev_null,
             "DList teardown saw a partially initialized sentinel"
         );
-        if next_null || prev_null {
+        if next_null && prev_null {
             return;
         }
 
         let head_ptr = &mut self.head as *mut Link;
+        if next_null {
+            self.set_empty(head_ptr);
+            return;
+        }
+        if prev_null {
+            return;
+        }
+
         let mut current = self.head.next;
         if current == head_ptr {
             return;
@@ -344,8 +389,7 @@ impl<T> DList<T> {
             }
         }
 
-        self.head.next = head_ptr;
-        self.head.prev = head_ptr;
+        self.set_empty(head_ptr);
     }
 
     /// Removes a specific node from the list.
@@ -382,8 +426,12 @@ impl<T> DList<T> {
                 );
             }
 
-            (*next).prev = prev;
-            (*prev).next = next;
+            if next == head_ptr && prev == head_ptr {
+                self.set_empty(head_ptr);
+            } else {
+                (*next).prev = prev;
+                (*prev).next = next;
+            }
 
             // Clear pointers to mark as unlinked.
             (*node_link).next = ptr::null_mut();
@@ -437,8 +485,12 @@ impl<T> DList<T> {
             let next = Self::normalize_head_ptr((*node_ptr).next, head_ptr);
             let prev = Self::normalize_head_ptr((*node_ptr).prev, head_ptr);
 
-            (*next).prev = prev;
-            (*prev).next = next;
+            if next == head_ptr && prev == head_ptr {
+                self.set_empty(head_ptr);
+            } else {
+                (*next).prev = prev;
+                (*prev).next = next;
+            }
 
             (*node_ptr).next = ptr::null_mut();
             (*node_ptr).prev = ptr::null_mut();
@@ -453,7 +505,11 @@ impl<T> DList<T> {
 
         let head_ptr = &mut self.head as *mut Link;
         CursorMut {
-            current: unsafe { Self::normalize_head_ptr((*head_ptr).next, head_ptr) },
+            current: if self.head.next.is_null() {
+                head_ptr
+            } else {
+                unsafe { Self::normalize_head_ptr((*head_ptr).next, head_ptr) }
+            },
             head: head_ptr,
             list: self,
         }
@@ -465,7 +521,11 @@ impl<T> DList<T> {
 
         let head_ptr = &mut self.head as *mut Link;
         CursorBackMut {
-            current: unsafe { Self::normalize_head_ptr((*head_ptr).prev, head_ptr) },
+            current: if self.head.next.is_null() {
+                head_ptr
+            } else {
+                unsafe { Self::normalize_head_ptr((*head_ptr).prev, head_ptr) }
+            },
             head: head_ptr,
             _list: self,
         }
@@ -595,6 +655,18 @@ mod tests {
     }
 
     #[test]
+    fn dlist_size_matches_sentinel_link() {
+        assert_eq!(
+            std::mem::size_of::<DList<Node>>(),
+            std::mem::size_of::<Link>()
+        );
+        assert_eq!(
+            std::mem::align_of::<DList<Node>>(),
+            std::mem::align_of::<Link>()
+        );
+    }
+
+    #[test]
     fn unlink_all_for_drop_handles_empty_list() {
         let mut list = DList::<Node>::new_uninit();
         list.init();
@@ -602,6 +674,34 @@ mod tests {
         list.unlink_all_for_drop();
 
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn unlink_all_for_drop_handles_moved_empty_list() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+
+        let mut moved = list;
+        moved.unlink_all_for_drop();
+
+        assert!(moved.is_empty());
+    }
+
+    #[test]
+    fn drain_all_for_drop_handles_moved_empty_list() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+
+        let mut moved = list;
+        let mut drained = false;
+        unsafe {
+            moved.drain_all_for_drop(offset_of!(Node, link), |_| {
+                drained = true;
+            });
+        }
+
+        assert!(!drained, "empty moved list should not drain payloads");
+        assert!(moved.is_empty());
     }
 
     #[test]

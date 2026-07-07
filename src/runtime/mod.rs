@@ -47,6 +47,9 @@ pub mod op;
 pub mod reactor;
 #[allow(dead_code)]
 pub(crate) mod retained;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod retained_test_support;
 #[doc(hidden)]
 pub mod task;
 #[cfg(debug_assertions)]

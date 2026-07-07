@@ -19,7 +19,7 @@
 //! slab allocation failure returns `WouldBlock`.
 
 use crate::utils::list::intrusive::slist::{Link, SList};
-use crate::utils::memory::provider::BasicMemoryProvider;
+use crate::utils::memory::provider::{BasicMemoryProvider, ProviderOwner};
 use crate::utils::memory::slab::{SlabAllocator, SlabAllocatorConfigError, SlabPageChain};
 use std::alloc::Layout;
 use std::io;
@@ -473,40 +473,37 @@ struct RetainedSizeClass {
     /// Slab allocator that requests pages for this class.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
     /// Stable provider backing `slab_factory` through its raw provider pointer.
-    provider: NonNull<BasicMemoryProvider>,
+    _provider: ProviderOwner<BasicMemoryProvider>,
 }
 
 impl RetainedSizeClass {
     fn new(block_size: usize) -> io::Result<Self> {
         let blocks_per_slab = std::cmp::max(1, RETAINED_SLAB_TARGET_BYTES / block_size);
-        let provider_ptr = Box::into_raw(Box::new(BasicMemoryProvider::new()));
-        let mut slab_factory = match SlabAllocator::new_uninit(
-            // SAFETY: provider_ptr comes from Box::into_raw and is not
-            // reconstructed as a Box until after slab_factory is no longer
-            // used. SlabAllocator stores only a raw pointer internally.
-            unsafe { &mut *provider_ptr },
-            block_size,
-            RETAINED_BLOCK_ALIGN,
-            blocks_per_slab,
-        ) {
+        let provider = ProviderOwner::new(BasicMemoryProvider::new());
+        let mut slab_factory = match unsafe {
+            // SAFETY: provider.as_ptr() comes from a heap allocation owned by
+            // ProviderOwner and remains stable until after slab_factory is
+            // manually dropped.
+            SlabAllocator::new_uninit_from_raw(
+                provider.as_ptr(),
+                block_size,
+                RETAINED_BLOCK_ALIGN,
+                blocks_per_slab,
+            )
+        } {
             Ok(slab_factory) => ManuallyDrop::new(slab_factory),
             Err(err) => {
-                unsafe { drop(Box::from_raw(provider_ptr)) };
                 return Err(slab_config_error_to_io(err));
             }
         };
         slab_factory.init();
-        let provider = unsafe {
-            // SAFETY: Box::into_raw never returns null.
-            NonNull::new_unchecked(provider_ptr)
-        };
 
         Ok(Self {
             block_size,
             free_list: SList::new(),
             slab_pages: SlabPageChain::new(),
             slab_factory,
-            provider,
+            _provider: provider,
         })
     }
 
@@ -548,7 +545,6 @@ impl Drop for RetainedSizeClass {
         unsafe { self.slab_pages.free_all(&mut self.slab_factory) };
 
         unsafe { ManuallyDrop::drop(&mut self.slab_factory) };
-        unsafe { drop(Box::from_raw(self.provider.as_ptr())) };
     }
 }
 

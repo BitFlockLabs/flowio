@@ -6,11 +6,13 @@
 
 use std::cell::Cell;
 use std::io;
-
 thread_local! {
     static FAIL_OP_ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static FAIL_SQE_SUBMITS: Cell<usize> = const { Cell::new(0) };
     static FAIL_RAW_SQE_SUBMITS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_RING_SUBMITS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_RING_SUBMIT_ERRNO: Cell<i32> = const { Cell::new(0) };
+    static FAIL_RING_WAITS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_RING_WAIT_ERRNO: Cell<i32> = const { Cell::new(0) };
     static FAIL_IOBUFF_POOL_SLAB_ALLOCS: Cell<usize> = const { Cell::new(0) };
     static FAIL_REACTOR_EXT_ARG_PROBES: Cell<usize> = const { Cell::new(0) };
 }
@@ -21,11 +23,11 @@ pub fn fail_next_op_alloc() {
     FAIL_OP_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
 
-/// Makes the next tracked SQE submission on this thread fail with
+/// Makes the next raw reactor SQE submission on this thread fail with
 /// `WouldBlock`.
 #[doc(hidden)]
 pub fn fail_next_sqe_submit() {
-    FAIL_SQE_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
+    fail_next_raw_sqe_submit();
 }
 
 /// Makes the next raw reactor SQE submission on this thread fail with
@@ -34,6 +36,24 @@ pub fn fail_next_sqe_submit() {
 #[allow(dead_code)]
 pub(crate) fn fail_next_raw_sqe_submit() {
     FAIL_RAW_SQE_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
+}
+
+/// Makes the next raw `io_uring_enter` submit call on this thread fail with a
+/// specific OS errno.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn fail_next_ring_submit_errno(errno: i32) {
+    FAIL_RING_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
+    FAIL_RING_SUBMIT_ERRNO.with(|stored| stored.set(errno));
+}
+
+/// Makes the next `io_uring_enter` wait call on this thread fail with a
+/// specific OS errno.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn fail_next_ring_wait_errno(errno: i32) {
+    FAIL_RING_WAITS.with(|fails| fails.set(fails.get().saturating_add(1)));
+    FAIL_RING_WAIT_ERRNO.with(|stored| stored.set(errno));
 }
 
 /// Makes the next `IoBuffPool` slab allocation on this thread fail.
@@ -65,8 +85,8 @@ pub(crate) fn take_op_alloc_failure() -> bool {
 }
 
 #[inline(always)]
-pub(crate) fn take_sqe_submit_failure() -> Option<io::Error> {
-    FAIL_SQE_SUBMITS.with(|fails| {
+pub(crate) fn take_raw_sqe_submit_failure() -> Option<io::Error> {
+    FAIL_RAW_SQE_SUBMITS.with(|fails| {
         let remaining = fails.get();
         if remaining == 0 {
             None
@@ -78,16 +98,41 @@ pub(crate) fn take_sqe_submit_failure() -> Option<io::Error> {
 }
 
 #[inline(always)]
-pub(crate) fn take_raw_sqe_submit_failure() -> Option<io::Error> {
-    FAIL_RAW_SQE_SUBMITS.with(|fails| {
+pub(crate) fn take_ring_submit_failure() -> Option<io::Error> {
+    FAIL_RING_SUBMITS.with(|fails| {
         let remaining = fails.get();
         if remaining == 0 {
             None
         } else {
             fails.set(remaining - 1);
-            Some(io::Error::from(io::ErrorKind::WouldBlock))
+            let errno = FAIL_RING_SUBMIT_ERRNO.with(|stored| stored.get());
+            if errno == 0 {
+                Some(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Some(io::Error::from_raw_os_error(errno))
+            }
         }
     })
+}
+
+#[inline(always)]
+pub(crate) fn take_ring_wait_failure() -> Option<io::Error> {
+    FAIL_RING_WAITS.with(|fails| {
+        let remaining = fails.get();
+        if remaining == 0 {
+            None
+        } else {
+            fails.set(remaining - 1);
+            let errno = FAIL_RING_WAIT_ERRNO.with(|stored| stored.get());
+            Some(io::Error::from_raw_os_error(errno))
+        }
+    })
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn ring_wait_failures_remaining() -> usize {
+    FAIL_RING_WAITS.with(Cell::get)
 }
 
 #[inline(always)]

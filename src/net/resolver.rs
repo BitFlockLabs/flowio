@@ -62,7 +62,11 @@ const DNS_TYPE_AAAA: u16 = 28;
 const DNS_FLAG_QR: u16 = 0x8000;
 const DNS_FLAG_TC: u16 = 0x0200;
 const DNS_RCODE_MASK: u16 = 0x000F;
+const DNS_RCODE_FORMERR: u8 = 1;
+const DNS_RCODE_SERVFAIL: u8 = 2;
 const DNS_RCODE_NXDOMAIN: u8 = 3;
+const DNS_RCODE_NOTIMP: u8 = 4;
+const DNS_RCODE_REFUSED: u8 = 5;
 const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CNAME_DEPTH: usize = 4;
@@ -199,13 +203,15 @@ impl DnsResolver {
         let (send_result, _) = socket.send(packet.to_vec()).await;
         send_result?;
         timeout(self.query_timeout, async {
+            let mut recv = vec![0u8; 2048];
             loop {
-                let recv = vec![0u8; 2048];
-                let (recv_result, recv) = socket.recv(recv, 2048).await;
+                let (recv_result, returned) = socket.recv(recv, 2048).await;
+                recv = returned;
                 let recv_len = recv_result?;
                 let response = &recv[..recv_len];
-                if response_matches_query_id(response, query_id)? {
-                    return Ok(response.to_vec());
+                if response_is_decodable_candidate(response, query_id) {
+                    recv.truncate(recv_len);
+                    return Ok(recv);
                 }
             }
         })
@@ -225,7 +231,15 @@ impl DnsResolver {
         }
 
         extend_unique_socket_addrs(addrs, &a.addresses, port);
-        let aaaa = self.lookup_name(current, DNS_TYPE_AAAA).await?;
+        let aaaa = match self.lookup_name(current, DNS_TYPE_AAAA).await {
+            Ok(aaaa) => aaaa,
+            Err(err) => {
+                if !addrs.is_empty() {
+                    return Ok(ResolveHostStep::Resolved);
+                }
+                return Err(err);
+            }
+        };
         if aaaa.nx_domain {
             if !addrs.is_empty() {
                 return Ok(ResolveHostStep::Resolved);
@@ -493,9 +507,138 @@ fn byte_range_eof(err: BufferRangeError) -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, err)
 }
 
-fn response_matches_query_id(packet: &[u8], query_id: u16) -> io::Result<bool> {
+fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
+    if packet.len() < 12 {
+        return false;
+    }
+
+    let Some(response_id) = read_u16_be_candidate(packet, 0) else {
+        return false;
+    };
+    if response_id != query_id {
+        return false;
+    }
+
+    let Some(flags) = read_u16_be_candidate(packet, 2) else {
+        return false;
+    };
+    if flags & DNS_FLAG_QR == 0 {
+        return false;
+    }
+
+    let Some(qdcount) = read_u16_be_candidate(packet, 4) else {
+        return false;
+    };
+    match qdcount {
+        0 => dns_rcode_allows_questionless_failover(dns_rcode(flags)),
+        1 => {
+            let Some((consumed, _)) = skip_dns_name(packet, 12, 0) else {
+                return false;
+            };
+            let Some(question_end) = checked_add_candidate(12, consumed, packet.len()) else {
+                return false;
+            };
+            checked_add_candidate(question_end, 4, packet.len()).is_some()
+        }
+        _ => false,
+    }
+}
+
+struct DnsResponseEnvelope {
+    flags: u16,
+    ancount: usize,
+    nscount: usize,
+    arcount: usize,
+    question: Option<DnsResponseQuestion>,
+}
+
+struct DnsResponseQuestion {
+    name: String,
+    qtype: u16,
+    qclass: u16,
+    end_offset: usize,
+}
+
+fn parse_response_envelope(packet: &[u8], query_id: u16) -> io::Result<DnsResponseEnvelope> {
+    if packet.len() < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "DNS response shorter than header",
+        ));
+    }
+
     let response_id = read_u16_be_at(packet, 0).map_err(byte_range_eof)?;
-    Ok(response_id == query_id)
+    if response_id != query_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response ID did not match query ID",
+        ));
+    }
+
+    let flags = read_u16_be_at(packet, 2).map_err(byte_range_eof)?;
+    if flags & DNS_FLAG_QR == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response packet was not marked as a response",
+        ));
+    }
+
+    let qdcount = read_u16_be_at(packet, 4).map_err(byte_range_eof)? as usize;
+    let ancount = read_u16_be_at(packet, 6).map_err(byte_range_eof)? as usize;
+    let nscount = read_u16_be_at(packet, 8).map_err(byte_range_eof)? as usize;
+    let arcount = read_u16_be_at(packet, 10).map_err(byte_range_eof)? as usize;
+
+    let question = match qdcount {
+        0 if dns_rcode_allows_questionless_failover(dns_rcode(flags)) => None,
+        0 => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response question count did not match query",
+            ));
+        }
+        1 => {
+            let mut offset = 12usize;
+            let (name, consumed) = decode_name(packet, offset, 0)?;
+            offset = checked_add(offset, consumed, packet.len())?;
+            let qtype = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
+            let qclass_offset = checked_add(offset, 2, packet.len())?;
+            let qclass = read_u16_be_at(packet, qclass_offset).map_err(byte_range_eof)?;
+            let end_offset = checked_add(offset, 4, packet.len())?;
+            Some(DnsResponseQuestion {
+                name,
+                qtype,
+                qclass,
+                end_offset,
+            })
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response question count did not match query",
+            ));
+        }
+    };
+
+    Ok(DnsResponseEnvelope {
+        flags,
+        ancount,
+        nscount,
+        arcount,
+        question,
+    })
+}
+
+#[inline(always)]
+fn dns_rcode(flags: u16) -> u8 {
+    (flags & DNS_RCODE_MASK) as u8
+}
+
+#[inline(always)]
+fn dns_rcode_allows_questionless_failover(rcode: u8) -> bool {
+    matches!(
+        rcode,
+        DNS_RCODE_FORMERR | DNS_RCODE_SERVFAIL | DNS_RCODE_NOTIMP | DNS_RCODE_REFUSED
+    )
 }
 
 fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port: u16) {
@@ -576,28 +719,8 @@ pub(crate) fn parse_response_packet(
     query_host: &str,
     qtype: u16,
 ) -> io::Result<LookupResult> {
-    if packet.len() < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "DNS response shorter than header",
-        ));
-    }
-
-    let response_id = read_u16_be_at(packet, 0).map_err(byte_range_eof)?;
-    if response_id != query_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response ID did not match query ID",
-        ));
-    }
-
-    let flags = read_u16_be_at(packet, 2).map_err(byte_range_eof)?;
-    if flags & DNS_FLAG_QR == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response packet was not marked as a response",
-        ));
-    }
+    let envelope = parse_response_envelope(packet, query_id)?;
+    let flags = envelope.flags;
     if flags & DNS_FLAG_TC != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -605,7 +728,7 @@ pub(crate) fn parse_response_packet(
         ));
     }
 
-    let rcode = (flags & DNS_RCODE_MASK) as u8;
+    let rcode = dns_rcode(flags);
     if rcode == DNS_RCODE_NXDOMAIN {
         return Ok(LookupResult {
             addresses: Vec::new(),
@@ -619,38 +742,27 @@ pub(crate) fn parse_response_packet(
         )));
     }
 
-    let qdcount = read_u16_be_at(packet, 4).map_err(byte_range_eof)? as usize;
-    let ancount = read_u16_be_at(packet, 6).map_err(byte_range_eof)? as usize;
-    let nscount = read_u16_be_at(packet, 8).map_err(byte_range_eof)? as usize;
-    let arcount = read_u16_be_at(packet, 10).map_err(byte_range_eof)? as usize;
-
-    let mut offset = 12usize;
-    if qdcount != 1 {
+    let Some(question) = envelope.question else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response question count did not match query",
         ));
-    }
-    let (question_name, consumed) = decode_name(packet, offset, 0)?;
-    if !dns_name_eq(&question_name, query_host) {
+    };
+    if !dns_name_eq(&question.name, query_host) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response question name did not match query",
         ));
     }
-    offset = checked_add(offset, consumed, packet.len())?;
-    let question_type = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
-    let question_class_offset = checked_add(offset, 2, packet.len())?;
-    let question_class = read_u16_be_at(packet, question_class_offset).map_err(byte_range_eof)?;
-    if question_type != qtype || question_class != DNS_CLASS_IN {
+    if question.qtype != qtype || question.qclass != DNS_CLASS_IN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response question type/class did not match query",
         ));
     }
-    offset = checked_add(offset, 4, packet.len())?;
+    let mut offset = question.end_offset;
 
-    let total_rrs = ancount + nscount + arcount;
+    let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;
     let max_rrs_by_packet = packet.len().saturating_sub(offset) / 11;
     let mut records = Vec::with_capacity(total_rrs.min(max_rrs_by_packet));
     for _ in 0..total_rrs {
@@ -857,6 +969,66 @@ pub(crate) fn decode_name(
     Ok((name, consumed))
 }
 
+// Candidate-drain fast path: mirror `decode_name` validation without
+// allocating label strings or `io::Error` values for rejected datagrams.
+fn skip_dns_name(packet: &[u8], offset: usize, depth: usize) -> Option<(usize, usize)> {
+    if depth > MAX_CNAME_DEPTH + 4 || offset >= packet.len() {
+        return None;
+    }
+
+    let mut pos = offset;
+    let mut consumed = 0usize;
+    let mut presentation_len = 0usize;
+
+    loop {
+        let len = *packet.get(pos)?;
+        if len & 0xC0 == 0xC0 {
+            let next = checked_add_candidate(pos, 1, packet.len())?;
+            let next_byte = *packet.get(next)?;
+            let pointer = (((len & 0x3F) as usize) << 8) | next_byte as usize;
+            if pointer >= pos {
+                return None;
+            }
+            consumed = consumed.checked_add(2)?;
+            let (_, suffix_len) = skip_dns_name(packet, pointer, depth + 1)?;
+            if suffix_len != 0 {
+                if presentation_len != 0 {
+                    presentation_len = presentation_len.checked_add(1)?;
+                }
+                presentation_len = presentation_len.checked_add(suffix_len)?;
+            }
+            break;
+        }
+
+        if len == 0 {
+            consumed = consumed.checked_add(1)?;
+            break;
+        }
+
+        if len & 0xC0 != 0 {
+            return None;
+        }
+
+        let label_len = len as usize;
+        let label_start = checked_add_candidate(pos, 1, packet.len())?;
+        let label_end = checked_add_candidate(label_start, label_len, packet.len())?;
+        if presentation_len != 0 {
+            presentation_len = presentation_len.checked_add(1)?;
+        }
+        presentation_len = presentation_len.checked_add(label_len)?;
+        if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
+            return None;
+        }
+        consumed = consumed.checked_add(1 + label_len)?;
+        pos = label_end;
+    }
+
+    if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
+        return None;
+    }
+    Some((consumed, presentation_len))
+}
+
 fn dns_name_eq(left: &str, right: &str) -> bool {
     left.trim_end_matches('.')
         .eq_ignore_ascii_case(right.trim_end_matches('.'))
@@ -876,6 +1048,19 @@ fn checked_add(base: usize, add: usize, limit: usize) -> io::Result<usize> {
         ));
     }
     Ok(value)
+}
+
+#[inline(always)]
+fn checked_add_candidate(base: usize, add: usize, limit: usize) -> Option<usize> {
+    let value = base.checked_add(add)?;
+    (value <= limit).then_some(value)
+}
+
+#[inline(always)]
+fn read_u16_be_candidate(packet: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let bytes = packet.get(offset..end)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 #[cfg(test)]

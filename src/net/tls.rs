@@ -211,8 +211,11 @@ pub struct TlsClientOptions {
 ///
 /// If a raw transport write fails after rustls has emitted TLS records, the
 /// stream is marked failed. Retrying the same plaintext on that stream could
-/// duplicate records that the kernel already accepted, so later TLS operations
-/// return `BrokenPipe`.
+/// duplicate records that the kernel already accepted, so later TLS write,
+/// flush, and shutdown operations return `BrokenPipe`. The read side may still
+/// drain already-decrypted plaintext and continue reading the transport until
+/// EOF; if a read requires a TLS transport write to make progress after the
+/// write latch is set, that read returns `BrokenPipe`.
 pub struct TlsClientStream {
     /// Underlying connected TCP transport owned by this TLS wrapper.
     stream: TcpStream,
@@ -485,7 +488,12 @@ impl TlsClientStream {
 
     /// Reads up to `len` decrypted plaintext bytes into `buffer`.
     ///
+    /// # Errors
     /// Returns `NotConnected` if the TLS handshake has not completed yet.
+    /// A clean TLS close returns `Ok(0)`.
+    /// After a raw transport write failure, already-decrypted plaintext may
+    /// still be returned; if a read needs to emit TLS records to make progress
+    /// after that latch is set, it returns `BrokenPipe`.
     ///
     /// This is the lowest-overhead TLS read API when the caller can handle
     /// short plaintext reads.
@@ -498,7 +506,11 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` if the TLS handshake has not completed yet.
     /// Returns `UnexpectedEof` if the TLS session reaches EOF before `len`
-    /// plaintext bytes become available.
+    /// plaintext bytes become available; any partial plaintext read into the
+    /// caller buffer remains published in that returned buffer.
+    /// After a raw transport write failure, already-decrypted plaintext may
+    /// still be returned; if a read needs to emit TLS records to make progress
+    /// after that latch is set, it returns `BrokenPipe`.
     ///
     /// This is the complete-buffer convenience API, not the lowest-overhead
     /// TLS read fast path. Prefer [`TlsClientStream::read`] when the caller
@@ -520,7 +532,11 @@ impl TlsClientStream {
     ///
     /// # Errors
     /// Returns `NotConnected` if called before handshake completion and
-    /// `BrokenPipe` if the TLS write side has already been shut down.
+    /// `BrokenPipe` if the TLS write side has already been shut down or a
+    /// prior raw transport write failed.
+    /// If rustls accepts plaintext but the following TLS-record flush fails,
+    /// this future returns an error without a progress count; the stream is
+    /// failed and callers must not retry the same plaintext on it.
     ///
     /// This is the lowest-overhead TLS write API when the caller can handle
     /// short plaintext writes.
@@ -530,8 +546,14 @@ impl TlsClientStream {
 
     /// Writes the entire plaintext buffer, draining TLS records as needed.
     ///
+    /// # Errors
     /// Returns `NotConnected` if called before handshake completion and
-    /// `BrokenPipe` if the TLS write side has already been shut down.
+    /// `BrokenPipe` if the TLS write side has already been shut down or a
+    /// prior raw transport write failed.
+    /// If rustls accepts plaintext but a later TLS-record flush fails, this
+    /// future returns an error even though some plaintext may already be queued
+    /// as TLS records; the stream is failed and callers must not retry the
+    /// same plaintext on it.
     ///
     /// This is the complete-buffer convenience API, not the lowest-overhead
     /// TLS write fast path. Prefer [`TlsClientStream::write`] when the caller
@@ -546,6 +568,9 @@ impl TlsClientStream {
     /// This does not advance the TLS handshake by itself beyond draining
     /// already-generated outbound records.
     ///
+    /// # Errors
+    /// Returns `BrokenPipe` if a prior raw transport write failed.
+    ///
     /// This is primarily a control-path API for callers that need an explicit
     /// flush boundary.
     pub fn flush(&mut self) -> TlsFlushFuture<'_> {
@@ -556,6 +581,11 @@ impl TlsClientStream {
     ///
     /// After this completes, further plaintext writes return `BrokenPipe`.
     /// The read side remains available until the peer closes its direction.
+    ///
+    /// # Errors
+    /// If the transport write side has previously failed, shutdown returns
+    /// `BrokenPipe` while reads can still drain plaintext that does not require
+    /// emitting more TLS records.
     /// This is a shutdown-path API rather than a steady-state fast-path API.
     pub fn shutdown(&mut self) -> TlsShutdownFuture<'_> {
         TlsShutdownFuture { stream: self }
@@ -703,6 +733,7 @@ impl TlsClientStream {
             while self.connection.wants_write() {
                 let wrote = self.connection.write_tls(&mut buffer)?;
                 if wrote == 0 {
+                    self.transport_write_failed = true;
                     self.restore_write_tls_buffer(buffer);
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -774,16 +805,18 @@ impl TlsClientStream {
         dst: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         loop {
-            match self.poll_flush_pending_tls(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Ready(Ok(())) => {}
-            }
-
             match self.connection.reader().read(dst) {
                 Ok(read) => return Poll::Ready(Ok(read)),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            if self.pending_write_tls.is_some() {
+                match self.poll_flush_pending_tls(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) => continue,
+                }
             }
 
             if self.pending_read_tls.is_some() || self.connection.wants_read() {
@@ -795,7 +828,11 @@ impl TlsClientStream {
             }
 
             if self.connection.wants_write() {
-                continue;
+                match self.poll_flush_pending_tls(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) => continue,
+                }
             }
 
             return Poll::Ready(Err(tls_internal_error(
@@ -1237,6 +1274,13 @@ impl Future for TlsShutdownFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if this.stream.transport_write_failed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls transport write failed",
+            )));
+        }
+
         if !this.stream.write_shutdown {
             this.stream.connection.send_close_notify();
             this.stream.write_shutdown = true;
@@ -1259,63 +1303,101 @@ impl Future for TlsShutdownFuture<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(miri))]
     use super::*;
+    #[cfg(all(debug_assertions, not(miri)))]
+    use crate::net::tls_test_peer;
+    #[cfg(not(miri))]
     use crate::runtime::executor::Executor;
+    #[cfg(not(miri))]
     use rustls::RootCertStore;
+    #[cfg(not(miri))]
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::time::Duration;
 
-    fn force_reset_on_drop(tcp: &std::net::TcpStream) {
-        let linger = libc::linger {
-            l_onoff: 1,
-            l_linger: 0,
-        };
-        let rc = unsafe {
-            libc::setsockopt(
-                tcp.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                &linger as *const libc::linger as *const libc::c_void,
-                std::mem::size_of::<libc::linger>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0, "setsockopt SO_LINGER failed");
-    }
-
-    fn drain_client_hello_then_reset(mut tcp: std::net::TcpStream) {
-        force_reset_on_drop(&tcp);
-        tcp.set_read_timeout(Some(Duration::from_millis(100)))
-            .expect("set_read_timeout failed");
-
-        let mut saw_bytes = false;
-        let mut buf = [0u8; 4096];
-        loop {
-            match tcp.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => saw_bytes = true,
-                Err(err)
-                    if err.kind() == io::ErrorKind::WouldBlock
-                        || err.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
-                Err(err) => panic!("server client-hello drain failed: {err}"),
-            }
+    #[cfg(not(miri))]
+    fn drain_pending_rustls_writes(connection: &mut ClientConnection) {
+        let mut sink = io::sink();
+        while connection.wants_write() {
+            let written = connection
+                .write_tls(&mut sink)
+                .expect("test rustls write drain failed");
+            assert!(written > 0, "rustls wanted write but emitted no bytes");
         }
-        assert!(
-            saw_bytes,
-            "server did not receive a ClientHello before reset"
-        );
     }
 
     #[test]
+    #[cfg(not(miri))]
+    fn shutdown_after_transport_write_failure_does_not_queue_close_notify() {
+        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("std bind failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let server = std::thread::spawn(move || {
+            let (_tcp, _) = listener.accept().expect("std accept failed");
+        });
+
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let options = TlsClientOptions {
+            rustls_buffer_limit: Some(1024),
+            transport_read_buffer_size: 128,
+            transport_write_buffer_size: 128,
+        };
+
+        let mut executor = Executor::new().expect("failed to construct runtime executor");
+        executor
+            .run(async move {
+                let tcp = TcpStream::connect(addr)
+                    .expect("connect init failed")
+                    .await
+                    .expect("connect failed");
+                let mut tls = TlsClientStream::new(
+                    tcp,
+                    config,
+                    ServerName::try_from("localhost").expect("invalid test server name"),
+                    options,
+                )
+                .expect("tls stream init failed");
+
+                drain_pending_rustls_writes(&mut tls.connection);
+                assert!(
+                    !tls.connection.wants_write(),
+                    "test setup should leave rustls with no pending writes"
+                );
+
+                tls.transport_write_failed = true;
+                let err = tls
+                    .shutdown()
+                    .await
+                    .expect_err("failed transport write should reject shutdown");
+
+                assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                assert!(
+                    !tls.write_shutdown,
+                    "shutdown must not mark close_notify queued after failed transport write"
+                );
+                assert!(
+                    !tls.connection.wants_write(),
+                    "shutdown must not queue close_notify after failed transport write"
+                );
+            })
+            .expect("executor run failed");
+
+        server.join().expect("server thread panicked");
+    }
+
+    #[test]
+    #[cfg(all(debug_assertions, not(miri)))]
     fn handshake_read_error_restores_transport_read_scratch() {
         let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("std bind failed");
         let addr = listener.local_addr().expect("local_addr failed");
         let server = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().expect("std accept failed");
-            drain_client_hello_then_reset(tcp);
+            tls_test_peer::force_reset_on_drop(&tcp);
+            tls_test_peer::drain_available_client_hello(tcp);
         });
 
         let config = Arc::new(

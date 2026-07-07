@@ -28,7 +28,7 @@
 use super::IoBuffError;
 use super::iobuff::{IoBuffHeader, IoBuffMut};
 use crate::utils::list::intrusive::slist::{Link as SListLink, SList};
-use crate::utils::memory::provider::BasicMemoryProvider;
+use crate::utils::memory::provider::{BasicMemoryProvider, ProviderOwner};
 use crate::utils::memory::slab::{SlabAllocator, SlabPageChain};
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
@@ -147,7 +147,7 @@ pub(crate) struct IoBuffPoolInner {
     /// Heap-allocated memory provider backing the slab allocator. Stored as a
     /// raw pointer so constructing the self-owning pool does not move a `Box`
     /// after `slab_factory` captures the provider address.
-    provider: NonNull<BasicMemoryProvider>,
+    _provider: ProviderOwner<BasicMemoryProvider>,
     /// Stable raw pointer to this inner allocation, stored in pool-backed
     /// buffer headers for final-slot release.
     pool_ptr: *mut IoBuffPoolInner,
@@ -198,32 +198,28 @@ impl IoBuffPoolInner {
         let slot_size = crate::utils::size_up(slot_min, slot_align)
             .map_err(|_| IoBuffPoolConfigError::LayoutOverflow)?;
 
-        let provider_ptr = Box::into_raw(Box::new(BasicMemoryProvider::new()));
+        let provider = ProviderOwner::new(BasicMemoryProvider::new());
 
-        let slab_factory = match SlabAllocator::new_uninit(
-            // SAFETY: provider_ptr comes from Box::into_raw and is not
-            // reconstructed as a Box until after slab_factory is no longer
-            // used. SlabAllocator stores only a raw pointer internally.
-            unsafe { &mut *provider_ptr },
-            slot_size,
-            slot_align,
-            config.objs_per_slab,
-        ) {
+        let slab_factory = match unsafe {
+            // SAFETY: provider.as_ptr() comes from a heap allocation owned by
+            // ProviderOwner and remains stable until after slab_factory is
+            // manually dropped.
+            SlabAllocator::new_uninit_from_raw(
+                provider.as_ptr(),
+                slot_size,
+                slot_align,
+                config.objs_per_slab,
+            )
+        } {
             Ok(slab_factory) => ManuallyDrop::new(slab_factory),
             Err(_) => {
-                unsafe { drop(Box::from_raw(provider_ptr)) };
                 return Err(IoBuffPoolConfigError::LayoutOverflow);
             }
         };
 
-        let provider = unsafe {
-            // SAFETY: Box::into_raw never returns null.
-            NonNull::new_unchecked(provider_ptr)
-        };
-
         Ok(Box::new(Self {
             slab_factory,
-            provider,
+            _provider: provider,
             pool_ptr: std::ptr::null_mut(),
             free_list: SList::new_uninit(),
             slab_pages: SlabPageChain::new(),
@@ -343,7 +339,6 @@ impl IoBuffPoolInner {
         unsafe { inner.slab_pages.free_all(&mut inner.slab_factory) };
 
         unsafe { ManuallyDrop::drop(&mut inner.slab_factory) };
-        unsafe { drop(Box::from_raw(inner.provider.as_ptr())) };
     }
 }
 

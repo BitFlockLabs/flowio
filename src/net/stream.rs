@@ -26,6 +26,7 @@
 //! If a future is dropped after completion but before polling its result, the
 //! completed state is freed immediately from `Drop`.
 
+use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
@@ -440,9 +441,6 @@ fn build_read_vectored_entry(
     .user_data(user_data)
 }
 
-const STREAM_SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
-const STREAM_SENDMSG_FLAGS: u32 = libc::MSG_NOSIGNAL as u32;
-
 #[inline(always)]
 fn empty_sendmsg_header() -> libc::msghdr {
     libc::msghdr {
@@ -458,10 +456,7 @@ fn empty_sendmsg_header() -> libc::msghdr {
 
 #[inline(always)]
 fn build_write_entry(fd: RawFd, ptr: *const u8, len: u32, user_data: u64) -> squeue::Entry {
-    opcode::Send::new(types::Fd(fd), ptr, len)
-        .flags(STREAM_SEND_FLAGS)
-        .build()
-        .user_data(user_data)
+    build_send_entry(fd, ptr, len, user_data)
 }
 
 #[inline(always)]
@@ -506,10 +501,7 @@ fn build_write_vectored_entry(
     }
 
     let msg = prepare_sendmsg_header(msg, iovecs, skip, count);
-    opcode::SendMsg::new(types::Fd(fd), msg)
-        .flags(STREAM_SENDMSG_FLAGS)
-        .build()
-        .user_data(user_data)
+    build_sendmsg_entry(fd, msg, user_data)
 }
 
 /// Advance past `bytes` consumed/filled bytes in an iovec array by mutating
@@ -811,6 +803,20 @@ fn try_writev_projected_with_dynamic_scratch<T: WritevProjection>(
 }
 
 #[inline]
+fn reserve_projected_scratch_capacity(
+    scratch: &mut Vec<MaybeUninit<libc::iovec>>,
+    expected_count: usize,
+) -> io::Result<()> {
+    if scratch.capacity() < expected_count {
+        let additional = expected_count - scratch.len();
+        scratch
+            .try_reserve_exact(additional)
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+    }
+    Ok(())
+}
+
+#[inline]
 fn try_writev_projected_with_vec_scratch<T: WritevProjection>(
     fd: RawFd,
     source: T,
@@ -818,12 +824,8 @@ fn try_writev_projected_with_vec_scratch<T: WritevProjection>(
     expected_total: usize,
     scratch: &mut Vec<MaybeUninit<libc::iovec>>,
 ) -> (io::Result<usize>, T) {
-    if scratch.capacity() < expected_count
-        && scratch
-            .try_reserve_exact(expected_count - scratch.capacity())
-            .is_err()
-    {
-        return (Err(io::Error::from(io::ErrorKind::WouldBlock)), source);
+    if let Err(err) = reserve_projected_scratch_capacity(scratch, expected_count) {
+        return (Err(err), source);
     }
 
     if scratch.len() < expected_count {
@@ -2794,29 +2796,31 @@ impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[repr(C)]
-    struct SqePrefix {
-        opcode: u8,
-        flags: u8,
-        ioprio: u16,
-        fd: i32,
-        off_or_addr2: u64,
-        addr: u64,
-        len: u32,
-        msg_flags: u32,
-        user_data: u64,
-    }
-
-    fn sqe_prefix(entry: &squeue::Entry) -> &SqePrefix {
-        unsafe { &*(entry as *const squeue::Entry as *const SqePrefix) }
-    }
+    use crate::net::send_sqe::test_support::sqe_prefix;
 
     fn initialized_iovec(base: *const u8, len: usize) -> MaybeUninit<libc::iovec> {
         MaybeUninit::new(libc::iovec {
             iov_base: base as *mut libc::c_void,
             iov_len: len,
         })
+    }
+
+    #[test]
+    fn projected_try_write_scratch_reserves_to_target_capacity() {
+        let mut scratch = Vec::<MaybeUninit<libc::iovec>>::with_capacity(300);
+        assert_eq!(scratch.len(), 0);
+        assert!(
+            scratch.capacity() < 512,
+            "test requires a below-target starting capacity"
+        );
+
+        reserve_projected_scratch_capacity(&mut scratch, 512)
+            .expect("projected scratch reserve should succeed");
+        assert!(
+            scratch.capacity() >= 512,
+            "projected scratch reserve must grow to the target capacity"
+        );
+        assert_eq!(scratch.len(), 0);
     }
 
     #[test]

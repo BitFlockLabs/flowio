@@ -35,7 +35,7 @@ use crate::runtime::task::{
 };
 use crate::runtime::timer::TimerRuntime;
 use crate::utils::list::intrusive::dlist::DList;
-use crate::utils::memory::pool::Pool;
+use crate::utils::memory::pool::{Pool, ProviderOwnedPool};
 use crate::utils::memory::provider::MemoryProvider;
 use io_uring::{opcode, squeue, types};
 use std::alloc::{Layout, alloc};
@@ -616,13 +616,11 @@ pub struct Executor {
     /// Scheduler counters captured after the most recent completed run.
     last_stats: RuntimeStats,
     /// Pool storing task allocations with stable addresses.
-    task_pool: ManuallyDrop<Pool<'static, Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>>,
+    task_pool: ManuallyDrop<ProviderOwnedPool<Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>>,
     /// Main queue of runnable tasks.
     ready_queue: ManuallyDrop<DList<TaskHeader>>,
     /// Runtime timer subsystem shared by all sleeps and deadlines.
     timers: ManuallyDrop<TimerRuntime>,
-    /// Backing memory provider for the task pool.
-    provider: Box<ExecutorTaskMemProvider>,
     /// Set after one-time intrusive/runtime initialization is complete.
     initialized: bool,
 }
@@ -668,17 +666,14 @@ impl Executor {
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn new_with_config(config: ExecutorConfig) -> io::Result<Self> {
-        let mut provider = Box::new(ExecutorTaskMemProvider::new());
-        let provider_ptr = &mut *provider as *mut ExecutorTaskMemProvider;
-
-        let task_pool = ManuallyDrop::new(
-            Pool::new_uninit(unsafe { &mut *provider_ptr }, TASKS_PER_SLAB)
-                .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?,
-        );
-        let ready_queue = ManuallyDrop::new(DList::new_uninit());
+        let task_pool = ProviderOwnedPool::new(ExecutorTaskMemProvider::new(), TASKS_PER_SLAB)
+            .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
+        let ready_queue = DList::new_uninit();
+        let reactor = Reactor::new_with_config(config.reactor)?;
+        let timers = TimerRuntime::new()?;
 
         Ok(Self {
-            reactor: Reactor::new_with_config(config.reactor)?,
+            reactor,
             process_quota: if config.process_quota == 0 {
                 DEFAULT_PROCESS_QUOTA
             } else {
@@ -687,10 +682,9 @@ impl Executor {
             cpu_affinity: config.cpu_affinity,
             #[cfg(debug_assertions)]
             last_stats: RuntimeStats::default(),
-            task_pool,
-            ready_queue,
-            timers: ManuallyDrop::new(TimerRuntime::new()?),
-            provider,
+            task_pool: ManuallyDrop::new(task_pool),
+            ready_queue: ManuallyDrop::new(ready_queue),
+            timers: ManuallyDrop::new(timers),
             initialized: false,
         })
     }
@@ -817,6 +811,22 @@ impl Executor {
         })
     }
 
+    #[inline(always)]
+    fn poll_io_and_process_timers(&mut self, runtime_state: &mut RuntimeState) -> io::Result<()> {
+        let _ = self.reactor.poll_io(
+            self.process_quota,
+            runtime_state as *mut RuntimeState,
+            &mut *self.ready_queue as *mut DList<TaskHeader>,
+        )?;
+        if self.timers.has_pending() {
+            let now_tick = self.timers.now_tick()?;
+            let _ = self
+                .timers
+                .process_at_with_budget(now_tick, self.process_quota)?;
+        }
+        Ok(())
+    }
+
     /// Runs the root future and continues until the executor drains all work.
     ///
     /// Call this once around a top-level task tree. The intended usage is a
@@ -845,14 +855,14 @@ impl Executor {
     /// ```
     pub fn run<F: Future<Output = ()> + 'static>(&mut self, initial_task: F) -> io::Result<()> {
         self.init()?;
-        self.provider.reset_debug_counts();
+        self.task_pool.provider_mut().reset_debug_counts();
         apply_cpu_affinity(self.cpu_affinity)?;
 
         let mut runtime_state = RuntimeState::new();
         let mut thread_ctx = ThreadCtx {
             ready_queue: &mut *self.ready_queue as *mut _,
             reactor: &mut self.reactor as *mut _,
-            task_pool: &mut *self.task_pool as *mut _,
+            task_pool: &mut **self.task_pool as *mut _,
             runtime_state: &mut runtime_state as *mut _,
             timers: &mut *self.timers as *mut _,
             owner_task: std::ptr::null_mut(),
@@ -925,17 +935,7 @@ impl Executor {
             }
 
             if self.reactor.flush_sqes()? == ReactorSubmitStatus::Busy {
-                let _ = self.reactor.poll_io(
-                    self.process_quota,
-                    &mut runtime_state as *mut RuntimeState,
-                    &mut *self.ready_queue as *mut DList<TaskHeader>,
-                )?;
-                if self.timers.has_pending() {
-                    let now_tick = self.timers.now_tick()?;
-                    let _ = self
-                        .timers
-                        .process_at_with_budget(now_tick, self.process_quota)?;
-                }
+                self.poll_io_and_process_timers(&mut runtime_state)?;
                 continue;
             }
             let completed = self.reactor.poll_io(
@@ -997,37 +997,18 @@ impl Executor {
             }
 
             if self.reactor.wait_for_events(timer_wait)? == ReactorSubmitStatus::Busy {
-                let _ = self.reactor.poll_io(
-                    self.process_quota,
-                    &mut runtime_state as *mut RuntimeState,
-                    &mut *self.ready_queue as *mut DList<TaskHeader>,
-                )?;
-                if self.timers.has_pending() {
-                    let now_tick = self.timers.now_tick()?;
-                    let _ = self
-                        .timers
-                        .process_at_with_budget(now_tick, self.process_quota)?;
-                }
+                self.poll_io_and_process_timers(&mut runtime_state)?;
                 continue 'run_loop;
             }
-            let _ = self.reactor.poll_io(
-                self.process_quota,
-                &mut runtime_state as *mut RuntimeState,
-                &mut *self.ready_queue as *mut DList<TaskHeader>,
-            )?;
-            if self.timers.has_pending() {
-                let now_tick = self.timers.now_tick()?;
-                let _ = self
-                    .timers
-                    .process_at_with_budget(now_tick, self.process_quota)?;
-            }
+            self.poll_io_and_process_timers(&mut runtime_state)?;
         }
     }
 
     #[cfg(debug_assertions)]
     fn snapshot_stats(&mut self, runtime_state: &mut RuntimeState) {
-        runtime_state.stats.task_slab_allocs = self.provider.request_count;
-        runtime_state.stats.task_slab_frees = self.provider.free_count;
+        let provider = self.task_pool.provider_ref();
+        runtime_state.stats.task_slab_allocs = provider.request_count;
+        runtime_state.stats.task_slab_frees = provider.free_count;
         let retained = self.reactor.retained_payload_stats();
         runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
         runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
@@ -1084,16 +1065,19 @@ fn apply_cpu_affinity(cpu_affinity: Option<usize>) -> io::Result<()> {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // `ready_queue` and `task_pool` are `new_uninit` until `init()` runs,
-        // so they may only be unlinked/dropped once `initialized` is set.
+        // `ready_queue` is `new_uninit` until `init()` runs, so it may only be
+        // unlinked/dropped once `initialized` is set. The task pool owns its
+        // provider even before init, so the wrapper is dropped on every path.
         if self.initialized {
             unsafe {
                 self.ready_queue.unlink_all_for_drop();
                 ManuallyDrop::drop(&mut self.ready_queue);
                 #[cfg(debug_assertions)]
                 self.task_pool.abandon_live_slots_for_drop();
-                ManuallyDrop::drop(&mut self.task_pool);
             }
+        }
+        unsafe {
+            ManuallyDrop::drop(&mut self.task_pool);
         }
         // `timers` is always fully constructed by `new_with_config`; its own
         // Drop handles its internal uninitialized pool. Drop it on every path
@@ -1172,11 +1156,6 @@ pub(crate) unsafe fn submit_tracked_sqe(
     pctx: &PollCtx,
     sqe: io_uring::squeue::Entry,
 ) -> io::Result<()> {
-    #[cfg(debug_assertions)]
-    if let Some(err) = crate::runtime::test_hooks::take_sqe_submit_failure() {
-        return Err(err);
-    }
-
     unsafe { (*pctx.reactor()).submit_sqe(sqe)? };
     unsafe {
         (*pctx.runtime_state()).inflight_ops += 1;
@@ -1510,13 +1489,23 @@ fn task_can_enter_ready_queue(flags: u64) -> bool {
 }
 
 #[inline(always)]
+unsafe fn task_flags_unchecked(task_ptr: *mut TaskHeader) -> u64 {
+    unsafe { (*std::ptr::addr_of!((*task_ptr).flags)).get() }
+}
+
+#[inline(always)]
+unsafe fn set_task_flag_unchecked(task_ptr: *mut TaskHeader, flag: u64) {
+    let flags = unsafe { &*std::ptr::addr_of!((*task_ptr).flags) };
+    flags.set(flags.get() | flag);
+}
+
+#[inline(always)]
 pub(crate) unsafe fn notify_task_into_list_unchecked(
     task_ptr: *mut TaskHeader,
     ready_list: *mut DList<TaskHeader>,
     runtime_state: *mut RuntimeState,
 ) -> bool {
-    let header = unsafe { &mut *task_ptr };
-    let flags = header.flags();
+    let flags = unsafe { task_flags_unchecked(task_ptr) };
     if task_is_completed(flags) {
         return false;
     }
@@ -1524,7 +1513,7 @@ pub(crate) unsafe fn notify_task_into_list_unchecked(
     if task_is_notified(flags) {
         return false;
     }
-    header.set_flag(TaskHeader::FLAG_NOTIFIED);
+    unsafe { set_task_flag_unchecked(task_ptr, TaskHeader::FLAG_NOTIFIED) };
 
     if task_can_enter_ready_queue(flags) {
         return unsafe { enqueue_ready_task_unchecked(task_ptr, ready_list, runtime_state) };
@@ -1539,8 +1528,7 @@ unsafe fn enqueue_notified_task_unchecked(
     ready_list: *mut DList<TaskHeader>,
     runtime_state: *mut RuntimeState,
 ) -> bool {
-    let header = unsafe { &mut *task_ptr };
-    let flags = header.flags();
+    let flags = unsafe { task_flags_unchecked(task_ptr) };
     if !task_is_notified(flags) {
         return false;
     }
@@ -1557,16 +1545,16 @@ unsafe fn enqueue_ready_task_unchecked(
     ready_list: *mut DList<TaskHeader>,
     _runtime_state: *mut RuntimeState,
 ) -> bool {
-    let header = unsafe { &mut *task_ptr };
+    let ready_link = unsafe { std::ptr::addr_of_mut!((*task_ptr).ready_link) };
     debug_assert!(
-        header.ready_link.is_unlinked(),
+        unsafe { (*ready_link).is_unlinked() },
         "enqueue_ready_task attempted to enqueue an already-linked task"
     );
     debug_assert!(
-        task_can_enter_ready_queue(header.flags()),
+        task_can_enter_ready_queue(unsafe { task_flags_unchecked(task_ptr) }),
         "enqueue_ready_task attempted to enqueue a completed, running, or already queued task"
     );
-    header.set_flag(TaskHeader::FLAG_QUEUED);
+    unsafe { set_task_flag_unchecked(task_ptr, TaskHeader::FLAG_QUEUED) };
     #[cfg(debug_assertions)]
     {
         if !_runtime_state.is_null() {
@@ -1576,7 +1564,7 @@ unsafe fn enqueue_ready_task_unchecked(
         }
     }
     unsafe {
-        (*ready_list).push_back_unchecked(&mut header.ready_link as *mut _);
+        (*ready_list).push_back_unchecked(ready_link);
     }
     true
 }
@@ -1646,6 +1634,7 @@ mod tests {
         unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
     }
 
+    #[cfg(not(miri))]
     struct GateFuture {
         id: usize,
         release: Rc<Cell<bool>>,
@@ -1653,6 +1642,7 @@ mod tests {
         polls: Rc<Cell<usize>>,
     }
 
+    #[cfg(not(miri))]
     impl GateFuture {
         fn new(
             id: usize,
@@ -1669,6 +1659,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
     impl Future for GateFuture {
         type Output = usize;
 
@@ -1683,6 +1674,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
     impl Drop for GateFuture {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
@@ -1755,7 +1747,7 @@ mod tests {
     #[cfg(not(miri))]
     fn executor_with_one_task_slab() -> Executor {
         let mut executor = Executor::new().expect("failed to construct executor");
-        executor.provider.max_request_count = Some(1);
+        executor.task_pool.provider_mut().max_request_count = Some(1);
         executor
     }
 
@@ -1785,8 +1777,8 @@ mod tests {
         assert!(unsafe {
             notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
         });
-        assert!(header.has_flag(TaskHeader::FLAG_NOTIFIED));
-        assert!(header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_NOTIFIED) });
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_QUEUED) });
         #[cfg(debug_assertions)]
         assert_eq!(runtime_state.stats.task_schedules, 1);
 
@@ -1807,23 +1799,23 @@ mod tests {
         ready_queue.init();
         let mut runtime_state = RuntimeState::new();
         let mut header = TaskHeader::new();
-        header.set_flag(TaskHeader::FLAG_RUNNING);
         let task_ptr = &mut header as *mut TaskHeader;
+        unsafe { (*task_ptr).set_flag(TaskHeader::FLAG_RUNNING) };
 
         assert!(!unsafe {
             notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
         });
-        assert!(header.has_flag(TaskHeader::FLAG_NOTIFIED));
-        assert!(!header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_NOTIFIED) });
+        assert!(!unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_QUEUED) });
         assert!(ready_queue.is_empty());
         #[cfg(debug_assertions)]
         assert_eq!(runtime_state.stats.task_schedules, 0);
 
-        header.clear_flag(TaskHeader::FLAG_RUNNING);
+        unsafe { (*task_ptr).clear_flag(TaskHeader::FLAG_RUNNING) };
         assert!(unsafe {
             enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
         });
-        assert!(header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_QUEUED) });
         #[cfg(debug_assertions)]
         assert_eq!(runtime_state.stats.task_schedules, 1);
 
@@ -1838,14 +1830,14 @@ mod tests {
         ready_queue.init();
         let mut runtime_state = RuntimeState::new();
         let mut header = TaskHeader::new();
-        header.set_flag(TaskHeader::FLAG_COMPLETED);
         let task_ptr = &mut header as *mut TaskHeader;
+        unsafe { (*task_ptr).set_flag(TaskHeader::FLAG_COMPLETED) };
 
         assert!(!unsafe {
             notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
         });
-        assert!(!header.has_flag(TaskHeader::FLAG_NOTIFIED));
-        assert!(!header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(!unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_NOTIFIED) });
+        assert!(!unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_QUEUED) });
         assert!(ready_queue.is_empty());
         #[cfg(debug_assertions)]
         assert_eq!(runtime_state.stats.task_schedules, 0);
@@ -1864,17 +1856,17 @@ mod tests {
         });
         assert!(ready_queue.is_empty());
 
-        header.set_flag(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED);
+        unsafe { (*task_ptr).set_flag(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED) };
         assert!(!unsafe {
             enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
         });
         assert!(ready_queue.is_empty());
 
-        header.clear_flag(TaskHeader::FLAG_QUEUED);
+        unsafe { (*task_ptr).clear_flag(TaskHeader::FLAG_QUEUED) };
         assert!(unsafe {
             enqueue_notified_task_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
         });
-        assert!(header.has_flag(TaskHeader::FLAG_QUEUED));
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_QUEUED) });
 
         let popped = unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
         assert_eq!(popped, Some(task_ptr));

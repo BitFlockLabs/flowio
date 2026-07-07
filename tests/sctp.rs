@@ -111,6 +111,16 @@ fn pooled_sctp_payload_chain(pool: &mut IoBuffPool) -> IoBuffVec<2> {
     chain.freeze()
 }
 
+fn pooled_sctp_recv_chain<const N: usize>(pool: &mut IoBuffPool) -> IoBuffVecMut<N> {
+    let mut chain = IoBuffVecMut::<N>::new();
+    for _ in 0..N {
+        chain
+            .push(pool.alloc().expect("pool recv buffer alloc failed"))
+            .unwrap();
+    }
+    chain
+}
+
 fn assert_sctp_send_kernel_error(err: &std::io::Error) {
     assert!(
         matches!(
@@ -124,6 +134,16 @@ fn assert_sctp_send_kernel_error(err: &std::io::Error) {
         ),
         "unexpected SCTP send kernel error: {err}"
     );
+}
+
+fn test_send_info(stream_id: u16, ppid: u32) -> SctpSendInfo {
+    SctpSendInfo {
+        stream_id,
+        flags: 0,
+        ppid,
+        context: 0,
+        assoc_id: 0,
+    }
 }
 
 #[test]
@@ -1087,6 +1107,433 @@ fn runtime_sctp_recv_msg_rejects_undersized_buffer_without_eor() {
 }
 
 #[test]
+fn runtime_sctp_recv_msg_resynchronizes_after_oversized_record() {
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_recv_msg_resynchronizes_after_oversized_record",
+        socket_config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+
+            let (send_res, _buf) = client
+                .send_msg(b"0123456789abcdef".to_vec(), test_send_info(1, 0x0102_0304))
+                .await;
+            assert_eq!(send_res.expect("first send_msg failed"), 16);
+
+            let (recv_res, recv_buf) = server.recv_msg(vec![0u8; 4], 4).await;
+            let err = recv_res.expect_err("oversized SCTP record should fail once");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(&recv_buf[..], b"0123");
+
+            let drops = Rc::new(Cell::new(0));
+            let (zero_res, zero_buf) = server
+                .recv_msg(DropTrackedReadWrite::zeroed(4, &drops), 0)
+                .await;
+            let err = zero_res.expect_err("zero-length recv_msg should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                drops.get(),
+                0,
+                "zero-length recv_msg dropped the returned buffer before the caller"
+            );
+            drop(zero_buf);
+            assert_eq!(
+                drops.get(),
+                1,
+                "zero-length recv_msg should return ownership exactly once"
+            );
+
+            let (send_res, _buf) = client
+                .send_msg(b"second".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            assert_eq!(send_res.expect("second send_msg failed"), 6);
+
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 64], 64))
+                .await
+                .expect("resynchronized SCTP recv timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) = recv_result.expect("second recv_msg failed");
+            assert_eq!(recv_len, 6);
+            assert_eq!(&recv_buf[..recv_len], b"second");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                    assert!(info.end_of_record);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected second data record, got {notification:?}");
+                }
+            }
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_recv_msg_vectored_resynchronizes_after_multi_completion_discard() {
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_recv_msg_vectored_resynchronizes_after_multi_completion_discard",
+        socket_config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 4,
+                tailroom: 0,
+                objs_per_slab: 2,
+            })
+            .expect("pool config invalid");
+            pool.init();
+
+            let oversized = vec![b'x'; 40];
+            let (send_res, _buf) = client
+                .send_msg(oversized, test_send_info(1, 0x0102_0304))
+                .await;
+            assert_eq!(send_res.expect("oversized send_msg failed"), 40);
+
+            let first_chain = pooled_sctp_recv_chain::<2>(&mut pool);
+            assert_eq!(pool.live_slots_for_test(), 2);
+            let (recv_res, first_chain) = server.recv_msg_vectored(first_chain).await;
+            let err = recv_res.expect_err("oversized SCTP record should fail once");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(first_chain.get(0).unwrap().payload_bytes(), b"xxxx");
+            assert_eq!(first_chain.get(1).unwrap().payload_bytes(), b"xxxx");
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "vectored SCTP recv chain was not returned to the caller"
+            );
+            drop(first_chain);
+            wait_for_live_slots(&pool, 0).await;
+
+            let (send_res, _buf) = client
+                .send_msg(b"ABCDEFGH".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            assert_eq!(send_res.expect("second send_msg failed"), 8);
+
+            let second_chain = pooled_sctp_recv_chain::<2>(&mut pool);
+            assert_eq!(pool.live_slots_for_test(), 2);
+            let recv_res = timeout(
+                Duration::from_secs(1),
+                server.recv_msg_vectored(second_chain),
+            )
+            .await
+            .expect("resynchronized SCTP vectored recv timed out");
+            let (recv_result, second_chain) = recv_res;
+            let (recv_len, meta) = recv_result.expect("second recv_msg_vectored failed");
+            assert_eq!(recv_len, 8);
+            assert_eq!(second_chain.get(0).unwrap().payload_bytes(), b"ABCD");
+            assert_eq!(second_chain.get(1).unwrap().payload_bytes(), b"EFGH");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                    assert!(info.end_of_record);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected second data record, got {notification:?}");
+                }
+            }
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "vectored SCTP discard path dropped the receive chain before returning it"
+            );
+            drop(second_chain);
+            wait_for_live_slots(&pool, 0).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_recv_msg_shutdown_without_control_is_clean_eof() {
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_recv_msg_shutdown_without_control_is_clean_eof",
+        socket_config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            client
+                .shutdown(Shutdown::Write)
+                .expect("client shutdown write failed");
+
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 32], 32))
+                .await
+                .expect("SCTP clean EOF recv timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) = recv_result.expect("clean EOF should not error");
+            assert_eq!(recv_len, 0);
+            assert!(recv_buf.is_empty());
+            match meta {
+                SctpRecvMeta::Data(info) => assert_eq!(info, Default::default()),
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected clean EOF data shape, got {notification:?}");
+                }
+            }
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_recv_msg_discard_state_drop_returns_buffer_once() {
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_recv_msg_discard_state_drop_returns_buffer_once",
+        socket_config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+
+            // Three 8-byte receive chunks: first enters discard state, the
+            // dropped second chunk is still non-EOR, and the next receive must
+            // discard the final EOR chunk before returning the following
+            // record.
+            let oversized = vec![b'x'; 24];
+            let (send_res, _buf) = client
+                .send_msg(oversized, test_send_info(1, 0x0102_0304))
+                .await;
+            assert_eq!(send_res.expect("oversized send_msg failed"), 24);
+
+            let (recv_res, recv_buf) = server.recv_msg(vec![0u8; 8], 8).await;
+            let err = recv_res.expect_err("oversized SCTP record should enter discard state");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(&recv_buf[..], b"xxxxxxxx");
+
+            let drops = Rc::new(Cell::new(0));
+            let recv = DropTrackedReadWrite::zeroed(8, &drops);
+            let mut discard = Box::pin(server.recv_msg(recv, 8));
+            let first_poll =
+                std::future::poll_fn(|cx| Poll::Ready(Future::poll(discard.as_mut(), cx))).await;
+            assert!(
+                matches!(first_poll, Poll::Pending),
+                "discard-state recv should submit before being dropped"
+            );
+            drop(discard);
+            assert_eq!(drops.get(), 0, "stashed discard buffer dropped early");
+
+            let (send_res, _buf) = client
+                .send_msg(b"after".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            assert_eq!(send_res.expect("post-cancel send_msg failed"), 5);
+
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 64], 64))
+                .await
+                .expect("post-discard SCTP recv timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) = recv_result.expect("post-discard recv failed");
+            assert_eq!(recv_len, 5);
+            assert_eq!(&recv_buf[..recv_len], b"after");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                    assert!(info.end_of_record);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected post-discard data record, got {notification:?}");
+                }
+            }
+            wait_for_drop_count(&drops, 1).await;
+            assert_eq!(
+                drops.get(),
+                1,
+                "discard-state recv buffer dropped more than once"
+            );
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_dropped_recv_msg_partial_head_discards_tail_before_next_record() {
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_dropped_recv_msg_partial_head_discards_tail_before_next_record",
+        socket_config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+
+            let (send_res, _buf) = client
+                .send_msg(vec![b't'; 16], test_send_info(1, 0x0102_0304))
+                .await;
+            assert_eq!(send_res.expect("oversized send_msg failed"), 16);
+
+            let drops = Rc::new(Cell::new(0));
+            let recv = DropTrackedReadWrite::zeroed(8, &drops);
+            let mut dropped_head = Box::pin(server.recv_msg(recv, 8));
+            let first_poll =
+                std::future::poll_fn(|cx| Poll::Ready(Future::poll(dropped_head.as_mut(), cx)))
+                    .await;
+            assert!(
+                matches!(first_poll, Poll::Pending),
+                "partial-head recv should submit before being dropped"
+            );
+            drop(dropped_head);
+            assert_eq!(drops.get(), 0, "stashed partial-head buffer dropped early");
+
+            let (send_res, _buf) = client
+                .send_msg(b"after".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            assert_eq!(send_res.expect("second send_msg failed"), 5);
+
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 64], 64))
+                .await
+                .expect("resynchronized SCTP recv timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) = recv_result.expect("resynchronized recv failed");
+            assert_eq!(recv_len, 5);
+            assert_eq!(&recv_buf[..recv_len], b"after");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                    assert!(info.end_of_record);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected resynchronized data record, got {notification:?}");
+                }
+            }
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_dropped_recv_msg_vectored_eor_retires_discard_state() {
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_dropped_recv_msg_vectored_eor_retires_discard_state",
+        socket_config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 4,
+                tailroom: 0,
+                objs_per_slab: 2,
+            })
+            .expect("pool config invalid");
+            pool.init();
+
+            let (send_res, _buf) = client
+                .send_msg(vec![b'x'; 16], test_send_info(1, 0x0102_0304))
+                .await;
+            assert_eq!(send_res.expect("oversized send_msg failed"), 16);
+
+            let (recv_res, recv_buf) = server.recv_msg(vec![0u8; 8], 8).await;
+            let err = recv_res.expect_err("oversized SCTP record should enter discard state");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(&recv_buf[..], b"xxxxxxxx");
+
+            let chain = pooled_sctp_recv_chain::<2>(&mut pool);
+            assert_eq!(pool.live_slots_for_test(), 2);
+            let mut discard = Box::pin(server.recv_msg_vectored(chain));
+            let first_poll =
+                std::future::poll_fn(|cx| Poll::Ready(Future::poll(discard.as_mut(), cx))).await;
+            assert!(
+                matches!(first_poll, Poll::Pending),
+                "vectored discard recv should submit before being dropped"
+            );
+            drop(discard);
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "stashed vectored discard chain dropped early"
+            );
+
+            let (send_res, _buf) = client
+                .send_msg(b"after".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            assert_eq!(send_res.expect("second send_msg failed"), 5);
+
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 64], 64))
+                .await
+                .expect("post-vectored-discard SCTP recv timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) = recv_result.expect("post-vectored-discard recv failed");
+            assert_eq!(recv_len, 5);
+            assert_eq!(&recv_buf[..recv_len], b"after");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                    assert!(info.end_of_record);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected post-vectored-discard data record, got {notification:?}");
+                }
+            }
+            wait_for_live_slots(&pool, 0).await;
+        })
+        .expect("executor run failed");
+}
+
+#[test]
 fn runtime_sctp_vectored_empty_chain_semantics() {
     let Some(mut stream) = raw_sctp_stream_or_skip("runtime_sctp_vectored_empty_chain_semantics")
     else {
@@ -1105,6 +1552,15 @@ fn runtime_sctp_vectored_empty_chain_semantics() {
 
             let (recv_res, recv_chain) = stream.recv_msg_vectored(IoBuffVecMut::<0>::new()).await;
             let err = recv_res.expect_err("recv_msg_vectored empty should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(recv_chain.is_empty());
+
+            let mut zero_writable = IoBuffVecMut::<1>::new();
+            zero_writable
+                .push(IoBuffMut::new(0, 0, 0))
+                .expect("zero-capacity recv chain push failed");
+            let (recv_res, recv_chain) = stream.recv_msg_vectored(zero_writable).await;
+            let err = recv_res.expect_err("recv_msg_vectored zero-writable should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(recv_chain.is_empty());
         })
@@ -1266,7 +1722,8 @@ fn runtime_sctp_cancelled_data_recv_retains_buffer_until_cqe() {
 
 #[test]
 fn runtime_sctp_cancelled_recv_msg_retains_buffer_until_cqe() {
-    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let mut config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    config.recv_rcvinfo = true;
     let Some(listener) = bind_sctp_listener_or_skip(
         "runtime_sctp_cancelled_recv_msg_retains_buffer_until_cqe",
         config,
@@ -1295,8 +1752,30 @@ fn runtime_sctp_cancelled_recv_msg_retains_buffer_until_cqe() {
                 "sctp recv_msg buffer dropped while original SQE was live"
             );
 
-            let (send_res, _buf) = server.send(b"x".to_vec()).await;
-            send_res.expect("server data send failed");
+            let (send_res, _buf) = server
+                .send_msg(b"x".to_vec(), test_send_info(1, 0x0102_0304))
+                .await;
+            send_res.expect("server first metadata send failed");
+            let (send_res, _buf) = server
+                .send_msg(b"y".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            send_res.expect("server second metadata send failed");
+            let recv_res = timeout(Duration::from_secs(1), client.recv_msg(vec![0u8; 16], 16))
+                .await
+                .expect("adopting recv_msg timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) = recv_result.expect("adopting recv_msg failed");
+            assert_eq!(recv_len, 1);
+            assert_eq!(&recv_buf[..recv_len], b"y");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected data after adopting dropped recv_msg, got {notification:?}");
+                }
+            }
             wait_for_drop_count(&drops, 1).await;
         })
         .expect("executor run failed");
@@ -1304,7 +1783,8 @@ fn runtime_sctp_cancelled_recv_msg_retains_buffer_until_cqe() {
 
 #[test]
 fn runtime_sctp_cancelled_recv_msg_vectored_retains_chain_until_cqe() {
-    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let mut config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    config.recv_rcvinfo = true;
     let Some(listener) = bind_sctp_listener_or_skip(
         "runtime_sctp_cancelled_recv_msg_vectored_retains_chain_until_cqe",
         config,
@@ -1348,8 +1828,33 @@ fn runtime_sctp_cancelled_recv_msg_vectored_retains_chain_until_cqe() {
                 "sctp recv_msg_vectored chain released before original CQE retired"
             );
 
-            let (send_res, _buf) = server.send(b"xy".to_vec()).await;
-            send_res.expect("server data send failed");
+            let (send_res, _buf) = server
+                .send_msg(b"xy".to_vec(), test_send_info(1, 0x0102_0304))
+                .await;
+            send_res.expect("server first metadata send failed");
+            let (send_res, _buf) = server
+                .send_msg(b"z".to_vec(), test_send_info(2, 0x0506_0708))
+                .await;
+            send_res.expect("server second metadata send failed");
+            let recv_res = timeout(Duration::from_secs(1), client.recv_msg(vec![0u8; 16], 16))
+                .await
+                .expect("adopting recv_msg after vectored drop timed out");
+            let (recv_result, recv_buf) = recv_res;
+            let (recv_len, meta) =
+                recv_result.expect("adopting recv_msg after vectored drop failed");
+            assert_eq!(recv_len, 1);
+            assert_eq!(&recv_buf[..recv_len], b"z");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 2);
+                    assert_eq!(info.ppid, 0x0506_0708);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!(
+                        "expected data after adopting dropped vectored recv, got {notification:?}"
+                    );
+                }
+            }
             wait_for_live_slots(&pool, 0).await;
         })
         .expect("executor run failed");

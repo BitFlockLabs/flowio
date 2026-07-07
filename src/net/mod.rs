@@ -123,9 +123,13 @@ use std::os::fd::RawFd;
 
 pub mod resolver;
 pub mod sctp;
+pub(crate) mod send_sqe;
 pub(crate) mod stream;
 pub mod tcp;
 pub mod tls;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod tls_test_peer;
 pub mod udp;
 pub mod unix;
 

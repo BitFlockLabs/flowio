@@ -1,6 +1,7 @@
 //! Pluggable raw-memory providers used by slab- and pool-backed allocators.
 
 use std::alloc::{Layout, alloc, dealloc};
+use std::ptr::NonNull;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -37,6 +38,45 @@ pub trait MemoryProvider {
     /// `ptr` must have been returned by a prior `request_memory` call on this
     /// provider, and `size` must match the original allocation size.
     unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize);
+}
+
+/// Owns a heap-allocated memory provider whose stable raw address is handed
+/// to slab and pool allocators.
+pub(crate) struct ProviderOwner<P: MemoryProvider + 'static> {
+    provider: NonNull<P>,
+}
+
+impl<P: MemoryProvider + 'static> ProviderOwner<P> {
+    pub(crate) fn new(provider: P) -> Self {
+        let provider_ptr = Box::into_raw(Box::new(provider));
+        Self {
+            provider: unsafe {
+                // SAFETY: Box::into_raw never returns null.
+                NonNull::new_unchecked(provider_ptr)
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_ptr(&self) -> *mut P {
+        self.provider.as_ptr()
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_ref(&self) -> &P {
+        unsafe { self.provider.as_ref() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_mut(&mut self) -> &mut P {
+        unsafe { self.provider.as_mut() }
+    }
+}
+
+impl<P: MemoryProvider + 'static> Drop for ProviderOwner<P> {
+    fn drop(&mut self) {
+        unsafe { drop(Box::from_raw(self.provider.as_ptr())) };
+    }
 }
 
 /// Heap-backed [`MemoryProvider`] using the global allocator.

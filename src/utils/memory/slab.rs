@@ -236,13 +236,17 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     /// `provider` must be non-null, valid for unique mutable access for `'a`,
     /// and must outlive the returned allocator. The caller must ensure no
     /// other mutable access aliases the provider while this allocator is used.
-    unsafe fn new_uninit_from_raw(
+    pub(crate) unsafe fn new_uninit_from_raw(
         provider: *mut P,
         obj_size: usize,
         obj_align: usize,
         objs_per_slab: usize,
     ) -> Result<Self, SlabAllocatorConfigError> {
-        let provider = NonNull::new(provider).ok_or(SlabAllocatorConfigError::SizeOverflow)?;
+        debug_assert!(
+            !provider.is_null(),
+            "SlabAllocator::new_uninit_from_raw requires a non-null provider"
+        );
+        let provider = unsafe { NonNull::new_unchecked(provider) };
         if objs_per_slab == 0 {
             return Err(SlabAllocatorConfigError::ObjsPerSlabZero);
         }

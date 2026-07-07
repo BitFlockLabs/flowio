@@ -16,6 +16,18 @@ fn expect_owned_view(view: Result<IoBuffOwnedView, (IoBuff, IoBuffError)>) -> Io
     view.expect("valid IoBuff owned view in test")
 }
 
+fn assert_active_window_within_allocation(buf: &RealIoBuffMut, base: *const u8, total: usize) {
+    let active = IoBuffReadOnly::as_ptr(buf);
+    let offset = unsafe { active.offset_from(base) };
+    assert!(offset >= 0, "active window moved before allocation base");
+    let end = offset as usize + buf.len();
+    assert!(
+        end <= total,
+        "active window end {end} exceeds allocation capacity {total}"
+    );
+    let _ = buf.bytes();
+}
+
 // ============================================================================
 // IoBuffMut — basic construction and payload operations
 // ============================================================================
@@ -458,6 +470,71 @@ fn buffer_mut_tailroom_append_after_advance_stays_after_payload() {
 
     assert_eq!(buf.payload_bytes(), b"cd");
     assert_eq!(buf.bytes(), b"cd:t");
+}
+
+#[test]
+fn buffer_mut_tailroom_advance_consumed_capacity_is_not_reused() {
+    let mut buf = IoBuffMut::new(0, 8, 4);
+
+    buf.payload_append(b"abcdefgh").unwrap();
+    buf.tailroom_append(b"WXYZ").unwrap();
+    buf.advance(10).unwrap();
+
+    assert_eq!(buf.bytes(), b"YZ");
+    assert_eq!(buf.tailroom_remaining(), 0);
+    assert_eq!(buf.tailroom_append(b"!!"), Err(IoBuffError::TailroomFull));
+}
+
+#[test]
+fn buffer_mut_headroom_advance_into_payload_keeps_prepend_closed() {
+    let mut buf = IoBuffMut::new(4, 8, 0);
+
+    buf.payload_append(b"abcdefgh").unwrap();
+    buf.headroom_prepend(b"WXYZ").unwrap();
+    buf.advance(6).unwrap();
+
+    assert_eq!(buf.bytes(), b"cdefgh");
+    assert_eq!(buf.headroom_remaining(), 0);
+    assert_eq!(buf.headroom_prepend(b"!"), Err(IoBuffError::HeadroomFull));
+}
+
+#[test]
+fn buffer_mut_tailroom_append_advance_interleavings_stay_in_bounds() {
+    const HEAD: &[u8; 3] = b"HDR";
+    const PAYLOAD: &[u8; 8] = b"abcdefgh";
+    const TAIL: &[u8; 4] = b"WXYZ";
+
+    for headroom in [0, HEAD.len()] {
+        let total = headroom + PAYLOAD.len() + TAIL.len();
+        for head_len in 0..=headroom {
+            for payload_len in 0..=PAYLOAD.len() {
+                for first_tail_len in 0..=TAIL.len() {
+                    let initial_len = head_len + payload_len + first_tail_len;
+                    for advance in 0..=initial_len {
+                        let mut buf = IoBuffMut::new(headroom, PAYLOAD.len(), TAIL.len());
+                        // SAFETY: a new buffer's active pointer starts exactly
+                        // `headroom` bytes after the backing allocation base.
+                        let base = unsafe { IoBuffReadOnly::as_ptr(&buf).sub(headroom) };
+
+                        buf.payload_append(&PAYLOAD[..payload_len]).unwrap();
+                        if head_len != 0 {
+                            buf.headroom_prepend(&HEAD[..head_len]).unwrap();
+                        }
+                        buf.tailroom_append(&TAIL[..first_tail_len]).unwrap();
+                        assert_active_window_within_allocation(&buf, base, total);
+
+                        buf.advance(advance).unwrap();
+                        assert_active_window_within_allocation(&buf, base, total);
+
+                        let remaining = buf.tailroom_remaining();
+                        buf.tailroom_append(&TAIL[..remaining]).unwrap();
+                        assert_eq!(buf.tailroom_remaining(), 0);
+                        assert_active_window_within_allocation(&buf, base, total);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

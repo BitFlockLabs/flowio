@@ -45,7 +45,7 @@ use crate::runtime::executor::{
 };
 use crate::runtime::task::TaskHeader;
 use crate::utils::list::intrusive::dlist::{DList, Link};
-use crate::utils::memory::pool::{InPlaceInit, Pool};
+use crate::utils::memory::pool::{InPlaceInit, Pool, ProviderOwnedPool};
 use crate::utils::memory::provider::BasicMemoryProvider;
 use std::array;
 use std::fmt;
@@ -359,10 +359,6 @@ impl TimerWheel {
         None
     }
 
-    fn next_nonempty_lvln_bucket(bits: u64, start: usize) -> Option<usize> {
-        Self::next_set_bit(bits, start).or_else(|| Self::next_set_bit(bits, 0))
-    }
-
     #[inline(always)]
     fn lvl0_bucket_occupied(&self, index: usize) -> bool {
         (self.lvl0_bits[index / 64] & (1u64 << (index % 64))) != 0
@@ -443,7 +439,7 @@ impl TimerWheel {
     }
 
     fn next_collect_work_tick(&self, target_tick: u64) -> Option<u64> {
-        self.candidate_deadline(0)
+        self.level0_candidate_deadline()
             .map(|deadline| deadline.max(self.current_tick))
             .into_iter()
             .chain(self.next_upper_cascade_tick())
@@ -571,44 +567,22 @@ impl TimerWheel {
         consumed
     }
 
-    // Recompute the global nearest deadline from the nearest non-empty bucket
-    // at each level. The occupancy bitsets keep this bounded even after
-    // heavy cancellation invalidates the cached nearest deadline.
+    // Recompute the global nearest deadline from the exact level-0 candidate
+    // plus the next upper-level cascade boundary. Level 1+ buckets are coarse
+    // and unordered, so their front entry may be later than another entry in
+    // the same bucket. A cascade-boundary wake can be up to one descent early
+    // per upper level, but it is bounded and avoids a late timer fire.
     fn recompute_next_deadline(&mut self) {
         self.next_deadline_tick = self
-            .candidate_deadline(0)
+            .level0_candidate_deadline()
             .into_iter()
-            .chain(self.candidate_deadline(1))
-            .chain(self.candidate_deadline(2))
-            .chain(self.candidate_deadline(3))
+            .chain(self.next_upper_cascade_tick())
             .min();
     }
 
-    fn candidate_deadline(&self, level: u8) -> Option<u64> {
-        let index = match level {
-            0 => self.next_nonempty_lvl0_bucket()?,
-            1 => Self::next_nonempty_lvln_bucket(
-                self.lvl1_bits,
-                ((self.current_tick >> 8) & ((LVLN_SLOTS as u64) - 1)) as usize,
-            )?,
-            2 => Self::next_nonempty_lvln_bucket(
-                self.lvl2_bits,
-                ((self.current_tick >> 14) & ((LVLN_SLOTS as u64) - 1)) as usize,
-            )?,
-            _ => Self::next_nonempty_lvln_bucket(
-                self.lvl3_bits,
-                ((self.current_tick >> 20) & ((LVLN_SLOTS as u64) - 1)) as usize,
-            )?,
-        };
-
-        let entry = unsafe {
-            match level {
-                0 => self.lvl0[index].front(TimerEntry::LINK_OFFSET)?,
-                1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET)?,
-                2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET)?,
-                _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET)?,
-            }
-        };
+    fn level0_candidate_deadline(&self) -> Option<u64> {
+        let index = self.next_nonempty_lvl0_bucket()?;
+        let entry = unsafe { self.lvl0[index].front(TimerEntry::LINK_OFFSET)? };
         Some(unsafe { (*entry).deadline_tick })
     }
 }
@@ -635,10 +609,8 @@ impl TimerWheel {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct TimerRuntime {
-    /// Stable provider backing the timer-entry pool.
-    _provider: Box<BasicMemoryProvider>,
     /// Pool of runtime-owned timer entries.
-    timer_pool: ManuallyDrop<Pool<'static, TimerEntry, BasicMemoryProvider>>,
+    timer_pool: ManuallyDrop<ProviderOwnedPool<TimerEntry, BasicMemoryProvider>>,
     /// Hierarchical timing wheel used to organize deadlines.
     wheel: TimerWheel,
     /// Most recent monotonic tick sample seen during executor processing.
@@ -664,12 +636,9 @@ impl TimerRuntime {
     /// Call [`TimerRuntime::init`] after moving it to its final memory
     /// location.
     pub fn new() -> io::Result<Self> {
-        let mut provider = Box::new(BasicMemoryProvider::new());
-        let provider_ptr = &mut *provider as *mut BasicMemoryProvider;
         Ok(Self {
-            _provider: provider,
             timer_pool: ManuallyDrop::new(
-                Pool::new_uninit(unsafe { &mut *provider_ptr }, TIMERS_PER_SLAB)
+                ProviderOwnedPool::new(BasicMemoryProvider::new(), TIMERS_PER_SLAB)
                     .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
             ),
             wheel: TimerWheel::new_uninit(),
@@ -818,6 +787,10 @@ impl TimerRuntime {
         if unsafe { (*entry).state } == TimerState::Armed {
             let deadline_tick = unsafe { (*entry).deadline_tick };
             self.wheel.remove(entry);
+            // Upper-level cached deadlines are cascade boundaries, not entry
+            // deadlines. Missing an exact match after cancellation can leave
+            // only an earlier stale boundary, which forces an early recompute
+            // rather than delaying another timer.
             if self.wheel.next_deadline_tick == Some(deadline_tick) {
                 self.wheel.next_deadline_dirty = true;
             }
@@ -1355,7 +1328,7 @@ mod tests {
 
         wheel.insert(entry_ptr);
         assert_eq!(wheel.next_deadline_tick, Some(105));
-        assert_eq!(wheel.candidate_deadline(0), Some(105));
+        assert_eq!(wheel.level0_candidate_deadline(), Some(105));
         assert_eq!(entry.bucket_level, 0);
 
         wheel.remove(entry_ptr);
@@ -1367,7 +1340,7 @@ mod tests {
         assert_eq!(entry.bucket_level, INVALID_BUCKET_LEVEL);
         assert_eq!(entry.bucket_index, 0);
         assert_eq!(wheel.next_deadline_tick, None);
-        assert_eq!(wheel.candidate_deadline(0), None);
+        assert_eq!(wheel.level0_candidate_deadline(), None);
     }
 
     #[test]
@@ -1393,7 +1366,7 @@ mod tests {
         assert_eq!(entry.bucket_level, INVALID_BUCKET_LEVEL);
         assert_eq!(entry.bucket_index, 0);
         assert_eq!(wheel.next_deadline_tick, None);
-        assert_eq!(wheel.candidate_deadline(0), None);
+        assert_eq!(wheel.level0_candidate_deadline(), None);
     }
 
     #[test]
@@ -1420,6 +1393,50 @@ mod tests {
         assert!(!wheel.has_pending_entries());
         assert_eq!(wheel.next_deadline_tick, Some(105));
         assert!(wheel.next_deadline_dirty);
+    }
+
+    #[test]
+    fn timer_wheel_level0_candidate_deadline_ignores_upper_cascade_buckets() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let deadline = LVL0_SLOTS as u64;
+        let mut entry = timer_entry_at(deadline);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+
+        assert_eq!(entry.bucket_level, 1);
+        assert_eq!(wheel.level0_candidate_deadline(), None);
+        assert_eq!(wheel.next_upper_cascade_tick(), Some(deadline));
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_recompute_uses_upper_cascade_boundary_not_bucket_front() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let bucket_base = 2u64 << 14;
+        let mut later_entry = timer_entry_at(bucket_base + 10_000);
+        let mut earlier_entry = timer_entry_at(bucket_base + 100);
+        let later_ptr = &mut later_entry as *mut TimerEntry;
+        let earlier_ptr = &mut earlier_entry as *mut TimerEntry;
+
+        wheel.insert(later_ptr);
+        wheel.insert(earlier_ptr);
+        assert_eq!(later_entry.bucket_level, 2);
+        assert_eq!(earlier_entry.bucket_level, 2);
+        assert_eq!(later_entry.bucket_index, earlier_entry.bucket_index);
+
+        wheel.next_deadline_dirty = true;
+        wheel.recompute_next_deadline();
+        wheel.next_deadline_dirty = false;
+
+        assert_eq!(wheel.next_deadline_tick, Some(bucket_base));
+        assert!(wheel.next_deadline_tick.unwrap() <= earlier_entry.deadline_tick);
+
+        wheel.remove(later_ptr);
+        wheel.remove(earlier_ptr);
     }
 
     #[test]
@@ -1496,6 +1513,25 @@ mod tests {
         assert_eq!(entry.bucket_index, 0);
 
         wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_runtime_pool_provider_survives_arm_cancel_under_miri() {
+        // Proxy Miri coverage for executor/reactor/timer holder ownership:
+        // executor and reactor construction require real io_uring/socket
+        // resources that Miri cannot run, while timer arm/cancel exercises the
+        // same provider-owned pool path that must drop its provider without
+        // retagging live entries.
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        let deadline = runtime.wheel.current_tick.saturating_add(10);
+
+        let entry = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+            .expect("arming test timer failed");
+        runtime
+            .cancel_sleep(entry)
+            .expect("canceling test timer failed");
     }
 
     #[test]

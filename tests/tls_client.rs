@@ -3,18 +3,25 @@ mod common;
 use common::{DropTrackedReadOnly, assert_poll_after_ready_parks};
 use flowio::net::tcp::TcpStream as FlowTcpStream;
 use flowio::net::tls::{TlsClientOptions, TlsClientStream};
+#[cfg(debug_assertions)]
+use flowio::net::tls_test_peer::{drain_available_client_hello, force_reset_on_drop};
 use flowio::runtime::executor::Executor;
-use flowio::runtime::timer::{sleep, timeout};
+#[cfg(debug_assertions)]
+use flowio::runtime::timer::sleep;
+use flowio::runtime::timer::timeout;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::mpsc;
 use std::time::Duration;
+#[cfg(debug_assertions)]
+use std::time::Instant;
 
 /// Small buffers force the 8KiB test payload to span multiple TLS records and
 /// exercise partial read/write pumping.
@@ -64,31 +71,6 @@ fn make_client_server_configs() -> (
     )
 }
 
-fn drain_available_client_hello(mut tcp: std::net::TcpStream) {
-    tcp.set_read_timeout(Some(Duration::from_millis(50)))
-        .expect("set_read_timeout failed");
-
-    let mut saw_bytes = false;
-    let mut buf = [0u8; 4096];
-    loop {
-        match tcp.read(&mut buf) {
-            Ok(0) => break,
-            Ok(_) => saw_bytes = true,
-            Err(err)
-                if err.kind() == io::ErrorKind::WouldBlock
-                    || err.kind() == io::ErrorKind::TimedOut =>
-            {
-                break;
-            }
-            Err(err) => panic!("server client-hello drain failed: {err}"),
-        }
-    }
-    assert!(
-        saw_bytes,
-        "server did not receive a ClientHello before close"
-    );
-}
-
 fn complete_server_handshake(tcp: &mut std::net::TcpStream, server_config: Arc<ServerConfig>) {
     let mut tls = ServerConnection::new(server_config).expect("server tls init failed");
     while tls.is_handshaking() {
@@ -96,23 +78,7 @@ fn complete_server_handshake(tcp: &mut std::net::TcpStream, server_config: Arc<S
     }
 }
 
-fn force_reset_on_drop(tcp: &std::net::TcpStream) {
-    let linger = libc::linger {
-        l_onoff: 1,
-        l_linger: 0,
-    };
-    let rc = unsafe {
-        libc::setsockopt(
-            tcp.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_LINGER,
-            &linger as *const libc::linger as *const libc::c_void,
-            std::mem::size_of::<libc::linger>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(rc, 0, "setsockopt SO_LINGER failed");
-}
-
+#[cfg(debug_assertions)]
 fn assert_tls_write_peer_close_error(err: &io::Error) {
     assert!(
         matches!(
@@ -126,6 +92,25 @@ fn assert_tls_write_peer_close_error(err: &io::Error) {
         ),
         "unexpected tls write peer-close error: {err}"
     );
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_server_reset(rx: &mpsc::Receiver<()>) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match rx.try_recv() {
+            Ok(()) => return,
+            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                sleep(Duration::from_millis(1))
+                    .await
+                    .expect("server reset wait sleep failed");
+            }
+            Err(mpsc::TryRecvError::Empty) => panic!("server did not reset before timeout"),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("server reset signal channel disconnected")
+            }
+        }
+    }
 }
 
 #[test]
@@ -252,6 +237,7 @@ fn tls_rental_futures_poll_after_ready_parks() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn tls_handshake_eof_returns_unexpected_eof() {
     let (client_config, _server_config, server_name, _expected_cert_der) =
         make_client_server_configs();
@@ -360,7 +346,7 @@ fn tls_truncated_close_read_exact_returns_unexpected_eof() {
             let (res, buf) = tls.read_exact(vec![0u8; 4], 4).await;
             let err = res.expect_err("truncated TLS close should fail read_exact");
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-            assert_eq!(buf.len(), 0, "truncated close should publish partial bytes");
+            assert_eq!(buf.len(), 0, "truncated close should publish no bytes");
         })
         .expect("executor run failed");
 
@@ -368,17 +354,23 @@ fn tls_truncated_close_read_exact_returns_unexpected_eof() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn tls_write_after_peer_reset_returns_payload_once() {
     let (client_config, server_config, server_name, _expected_cert_der) =
         make_client_server_configs();
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
+    let (server_reset_tx, server_reset_rx) = mpsc::channel();
 
     let server = std::thread::spawn(move || {
         let (mut tcp, _) = listener.accept().expect("std accept failed");
         complete_server_handshake(&mut tcp, server_config);
         force_reset_on_drop(&tcp);
+        drop(tcp);
+        server_reset_tx
+            .send(())
+            .expect("failed to signal server reset");
     });
 
     let mut executor = Executor::new().expect("failed to construct runtime executor");
@@ -392,9 +384,7 @@ fn tls_write_after_peer_reset_returns_payload_once() {
                 TlsClientStream::new(tcp, client_config, server_name, tls_options()).unwrap();
 
             tls.handshake().await.expect("client handshake failed");
-            sleep(Duration::from_millis(20))
-                .await
-                .expect("peer reset wait sleep failed");
+            wait_for_server_reset(&server_reset_rx).await;
 
             let drops = Rc::new(Cell::new(0));
             let payload = DropTrackedReadOnly::new(b"after-reset".to_vec(), &drops);
@@ -404,6 +394,83 @@ fn tls_write_after_peer_reset_returns_payload_once() {
             assert_eq!(drops.get(), 0, "tls write payload dropped before return");
             drop(returned);
             assert_eq!(drops.get(), 1, "tls write payload dropped exactly once");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn tls_read_drains_staged_plaintext_after_write_failure() {
+    let (client_config, server_config, server_name, _expected_cert_der) =
+        make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let (client_read_done_tx, client_read_done_rx) = mpsc::channel();
+    let (server_reset_tx, server_reset_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        let mut tls = ServerConnection::new(server_config).expect("server tls init failed");
+
+        while tls.is_handshaking() {
+            tls.complete_io(&mut tcp).expect("server handshake failed");
+        }
+
+        tls.writer()
+            .write_all(b"abcdefgh")
+            .expect("server staged plaintext write failed");
+        while tls.wants_write() {
+            tls.complete_io(&mut tcp)
+                .expect("server plaintext flush failed");
+        }
+
+        client_read_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client did not read first plaintext fragment");
+        force_reset_on_drop(&tcp);
+        drop(tcp);
+        server_reset_tx
+            .send(())
+            .expect("failed to signal server reset");
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = FlowTcpStream::connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+            let mut tls =
+                TlsClientStream::new(tcp, client_config, server_name, tls_options()).unwrap();
+
+            tls.handshake().await.expect("client handshake failed");
+
+            let (res, first) = tls.read(vec![0u8; 4], 4).await;
+            assert_eq!(res.expect("first TLS read failed"), 4);
+            assert_eq!(&first[..], b"abcd");
+            client_read_done_tx
+                .send(())
+                .expect("failed to signal first client read");
+            wait_for_server_reset(&server_reset_rx).await;
+
+            let (res, _returned) = tls.write_all(b"after-reset".to_vec()).await;
+            let err = res.expect_err("write after peer reset should fail");
+            assert_tls_write_peer_close_error(&err);
+
+            let (res, second) = tls.read(vec![0u8; 4], 4).await;
+            assert_eq!(
+                res.expect("staged plaintext should remain readable after write failure"),
+                4
+            );
+            assert_eq!(&second[..], b"efgh");
+
+            let (res, _returned) = tls.write_all(b"still-failed".to_vec()).await;
+            let err = res.expect_err("latched write failure should persist");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         })
         .expect("executor run failed");
 

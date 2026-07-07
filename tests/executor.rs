@@ -18,7 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -91,6 +91,54 @@ impl<F: Future + Unpin> Future for SecondPollSharedFuture<F> {
     }
 }
 
+struct BatchedNops {
+    nops: Vec<Nop>,
+    completed: Vec<bool>,
+}
+
+impl BatchedNops {
+    fn new(count: usize) -> Self {
+        Self {
+            nops: (0..count).map(|_| Nop::new()).collect(),
+            completed: vec![false; count],
+        }
+    }
+}
+
+impl Future for BatchedNops {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut completed_count = 0usize;
+
+        for index in 0..this.nops.len() {
+            if this.completed[index] {
+                completed_count += 1;
+                continue;
+            }
+
+            match Pin::new(&mut this.nops[index]).poll(cx) {
+                Poll::Ready(Ok(0)) => {
+                    this.completed[index] = true;
+                    completed_count += 1;
+                }
+                Poll::Ready(Ok(_)) => {
+                    return Poll::Ready(Err(io::Error::other("unexpected NOP result")));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {}
+            }
+        }
+
+        if completed_count == this.nops.len() {
+            Poll::Ready(Ok(completed_count))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 fn run_cross_task_repoll<F>(future: F)
 where
     F: Future + Unpin + 'static,
@@ -153,6 +201,22 @@ impl Drop for SignalHandlerGuard {
     fn drop(&mut self) {
         let rc = unsafe { libc::sigaction(self.signal, &self.old_action, std::ptr::null_mut()) };
         assert_eq!(rc, 0, "sigaction restore failed");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn write_all_raw_fd(fd: RawFd, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("raw fd write failed: {err}");
+        }
+        assert!(rc > 0, "raw fd write made no progress");
+        bytes = &bytes[rc as usize..];
     }
 }
 
@@ -595,6 +659,51 @@ fn runtime_executor_runs_nop_future() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_untimed_wait_eintr_does_not_abort_blocked_read() {
+    let mut executor = new_executor();
+    let (writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+    let writer_fd = unsafe { libc::dup(writer.as_raw_fd()) };
+    assert!(
+        writer_fd >= 0,
+        "dup writer fd failed: {}",
+        io::Error::last_os_error()
+    );
+    let release_writer = Arc::new(AtomicBool::new(false));
+    let writer_release = Arc::clone(&release_writer);
+
+    let writer_thread = std::thread::spawn(move || {
+        while !writer_release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        write_all_raw_fd(writer_fd, b"wake");
+        let rc = unsafe { libc::close(writer_fd) };
+        assert_eq!(rc, 0, "close duplicated writer fd failed");
+    });
+
+    executor
+        .run(async move {
+            let _writer = writer;
+            test_hooks::fail_next_ring_wait_errno(libc::EINTR);
+            release_writer.store(true, Ordering::Release);
+            let (result, buffer) = reader.read_exact(vec![0u8; 4], 4).await;
+            assert_eq!(result.expect("read failed after EINTR"), 4);
+            assert_eq!(&buffer, b"wake");
+        })
+        .expect("executor run should absorb untimed wait EINTR");
+
+    writer_thread
+        .join()
+        .expect("delayed writer thread panicked");
+    assert_eq!(
+        test_hooks::ring_wait_failures_remaining(),
+        0,
+        "untimed wait EINTR hook was not consumed"
+    );
+}
+
 #[test]
 fn runtime_executor_drains_multiple_nop_completions() {
     const NOPS: usize = 8;
@@ -628,6 +737,47 @@ fn runtime_executor_drains_multiple_nop_completions() {
     #[cfg(not(debug_assertions))]
     {
         let _ = executor;
+    }
+}
+
+#[test]
+#[cfg(not(miri))]
+fn runtime_poll_io_budget_boundary_preserves_nop_completions() {
+    const PROCESS_QUOTA: usize = 1;
+    const NOPS: usize = 8;
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut executor = new_executor_with(PROCESS_QUOTA, None);
+
+        executor
+            .run(async move {
+                let completed = BatchedNops::new(NOPS)
+                    .await
+                    .expect("batched NOPs should complete");
+                assert_eq!(completed, NOPS);
+            })
+            .expect("executor run failed");
+
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.sqe_submits, NOPS);
+            assert_eq!(stats.cqe_completions, NOPS);
+        }
+
+        done_tx.send(()).expect("done receiver dropped");
+    });
+
+    match done_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(()) => worker.join().expect("boundary regression worker panicked"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("budget-boundary NOP batch did not complete before timeout");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            worker.join().expect("boundary regression worker panicked");
+            panic!("boundary regression worker exited without reporting completion");
+        }
     }
 }
 
@@ -792,6 +942,48 @@ fn runtime_write_submit_failure_returns_retained_payload() {
             let (res, returned) = writer.write(tracked).await;
             let err = res.expect_err("forced SQE submit failure should return WouldBlock");
             assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(drops.get(), 0, "payload dropped before caller return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_write_ring_submit_eintr_is_absorbed() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"eintr".to_vec(), &drops);
+
+            test_hooks::fail_next_ring_submit_errno(libc::EINTR);
+            let (res, returned) = writer.write(tracked).await;
+            assert_eq!(res.expect("EINTR should be absorbed"), 5);
+            assert_eq!(drops.get(), 0, "payload dropped before caller return");
+            drop(returned);
+            assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_write_ring_submit_ebusy_is_absorbed() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let drops = Rc::new(Cell::new(0));
+            let tracked = DropTrackedReadOnly::new(b"ebusy".to_vec(), &drops);
+
+            test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+            let (res, returned) = writer.write(tracked).await;
+            assert_eq!(res.expect("EBUSY should be absorbed"), 5);
             assert_eq!(drops.get(), 0, "payload dropped before caller return");
             drop(returned);
             assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
@@ -1085,6 +1277,10 @@ fn runtime_sleep_zero_completes_without_timer_wake() {
 #[cfg(all(target_os = "linux", not(miri)))]
 #[test]
 fn runtime_signal_interrupt_does_not_abort_wait() {
+    const SLEEP_TARGET: Duration = Duration::from_millis(80);
+    const MIN_ELAPSED: Duration = Duration::from_millis(60);
+    const MAX_ELAPSED: Duration = Duration::from_millis(100);
+
     let _signal_lock = SIGNAL_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1120,7 +1316,7 @@ fn runtime_signal_interrupt_does_not_abort_wait() {
         let armed = Arc::clone(&armed);
         async move {
             armed.store(true, Ordering::Release);
-            sleep(Duration::from_millis(40))
+            sleep(SLEEP_TARGET)
                 .await
                 .expect("sleep interrupted by signal");
             *observed_flag.borrow_mut() = Some(start.elapsed());
@@ -1139,12 +1335,12 @@ fn runtime_signal_interrupt_does_not_abort_wait() {
         .borrow()
         .expect("sleep did not record completion duration");
     assert!(
-        elapsed >= Duration::from_millis(20),
+        elapsed >= MIN_ELAPSED,
         "sleep completed implausibly early after signal: {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(250),
-        "signal interruptions stretched sleep too far: {elapsed:?}"
+        elapsed < MAX_ELAPSED,
+        "signal interruptions likely restarted the full wait timeout: {elapsed:?}"
     );
 }
 

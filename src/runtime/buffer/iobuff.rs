@@ -485,6 +485,11 @@ impl IoBuffMut {
         self.headroom_len() + self.payload_len + self.tailroom_len
     }
 
+    #[inline(always)]
+    fn active_end_offset(&self) -> usize {
+        self.offset + self.active_len()
+    }
+
     // -----------------------------------------------------------------------
     // Headroom operations
     // -----------------------------------------------------------------------
@@ -689,9 +694,15 @@ impl IoBuffMut {
     }
 
     /// Returns the number of tailroom bytes still available for appending.
+    ///
+    /// After [`advance()`](Self::advance) consumes bytes into the tailroom
+    /// region, those consumed trailer bytes stay outside the active window and
+    /// are not reusable as append space.
     #[inline(always)]
     pub fn tailroom_remaining(&self) -> usize {
-        self.tailroom_capacity() - self.tailroom_len
+        let tailroom_region_end =
+            self.payload_start_offset() + self.payload_len + self.tailroom_capacity();
+        tailroom_region_end.saturating_sub(self.active_end_offset())
     }
 
     /// Appends bytes into the tailroom region immediately after the written
@@ -707,7 +718,7 @@ impl IoBuffMut {
         // active window (headroom + payload + tailroom) contiguous.
         unsafe {
             let dst = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
-                .add(self.payload_start_offset() + self.payload_len + self.tailroom_len);
+                .add(self.active_end_offset());
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         self.tailroom_len += data.len();

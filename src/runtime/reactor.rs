@@ -5,7 +5,7 @@ use crate::runtime::op::CompletionState;
 #[cfg(debug_assertions)]
 use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::retained::{RetainedIovecScratch, RetainedPayload, RetainedPayloadPool};
-use crate::utils::memory::pool::Pool;
+use crate::utils::memory::pool::{Pool, ProviderOwnedPool};
 use crate::utils::memory::provider::BasicMemoryProvider;
 use io_uring::{IoUring, opcode, types};
 use std::io;
@@ -151,7 +151,13 @@ unsafe fn free_op_fields(
     op_pool: &mut Pool<'static, CompletionState, BasicMemoryProvider>,
     live_ops: &mut usize,
     ptr: *mut CompletionState,
-) {
+) -> io::Result<()> {
+    if *live_ops == 0 {
+        return Err(io::Error::other(
+            "reactor freed more operations than it allocated",
+        ));
+    }
+
     unlink_pending_cancel(
         pending_cancel_head,
         pending_cancel_tail,
@@ -159,12 +165,9 @@ unsafe fn free_op_fields(
         ptr,
     );
     unsafe { (*ptr).drop_retained_payload(retained_pool) };
-    debug_assert!(
-        *live_ops > 0,
-        "reactor freed more operations than it allocated"
-    );
-    *live_ops = live_ops.saturating_sub(1);
+    *live_ops -= 1;
     unsafe { op_pool.free(ptr) };
+    Ok(())
 }
 
 /// User-facing `io_uring` setup configuration embedded inside
@@ -219,7 +222,7 @@ pub(crate) struct Reactor {
     pending_cancel_tail: *mut CompletionState,
     pending_cancel_len: usize,
     /// Pool of reusable completion-state records for in-flight operations.
-    op_pool: ManuallyDrop<Pool<'static, CompletionState, BasicMemoryProvider>>,
+    op_pool: ManuallyDrop<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>,
     /// Maximum number of live completion-state records.
     max_live_ops: usize,
     /// Number of completion-state records currently checked out.
@@ -227,10 +230,6 @@ pub(crate) struct Reactor {
     /// Pool of pointer-stable retained payload blocks referenced by in-flight
     /// operations after their owning futures are dropped.
     retained_pool: RetainedPayloadPool,
-    /// Stable memory provider backing `op_pool`.
-    _op_pool_provider: Box<BasicMemoryProvider>,
-    /// Set after `op_pool.init()` so drop knows whether the pool is live.
-    initialized: bool,
 }
 
 impl Reactor {
@@ -238,12 +237,9 @@ impl Reactor {
         let ring = IoUring::new(config.ring_entries)?;
         validate_required_ring_features(&ring)?;
 
-        let mut provider = Box::new(BasicMemoryProvider::new());
-        let provider_ptr = &mut *provider as *mut BasicMemoryProvider;
-        let op_pool = ManuallyDrop::new(
-            Pool::new_uninit(unsafe { &mut *provider_ptr }, OP_POOL_OBJS_PER_SLAB)
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
-        );
+        let op_pool = ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let retained_pool = RetainedPayloadPool::new()?;
 
         Ok(Self {
             ring,
@@ -251,18 +247,15 @@ impl Reactor {
             pending_cancel_head: std::ptr::null_mut(),
             pending_cancel_tail: std::ptr::null_mut(),
             pending_cancel_len: 0,
-            op_pool,
+            op_pool: ManuallyDrop::new(op_pool),
             max_live_ops: config.ring_entries as usize,
             live_ops: 0,
-            retained_pool: RetainedPayloadPool::new()?,
-            _op_pool_provider: provider,
-            initialized: false,
+            retained_pool,
         })
     }
 
     pub fn init(&mut self) {
         self.op_pool.init();
-        self.initialized = true;
     }
 
     /// Allocate a fresh `CompletionState` for one SQE submission.
@@ -346,6 +339,41 @@ impl Reactor {
         !self.pending_cancel_head.is_null()
     }
 
+    #[inline(always)]
+    fn submit_ring(&mut self) -> io::Result<usize> {
+        #[cfg(debug_assertions)]
+        if let Some(err) = crate::runtime::test_hooks::take_ring_submit_failure() {
+            return Err(err);
+        }
+
+        self.ring.submit()
+    }
+
+    #[inline(always)]
+    fn refresh_completion_queue_view_after_submit_busy(&mut self) {
+        let mut cq = self.ring.completion();
+        cq.sync();
+    }
+
+    #[inline(always)]
+    fn submit_ring_for_sqe_capacity(&mut self) -> io::Result<()> {
+        let mut retried_after_busy = false;
+        loop {
+            match self.submit_ring() {
+                Ok(_) => return Ok(()),
+                Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
+                Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
+                    if retried_after_busy {
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                    }
+                    retried_after_busy = true;
+                    self.refresh_completion_queue_view_after_submit_busy();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     fn queue_pending_cancel(&mut self, ptr: *mut CompletionState) {
         debug_assert!(
             !ptr.is_null(),
@@ -394,13 +422,37 @@ impl Reactor {
         }
     }
 
+    #[inline(always)]
+    fn submit_with_args(
+        &mut self,
+        min_complete: usize,
+        args: &types::SubmitArgs<'_, '_>,
+    ) -> io::Result<usize> {
+        #[cfg(debug_assertions)]
+        if let Some(err) = crate::runtime::test_hooks::take_ring_wait_failure() {
+            return Err(err);
+        }
+
+        self.ring.submitter().submit_with_args(min_complete, args)
+    }
+
+    #[inline(always)]
+    fn submit_and_wait(&mut self, min_complete: usize) -> io::Result<usize> {
+        #[cfg(debug_assertions)]
+        if let Some(err) = crate::runtime::test_hooks::take_ring_wait_failure() {
+            return Err(err);
+        }
+
+        self.ring.submit_and_wait(min_complete)
+    }
+
     /// Return a retired `CompletionState` to the pool.
     ///
     /// This releases any retained payload before recycling the state slot. The
     /// retained payload, if present, owns memory referenced by the original
     /// SQE and must only be released after that original CQE has been observed.
     #[inline(always)]
-    pub fn free_op(&mut self, ptr: *mut CompletionState) {
+    fn try_free_op(&mut self, ptr: *mut CompletionState) -> io::Result<()> {
         debug_assert!(!ptr.is_null(), "reactor free_op called with null pointer");
         unsafe {
             free_op_fields(
@@ -412,7 +464,14 @@ impl Reactor {
                 &mut self.live_ops,
                 ptr,
             )
-        };
+        }
+    }
+
+    #[inline(always)]
+    pub fn free_op(&mut self, ptr: *mut CompletionState) {
+        if let Err(err) = self.try_free_op(ptr) {
+            debug_assert!(false, "reactor free_op failed: {err}");
+        }
     }
 
     /// Mark an in-flight operation as orphaned and submit `ASYNC_CANCEL`.
@@ -443,7 +502,7 @@ impl Reactor {
         let mut sq = self.ring.submission();
         if sq.is_full() {
             drop(sq);
-            self.ring.submit()?;
+            self.submit_ring_for_sqe_capacity()?;
             self.pending = false;
             sq = self.ring.submission();
         }
@@ -463,7 +522,7 @@ impl Reactor {
         self.retry_pending_cancels();
         if self.pending {
             loop {
-                match self.ring.submit() {
+                match self.submit_ring() {
                     Ok(_) => break,
                     Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
                     Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
@@ -496,7 +555,6 @@ impl Reactor {
         if self.has_pending_cancels() {
             return Ok(ReactorSubmitStatus::Busy);
         }
-        self.pending = false;
         if let Some(timeout) = timeout {
             let initial_timeout = if timeout.is_zero() {
                 Duration::from_nanos(1)
@@ -517,9 +575,13 @@ impl Reactor {
                 };
                 let timespec = types::Timespec::from(timeout);
                 let args = types::SubmitArgs::new().timespec(&timespec);
-                match self.ring.submitter().submit_with_args(1, &args) {
-                    Ok(_) => return Ok(ReactorSubmitStatus::Ready),
+                match self.submit_with_args(1, &args) {
+                    Ok(_) => {
+                        self.pending = false;
+                        return Ok(ReactorSubmitStatus::Ready);
+                    }
                     Err(err) if is_raw_os_error(&err, libc::ETIME) => {
+                        self.pending = false;
                         return Ok(ReactorSubmitStatus::Ready);
                     }
                     Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
@@ -533,8 +595,11 @@ impl Reactor {
             }
         } else {
             loop {
-                match self.ring.submit_and_wait(1) {
-                    Ok(_) => return Ok(ReactorSubmitStatus::Ready),
+                match self.submit_and_wait(1) {
+                    Ok(_) => {
+                        self.pending = false;
+                        return Ok(ReactorSubmitStatus::Ready);
+                    }
                     Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
                     Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
                         return Ok(ReactorSubmitStatus::Busy);
@@ -547,6 +612,12 @@ impl Reactor {
 
     /// Drains completed CQEs, updates `CompletionState`, and wakes waiting
     /// tasks as needed.
+    ///
+    /// `max_completions` limits budget-consuming target CQEs. Cancel CQEs
+    /// (`user_data == 0`) do not count against that budget while the loop is
+    /// still draining. Once the budget is exhausted, no further CQEs are popped;
+    /// a cancel CQE queued behind the boundary is left for the next pass rather
+    /// than risking loss of a target CQE.
     pub fn poll_io(
         &mut self,
         max_completions: usize,
@@ -558,15 +629,15 @@ impl Reactor {
         let mut cq = self.ring.completion();
 
         let mut seen = 0usize;
-        for cqe in &mut cq {
+        while seen < max_completions {
+            let Some(cqe) = cq.next() else {
+                break;
+            };
             let user_data = cqe.user_data();
             if !cqe_consumes_poll_budget(user_data) {
                 // Cancel SQE completion — silently skip. Retained payloads are
                 // released only when the original target CQE is observed.
                 continue;
-            }
-            if seen >= max_completions {
-                break;
             }
 
             let state = user_data as *mut CompletionState;
@@ -589,7 +660,7 @@ impl Reactor {
                         &mut self.op_pool,
                         &mut self.live_ops,
                         state,
-                    );
+                    )?;
                 } else {
                     let waiter = (*state).take_waiter();
                     if !waiter.is_null() {
@@ -614,9 +685,7 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
-        if self.initialized {
-            unsafe { ManuallyDrop::drop(&mut self.op_pool) };
-        }
+        unsafe { ManuallyDrop::drop(&mut self.op_pool) };
     }
 }
 
@@ -642,6 +711,10 @@ mod tests {
                 libc::close(fd);
             }
         }
+    }
+
+    fn nop_sqe(user_data: u64) -> io_uring::squeue::Entry {
+        opcode::Nop::new().build().user_data(user_data)
     }
 
     #[test]
@@ -678,6 +751,44 @@ mod tests {
 
         reactor.free_op(second);
         reactor.free_op(first);
+    }
+
+    #[test]
+    fn free_op_retirement_updates_live_accounting() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "op allocation failed");
+        assert_eq!(reactor.live_ops, 1);
+
+        reactor
+            .try_free_op(state)
+            .expect("live op should retire cleanly");
+
+        assert_eq!(reactor.live_ops, 0);
+    }
+
+    #[test]
+    fn free_op_without_live_op_is_an_error() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "op allocation failed");
+        reactor.live_ops = 0;
+
+        let err = reactor
+            .try_free_op(state)
+            .expect_err("freeing without a live op should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(reactor.live_ops, 0);
+
+        reactor.live_ops = 1;
+        reactor.free_op(state);
     }
 
     #[test]
@@ -754,6 +865,142 @@ mod tests {
         close_orphan_result_fd_if_needed(&without_flag);
         assert!(!raw_fd_is_closed(fd_without_flag));
         close_fd_if_open(fd_without_flag);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn submit_sqe_full_queue_absorbs_eintr_before_push() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+
+        reactor
+            .submit_sqe(nop_sqe(1))
+            .expect("first nop submit failed");
+        reactor
+            .submit_sqe(nop_sqe(2))
+            .expect("second nop submit failed");
+
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EINTR);
+        reactor
+            .submit_sqe(nop_sqe(3))
+            .expect("EINTR while making SQ space should be absorbed");
+        assert!(
+            reactor.pending,
+            "third NOP should remain pending after push"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn submit_sqe_full_queue_transient_ebusy_retries_and_pushes() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+
+        reactor
+            .submit_sqe(nop_sqe(1))
+            .expect("first nop submit failed");
+        reactor
+            .submit_sqe(nop_sqe(2))
+            .expect("second nop submit failed");
+
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+        reactor
+            .submit_sqe(nop_sqe(3))
+            .expect("transient EBUSY should be retried");
+        assert!(
+            reactor.pending,
+            "third NOP should remain pending after transient submit pressure"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn submit_sqe_full_queue_persistent_ebusy_returns_would_block() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+
+        reactor
+            .submit_sqe(nop_sqe(1))
+            .expect("first nop submit failed");
+        reactor
+            .submit_sqe(nop_sqe(2))
+            .expect("second nop submit failed");
+
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+        let err = reactor
+            .submit_sqe(nop_sqe(3))
+            .expect_err("persistent EBUSY should surface as pressure");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            reactor.pending,
+            "existing queued SQEs should remain pending after pressure"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn flush_sqes_reports_busy_on_submit_ebusy() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+
+        reactor.submit_sqe(nop_sqe(1)).expect("nop submit failed");
+
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+        let status = reactor
+            .flush_sqes()
+            .expect("flush should not fail on EBUSY");
+        assert_eq!(status, ReactorSubmitStatus::Busy);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn wait_for_events_reports_busy_with_pending_cancel_retry() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "op allocation failed");
+
+        unsafe { (*state).set_orphaned() };
+        reactor.queue_pending_cancel(state);
+
+        crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+        let status = reactor
+            .wait_for_events(Some(Duration::ZERO))
+            .expect("wait_for_events should report pending cancel pressure");
+        assert_eq!(status, ReactorSubmitStatus::Busy);
+
+        reactor.free_op(state);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn wait_for_events_busy_keeps_queued_cancel_sqe_pending() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "op allocation failed");
+
+        unsafe { (*state).set_orphaned() };
+        reactor.queue_pending_cancel(state);
+
+        crate::runtime::test_hooks::fail_next_ring_wait_errno(libc::EBUSY);
+        let status = reactor
+            .wait_for_events(Some(Duration::from_millis(1)))
+            .expect("wait_for_events should report busy wait pressure");
+        assert_eq!(status, ReactorSubmitStatus::Busy);
+        assert!(
+            reactor.pending,
+            "queued cancel SQE must stay pending after wait pressure"
+        );
+
+        reactor.free_op(state);
     }
 
     #[cfg(debug_assertions)]
