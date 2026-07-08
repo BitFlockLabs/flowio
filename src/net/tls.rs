@@ -908,7 +908,7 @@ pub struct TlsReadFuture<'a, B: IoBuffReadWrite> {
 impl<'a, B: IoBuffReadWrite> TlsReadFuture<'a, B> {
     fn new(stream: &'a mut TlsClientStream, buffer: B, len: usize) -> Self {
         let mut input_error = None;
-        let target = match checked_read_len("tls read", len, buffer.writable_len()) {
+        let target = match checked_read_len(len, buffer.writable_len()) {
             Ok(target) => target as usize,
             Err(err) => {
                 input_error = Some(err);
@@ -989,7 +989,7 @@ pub struct TlsReadExactFuture<'a, B: IoBuffReadWrite> {
 impl<'a, B: IoBuffReadWrite> TlsReadExactFuture<'a, B> {
     fn new(stream: &'a mut TlsClientStream, mut buffer: B, len: usize) -> Self {
         let mut input_error = None;
-        let target = match checked_read_len("tls read_exact", len, buffer.writable_len()) {
+        let target = match checked_read_len(len, buffer.writable_len()) {
             Ok(target) => target as usize,
             Err(err) => {
                 input_error = Some(err);

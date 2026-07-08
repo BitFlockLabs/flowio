@@ -144,7 +144,7 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     /// The caller must ensure the memory provider is valid and that
     /// the `InPlaceInit::init_at` implementation does not panic.
     pub unsafe fn alloc(&mut self, args: T::Args) -> Option<*mut T> {
-        let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front(0) } {
+        let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front() } {
             link_ptr
         } else {
             unsafe {
@@ -235,6 +235,7 @@ impl<T: InPlaceInit, P: super::provider::MemoryProvider + 'static> ProviderOwned
         Ok(Self { provider, pool })
     }
 
+    #[cfg(debug_assertions)]
     #[inline(always)]
     pub(crate) fn provider_ref(&self) -> &P {
         self.provider.as_ref()
@@ -342,6 +343,7 @@ mod tests {
     }
 
     struct TestSlot {
+        #[allow(dead_code)]
         value: usize,
     }
 

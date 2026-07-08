@@ -35,7 +35,6 @@ const RETAINED_SIZE_CLASSES: [usize; 11] = [
     64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
 pub(crate) const RETAINED_IOVEC_INLINE_COUNT: usize = 16;
-pub(crate) const RETAINED_IOVEC_MAX_COUNT: usize = 1024;
 const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
 
 #[derive(Clone, Copy)]
@@ -509,7 +508,7 @@ impl RetainedSizeClass {
 
     #[inline(always)]
     fn alloc_block(&mut self) -> Option<ClassAllocResult> {
-        if let Some(ptr) = unsafe { self.free_list.pop_front(0) } {
+        if let Some(ptr) = unsafe { self.free_list.pop_front() } {
             return Some(ClassAllocResult {
                 ptr,
                 reused: true,

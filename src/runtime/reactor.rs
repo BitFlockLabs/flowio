@@ -713,6 +713,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn nop_sqe(user_data: u64) -> io_uring::squeue::Entry {
         opcode::Nop::new().build().user_data(user_data)
     }

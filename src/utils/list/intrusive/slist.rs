@@ -134,10 +134,9 @@ impl<T> SList<T> {
 
     /// # Safety
     ///
-    /// The caller must ensure that the `offset` correctly represents the byte
-    /// distance from the start of the container `T` to the `Link` field.
+    /// The caller must ensure that `T` begins with the intrusive `Link` field.
     #[inline(always)]
-    pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T> {
+    pub unsafe fn pop_front(&mut self) -> Option<*mut T> {
         debug_assert_slist_sanity!(self);
         if self.is_empty() {
             return None;
@@ -147,8 +146,7 @@ impl<T> SList<T> {
             self.head = (*node_ptr).next;
             (*node_ptr).next = ptr::null_mut();
 
-            let container_ptr = (node_ptr as *mut u8).sub(offset) as *mut T;
-            Some(container_ptr)
+            Some(node_ptr as *mut T)
         }
     }
 }

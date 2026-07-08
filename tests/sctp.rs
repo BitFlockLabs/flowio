@@ -146,6 +146,8 @@ fn test_send_info(stream_id: u16, ppid: u32) -> SctpSendInfo {
     }
 }
 
+const LINUX_SCTP_COMM_UP: u16 = 0;
+
 #[test]
 fn sctp_unsupported_does_not_mask_einval() {
     let err = std::io::Error::from_raw_os_error(libc::EINVAL);
@@ -797,6 +799,55 @@ fn notification_mask_defaults() {
     );
     assert!(!SctpNotificationMask::none().association);
     assert!(SctpNotificationMask::all().authentication);
+}
+
+#[test]
+fn runtime_sctp_connect_delivers_comm_up_notification_when_subscribed() {
+    let mut config = SctpSocketConfig::signaling(SctpInitConfig::diameter_default());
+    config.notifications = SctpNotificationMask {
+        association: true,
+        ..SctpNotificationMask::none()
+    };
+
+    let mut listener = match bind_sctp_listener_or_skip(
+        "runtime_sctp_connect_delivers_comm_up_notification_when_subscribed",
+        config,
+    ) {
+        Some(listener) => listener,
+        None => return,
+    };
+
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let server =
+                Executor::spawn(async move { listener.accept().await.expect("accept failed").0 })
+                    .expect("accept spawn failed");
+
+            let mut client = connector
+                .connect(addr)
+                .expect("connect setup failed")
+                .await
+                .expect("connect failed");
+            let _server = server.await;
+
+            let recv_res = timeout(Duration::from_secs(1), client.recv_msg(vec![0u8; 256], 256))
+                .await
+                .expect("COMM_UP notification was not delivered after connect");
+            let (result, _buf) = recv_res;
+            let (recv_len, meta) = result.expect("client recv_msg failed");
+            assert!(recv_len > 0, "COMM_UP notification should carry bytes");
+            match meta {
+                SctpRecvMeta::Notification(SctpNotification::AssocChange { state, .. }) => {
+                    assert_eq!(state, LINUX_SCTP_COMM_UP);
+                }
+                other => panic!("expected COMM_UP assoc-change notification, got {other:?}"),
+            }
+        })
+        .expect("executor run failed");
 }
 
 #[test]

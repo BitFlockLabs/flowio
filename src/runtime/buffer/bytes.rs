@@ -102,11 +102,7 @@ impl std::error::Error for BufferRangeError {}
 fn checked_slice(src: &[u8], offset: usize, width: usize) -> Result<&[u8], BufferRangeError> {
     let err = BufferRangeError::new(offset, width, src.len());
     let end = offset.checked_add(width).ok_or(err)?;
-    let bytes = src.get(offset..end).ok_or(err)?;
-    if bytes.len() != width {
-        return Err(err);
-    }
-    Ok(bytes)
+    src.get(offset..end).ok_or(err)
 }
 
 #[inline]
@@ -118,11 +114,7 @@ fn checked_slice_mut(
     let len = dst.len();
     let err = BufferRangeError::new(offset, width, len);
     let end = offset.checked_add(width).ok_or(err)?;
-    let bytes = dst.get_mut(offset..end).ok_or(err)?;
-    if bytes.len() != width {
-        return Err(err);
-    }
-    Ok(bytes)
+    dst.get_mut(offset..end).ok_or(err)
 }
 
 #[inline]

@@ -236,69 +236,84 @@ trait WriteBufferChain<const N: usize>: Sized {
     fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]);
 }
 
+trait WriteBufferItem {
+    fn write_ptr(&self) -> *const u8;
+
+    fn write_len(&self) -> usize;
+}
+
+impl<T: IoBuffReadOnly> WriteBufferItem for T {
+    #[inline(always)]
+    fn write_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    #[inline(always)]
+    fn write_len(&self) -> usize {
+        self.len()
+    }
+}
+
+#[inline(always)]
+fn write_iovec_count_and_len<'a, I, T>(iter: I) -> (usize, usize)
+where
+    I: IntoIterator<Item = &'a T>,
+    T: WriteBufferItem + 'a,
+{
+    let mut iov_count = 0;
+    let mut total = 0;
+    for buf in iter {
+        let len = buf.write_len();
+        total += len;
+        if len != 0 {
+            iov_count += 1;
+        }
+    }
+    (iov_count, total)
+}
+
+#[inline(always)]
+fn fill_write_iovecs<'a, I, T>(iter: I, dst: &mut [MaybeUninit<libc::iovec>])
+where
+    I: IntoIterator<Item = &'a T>,
+    T: WriteBufferItem + 'a,
+{
+    let mut iov_count = 0;
+    for buf in iter {
+        let len = buf.write_len();
+        if len == 0 {
+            continue;
+        }
+        debug_assert!(iov_count < dst.len(), "writev scratch too small");
+        dst[iov_count].write(libc::iovec {
+            iov_base: buf.write_ptr() as *mut libc::c_void,
+            iov_len: len,
+        });
+        iov_count += 1;
+    }
+}
+
 impl<const N: usize> WriteBufferChain<N> for IoBuffVec<N> {
     #[inline(always)]
     fn write_iovec_count_and_len(&self) -> (usize, usize) {
-        let mut iov_count = 0;
-        let mut total = 0;
-        for buf in self.iter() {
-            let len = buf.len();
-            total += len;
-            if len != 0 {
-                iov_count += 1;
-            }
-        }
-        (iov_count, total)
+        write_iovec_count_and_len(self.iter())
     }
 
     #[inline(always)]
     fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
-        let mut iov_count = 0;
-        for buf in self.iter() {
-            let len = buf.len();
-            if len == 0 {
-                continue;
-            }
-            debug_assert!(iov_count < dst.len(), "writev scratch too small");
-            dst[iov_count].write(libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: len,
-            });
-            iov_count += 1;
-        }
+        fill_write_iovecs(self.iter(), dst);
     }
 }
 
 impl<B: IoBuffReadOnly, const N: usize> WriteBufferChain<N> for IoBuffReadOnlyVec<B, N> {
     #[inline(always)]
     fn write_iovec_count_and_len(&self) -> (usize, usize) {
-        let mut iov_count = 0;
-        let mut total = 0;
-        for buf in self.iter() {
-            let len = buf.len();
-            total += len;
-            if len != 0 {
-                iov_count += 1;
-            }
-        }
-        (iov_count, total)
+        write_iovec_count_and_len(self.iter())
     }
 
     #[inline(always)]
     fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
-        let mut iov_count = 0;
-        for buf in self.iter() {
-            let len = buf.len();
-            if len == 0 {
-                continue;
-            }
-            debug_assert!(iov_count < dst.len(), "writev scratch too small");
-            dst[iov_count].write(libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: len,
-            });
-            iov_count += 1;
-        }
+        fill_write_iovecs(self.iter(), dst);
     }
 }
 
@@ -551,6 +566,7 @@ fn clamp_iovecs_to_read_limit(iovecs: &mut [libc::iovec], skip: usize, max_bytes
         remaining == 0,
         "readv_exact clamp exceeded materialized writable iovecs"
     );
+
     iovecs.len() - skip
 }
 
@@ -649,7 +665,7 @@ pub(crate) fn try_read_once<B: IoBuffReadWrite>(
     mut buffer: B,
     len: usize,
 ) -> (io::Result<usize>, B) {
-    let len = match super::checked_read_len("try_read", len, buffer.writable_len()) {
+    let len = match super::checked_read_len(len, buffer.writable_len()) {
         Ok(len) => len as usize,
         Err(err) => return (Err(err), buffer),
     };
@@ -677,7 +693,7 @@ pub(crate) fn try_read_append_once(
     len: usize,
 ) -> (io::Result<usize>, IoBuffMut) {
     let start_len = buffer.payload_len();
-    let len = match super::checked_read_len("try_read_append", len, buffer.payload_remaining()) {
+    let len = match super::checked_read_len(len, buffer.payload_remaining()) {
         Ok(len) => len as usize,
         Err(err) => return (Err(err), buffer),
     };
@@ -945,7 +961,7 @@ pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
 impl<'a, B: IoBuffReadWrite, S> ReadFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B, len: usize) -> Self {
         let mut input_error = None;
-        let len = match super::checked_read_len("read", len, buffer.writable_len()) {
+        let len = match super::checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -1056,7 +1072,7 @@ pub struct WriteFuture<'a, B: IoBuffReadOnly, S> {
 impl<'a, B: IoBuffReadOnly, S> WriteFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B) -> Self {
         let mut input_error = None;
-        let len = match super::checked_send_len("write", buffer.len()) {
+        let len = match super::checked_send_len(buffer.len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -1172,7 +1188,7 @@ pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
 impl<'a, B: IoBuffReadOnly, S> WriteAllFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B) -> Self {
         let mut input_error = None;
-        let total = match super::checked_send_len("write_all", buffer.len()) {
+        let total = match super::checked_send_len(buffer.len()) {
             Ok(total) => total,
             Err(err) => {
                 input_error = Some(err);
@@ -1354,7 +1370,7 @@ pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
 impl<'a, B: IoBuffReadWrite, S> ReadExactFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B, len: usize) -> Self {
         let mut input_error = None;
-        let target = match super::checked_read_len("read_exact", len, buffer.writable_len()) {
+        let target = match super::checked_read_len(len, buffer.writable_len()) {
             Ok(target) => target,
             Err(err) => {
                 input_error = Some(err);
@@ -1546,14 +1562,13 @@ impl<'a, S> ReadExactAppendFuture<'a, S> {
     pub(crate) fn new(fd: RawFd, buffer: IoBuffMut, len: usize) -> Self {
         let start_len = buffer.payload_len();
         let mut input_error = None;
-        let target =
-            match super::checked_read_len("read_exact_append", len, buffer.payload_remaining()) {
-                Ok(target) => target,
-                Err(err) => {
-                    input_error = Some(err);
-                    0
-                }
-            };
+        let target = match super::checked_read_len(len, buffer.payload_remaining()) {
+            Ok(target) => target,
+            Err(err) => {
+                input_error = Some(err);
+                0
+            }
+        };
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
@@ -2597,7 +2612,7 @@ impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
         let iov_count = buffer.segments();
         let writable = buffer.writable_len();
         let mut input_error = None;
-        let target = match super::checked_read_len("readv_exact", target, writable) {
+        let target = match super::checked_read_len(target, writable) {
             Ok(target) => target as usize,
             Err(err) => {
                 input_error = Some(err);
@@ -2831,6 +2846,114 @@ mod tests {
         );
         assert_eq!(classify_retry_cqe_result(0), RetryCqeResult::Zero);
         assert_eq!(classify_retry_cqe_result(7), RetryCqeResult::Bytes(7));
+    }
+
+    #[test]
+    fn advance_iovecs_in_place_handles_partial_and_full_entries() {
+        let mut bytes = [0u8; 16];
+        let base = bytes.as_mut_ptr();
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: base.cast(),
+                iov_len: 3,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(3) }.cast(),
+                iov_len: 5,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(8) }.cast(),
+                iov_len: 8,
+            },
+        ];
+        let mut skip = 0usize;
+
+        advance_iovecs_in_place(&mut iovecs, &mut skip, 4);
+        assert_eq!(skip, 1);
+        assert_eq!(iovecs[1].iov_base, unsafe { base.add(4) }.cast());
+        assert_eq!(iovecs[1].iov_len, 4);
+
+        advance_iovecs_in_place(&mut iovecs, &mut skip, 4);
+        assert_eq!(skip, 2);
+        assert_eq!(iovecs[2].iov_base, unsafe { base.add(8) }.cast());
+        assert_eq!(iovecs[2].iov_len, 8);
+    }
+
+    #[test]
+    fn advance_iovecs_in_place_zero_bytes_is_noop() {
+        let mut bytes = [0u8; 8];
+        let base = bytes.as_mut_ptr();
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: base.cast(),
+                iov_len: 3,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(3) }.cast(),
+                iov_len: 5,
+            },
+        ];
+        let mut skip = 1usize;
+
+        advance_iovecs_in_place(&mut iovecs, &mut skip, 0);
+
+        assert_eq!(skip, 1);
+        assert_eq!(iovecs[0].iov_base, base.cast());
+        assert_eq!(iovecs[0].iov_len, 3);
+        assert_eq!(iovecs[1].iov_base, unsafe { base.add(3) }.cast());
+        assert_eq!(iovecs[1].iov_len, 5);
+    }
+
+    #[test]
+    fn clamp_iovecs_to_read_limit_clamps_from_skip_index() {
+        let mut bytes = [0u8; 16];
+        let base = bytes.as_mut_ptr();
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: base.cast(),
+                iov_len: 3,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(3) }.cast(),
+                iov_len: 5,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(8) }.cast(),
+                iov_len: 8,
+            },
+        ];
+
+        let count = clamp_iovecs_to_read_limit(&mut iovecs, 1, 6);
+
+        assert_eq!(count, 2);
+        assert_eq!(iovecs[0].iov_len, 3);
+        assert_eq!(iovecs[1].iov_len, 5);
+        assert_eq!(iovecs[2].iov_len, 1);
+    }
+
+    #[test]
+    fn clamp_iovecs_to_read_limit_keeps_exact_full_remaining_window() {
+        let mut bytes = [0u8; 16];
+        let base = bytes.as_mut_ptr();
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: base.cast(),
+                iov_len: 3,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(3) }.cast(),
+                iov_len: 5,
+            },
+            libc::iovec {
+                iov_base: unsafe { base.add(8) }.cast(),
+                iov_len: 8,
+            },
+        ];
+        let count = clamp_iovecs_to_read_limit(&mut iovecs, 1, 13);
+
+        assert_eq!(count, 2);
+        assert_eq!(iovecs[1].iov_len, 5);
+        assert_eq!(iovecs[2].iov_len, 8);
     }
 
     #[test]

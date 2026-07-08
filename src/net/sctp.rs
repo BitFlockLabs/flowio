@@ -237,9 +237,9 @@ struct SctpEventSubscribe {
 }
 
 impl SctpEventSubscribe {
-    const fn from_mask(mask: SctpNotificationMask, recv_rcvinfo: bool) -> Self {
+    const fn from_mask(mask: SctpNotificationMask) -> Self {
         Self {
-            sctp_data_io_event: recv_rcvinfo as u8,
+            sctp_data_io_event: 0,
             sctp_association_event: mask.association as u8,
             sctp_address_event: mask.address as u8,
             sctp_send_failure_event: 0,
@@ -2654,12 +2654,7 @@ impl SctpStream {
     /// This is signaling setup/control-plane work. Data-only fast paths should
     /// use [`SctpSocketConfig::data`] and avoid per-message mask changes.
     pub fn set_notification_mask(&self, mask: SctpNotificationMask) -> io::Result<()> {
-        let recv_rcvinfo: libc::c_int = super::get_sock_opt(
-            self.fd.as_raw_fd(),
-            libc::IPPROTO_SCTP,
-            libc::SCTP_RECVRCVINFO,
-        )?;
-        set_sctp_events(self.fd.as_raw_fd(), mask, recv_rcvinfo != 0)
+        set_sctp_events(self.fd.as_raw_fd(), mask)
     }
 
     /// Applies association-wide retransmission and RTO policy.
@@ -2698,7 +2693,7 @@ impl SctpStream {
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> DataRecvFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv", len, buffer.writable_len()) {
+        let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -2722,7 +2717,7 @@ impl SctpStream {
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> DataSendFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_send_len("send", buffer.len()) {
+        let len = match checked_send_len(buffer.len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -2799,7 +2794,7 @@ impl SctpStream {
         info: SctpSendInfo,
     ) -> SendFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_send_len("send_msg", buffer.len()) {
+        let len = match checked_send_len(buffer.len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -3005,7 +3000,7 @@ fn checked_sctp_metadata_read_len(requested: usize, writable: usize) -> io::Resu
     if requested == 0 {
         return Err(invalid_zero_length_sctp_metadata_recv());
     }
-    checked_read_len("recv_msg", requested, writable)
+    checked_read_len(requested, writable)
 }
 
 #[inline(always)]
@@ -4069,7 +4064,7 @@ impl Future for ConnectFuture<'_> {
                 }
 
                 if let Err(err) =
-                    apply_sctp_connected_socket_config(this.slot.fd, this.slot.connected_config)
+                    apply_sctp_connect_established_config(this.slot.fd, this.slot.connected_config)
                 {
                     this.slot.cleanup_fd();
                     return Poll::Ready(Err(err));
@@ -4259,14 +4254,14 @@ fn raw_sndinfo_from_public(info: SctpSendInfo) -> libc::sctp_sndinfo {
     }
 }
 
-fn set_sctp_events(fd: RawFd, mask: SctpNotificationMask, recv_rcvinfo: bool) -> io::Result<()> {
-    let events = SctpEventSubscribe::from_mask(mask, recv_rcvinfo);
+fn set_sctp_events(fd: RawFd, mask: SctpNotificationMask) -> io::Result<()> {
+    let events = SctpEventSubscribe::from_mask(mask);
     set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_EVENTS, &events)?;
     Ok(())
 }
 
 fn apply_sctp_socket_options(fd: RawFd, options: SctpSocketOptions) -> io::Result<()> {
-    set_sctp_events(fd, options.notifications, options.recv_rcvinfo)?;
+    set_sctp_events(fd, options.notifications)?;
 
     let recv_rcvinfo: libc::c_int = if options.recv_rcvinfo { 1 } else { 0 };
     set_sock_opt(
@@ -4384,13 +4379,22 @@ fn apply_sctp_connected_socket_config(fd: RawFd, config: SctpSocketConfig) -> io
     Ok(())
 }
 
+fn apply_sctp_connect_established_config(fd: RawFd, config: SctpSocketConfig) -> io::Result<()> {
+    if let Some(assoc) = config.assoc {
+        apply_assoc_config_raw(fd, assoc)?;
+    }
+    if let Some(params) = config.default_peer_addr_params {
+        apply_default_peer_addr_params(fd, params)?;
+    }
+    Ok(())
+}
+
+fn apply_sctp_init_config(fd: RawFd, config: SctpInitConfig) -> io::Result<()> {
+    set_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_INITMSG, &config.as_raw())
+}
+
 fn configure_sctp_socket(fd: RawFd, config: SctpSocketConfig) -> io::Result<()> {
-    set_sock_opt(
-        fd,
-        libc::IPPROTO_SCTP,
-        libc::SCTP_INITMSG,
-        &config.init.as_raw(),
-    )?;
+    apply_sctp_init_config(fd, config.init)?;
     apply_sctp_socket_options(fd, config.socket_options())
 }
 
@@ -4984,7 +4988,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
     }
 
     let notification = match sn_type as libc::c_int {
-        x if x == local_sctp_assoc_change() => {
+        x if x == LOCAL_SCTP_ASSOC_CHANGE => {
             if buffer.len() < 20 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -4996,7 +5000,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, 16).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_peer_addr_change() => {
+        x if x == LOCAL_SCTP_PEER_ADDR_CHANGE => {
             let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
             let min_len = 8 + storage_len + 12;
             if buffer.len() < min_len {
@@ -5023,8 +5027,8 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, base + 8).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_send_failed() => parse_legacy_send_failed_notification(buffer)?,
-        x if x == local_sctp_remote_error() => {
+        x if x == LOCAL_SCTP_SEND_FAILED => parse_legacy_send_failed_notification(buffer)?,
+        x if x == LOCAL_SCTP_REMOTE_ERROR => {
             if buffer.len() < 16 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5033,7 +5037,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_shutdown_event() => {
+        x if x == LOCAL_SCTP_SHUTDOWN_EVENT => {
             if buffer.len() < 12 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5041,7 +5045,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_adaptation_indication() => {
+        x if x == LOCAL_SCTP_ADAPTATION_INDICATION => {
             if buffer.len() < 16 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5050,7 +5054,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_partial_delivery_event() => {
+        x if x == LOCAL_SCTP_PARTIAL_DELIVERY_EVENT => {
             if buffer.len() < 24 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5061,7 +5065,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 sequence: read_u32_at(buffer, 20).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_sender_dry_event() => {
+        x if x == LOCAL_SCTP_SENDER_DRY_EVENT => {
             if buffer.len() < 12 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5069,7 +5073,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_stream_reset_event() => {
+        x if x == LOCAL_SCTP_STREAM_RESET_EVENT => {
             if buffer.len() < 12 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5078,7 +5082,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_assoc_reset_event() => {
+        x if x == LOCAL_SCTP_ASSOC_RESET_EVENT => {
             if buffer.len() < 20 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5089,7 +5093,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 remote_tsn: read_u32_at(buffer, 16).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_stream_change_event() => {
+        x if x == LOCAL_SCTP_STREAM_CHANGE_EVENT => {
             if buffer.len() < 16 {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -5100,7 +5104,7 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 outbound_streams: read_u16_at(buffer, 14).map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == local_sctp_send_failed_event() => parse_send_failed_event_notification(buffer)?,
+        x if x == LOCAL_SCTP_SEND_FAILED_EVENT => parse_send_failed_event_notification(buffer)?,
         _ => SctpNotification::Other {
             kind: sn_type,
             flags: sn_flags,
@@ -5111,53 +5115,18 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
     Ok(SctpRecvMeta::Notification(notification))
 }
 
-const fn local_sctp_assoc_change() -> libc::c_int {
-    local_sctp_notification_type(1)
-}
-
-const fn local_sctp_peer_addr_change() -> libc::c_int {
-    local_sctp_notification_type(2)
-}
-
-const fn local_sctp_send_failed() -> libc::c_int {
-    local_sctp_notification_type(3)
-}
-
-const fn local_sctp_remote_error() -> libc::c_int {
-    local_sctp_notification_type(4)
-}
-
-const fn local_sctp_shutdown_event() -> libc::c_int {
-    local_sctp_notification_type(5)
-}
-
-const fn local_sctp_partial_delivery_event() -> libc::c_int {
-    local_sctp_notification_type(6)
-}
-
-const fn local_sctp_adaptation_indication() -> libc::c_int {
-    local_sctp_notification_type(7)
-}
-
-const fn local_sctp_sender_dry_event() -> libc::c_int {
-    local_sctp_notification_type(9)
-}
-
-const fn local_sctp_stream_reset_event() -> libc::c_int {
-    local_sctp_notification_type(10)
-}
-
-const fn local_sctp_assoc_reset_event() -> libc::c_int {
-    local_sctp_notification_type(11)
-}
-
-const fn local_sctp_stream_change_event() -> libc::c_int {
-    local_sctp_notification_type(12)
-}
-
-const fn local_sctp_send_failed_event() -> libc::c_int {
-    local_sctp_notification_type(13)
-}
+const LOCAL_SCTP_ASSOC_CHANGE: libc::c_int = local_sctp_notification_type(1);
+const LOCAL_SCTP_PEER_ADDR_CHANGE: libc::c_int = local_sctp_notification_type(2);
+const LOCAL_SCTP_SEND_FAILED: libc::c_int = local_sctp_notification_type(3);
+const LOCAL_SCTP_REMOTE_ERROR: libc::c_int = local_sctp_notification_type(4);
+const LOCAL_SCTP_SHUTDOWN_EVENT: libc::c_int = local_sctp_notification_type(5);
+const LOCAL_SCTP_PARTIAL_DELIVERY_EVENT: libc::c_int = local_sctp_notification_type(6);
+const LOCAL_SCTP_ADAPTATION_INDICATION: libc::c_int = local_sctp_notification_type(7);
+const LOCAL_SCTP_SENDER_DRY_EVENT: libc::c_int = local_sctp_notification_type(9);
+const LOCAL_SCTP_STREAM_RESET_EVENT: libc::c_int = local_sctp_notification_type(10);
+const LOCAL_SCTP_ASSOC_RESET_EVENT: libc::c_int = local_sctp_notification_type(11);
+const LOCAL_SCTP_STREAM_CHANGE_EVENT: libc::c_int = local_sctp_notification_type(12);
+const LOCAL_SCTP_SEND_FAILED_EVENT: libc::c_int = local_sctp_notification_type(13);
 
 const fn local_sctp_notification_type(index: libc::c_int) -> libc::c_int {
     (1 << 15) | index
@@ -5180,22 +5149,22 @@ pub fn test_parse_recv_meta(
 
 #[doc(hidden)]
 pub const fn test_assoc_change_type() -> libc::c_int {
-    local_sctp_assoc_change()
+    LOCAL_SCTP_ASSOC_CHANGE
 }
 
 #[doc(hidden)]
 pub const fn test_adaptation_indication_type() -> libc::c_int {
-    local_sctp_adaptation_indication()
+    LOCAL_SCTP_ADAPTATION_INDICATION
 }
 
 #[doc(hidden)]
 pub const fn test_peer_addr_change_type() -> libc::c_int {
-    local_sctp_peer_addr_change()
+    LOCAL_SCTP_PEER_ADDR_CHANGE
 }
 
 #[doc(hidden)]
 pub const fn test_send_failed_type() -> libc::c_int {
-    local_sctp_send_failed()
+    LOCAL_SCTP_SEND_FAILED
 }
 
 #[doc(hidden)]
@@ -5210,42 +5179,42 @@ pub const fn test_send_failed_info_offset() -> usize {
 
 #[doc(hidden)]
 pub const fn test_remote_error_type() -> libc::c_int {
-    local_sctp_remote_error()
+    LOCAL_SCTP_REMOTE_ERROR
 }
 
 #[doc(hidden)]
 pub const fn test_shutdown_event_type() -> libc::c_int {
-    local_sctp_shutdown_event()
+    LOCAL_SCTP_SHUTDOWN_EVENT
 }
 
 #[doc(hidden)]
 pub const fn test_partial_delivery_event_type() -> libc::c_int {
-    local_sctp_partial_delivery_event()
+    LOCAL_SCTP_PARTIAL_DELIVERY_EVENT
 }
 
 #[doc(hidden)]
 pub const fn test_sender_dry_event_type() -> libc::c_int {
-    local_sctp_sender_dry_event()
+    LOCAL_SCTP_SENDER_DRY_EVENT
 }
 
 #[doc(hidden)]
 pub const fn test_stream_reset_event_type() -> libc::c_int {
-    local_sctp_stream_reset_event()
+    LOCAL_SCTP_STREAM_RESET_EVENT
 }
 
 #[doc(hidden)]
 pub const fn test_assoc_reset_event_type() -> libc::c_int {
-    local_sctp_assoc_reset_event()
+    LOCAL_SCTP_ASSOC_RESET_EVENT
 }
 
 #[doc(hidden)]
 pub const fn test_stream_change_event_type() -> libc::c_int {
-    local_sctp_stream_change_event()
+    LOCAL_SCTP_STREAM_CHANGE_EVENT
 }
 
 #[doc(hidden)]
 pub const fn test_send_failed_event_type() -> libc::c_int {
-    local_sctp_send_failed_event()
+    LOCAL_SCTP_SEND_FAILED_EVENT
 }
 
 #[cfg(test)]
@@ -5325,7 +5294,7 @@ mod tests {
     }
 
     fn test_partial_delivery_notification(indication: u32) -> Vec<u8> {
-        let mut bytes = test_notification_buffer(local_sctp_partial_delivery_event(), 24);
+        let mut bytes = test_notification_buffer(LOCAL_SCTP_PARTIAL_DELIVERY_EVENT, 24);
         write_u32_ne(&mut bytes, 8, indication);
         bytes
     }
@@ -5363,7 +5332,7 @@ mod tests {
 
     #[test]
     fn sctp_notification_eor_tail_retires_discard() {
-        let data = test_notification_buffer(local_sctp_assoc_change(), 20);
+        let data = test_notification_buffer(LOCAL_SCTP_ASSOC_CHANGE, 20);
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
 
         assert!(!sctp_notification_retires_discard(&data, msg.msg_flags));
@@ -5439,13 +5408,13 @@ mod tests {
     }
 
     #[test]
-    fn notification_mask_enables_modern_send_failure_event_only() {
-        let subscribed = SctpEventSubscribe::from_mask(SctpNotificationMask::all(), true);
-        assert_eq!(subscribed.sctp_data_io_event, 1);
+    fn notification_mask_uses_modern_send_failure_without_legacy_data_io() {
+        let subscribed = SctpEventSubscribe::from_mask(SctpNotificationMask::all());
+        assert_eq!(subscribed.sctp_data_io_event, 0);
         assert_eq!(subscribed.sctp_send_failure_event, 0);
         assert_eq!(subscribed.sctp_send_failure_event_event, 1);
 
-        let unsubscribed = SctpEventSubscribe::from_mask(SctpNotificationMask::none(), false);
+        let unsubscribed = SctpEventSubscribe::from_mask(SctpNotificationMask::none());
         assert_eq!(unsubscribed.sctp_data_io_event, 0);
         assert_eq!(unsubscribed.sctp_send_failure_event, 0);
         assert_eq!(unsubscribed.sctp_send_failure_event_event, 0);

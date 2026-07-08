@@ -210,7 +210,7 @@ impl DnsResolver {
                 let recv_len = recv_result?;
                 let response = &recv[..recv_len];
                 if response_is_decodable_candidate(response, query_id) {
-                    recv.truncate(recv_len);
+                    debug_assert_eq!(recv.len(), recv_len);
                     return Ok(recv);
                 }
             }
@@ -889,6 +889,18 @@ pub(crate) fn decode_name(
     offset: usize,
     depth: usize,
 ) -> io::Result<(String, usize)> {
+    let mut labels = Vec::new();
+    let (consumed, _) = walk_dns_name(packet, offset, depth, Some(&mut labels))?;
+    let name = labels.join(".");
+    Ok((name, consumed))
+}
+
+fn walk_dns_name(
+    packet: &[u8],
+    offset: usize,
+    depth: usize,
+    mut labels: Option<&mut Vec<String>>,
+) -> io::Result<(usize, usize)> {
     if depth > MAX_CNAME_DEPTH + 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -902,19 +914,17 @@ pub(crate) fn decode_name(
         ));
     }
 
-    let mut labels = Vec::new();
     let mut pos = offset;
     let mut consumed = 0usize;
+    let mut presentation_len = 0usize;
 
     loop {
-        if pos >= packet.len() {
-            return Err(io::Error::new(
+        let len = *packet.get(pos).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "DNS name exceeded packet length",
-            ));
-        }
-
-        let len = packet[pos];
+            )
+        })?;
         if len & 0xC0 == 0xC0 {
             let next = checked_add(pos, 1, packet.len())?;
             let next_byte = *packet.get(next).ok_or_else(|| {
@@ -931,9 +941,17 @@ pub(crate) fn decode_name(
                 ));
             }
             consumed += 2;
-            let (suffix, _) = decode_name(packet, pointer, depth + 1)?;
-            if !suffix.is_empty() {
-                labels.push(suffix);
+            let child_labels = labels.as_deref_mut();
+            let (_, suffix_len) = walk_dns_name(packet, pointer, depth + 1, child_labels)?;
+            if suffix_len != 0 {
+                if presentation_len != 0 {
+                    presentation_len = presentation_len.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
+                    })?;
+                }
+                presentation_len = presentation_len.checked_add(suffix_len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
+                })?;
             }
             break;
         }
@@ -953,80 +971,35 @@ pub(crate) fn decode_name(
         let label_len = len as usize;
         let label_start = checked_add(pos, 1, packet.len())?;
         let label_end = checked_add(label_start, label_len, packet.len())?;
-        labels.push(String::from_utf8_lossy(&packet[label_start..label_end]).into_owned());
+        if presentation_len != 0 {
+            presentation_len = presentation_len.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
+            })?;
+        }
+        presentation_len = presentation_len.checked_add(label_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
+        })?;
+        if let Some(labels) = labels.as_mut() {
+            labels.push(String::from_utf8_lossy(&packet[label_start..label_end]).into_owned());
+        }
         consumed += 1 + label_len;
         pos = label_end;
     }
 
-    let name = labels.join(".");
-    if name.len() > DNS_MAX_NAME_PRESENTATION_LEN {
+    // DNS name limits are defined on raw label octets plus separators. Keep
+    // this check independent of the lossy UTF-8 string used by decode callers.
+    if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS name exceeded maximum length",
         ));
     }
 
-    Ok((name, consumed))
+    Ok((consumed, presentation_len))
 }
 
-// Candidate-drain fast path: mirror `decode_name` validation without
-// allocating label strings or `io::Error` values for rejected datagrams.
 fn skip_dns_name(packet: &[u8], offset: usize, depth: usize) -> Option<(usize, usize)> {
-    if depth > MAX_CNAME_DEPTH + 4 || offset >= packet.len() {
-        return None;
-    }
-
-    let mut pos = offset;
-    let mut consumed = 0usize;
-    let mut presentation_len = 0usize;
-
-    loop {
-        let len = *packet.get(pos)?;
-        if len & 0xC0 == 0xC0 {
-            let next = checked_add_candidate(pos, 1, packet.len())?;
-            let next_byte = *packet.get(next)?;
-            let pointer = (((len & 0x3F) as usize) << 8) | next_byte as usize;
-            if pointer >= pos {
-                return None;
-            }
-            consumed = consumed.checked_add(2)?;
-            let (_, suffix_len) = skip_dns_name(packet, pointer, depth + 1)?;
-            if suffix_len != 0 {
-                if presentation_len != 0 {
-                    presentation_len = presentation_len.checked_add(1)?;
-                }
-                presentation_len = presentation_len.checked_add(suffix_len)?;
-            }
-            break;
-        }
-
-        if len == 0 {
-            consumed = consumed.checked_add(1)?;
-            break;
-        }
-
-        if len & 0xC0 != 0 {
-            return None;
-        }
-
-        let label_len = len as usize;
-        let label_start = checked_add_candidate(pos, 1, packet.len())?;
-        let label_end = checked_add_candidate(label_start, label_len, packet.len())?;
-        if presentation_len != 0 {
-            presentation_len = presentation_len.checked_add(1)?;
-        }
-        presentation_len = presentation_len.checked_add(label_len)?;
-        if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
-            return None;
-        }
-        consumed = consumed.checked_add(1 + label_len)?;
-        pos = label_end;
-    }
-
-    if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
-        return None;
-    }
-    Some((consumed, presentation_len))
+    walk_dns_name(packet, offset, depth, None).ok()
 }
 
 fn dns_name_eq(left: &str, right: &str) -> bool {

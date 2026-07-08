@@ -347,6 +347,71 @@ fn runtime_tcp_try_writev_projected_invalid_projection_returns_source() {
 }
 
 #[test]
+fn runtime_tcp_try_clone_for_split_duplicates_connected_stream_descriptor() {
+    let (mut read_owner, mut peer) = connected_try_tcp_stream();
+    let mut write_owner = read_owner
+        .try_clone_for_split()
+        .expect("try_clone_for_split failed");
+
+    let (res, sent) = write_owner.try_write(b"ping".to_vec());
+    assert_eq!(res.expect("split write failed"), 4);
+    assert_eq!(sent, b"ping".to_vec());
+
+    let mut got = [0u8; 4];
+    peer.read_exact(&mut got).expect("std peer read failed");
+    assert_eq!(&got, b"ping");
+
+    drop(write_owner);
+
+    peer.write_all(b"pong").expect("std peer write failed");
+    let (res, recv) = read_owner.try_read(vec![0u8; 4], 4);
+    assert_eq!(res.expect("read after dropping split owner failed"), 4);
+    assert_eq!(&recv[..], b"pong");
+}
+
+#[test]
+fn runtime_tcp_split_clone_supports_concurrent_async_read_and_write() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+
+    let peer = std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+        stream.write_all(b"pong").expect("std write failed");
+
+        let mut got = [0u8; 4];
+        stream.read_exact(&mut got).expect("std read failed");
+        assert_eq!(&got, b"ping");
+    });
+
+    run_test(async move {
+        let (mut read_owner, _addr) = listener.accept().await.expect("accept failed");
+        let mut write_owner = read_owner
+            .try_clone_for_split()
+            .expect("try_clone_for_split failed");
+
+        let writer = Executor::spawn(async move {
+            let (res, sent) = write_owner.write_all(b"ping".to_vec()).await;
+            assert_eq!(res.expect("split async write failed"), 4);
+            sent
+        })
+        .expect("spawn split writer failed");
+
+        let reader = Executor::spawn(async move {
+            let (res, recv) = read_owner.read_exact(vec![0u8; 4], 4).await;
+            assert_eq!(res.expect("split async read failed"), 4);
+            recv
+        })
+        .expect("spawn split reader failed");
+
+        assert_eq!(writer.await, b"ping".to_vec());
+        assert_eq!(&reader.await[..], b"pong");
+    });
+
+    peer.join().expect("peer panicked");
+}
+
+#[test]
 fn runtime_tcp_ping_pong() {
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");

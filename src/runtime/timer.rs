@@ -613,8 +613,6 @@ pub struct TimerRuntime {
     timer_pool: ManuallyDrop<ProviderOwnedPool<TimerEntry, BasicMemoryProvider>>,
     /// Hierarchical timing wheel used to organize deadlines.
     wheel: TimerWheel,
-    /// Most recent monotonic tick sample seen during executor processing.
-    cached_now_tick: u64,
     /// Per-pass base used to convert relative and absolute deadlines
     /// consistently without repeated clock reads.
     arm_base: Option<ArmBase>,
@@ -642,7 +640,6 @@ impl TimerRuntime {
                     .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
             ),
             wheel: TimerWheel::new_uninit(),
-            cached_now_tick: 0,
             arm_base: None,
         })
     }
@@ -651,16 +648,13 @@ impl TimerRuntime {
     pub fn init(&mut self) -> io::Result<()> {
         self.timer_pool.init();
         self.wheel.init()?;
-        self.cached_now_tick = self.wheel.current_tick;
         self.arm_base = None;
         Ok(())
     }
 
     /// Samples and returns the current monotonic timer tick.
     pub fn now_tick(&mut self) -> io::Result<u64> {
-        let now = now_tick()?;
-        self.cached_now_tick = now;
-        Ok(now)
+        now_tick()
     }
 
     #[inline(always)]
@@ -726,7 +720,6 @@ impl TimerRuntime {
         // per armed timer.
         let instant = Instant::now();
         let tick = now_tick()?;
-        self.cached_now_tick = tick;
 
         // When the wheel is empty, its current tick may be arbitrarily stale
         // after a long timer-free idle period. Snap it forward so newly armed
@@ -807,7 +800,6 @@ impl TimerRuntime {
     ///
     /// Returns `true` when timer work remains pending for a later pass.
     pub fn process_at_with_budget(&mut self, now: u64, budget: usize) -> io::Result<bool> {
-        self.cached_now_tick = now;
         if now >= self.wheel.current_tick {
             return Ok(self.collect_expired(now, budget));
         }
@@ -1455,6 +1447,60 @@ mod tests {
         assert!(wheel.has_pending_cascade());
         assert_eq!(wheel.process_cascade_with_budget(0), 0);
         assert!(wheel.has_pending_cascade());
+
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(entry.bucket_level, 0);
+        assert_eq!(entry.bucket_index, 0);
+        assert!(unsafe { wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some() });
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_level2_cascade_reinserts_due_entry_into_level0() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let deadline = 1u64 << 14;
+        let mut entry = timer_entry_at(deadline);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+        assert_eq!(entry.bucket_level, 2);
+        assert_eq!(entry.bucket_index, 1);
+
+        wheel.current_tick = deadline;
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.cascade_count, 2);
+        assert_eq!(wheel.cascade_levels[1], 2);
+        assert_eq!(wheel.cascade_indices[1], 1);
+
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(entry.bucket_level, 0);
+        assert_eq!(entry.bucket_index, 0);
+        assert!(unsafe { wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some() });
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_level3_cascade_reinserts_due_entry_into_level0() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let deadline = 1u64 << 20;
+        let mut entry = timer_entry_at(deadline);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+        assert_eq!(entry.bucket_level, 3);
+        assert_eq!(entry.bucket_index, 1);
+
+        wheel.current_tick = deadline;
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.cascade_count, 3);
+        assert_eq!(wheel.cascade_levels[2], 3);
+        assert_eq!(wheel.cascade_indices[2], 1);
 
         assert_eq!(wheel.process_cascade_with_budget(1), 1);
         assert!(!wheel.has_pending_cascade());

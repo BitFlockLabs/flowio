@@ -247,7 +247,7 @@ impl IoBuffPoolInner {
         }
 
         let free_list = unsafe { std::ptr::addr_of_mut!((*pool_ptr).free_list) };
-        let slot_ptr = if let Some(link_ptr) = unsafe { (*free_list).pop_front(0) } {
+        let slot_ptr = if let Some(link_ptr) = unsafe { (*free_list).pop_front() } {
             link_ptr
         } else {
             let slot_size = unsafe { (*pool_ptr).slot_size };

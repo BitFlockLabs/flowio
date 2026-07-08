@@ -18,7 +18,9 @@ use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
+#[cfg(debug_assertions)]
+use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

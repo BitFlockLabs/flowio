@@ -62,6 +62,7 @@ impl<P: MemoryProvider + 'static> ProviderOwner<P> {
         self.provider.as_ptr()
     }
 
+    #[cfg(debug_assertions)]
     #[inline(always)]
     pub(crate) fn as_ref(&self) -> &P {
         unsafe { self.provider.as_ref() }

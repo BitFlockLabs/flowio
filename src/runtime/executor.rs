@@ -43,8 +43,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
-use std::mem::ManuallyDrop;
-use std::mem::size_of;
+use std::mem::{ManuallyDrop, align_of, size_of};
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -56,6 +55,8 @@ use std::task::{Context, Poll, Waker};
 pub const DEFAULT_PROCESS_QUOTA: usize = 128;
 /// Bytes reserved for each fixed executor task slot.
 const TASK_POOL_SIZE: usize = 4096;
+/// Maximum alignment currently guaranteed for payloads stored in `Task::data`.
+const TASK_DATA_ALIGN: usize = align_of::<TaskHeader>();
 /// Number of task slots allocated per task-pool slab page.
 const TASKS_PER_SLAB: usize = 1024;
 
@@ -86,7 +87,8 @@ pub struct RuntimeStats {
     pub task_frees: usize,
     /// Total number of times tasks were polled by the executor.
     pub task_polls: usize,
-    /// Number of times a task was scheduled into the ready queue.
+    /// Number of task ready-queue enqueues from wake reschedules. Initial
+    /// spawn enqueues are not counted.
     pub task_schedules: usize,
     /// Number of SQEs pushed to the io_uring submission queue.
     pub sqe_submits: usize,
@@ -453,7 +455,7 @@ pub enum TrySpawnError<F> {
         future: F,
     },
     /// The concrete `JoinTask<F>` does not fit in the executor's fixed task
-    /// slot.
+    /// slot size or alignment.
     TaskTooLarge {
         /// The original future passed to `try_spawn`.
         future: F,
@@ -758,7 +760,9 @@ impl Executor {
             }
             let ctx = unsafe { &*ctx_ptr };
 
-            if size_of::<JoinTask<F>>() > TASK_POOL_SIZE {
+            if size_of::<JoinTask<F>>() > TASK_POOL_SIZE
+                || align_of::<JoinTask<F>>() > TASK_DATA_ALIGN
+            {
                 return Err(TrySpawnError::TaskTooLarge { future });
             }
 
@@ -1248,43 +1252,33 @@ pub(crate) fn try_submit_detached_close(fd: RawFd) -> bool {
 #[doc(hidden)]
 pub fn note_waiter_wake() {
     #[cfg(debug_assertions)]
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
-            return;
-        }
-        unsafe {
-            (*(*ctx_ptr).runtime_state).stats.waiter_wakes += 1;
-        }
-    });
+    record_runtime_stat(|stats| stats.waiter_wakes += 1);
 }
 
 #[inline(always)]
 #[doc(hidden)]
 pub fn note_timer_now_tick_call() {
     #[cfg(debug_assertions)]
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
-            return;
-        }
-        unsafe {
-            (*(*ctx_ptr).runtime_state).stats.timer_now_tick_calls += 1;
-        }
-    });
+    record_runtime_stat(|stats| stats.timer_now_tick_calls += 1);
 }
 
 #[inline(always)]
 #[doc(hidden)]
 pub fn note_timer_expired() {
     #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| stats.timer_expired += 1);
+}
+
+#[cfg(debug_assertions)]
+#[inline(always)]
+fn record_runtime_stat(update: impl FnOnce(&mut RuntimeStats)) {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
         if ctx_ptr.is_null() {
             return;
         }
         unsafe {
-            (*(*ctx_ptr).runtime_state).stats.timer_expired += 1;
+            update(&mut (*(*ctx_ptr).runtime_state).stats);
         }
     });
 }
@@ -1634,6 +1628,43 @@ mod tests {
         unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
     }
 
+    #[repr(align(16))]
+    struct Align16Payload;
+
+    struct OveralignedSpawnFuture {
+        id: usize,
+        drops: Rc<Cell<usize>>,
+        polls: Rc<Cell<usize>>,
+        _payload: Align16Payload,
+    }
+
+    impl OveralignedSpawnFuture {
+        fn new(id: usize, drops: &Rc<Cell<usize>>, polls: &Rc<Cell<usize>>) -> Self {
+            Self {
+                id,
+                drops: Rc::clone(drops),
+                polls: Rc::clone(polls),
+                _payload: Align16Payload,
+            }
+        }
+    }
+
+    impl Future for OveralignedSpawnFuture {
+        type Output = usize;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.set(this.polls.get() + 1);
+            Poll::Ready(this.id)
+        }
+    }
+
+    impl Drop for OveralignedSpawnFuture {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
     #[cfg(not(miri))]
     struct GateFuture {
         id: usize,
@@ -1679,6 +1710,41 @@ mod tests {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
         }
+    }
+
+    #[test]
+    fn try_spawn_rejects_overaligned_future_before_task_slot_write() {
+        assert!(size_of::<JoinTask<OveralignedSpawnFuture>>() <= TASK_POOL_SIZE);
+        assert!(align_of::<JoinTask<OveralignedSpawnFuture>>() > TASK_DATA_ALIGN);
+
+        let drops = Rc::new(Cell::new(0usize));
+        let polls = Rc::new(Cell::new(0usize));
+        let mut ctx = ThreadCtx {
+            ready_queue: std::ptr::null_mut(),
+            reactor: std::ptr::null_mut(),
+            task_pool: std::ptr::null_mut(),
+            runtime_state: std::ptr::null_mut(),
+            timers: std::ptr::null_mut(),
+            owner_task: std::ptr::null_mut(),
+        };
+        let _guard = ExecutorCtxGuard::set(&mut ctx);
+
+        let future = OveralignedSpawnFuture::new(313, &drops, &polls);
+        let returned = match Executor::try_spawn(future) {
+            Ok(_) => panic!("over-aligned task should not spawn"),
+            Err(TrySpawnError::TaskTooLarge { future }) => future,
+            Err(_) => panic!("over-aligned task returned the wrong failure class"),
+        };
+
+        assert_eq!(returned.id, 313);
+        assert_eq!(polls.get(), 0, "rejected future must not be polled");
+        assert_eq!(
+            drops.get(),
+            0,
+            "rejected future must be returned before being dropped"
+        );
+        drop(returned);
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]

@@ -266,7 +266,7 @@ impl UdpSocket {
     /// This is the preferred receive API on the fixed-peer UDP fast path.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv", len, buffer.writable_len()) {
+        let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -292,7 +292,7 @@ impl UdpSocket {
     /// fast path when buffer sizing is guaranteed by the protocol.
     pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvMsgFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv_msg", len, buffer.writable_len()) {
+        let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -314,7 +314,7 @@ impl UdpSocket {
     /// This is the preferred send API on the fixed-peer UDP fast path.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_send_len("udp send", buffer.len()) {
+        let len = match checked_send_len(buffer.len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -341,7 +341,7 @@ impl UdpSocket {
         len: usize,
     ) -> RecvFromFuture<'_, B> {
         let mut input_error = None;
-        let len = match checked_read_len("recv_from", len, buffer.writable_len()) {
+        let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);

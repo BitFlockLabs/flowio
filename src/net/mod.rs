@@ -334,7 +334,7 @@ pub(crate) fn invalid_input_kind() -> io::Error {
 
 /// Validates a caller-supplied read length against the writable capacity that
 /// the buffer actually exposes to the kernel.
-pub(crate) fn checked_read_len(_op: &str, requested: usize, writable: usize) -> io::Result<u32> {
+pub(crate) fn checked_read_len(requested: usize, writable: usize) -> io::Result<u32> {
     if requested > writable {
         return Err(invalid_input(READ_LEN_EXCEEDS_WRITABLE));
     }
@@ -347,7 +347,7 @@ pub(crate) fn checked_read_len(_op: &str, requested: usize, writable: usize) -> 
 
 /// Validates a contiguous send length against io_uring opcodes that accept a
 /// 32-bit byte count.
-pub(crate) fn checked_send_len(_op: &str, requested: usize) -> io::Result<u32> {
+pub(crate) fn checked_send_len(requested: usize) -> io::Result<u32> {
     if requested > u32::MAX as usize {
         return Err(invalid_input(LEN_EXCEEDS_U32));
     }
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn checked_read_len_rejects_over_writable_with_static_message() {
-        let err = checked_read_len("read", 2, 1).expect_err("oversize read should fail");
+        let err = checked_read_len(2, 1).expect_err("oversize read should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(err.to_string(), READ_LEN_EXCEEDS_WRITABLE);
     }
@@ -594,11 +594,11 @@ mod tests {
         let oversized = u32::MAX as usize + 1;
 
         let read_err =
-            checked_read_len("read", oversized, usize::MAX).expect_err("oversize read should fail");
+            checked_read_len(oversized, usize::MAX).expect_err("oversize read should fail");
         assert_eq!(read_err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(read_err.to_string(), LEN_EXCEEDS_U32);
 
-        let send_err = checked_send_len("write", oversized).expect_err("oversize send should fail");
+        let send_err = checked_send_len(oversized).expect_err("oversize send should fail");
         assert_eq!(send_err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(send_err.to_string(), LEN_EXCEEDS_U32);
     }

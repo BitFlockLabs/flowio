@@ -20,6 +20,9 @@
 //!   contiguous payload, the contiguous APIs stay simpler and usually faster.
 //! - For fixed-shape hot-path buffers, pair TCP with
 //!   [`crate::runtime::buffer::pool::IoBuffPool`].
+//! - Use [`TcpStream::try_clone_for_split`] only during connection setup when
+//!   separate read/write owners are needed. The handles share one kernel TCP
+//!   stream.
 //!
 //! Prefer not to use on the fast path:
 //! - Prefer not to use [`TcpStream::connect`] and
@@ -533,12 +536,15 @@ impl TcpStream {
         current_local_addr(self.fd.as_raw_fd())
     }
 
-    /// Duplicates this connected stream descriptor for explicit read/write split ownership.
+    /// Duplicates this connected stream descriptor for explicit read/write
+    /// split ownership.
     ///
     /// The duplicate is a separate runtime-owned descriptor referring to the
     /// same underlying socket. Use this during connection setup when one task
     /// needs to own reads while another owns writes. This is control-plane
-    /// setup work, not a per-message fast-path operation.
+    /// setup work, not a per-message fast-path operation. Dropping one handle
+    /// closes only that descriptor; the underlying TCP stream remains open
+    /// while another duplicated handle is alive.
     pub fn try_clone_for_split(&self) -> io::Result<Self> {
         let fd = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {

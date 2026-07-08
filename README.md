@@ -99,6 +99,9 @@ buffer.payload_append(b"frame").unwrap();
 On stream transports and TLS, `read` and `write` are the lowest-overhead APIs
 when the caller can handle short reads and writes. Use `read_exact` and
 `write_all` only when the protocol really wants complete-buffer semantics.
+For TCP read/write split ownership, call `TcpStream::try_clone_for_split`
+during connection setup only. It duplicates the connected descriptor; both
+handles share one kernel TCP stream and socket options.
 
 Use vectored APIs only when the payload is already segmented. For one
 contiguous payload, use the contiguous APIs.
