@@ -17,7 +17,6 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(debug_assertions)]
 use std::sync::mpsc;
 use std::time::Duration;
 #[cfg(debug_assertions)]
@@ -31,6 +30,18 @@ fn tls_options() -> TlsClientOptions {
         transport_read_buffer_size: 2048,
         transport_write_buffer_size: 2048,
     }
+}
+
+fn large_read_tls_options() -> TlsClientOptions {
+    TlsClientOptions {
+        rustls_buffer_limit: None,
+        transport_read_buffer_size: 64 * 1024,
+        transport_write_buffer_size: 2048,
+    }
+}
+
+fn bulk_tls_payload() -> Vec<u8> {
+    (0..48 * 1024).map(|idx| (idx % 251) as u8).collect()
 }
 
 /// Builds matched self-signed client/server configs plus the localhost server
@@ -71,11 +82,19 @@ fn make_client_server_configs() -> (
     )
 }
 
-fn complete_server_handshake(tcp: &mut std::net::TcpStream, server_config: Arc<ServerConfig>) {
+fn server_connection_after_handshake(
+    tcp: &mut std::net::TcpStream,
+    server_config: Arc<ServerConfig>,
+) -> ServerConnection {
     let mut tls = ServerConnection::new(server_config).expect("server tls init failed");
     while tls.is_handshaking() {
         tls.complete_io(tcp).expect("server handshake failed");
     }
+    tls
+}
+
+fn complete_server_handshake(tcp: &mut std::net::TcpStream, server_config: Arc<ServerConfig>) {
+    let _ = server_connection_after_handshake(tcp, server_config);
 }
 
 #[cfg(debug_assertions)]
@@ -207,11 +226,14 @@ fn tls_rental_futures_poll_after_ready_parks() {
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
+    let (client_done_tx, client_done_rx) = mpsc::channel();
 
     let server = std::thread::spawn(move || {
         let (mut tcp, _) = listener.accept().expect("std accept failed");
         complete_server_handshake(&mut tcp, server_config);
-        std::thread::sleep(Duration::from_millis(50));
+        client_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client did not finish poll-after-ready checks");
     });
 
     let mut executor = Executor::new().expect("failed to construct runtime executor");
@@ -230,6 +252,62 @@ fn tls_rental_futures_poll_after_ready_parks() {
             assert_poll_after_ready_parks(tls.read_exact(Vec::<u8>::new(), 0)).await;
             assert_poll_after_ready_parks(tls.write(Vec::<u8>::new())).await;
             assert_poll_after_ready_parks(tls.write_all(Vec::<u8>::new())).await;
+            client_done_tx
+                .send(())
+                .expect("failed to signal client poll-after-ready completion");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_large_transport_read_buffer_handles_bulk_ciphertext() {
+    let (client_config, server_config, server_name, _expected_cert_der) =
+        make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let payload = bulk_tls_payload();
+    let expected = payload.clone();
+    let (server_sent_tx, server_sent_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+
+        tls.writer()
+            .write_all(&payload)
+            .expect("server bulk write_all failed");
+        while tls.wants_write() {
+            tls.complete_io(&mut tcp).expect("server bulk flush failed");
+        }
+        server_sent_tx
+            .send(())
+            .expect("failed to signal server bulk flush");
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = FlowTcpStream::connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+            let mut tls =
+                TlsClientStream::new(tcp, client_config, server_name, large_read_tls_options())
+                    .unwrap();
+
+            tls.handshake().await.expect("client handshake failed");
+            server_sent_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server did not flush bulk TLS payload");
+
+            let (res, recv) = tls
+                .read_exact(vec![0u8; expected.len()], expected.len())
+                .await;
+            assert_eq!(res.expect("client bulk read_exact failed"), expected.len());
+            assert_eq!(recv, expected);
         })
         .expect("executor run failed");
 

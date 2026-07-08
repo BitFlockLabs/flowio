@@ -2160,6 +2160,10 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
                         );
                         payload.skip = skip;
                     }
+                    #[cfg(debug_assertions)]
+                    unsafe {
+                        (*pctx.runtime_state()).stats.writev_partial_continuations += 1;
+                    }
                 }
             }
         }
@@ -2312,6 +2316,8 @@ pub struct WritevProjectedFuture<'a, T: WritevProjection, S> {
     iov_count: usize,
     /// Total projected byte length reported by the source.
     total: usize,
+    /// Input-shape validation result computed once at construction.
+    input_error: Option<io::Error>,
     /// Stream descriptor written by this future.
     fd: RawFd,
     /// Borrows the parent stream for the future lifetime.
@@ -2321,11 +2327,13 @@ pub struct WritevProjectedFuture<'a, T: WritevProjection, S> {
 impl<'a, T: WritevProjection, S> WritevProjectedFuture<'a, T, S> {
     pub(crate) fn new(fd: RawFd, source: T) -> Self {
         let (iov_count, total) = source.writev_count_and_len();
+        let input_error = validate_projected_count_and_len(iov_count, total).err();
         Self {
             state_ptr: std::ptr::null_mut(),
             source: Some(source),
             iov_count,
             total,
+            input_error,
             fd,
             _marker: PhantomData,
         }
@@ -2354,7 +2362,9 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
             return Poll::Pending;
         }
 
-        if let Err(err) = validate_projected_count_and_len(this.iov_count, this.total) {
+        if this.state_ptr.is_null()
+            && let Some(err) = this.input_error.take()
+        {
             let source = unsafe { opt_take(&mut this.source) };
             return Poll::Ready((Err(err), source));
         }
@@ -2505,6 +2515,10 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
                             n,
                         );
                         payload.skip = skip;
+                    }
+                    #[cfg(debug_assertions)]
+                    unsafe {
+                        (*pctx.runtime_state()).stats.writev_partial_continuations += 1;
                     }
                 }
             }

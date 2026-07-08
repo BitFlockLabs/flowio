@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy)]
 enum TestAnswer {
     A(Ipv4Addr),
+    OversizedA(Ipv4Addr),
     Aaaa(Ipv6Addr),
     AFor(&'static str, Ipv4Addr),
     Cname(&'static str),
@@ -352,6 +353,54 @@ fn resolve_host_falls_back_after_malformed_first_nameserver() {
             assert_eq!(
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    bad_thread.join().expect("bad dns thread panicked");
+    good_thread.join().expect("good dns thread panicked");
+}
+
+#[test]
+fn resolve_host_falls_back_after_oversized_first_nameserver_response() {
+    let bad_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind oversized dns socket");
+    let bad_nameserver = bad_server
+        .local_addr()
+        .expect("failed to read oversized dns socket addr");
+    let bad_thread = thread::spawn(move || {
+        serve_dns_queries(bad_server, 2, |name, _qtype| match name {
+            "db.example.test" => TestAnswer::OversizedA(Ipv4Addr::new(192, 0, 2, 200)),
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let good_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind fallback dns socket");
+    let good_nameserver = good_server
+        .local_addr()
+        .expect("failed to read fallback dns socket addr");
+    let good_thread = thread::spawn(move || {
+        serve_dns_queries(good_server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 62)),
+            ("db.example.test", 28) => TestAnswer::Empty,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![bad_nameserver, good_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("resolver should fail over after oversized UDP response");
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 62), 5432))]
             );
         })
         .expect("executor run failed");
@@ -1166,6 +1215,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         TestAnswer::MultiHopCnameWithA(_, _, _) => 3u16,
         TestAnswer::CyclicCname(_) => 2u16,
         TestAnswer::A(_)
+        | TestAnswer::OversizedA(_)
         | TestAnswer::Aaaa(_)
         | TestAnswer::AFor(_, _)
         | TestAnswer::Cname(_)
@@ -1224,6 +1274,15 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             push_u32_be(&mut response, 60);
             push_u16_be(&mut response, 4);
             response.extend_from_slice(&ip.octets());
+        }
+        TestAnswer::OversizedA(ip) => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 1);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 4);
+            response.extend_from_slice(&ip.octets());
+            response.resize(2049, 0xA5);
         }
         TestAnswer::Aaaa(ip) => {
             push_u16_be(&mut response, 0xC00C);

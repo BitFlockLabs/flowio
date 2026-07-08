@@ -3065,9 +3065,7 @@ fn update_discarding_after_dropped_completion(
         *discarding_tail = false;
     } else if *discarding_tail {
         *discarding_tail = sctp_discarding_after_completion(msg, data_slice);
-    } else if !sctp_msg_notification(msg.msg_flags)
-        && sctp_msg_partial_nonempty(actual, msg.msg_flags)
-    {
+    } else if sctp_msg_partial_nonempty(actual, msg.msg_flags) {
         *discarding_tail = true;
     }
 }
@@ -5027,6 +5025,8 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                 assoc_id: read_i32_at(buffer, base + 8).map_err(byte_range_invalid_data)?,
             }
         }
+        // Defensive only: FlowIO configures sctp_send_failure_event=0, but
+        // untrusted/test notification bytes can still exercise this legacy layout.
         x if x == LOCAL_SCTP_SEND_FAILED => parse_legacy_send_failed_notification(buffer)?,
         x if x == LOCAL_SCTP_REMOTE_ERROR => {
             if buffer.len() < 16 {
@@ -5326,6 +5326,17 @@ mod tests {
         assert!(sctp_discarding_after_completion(&msg, &data));
 
         let mut discarding_tail = true;
+        update_discarding_after_dropped_completion(&mut discarding_tail, data.len(), &msg, &data);
+        assert!(discarding_tail);
+    }
+
+    #[test]
+    fn sctp_dropped_partial_notification_starts_discard() {
+        let data = test_notification_buffer(LOCAL_SCTP_ASSOC_CHANGE, 8);
+        let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+
+        assert!(sctp_msg_partial_nonempty(data.len(), msg.msg_flags));
+        let mut discarding_tail = false;
         update_discarding_after_dropped_completion(&mut discarding_tail, data.len(), &msg, &data);
         assert!(discarding_tail);
     }

@@ -257,50 +257,15 @@ impl<T> DList<T> {
         }
     }
 
-    /// Appends all nodes from `other` to the back of `self` in O(1).
-    ///
-    /// This is reserved low-level infrastructure for queue-splice paths that
-    /// need to move an entire list without per-node relinking.
-    ///
-    /// Both lists must be initialized, and `self` and `other` must be distinct
-    /// lists. After this returns, `other` is empty and reusable.
-    #[inline(always)]
-    pub fn append_back(&mut self, other: &mut Self) {
-        debug_assert_list_inited!(self);
-        debug_assert_list_inited!(other);
-        debug_assert!(
-            !std::ptr::eq(self, other),
-            "DList::append_back requires distinct lists"
-        );
-
-        if other.is_empty() {
-            return;
-        }
-
-        let self_head = &mut self.head as *mut Link;
-        let other_head = &mut other.head as *mut Link;
-
-        unsafe {
-            let first = (*other_head).next;
-            let last = (*other_head).prev;
-            let self_last = Self::normalize_head_ptr((*self_head).prev, self_head);
-
-            (*self_last).next = first;
-            (*first).prev = self_last;
-            (*last).next = self_head;
-            (*self_head).prev = last;
-
-            other.set_empty(other_head);
-        }
-    }
-
     /// Unlinks every payload node without requiring the container offset.
     ///
     /// This is for owner teardown paths that are already discarding the
     /// backing storage for every linked node. Normal list users should remove
     /// or pop nodes explicitly so ownership remains visible. A fully
     /// uninitialized list sentinel is tolerated for defensive teardown, but a
-    /// partially initialized sentinel is rejected in debug builds.
+    /// partially initialized sentinel is rejected in debug builds. Initialized
+    /// non-empty lists must not move after `init`; moved-empty sentinels remain
+    /// tolerated for teardown.
     pub(crate) fn unlink_all_for_drop(&mut self) {
         let next_null = self.head.next.is_null();
         let prev_null = self.head.prev.is_null();

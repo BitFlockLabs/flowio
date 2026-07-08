@@ -125,6 +125,10 @@ const ECDSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01
 type PendingTlsRead = stream::ReadFuture<'static, Vec<u8>, TlsTransportMarker>;
 type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMarker>;
 
+/// rustls deframer `MAX_WIRE_SIZE`; keep each raw read to at most one TLS
+/// record so ciphertext and plaintext staging are both drained between feeds.
+const TLS_MAX_WIRE_READ_SIZE: usize = 18_437;
+
 /// Marker type used when the shared stream futures are driving raw TLS record
 /// I/O for the wrapper instead of borrowing a public transport object.
 struct TlsTransportMarker;
@@ -146,11 +150,13 @@ fn tls_internal_error(message: &'static str) -> io::Error {
 /// This type intentionally does not implement `Default` so callers must make
 /// the buffering decision explicitly.
 ///
-/// `transport_read_buffer_size` is the scratch capacity used for each raw TLS
-/// read attempt from the underlying socket. `transport_write_buffer_size` is
-/// the initial capacity used when collecting TLS records emitted by rustls
-/// before writing them to the socket; the buffer may still grow if rustls
-/// emits more than the initial capacity in one flush cycle.
+/// `transport_read_buffer_size` is the reusable ciphertext scratch capacity;
+/// each submitted raw read is bounded by rustls' maximum wire-record size so
+/// internal rustls ciphertext and plaintext buffers are drained between records.
+/// `transport_write_buffer_size` is the initial capacity used when collecting
+/// TLS records emitted by rustls before writing them to the socket; the buffer
+/// may still grow if rustls emits more than the initial capacity in one flush
+/// cycle.
 ///
 /// For steady-state use, pick values once per connection profile and reuse
 /// them. Recomputing or reallocating these choices per operation is not the
@@ -672,11 +678,10 @@ impl TlsClientStream {
                     "rustls made no progress reading non-empty TLS transport input",
                 ));
             }
+            self.connection
+                .process_new_packets()
+                .map_err(tls_protocol_error)?;
         }
-
-        self.connection
-            .process_new_packets()
-            .map_err(tls_protocol_error)?;
         Ok(())
     }
 
@@ -790,7 +795,7 @@ impl TlsClientStream {
             }
 
             let buffer = self.take_read_tls_buffer();
-            let len = buffer.capacity();
+            let len = buffer.capacity().min(TLS_MAX_WIRE_READ_SIZE);
             self.pending_read_tls = Some(stream::ReadFuture::new(
                 self.stream.as_raw_fd(),
                 buffer,

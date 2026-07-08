@@ -127,6 +127,9 @@ pub struct RuntimeStats {
     pub writev_scratch_oversize_rejections: usize,
     /// Vectored I/O scratch sidecar allocation failures.
     pub writev_scratch_alloc_failures: usize,
+    /// Partial vectored-write completions that advanced retained iovec
+    /// metadata before resubmitting the remaining write window.
+    pub writev_partial_continuations: usize,
 }
 
 struct ExecutorTaskMemProvider {
@@ -252,6 +255,11 @@ pub struct ExecutorConfig {
     /// processing fair within one loop pass.
     pub process_quota: usize,
     /// Optional zero-based CPU id to pin the loop thread to on Linux.
+    ///
+    /// On Linux, values must fit the platform `cpu_set_t` bitset passed to
+    /// `sched_setaffinity`; larger values are rejected as `InvalidInput`
+    /// before calling libc. CPUs that fit the bitset but are not valid for the
+    /// process are reported through the kernel error from `sched_setaffinity`.
     ///
     /// On non-Linux targets, `Some(_)` is rejected as unsupported.
     pub cpu_affinity: Option<usize>,
@@ -958,9 +966,10 @@ impl Executor {
                 false
             };
             let queue_empty = self.ready_queue.is_empty();
+            let timers_pending_after = self.timers.has_pending();
             let drained = runtime_state.live_tasks == 0
                 && runtime_state.inflight_ops == 0
-                && !timers_pending
+                && !timers_pending_after
                 && queue_empty;
 
             if drained {
@@ -1043,6 +1052,14 @@ fn apply_cpu_affinity(cpu_affinity: Option<usize>) -> io::Result<()> {
     let Some(cpu) = cpu_affinity else {
         return Ok(());
     };
+
+    let max_cpu = 8 * size_of::<libc::cpu_set_t>();
+    if cpu >= max_cpu {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "cpu_affinity exceeds platform cpu_set_t capacity",
+        ));
+    }
 
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
     unsafe {

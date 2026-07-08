@@ -70,6 +70,7 @@ const DNS_RCODE_REFUSED: u8 = 5;
 const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CNAME_DEPTH: usize = 4;
+const DNS_UDP_RESPONSE_BUFFER_SIZE: usize = 2048;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const HOSTS_PATH: &str = "/etc/hosts";
 
@@ -203,11 +204,22 @@ impl DnsResolver {
         let (send_result, _) = socket.send(packet.to_vec()).await;
         send_result?;
         timeout(self.query_timeout, async {
-            let mut recv = vec![0u8; 2048];
+            let mut recv = vec![0u8; DNS_UDP_RESPONSE_BUFFER_SIZE];
             loop {
-                let (recv_result, returned) = socket.recv(recv, 2048).await;
+                let (recv_result, returned) = socket.recv(recv, DNS_UDP_RESPONSE_BUFFER_SIZE).await;
                 recv = returned;
                 let recv_len = recv_result?;
+                if recv_len == DNS_UDP_RESPONSE_BUFFER_SIZE {
+                    // This resolver does not advertise EDNS0, so conforming
+                    // UDP responses fit the legacy DNS payload size and set
+                    // TC when truncated. Connected UDP recv does not expose
+                    // MSG_TRUNC, so a full scratch buffer is the reliable
+                    // signal for anomalous truncation.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DNS UDP response filled the receive buffer",
+                    ));
+                }
                 let response = &recv[..recv_len];
                 if response_is_decodable_candidate(response, query_id) {
                     debug_assert_eq!(recv.len(), recv_len);

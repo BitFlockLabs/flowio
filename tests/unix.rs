@@ -693,15 +693,21 @@ fn runtime_unix_readv_exact_clamps_target_below_chain_capacity() {
 /// Large writev_all + readv_exact forcing partial kernel transfers.
 #[test]
 fn runtime_unix_writev_all_readv_exact_large() {
-    let seg_size = 128 * 1024; // 128KB per segment
+    let seg_size = 512 * 1024; // 512KB per segment
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     executor
         .run(async move {
             let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            writer
+                .set_send_buffer_size(4096)
+                .expect("set writer send buffer failed");
+            reader
+                .set_recv_buffer_size(4096)
+                .expect("set reader recv buffer failed");
 
             Executor::spawn(async move {
-                // Reader: readv_exact 2 segments of 128KB each = 256KB total.
+                // Reader: readv_exact 2 segments of 512KB each = 1MB total.
                 let read_chain = make_read_chain([seg_size, seg_size]);
 
                 let total = seg_size * 2;
@@ -728,7 +734,7 @@ fn runtime_unix_writev_all_readv_exact_large() {
             })
             .expect("spawn reader failed");
 
-            // Writer: writev_all 2 segments of 128KB each.
+            // Writer: writev_all 2 segments of 512KB each.
             let data = vec![0xABu8; seg_size];
             let mut seg1 = IoBuffMut::new(0, seg_size, 0);
             seg1.payload_append(&data).unwrap();
@@ -744,6 +750,15 @@ fn runtime_unix_writev_all_readv_exact_large() {
             assert_eq!(res.expect("writev_all failed"), seg_size * 2);
         })
         .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert!(
+            stats.writev_partial_continuations > 0,
+            "large writev_all/readv_exact should force a partial write continuation"
+        );
+    }
 }
 
 /// writev + readv round-trip with spawned ponger.

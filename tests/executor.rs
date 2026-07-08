@@ -579,6 +579,18 @@ fn runtime_executor_runs_with_cpu_affinity() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn runtime_executor_rejects_out_of_range_cpu_affinity_without_panic() {
+    let max_cpu = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    let mut executor = new_executor_with(16, Some(max_cpu));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(async {})));
+    let run_result = result.expect("out-of-range CPU affinity should not panic");
+    let err = run_result.expect_err("out-of-range CPU affinity should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn runtime_executor_keeps_cpu_affinity_across_spawned_work() {
     let current_cpu = unsafe { libc::sched_getcpu() };
     assert!(current_cpu >= 0, "sched_getcpu failed");
