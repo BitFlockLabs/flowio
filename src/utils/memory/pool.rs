@@ -1,8 +1,7 @@
 //! Slab-backed object pool with intrusive free-list reuse.
 
 use crate::utils;
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::ops::{Deref, DerefMut};
+use std::mem::MaybeUninit;
 
 /// Configuration error returned while constructing a slab-backed pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,67 +211,6 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     }
 }
 
-/// Owns a heap-allocated memory provider plus a pool that stores a raw pointer
-/// to that provider.
-///
-/// The provider is kept as a raw `NonNull` instead of a moved `Box` so the pool
-/// never holds a Stacked-Borrows-invalidating reference into an object that is
-/// later moved. Drop order is pool first, then provider.
-pub(crate) struct ProviderOwnedPool<T: InPlaceInit, P: super::provider::MemoryProvider + 'static> {
-    provider: super::provider::ProviderOwner<P>,
-    pool: ManuallyDrop<Pool<'static, T, P>>,
-}
-
-impl<T: InPlaceInit, P: super::provider::MemoryProvider + 'static> ProviderOwnedPool<T, P> {
-    pub(crate) fn new(provider: P, objs_per_slab: usize) -> Result<Self, PoolConfigError> {
-        let provider = super::provider::ProviderOwner::new(provider);
-        let pool = match unsafe { Pool::new_uninit_from_raw(provider.as_ptr(), objs_per_slab) } {
-            Ok(pool) => ManuallyDrop::new(pool),
-            Err(err) => {
-                return Err(err);
-            }
-        };
-        Ok(Self { provider, pool })
-    }
-
-    #[cfg(debug_assertions)]
-    #[inline(always)]
-    pub(crate) fn provider_ref(&self) -> &P {
-        self.provider.as_ref()
-    }
-
-    #[inline(always)]
-    pub(crate) fn provider_mut(&mut self) -> &mut P {
-        self.provider.as_mut()
-    }
-}
-
-impl<T: InPlaceInit, P: super::provider::MemoryProvider + 'static> Deref
-    for ProviderOwnedPool<T, P>
-{
-    type Target = Pool<'static, T, P>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.pool
-    }
-}
-
-impl<T: InPlaceInit, P: super::provider::MemoryProvider + 'static> DerefMut
-    for ProviderOwnedPool<T, P>
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.pool
-    }
-}
-
-impl<T: InPlaceInit, P: super::provider::MemoryProvider + 'static> Drop
-    for ProviderOwnedPool<T, P>
-{
-    fn drop(&mut self) {
-        unsafe { ManuallyDrop::drop(&mut self.pool) };
-    }
-}
-
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T, P> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -288,108 +226,5 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T
         // abandon task futures whose destructors require runtime TLS or pools
         // that are already being torn down.
         unsafe { self.slab_pages.free_all(&mut self.slab_factory) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{InPlaceInit, ProviderOwnedPool};
-    use crate::utils::memory::provider::MemoryProvider;
-    use std::cell::Cell;
-    use std::mem::MaybeUninit;
-    use std::rc::Rc;
-
-    struct DropCountingProvider {
-        drops: Rc<Cell<usize>>,
-        storage: Box<[usize; 128]>,
-        used: bool,
-    }
-
-    impl DropCountingProvider {
-        fn new(drops: Rc<Cell<usize>>) -> Self {
-            Self {
-                drops,
-                storage: Box::new([0; 128]),
-                used: false,
-            }
-        }
-    }
-
-    impl Drop for DropCountingProvider {
-        fn drop(&mut self) {
-            self.drops.set(self.drops.get() + 1);
-        }
-    }
-
-    impl MemoryProvider for DropCountingProvider {
-        fn init(&mut self, _required_align: usize) {
-            self.used = false;
-        }
-
-        fn alignment_guarantee(&self) -> usize {
-            std::mem::align_of::<usize>()
-        }
-
-        fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
-            let capacity = self.storage.len() * std::mem::size_of::<usize>();
-            if self.used || size > capacity {
-                return None;
-            }
-            self.used = true;
-            Some(self.storage.as_mut_ptr().cast::<u8>())
-        }
-
-        unsafe fn free_memory(&mut self, _ptr: *mut u8, _size: usize) {}
-    }
-
-    struct TestSlot {
-        #[allow(dead_code)]
-        value: usize,
-    }
-
-    impl InPlaceInit for TestSlot {
-        type Args = usize;
-
-        fn init_at(slot: &mut MaybeUninit<Self>, value: Self::Args) {
-            slot.write(Self { value });
-        }
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn provider_owned_pool_drops_provider_when_pool_drop_panics() {
-        let drops = Rc::new(Cell::new(0));
-        let provider = DropCountingProvider::new(Rc::clone(&drops));
-        let mut pool = ProviderOwnedPool::<TestSlot, _>::new(provider, 1)
-            .expect("provider-owned pool construction failed");
-        pool.init();
-
-        let slot = unsafe { pool.alloc(7).expect("pool slot allocation failed") };
-        unsafe {
-            assert_eq!((*slot).value, 7);
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pool)));
-
-        assert!(result.is_err(), "live slot should trigger pool drop panic");
-        assert_eq!(drops.get(), 1, "provider must drop while unwinding");
-    }
-
-    #[test]
-    fn provider_owned_pool_drops_provider_after_constructor_error() {
-        let drops = Rc::new(Cell::new(0));
-        let provider = DropCountingProvider::new(Rc::clone(&drops));
-
-        let result = ProviderOwnedPool::<TestSlot, _>::new(provider, 0);
-
-        assert!(matches!(
-            result,
-            Err(super::PoolConfigError::ObjsPerSlabZero)
-        ));
-        assert_eq!(
-            drops.get(),
-            1,
-            "provider must drop when pool construction fails"
-        );
     }
 }

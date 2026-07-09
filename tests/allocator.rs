@@ -1,8 +1,6 @@
-use flowio::utils::memory::owned::{OwnedBuffer, OwnedBufferPool};
 use flowio::utils::memory::pool::*;
 use flowio::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
 use flowio::utils::memory::slab::{Slab, SlabAllocator};
-use static_assertions::assert_not_impl_any;
 use std::mem::MaybeUninit;
 
 // verbose memory provider
@@ -89,83 +87,6 @@ impl InPlaceInit for HardwareTask {
     fn init_at(slot: &mut MaybeUninit<Self>, id: Self::Args) {
         slot.write(HardwareTask { id });
     }
-}
-
-/// Pool is !Unpin because buffers keep a raw back-pointer to it; checked-out
-/// OwnedBuffer handles are !Send/!Sync and stay on the runtime thread.
-#[test]
-fn owned_buffer_pool_requires_pin_and_buffers_stay_single_threaded() {
-    assert_not_impl_any!(OwnedBufferPool<'static, Task, VerboseProvider>: Unpin);
-    assert_not_impl_any!(OwnedBuffer<'static, 'static, Task, VerboseProvider>: Send, Sync);
-}
-
-#[test]
-fn owned_buffer_pool_allows_multiple_live_buffers_from_shared_pin() {
-    let mut provider = VerboseProvider::new(4096, 64);
-    let mut pool = OwnedBufferPool::<Task, _>::new_uninit(&mut provider, 2).unwrap();
-    pool.init();
-
-    let pool = Box::pin(pool);
-    let first = pool
-        .as_ref()
-        .alloc(404)
-        .expect("first owned buffer alloc failed");
-    let second = pool
-        .as_ref()
-        .alloc(405)
-        .expect("second owned buffer alloc failed");
-    assert_eq!(first.id, 404);
-    assert_eq!(second.id, 405);
-
-    drop(first);
-    drop(second);
-
-    let reused = pool.as_ref().alloc(406).expect("owned buffer reuse failed");
-    assert_eq!(reused.id, 406);
-}
-
-/// into_raw_parts forgets the handle without changing the outstanding count;
-/// from_raw reconstructs it, so the reconstructed Drop returns the slot.
-#[test]
-fn owned_buffer_raw_parts_round_trip_returns_slot_to_pool() {
-    let mut provider = VerboseProvider::new(127, 64);
-    let mut pool = OwnedBufferPool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
-    pool.init();
-
-    let pool = Box::pin(pool);
-    let buffer = pool.as_ref().alloc(700).expect("owned buffer alloc failed");
-    let (ptr, pool_ptr) = buffer.into_raw_parts();
-
-    let recovered = unsafe { OwnedBuffer::from_raw(ptr, pool_ptr) };
-    assert_eq!(recovered.id, 700);
-    drop(recovered);
-
-    let reused = pool
-        .as_ref()
-        .alloc(701)
-        .expect("raw round-trip did not return slot to pool");
-    assert_eq!(reused.id, 701);
-}
-
-/// into_raw forgets the handle; free_raw returns the slot and decrements the
-/// outstanding count so the pool drop invariant remains balanced.
-#[test]
-fn owned_buffer_free_raw_returns_slot_to_pool() {
-    let mut provider = VerboseProvider::new(127, 64);
-    let mut pool = OwnedBufferPool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
-    pool.init();
-
-    let pool = Box::pin(pool);
-    let buffer = pool.as_ref().alloc(800).expect("owned buffer alloc failed");
-    let ptr = buffer.into_raw();
-
-    unsafe { pool.as_ref().free_raw(ptr) };
-
-    let reused = pool
-        .as_ref()
-        .alloc(801)
-        .expect("free_raw did not return slot to pool");
-    assert_eq!(reused.id, 801);
 }
 
 #[test]

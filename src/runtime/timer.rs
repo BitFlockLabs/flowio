@@ -45,8 +45,9 @@ use crate::runtime::executor::{
 };
 use crate::runtime::task::TaskHeader;
 use crate::utils::list::intrusive::dlist::{DList, Link};
-use crate::utils::memory::pool::{InPlaceInit, Pool, ProviderOwnedPool};
+use crate::utils::memory::pool::{InPlaceInit, Pool};
 use crate::utils::memory::provider::BasicMemoryProvider;
+use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use std::array;
 use std::fmt;
 use std::future::Future;

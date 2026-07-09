@@ -5,8 +5,9 @@ use crate::runtime::op::CompletionState;
 #[cfg(debug_assertions)]
 use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::retained::{RetainedIovecScratch, RetainedPayload, RetainedPayloadPool};
-use crate::utils::memory::pool::{Pool, ProviderOwnedPool};
+use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::BasicMemoryProvider;
+use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use io_uring::{IoUring, opcode, types};
 use std::io;
 use std::mem::ManuallyDrop;

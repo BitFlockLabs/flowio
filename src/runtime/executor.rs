@@ -35,8 +35,9 @@ use crate::runtime::task::{
 };
 use crate::runtime::timer::TimerRuntime;
 use crate::utils::list::intrusive::dlist::DList;
-use crate::utils::memory::pool::{Pool, ProviderOwnedPool};
+use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::MemoryProvider;
+use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use io_uring::{opcode, squeue, types};
 use std::alloc::{Layout, alloc};
 use std::cell::Cell;
