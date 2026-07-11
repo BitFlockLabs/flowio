@@ -11,18 +11,22 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
+//! Preferred on the fast path:
 //! - Construct the executor once and keep it alive for the lifetime of the
 //!   thread that owns the runtime.
+//! - Use [`executor::Executor::spawn`] inside that run boundary, or
+//!   [`executor::Executor::try_spawn`] when admission failure must return the
+//!   unpolled future.
 //! - Prefer pool-backed buffers from [`buffer::pool::IoBuffPool`] for
 //!   fixed-shape steady-state I/O because that avoids allocator churn after
-//!   warmup.
+//!   enough slots have been acquired and returned.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to construct a fresh executor around each request or
-//!   operation. Reuse the thread's long-lived executor instead.
-//! - Prefer not to use [`timer`] as a substitute for the transport data path
-//!   exposed under [`crate::net`]. Timers are control-path/runtime helpers.
+//! Avoid on the fast path:
+//! - Do not construct a fresh executor or enter a new [`executor::Executor::run`]
+//!   boundary around each request. Spawn work inside the long-lived run.
+//! - Do not arm a separate timer around every small I/O step when one
+//!   [`timer::timeout_at`] around the protocol phase preserves the required
+//!   deadline semantics.
 //!
 //! # Example
 //! ```no_run
@@ -40,19 +44,15 @@
 pub mod buffer;
 pub mod executor;
 pub(crate) mod fd;
-#[doc(hidden)]
-pub mod io;
-#[doc(hidden)]
-pub mod op;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod io;
+pub(crate) mod op;
 pub mod reactor;
 #[allow(dead_code)]
 pub(crate) mod retained;
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub mod retained_test_support;
-#[doc(hidden)]
-pub mod task;
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub mod test_hooks;
+#[cfg(feature = "test-support")]
+pub(crate) mod retained_test_support;
+pub(crate) mod task;
+#[cfg(any(debug_assertions, feature = "test-support"))]
+pub(crate) mod test_hooks;
 pub mod timer;

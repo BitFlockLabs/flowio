@@ -1,6 +1,6 @@
 #![cfg(debug_assertions)]
 
-use flowio::runtime::retained_test_support::RetainedPayloadPool;
+use flowio::test_support::runtime::retained_test_support::RetainedPayloadPool;
 use std::cell::Cell;
 use std::rc::Rc;
 

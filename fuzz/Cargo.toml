@@ -47,6 +47,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dns_response_prefilter"
+path = "fuzz_targets/dns_response_prefilter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sctp_parse_assoc_addrs"
 path = "fuzz_targets/sctp_parse_assoc_addrs.rs"
 test = false

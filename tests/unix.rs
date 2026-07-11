@@ -1,15 +1,175 @@
 mod common;
 
 use common::{
-    HugeReadOnly, TestIoBuffMut as IoBuffMut, TestProjected, assert_poll_after_ready_parks,
-    make_payload_chain, make_read_chain, make_read_only_chain, run_test,
+    HugeReadOnly, TestIoBuffMut as IoBuffMut, TestProjected, TryMismatchedProjected,
+    TryOversizedProjected, assert_poll_after_ready_parks, fill_try_send_buffer, make_payload_chain,
+    make_read_chain, make_read_only_chain, run_test,
 };
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
-use std::io;
-use std::os::fd::AsRawFd;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, IntoRawFd};
+
+/// Returns a FlowIO UnixStream wrapping one nonblocking socketpair endpoint
+/// plus its connected std peer for one-shot tests that do not need a reactor.
+fn connected_try_unix_stream() -> (UnixStream, std::os::unix::net::UnixStream) {
+    let (stream, peer) = std::os::unix::net::UnixStream::pair().expect("socketpair failed");
+    stream
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+    (UnixStream::from_raw_fd(stream.into_raw_fd()), peer)
+}
+
+#[test]
+fn runtime_unix_try_read_immediate_partial_and_would_block() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+    peer.write_all(b"hi").expect("std write failed");
+
+    let (res, buf) = stream.try_read(vec![0u8; 5], 5);
+    assert_eq!(res.expect("try_read failed"), 2);
+    assert_eq!(&buf[..], b"hi");
+
+    let (res, buf) = stream.try_read(vec![0u8; 4], 4);
+    let err = res.expect_err("try_read should report WouldBlock");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        buf.len(),
+        4,
+        "buffer ownership and length should be preserved"
+    );
+
+    peer.write_all(b"pong").expect("std write failed");
+    let (res, buf) = stream.try_read(buf, 4);
+    assert_eq!(res.expect("second try_read failed"), 4);
+    assert_eq!(&buf[..], b"pong");
+}
+
+#[test]
+fn runtime_unix_try_read_rejects_invalid_len() {
+    let (mut stream, _peer) = connected_try_unix_stream();
+    let mut recv = IoBuffMut::new(0, 4, 0);
+    recv.payload_append(b"ab").unwrap();
+
+    let (res, recv) = stream.try_read(recv, 3);
+    let err = res.expect_err("oversize try_read should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(recv.payload_bytes(), b"ab");
+}
+
+#[test]
+fn runtime_unix_try_read_append_success_partial_and_would_block() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+    peer.write_all(b"body").expect("std write failed");
+
+    let mut recv = IoBuffMut::new(0, 12, 0);
+    recv.payload_append(b"HEAD").unwrap();
+    let (res, recv) = stream.try_read_append(recv, 4);
+    assert_eq!(res.expect("try_read_append failed"), 4);
+    assert_eq!(recv.payload_bytes(), b"HEADbody");
+
+    peer.write_all(b"!!").expect("std write failed");
+    let (res, recv) = stream.try_read_append(recv, 4);
+    assert_eq!(res.expect("partial try_read_append failed"), 2);
+    assert_eq!(recv.payload_bytes(), b"HEADbody!!");
+
+    let (res, recv) = stream.try_read_append(recv, 2);
+    let err = res.expect_err("try_read_append should report WouldBlock");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(recv.payload_bytes(), b"HEADbody!!");
+
+    let (res, recv) = stream.try_read_append(recv, 3);
+    let err = res.expect_err("oversize try_read_append should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(recv.payload_bytes(), b"HEADbody!!");
+}
+
+#[test]
+fn runtime_unix_try_write_immediate_success() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+
+    let (res, buf) = stream.try_write(b"ping".to_vec());
+    assert_eq!(res.expect("try_write failed"), 4);
+    assert_eq!(buf, b"ping".to_vec());
+
+    let mut got = [0u8; 4];
+    peer.read_exact(&mut got).expect("std read failed");
+    assert_eq!(&got, b"ping");
+}
+
+#[test]
+fn runtime_unix_try_write_partial_and_would_block() {
+    let (mut stream, _peer) = connected_try_unix_stream();
+    stream
+        .set_send_buffer_size(4096)
+        .expect("set send buffer size failed");
+
+    let (saw_partial, payload) = fill_try_send_buffer(|payload| stream.try_write(payload));
+    assert!(
+        saw_partial,
+        "bounded nonblocking fill should observe at least one partial write"
+    );
+
+    let source = TestProjected::new([&b"x"[..]]);
+    let (res, source) = stream.try_writev_projected(source);
+    let err = res.expect_err("full socket should reject try_writev_projected");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(source.expected(), b"x".to_vec());
+
+    let (res, payload) = stream.try_write(payload);
+    let err = res.expect_err("full socket should reject try_write");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(payload.len(), 1024 * 1024);
+}
+
+#[test]
+fn runtime_unix_try_writev_projected_immediate_success() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+
+    let source = TestProjected::new([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
+    let expected = source.expected();
+    let (res, source) = stream.try_writev_projected(source);
+    assert_eq!(res.expect("try_writev_projected failed"), expected.len());
+    assert_eq!(source.expected(), expected);
+
+    let mut got = vec![0u8; expected.len()];
+    peer.read_exact(&mut got).expect("std read failed");
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn runtime_unix_try_writev_projected_large_piece_count_immediate_success() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+
+    let source = TestProjected::new([&b"x"[..]; 17]);
+    let expected = source.expected();
+    let (res, source) = stream.try_writev_projected(source);
+    assert_eq!(
+        res.expect("17-piece try_writev_projected failed"),
+        expected.len()
+    );
+    assert_eq!(source.expected(), expected);
+
+    let mut got = vec![0u8; expected.len()];
+    peer.read_exact(&mut got).expect("std read failed");
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn runtime_unix_try_writev_projected_invalid_projection_returns_source() {
+    let (mut stream, _peer) = connected_try_unix_stream();
+
+    let (res, source) = stream.try_writev_projected(TryMismatchedProjected);
+    let err = res.expect_err("mismatched projection should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let _source = source;
+
+    let (res, source) = stream.try_writev_projected(TryOversizedProjected);
+    let err = res.expect_err("oversized projection should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let _source = source;
+}
 
 /// Basic ping-pong with Vec<u8> buffers and a spawned async peer.
 #[test]
@@ -835,9 +995,8 @@ fn runtime_unix_rental_futures_poll_after_ready_parks() {
         assert_poll_after_ready_parks(writer.writev_all(make_payload_chain::<0>([]))).await;
         assert_poll_after_ready_parks(reader.readv(make_read_chain::<0>([]))).await;
         assert_poll_after_ready_parks(reader.readv_exact(make_read_chain::<0>([]), 0)).await;
-        assert_poll_after_ready_parks(writer.writev_read_only(make_read_only_chain::<0>([]))).await;
-        assert_poll_after_ready_parks(writer.writev_all_read_only(make_read_only_chain::<0>([])))
-            .await;
+        assert_poll_after_ready_parks(writer.writev(make_read_only_chain::<0>([]))).await;
+        assert_poll_after_ready_parks(writer.writev_all(make_read_only_chain::<0>([]))).await;
         assert_poll_after_ready_parks(writer.writev_projected(TestProjected::<0>::new([]))).await;
         assert_poll_after_ready_parks(writer.writev_all_projected(TestProjected::<0>::new([])))
             .await;
@@ -845,18 +1004,18 @@ fn runtime_unix_rental_futures_poll_after_ready_parks() {
 }
 
 #[test]
-fn runtime_unix_writev_read_only_empty_and_single_segment() {
+fn runtime_unix_writev_readonly_chain_empty_and_single_segment() {
     run_test(async move {
         let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
 
-        let (res, chain) = writer.writev_read_only(make_read_only_chain::<0>([])).await;
-        assert_eq!(res.expect("writev_read_only empty failed"), 0);
+        let (res, chain) = writer.writev(make_read_only_chain::<0>([])).await;
+        assert_eq!(res.expect("empty read-only chain writev failed"), 0);
         assert!(chain.is_empty());
 
         let (res, chain) = writer
-            .writev_all_read_only(make_read_only_chain([&b"single"[..]]))
+            .writev_all(make_read_only_chain([&b"single"[..]]))
             .await;
-        assert_eq!(res.expect("writev_all_read_only failed"), 6);
+        assert_eq!(res.expect("read-only chain writev_all failed"), 6);
         let recovered: Vec<Vec<u8>> = chain.into_iter().collect();
         assert_eq!(recovered, vec![b"single".to_vec()]);
 
@@ -867,13 +1026,13 @@ fn runtime_unix_writev_read_only_empty_and_single_segment() {
 }
 
 #[test]
-fn runtime_unix_writev_all_read_only_writes_segments_in_order() {
+fn runtime_unix_writev_all_readonly_chain_writes_segments_in_order() {
     run_test(async move {
         let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
 
         let chain = make_read_only_chain([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
-        let (res, chain) = writer.writev_all_read_only(chain).await;
-        assert_eq!(res.expect("writev_all_read_only failed"), 11);
+        let (res, chain) = writer.writev_all(chain).await;
+        assert_eq!(res.expect("read-only chain writev_all failed"), 11);
         assert_eq!(chain.segments(), 4);
 
         let (res, buf) = reader.read_exact(vec![0u8; 11], 11).await;
@@ -925,7 +1084,7 @@ fn runtime_unix_writev_all_projected_writes_segments_in_order() {
 }
 
 #[test]
-fn runtime_unix_writev_all_read_only_large() {
+fn runtime_unix_writev_all_readonly_chain_large() {
     let seg_size = 128 * 1024;
     run_test(async move {
         let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
@@ -946,8 +1105,11 @@ fn runtime_unix_writev_all_read_only_large() {
                 first, second,
             ]);
 
-        let (res, chain) = writer.writev_all_read_only(chain).await;
-        assert_eq!(res.expect("writev_all_read_only failed"), seg_size * 2);
+        let (res, chain) = writer.writev_all(chain).await;
+        assert_eq!(
+            res.expect("read-only chain writev_all failed"),
+            seg_size * 2
+        );
         assert_eq!(chain.segments(), 2);
     });
 }

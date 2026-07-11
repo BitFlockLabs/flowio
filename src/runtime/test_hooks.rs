@@ -1,8 +1,11 @@
-//! Debug-only fault injection hooks for integration tests.
+//! Development-only fault injection hooks for repository tests.
 //!
-//! These hooks are intentionally excluded from release builds. They make
-//! otherwise unreachable pressure paths deterministic without changing
-//! production behavior.
+//! The module is compiled in debug builds or when `test-support` is enabled;
+//! normal release builds exclude it. The thread-local counters make otherwise
+//! unreachable pressure and kernel-error paths deterministic without changing
+//! production behavior when no hook is armed.
+
+#![allow(dead_code)]
 
 use std::cell::Cell;
 use std::io;
@@ -19,6 +22,7 @@ thread_local! {
 
 /// Makes the next completion-state allocation on this thread fail.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn fail_next_op_alloc() {
     FAIL_OP_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
@@ -26,6 +30,7 @@ pub fn fail_next_op_alloc() {
 /// Makes the next raw reactor SQE submission on this thread fail with
 /// `WouldBlock`.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn fail_next_sqe_submit() {
     fail_next_raw_sqe_submit();
 }

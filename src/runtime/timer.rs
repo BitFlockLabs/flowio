@@ -12,17 +12,21 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path-adjacent choices:
-//! - Use timers for control-path sleeps, deadlines, and connect/setup
-//!   timeouts.
-//! - Most applications should use the top-level [`sleep`], [`sleep_until`],
-//!   [`timeout`], and [`timeout_at`] helpers rather than interacting with
-//!   [`TimerRuntime`] directly.
+//! Preferred when a fast path requires a deadline:
+//! - Use the top-level [`sleep`], [`sleep_until`], [`timeout`], and
+//!   [`timeout_at`] helpers; they use the executor-owned bounded timer wheel.
+//! - Compute one absolute phase deadline and use [`timeout_at`] when several
+//!   operations share the same budget.
+//! - Account for timer storage explicitly: entries are acquired in fixed
+//!   1024-entry slabs, but there is currently no user-configurable total timer
+//!   cap.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to wrap every tiny steady-state I/O step in its own timer
-//!   when a surrounding protocol loop can track deadlines more coarsely.
-//!   Per-step timers are not the crate's data-plane fast path.
+//! Avoid on the fast path:
+//! - Do not wrap every small I/O step in a separate timer when one phase-level
+//!   deadline preserves protocol semantics. Each armed timer consumes a pooled
+//!   timer entry and adds insertion, cancellation, or expiry work.
+//! - Do not remove a required timeout merely for speed. Keep per-operation
+//!   timers when the protocol needs independent deadlines.
 //!
 //! # Example
 //! ```no_run
@@ -588,36 +592,28 @@ impl TimerWheel {
     }
 }
 
-/// Runtime-owned timer subsystem.
-///
-/// Logical timers live entirely in user space. The timer wheel computes the
-/// next wake deadline and the executor uses that deadline to bound how long it
-/// may block in the reactor.
-///
-/// Most applications should use the free functions in this module. This type
-/// is public for explicit runtime integration and testing rather than as the
-/// normal application fast-path entry point. Creating and initializing a
-/// timer runtime is setup work; timer arming/canceling happens through the
-/// executor-owned runtime.
-///
-/// # Example
-/// ```no_run
-/// use flowio::runtime::timer::TimerRuntime;
-///
-/// let mut timers = TimerRuntime::new()?;
-/// timers.init()?;
-/// let _tick = timers.now_tick()?;
-/// # Ok::<(), std::io::Error>(())
-/// ```
-pub struct TimerRuntime {
-    /// Pool of runtime-owned timer entries.
-    timer_pool: ManuallyDrop<ProviderOwnedPool<TimerEntry, BasicMemoryProvider>>,
-    /// Hierarchical timing wheel used to organize deadlines.
-    wheel: TimerWheel,
-    /// Per-pass base used to convert relative and absolute deadlines
-    /// consistently without repeated clock reads.
-    arm_base: Option<ArmBase>,
+macro_rules! define_timer_runtime {
+    ($vis:vis) => {
+        /// Executor-owned timer subsystem.
+        ///
+        /// Exposed publicly only by the dev-only `test-support` feature for
+        /// benchmark probes. Applications should use the free timer helpers.
+        $vis struct TimerRuntime {
+            /// Pool of runtime-owned timer entries.
+            timer_pool: ManuallyDrop<ProviderOwnedPool<TimerEntry, BasicMemoryProvider>>,
+            /// Hierarchical timing wheel used to organize deadlines.
+            wheel: TimerWheel,
+            /// Per-pass base used to convert relative and absolute deadlines
+            /// consistently without repeated clock reads.
+            arm_base: Option<ArmBase>,
+        }
+    };
 }
+
+#[cfg(feature = "test-support")]
+define_timer_runtime!(pub);
+#[cfg(not(feature = "test-support"))]
+define_timer_runtime!(pub(crate));
 
 #[derive(Clone, Copy)]
 struct ArmBase {
@@ -659,30 +655,9 @@ impl TimerRuntime {
     }
 
     #[inline(always)]
+    /// Clears the cached arm-time sample at the start of an executor pass.
     pub(crate) fn begin_executor_pass(&mut self) {
         self.arm_base = None;
-    }
-
-    /// Creates a duration-based sleep future.
-    ///
-    /// The receiver is not captured; the future binds to the active
-    /// executor's timer runtime when it is first polled.
-    ///
-    /// Most callers will prefer the top-level [`sleep`] helper.
-    #[doc(hidden)]
-    pub fn sleep(&mut self, duration: Duration) -> Sleep {
-        Sleep::new_duration(duration)
-    }
-
-    /// Creates a deadline-based sleep future.
-    ///
-    /// The receiver is not captured; the future binds to the active
-    /// executor's timer runtime when it is first polled.
-    ///
-    /// Most callers will prefer the top-level [`sleep_until`] helper.
-    #[doc(hidden)]
-    pub fn sleep_until(&mut self, deadline: Instant) -> Sleep {
-        Sleep::new_deadline(deadline)
     }
 
     fn submit_sleep_at_tick(
@@ -974,6 +949,8 @@ fn now_tick() -> io::Result<u64> {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `ts` points to writable timespec storage for the duration of the
+    // libc call, and CLOCK_MONOTONIC requires no additional ownership.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -983,6 +960,12 @@ fn now_tick() -> io::Result<u64> {
 }
 
 #[inline(always)]
+/// Replaces an armed timer's waiter with the task currently being polled.
+///
+/// # Safety
+///
+/// `entry` must point to a live timer entry owned by the active executor, and
+/// this function must run during the poll of the future that owns that entry.
 unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry) {
     debug_assert!(
         !entry.is_null(),
@@ -998,12 +981,14 @@ unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry) {
 
 /// One-shot sleep future scheduled by the runtime timer wheel.
 ///
-/// Constructed by [`sleep`], [`sleep_until`], or the corresponding
-/// [`TimerRuntime`] methods.
+/// Constructed by [`sleep`] or [`sleep_until`].
 ///
-/// This is a control-path timer primitive. Prefer arming deadlines around
-/// larger protocol phases instead of wrapping every data-path read/write step
-/// with a separate sleep or timeout.
+/// Timer entries come from the executor-owned pool when first polled. Prefer
+/// one deadline around a larger protocol phase instead of wrapping every
+/// data-path read/write step when the same timeout semantics can be preserved.
+///
+/// The future must be polled inside [`crate::runtime::executor::Executor::run`]
+/// on the thread that owns that executor.
 ///
 /// # Example
 /// ```no_run
@@ -1029,7 +1014,7 @@ pub struct Sleep {
 
 impl Sleep {
     /// Creates a sleep that will arm from a relative duration on first poll.
-    pub fn new_duration(duration: Duration) -> Self {
+    pub(crate) fn new_duration(duration: Duration) -> Self {
         Self {
             duration: Some(duration),
             deadline: None,
@@ -1038,7 +1023,7 @@ impl Sleep {
     }
 
     /// Creates a sleep that will arm from an absolute deadline on first poll.
-    pub fn new_deadline(deadline: Instant) -> Self {
+    pub(crate) fn new_deadline(deadline: Instant) -> Self {
         Self {
             duration: None,
             deadline: Some(deadline),
@@ -1131,7 +1116,8 @@ impl Drop for Sleep {
 ///
 /// A zero duration completes immediately without arming the timer wheel.
 ///
-/// This is a control-path primitive rather than a transport data-path API.
+/// The returned future must be polled inside an active
+/// [`crate::runtime::executor::Executor::run`].
 ///
 /// # Example
 /// ```no_run
@@ -1151,7 +1137,8 @@ pub fn sleep(duration: Duration) -> Sleep {
 
 /// Sleeps until the provided monotonic deadline.
 ///
-/// This is a control-path primitive rather than a transport data-path API.
+/// The returned future must be polled inside an active
+/// [`crate::runtime::executor::Executor::run`].
 ///
 /// # Example
 /// ```no_run
@@ -1172,8 +1159,12 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 
 /// Future returned by [`timeout`] and [`timeout_at`].
 ///
-/// This is a control-path deadline wrapper, not a special transport fast-path
-/// primitive.
+/// This is a runtime deadline wrapper, not a transport I/O primitive. It arms
+/// one pooled timer entry if the wrapped future does not complete first.
+///
+/// The wrapper must be polled inside an active
+/// [`crate::runtime::executor::Executor::run`]. A timer-runtime error is
+/// reported as [`Elapsed`], the same output used for deadline expiry.
 ///
 /// # Example
 /// ```no_run
@@ -1233,9 +1224,11 @@ impl<F: Future> Future for Timeout<F> {
 
 /// Runs a future with a relative timeout.
 ///
-/// This is a control-path deadline wrapper. It is useful around larger
-/// operations or phases, but it is not intended to be the crate's per-message
-/// I/O fast path.
+/// Prefer this around a larger operation or protocol phase when one relative
+/// budget applies. Avoid creating one wrapper per tiny I/O step when a shared
+/// phase deadline has the same semantics.
+/// The returned wrapper must be polled inside an active
+/// [`crate::runtime::executor::Executor::run`].
 ///
 /// # Example
 /// ```no_run
@@ -1259,9 +1252,11 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
 
 /// Runs a future with an absolute monotonic deadline.
 ///
-/// This is a control-path deadline wrapper. It is useful around larger
-/// operations or phases, but it is not intended to be the crate's per-message
-/// I/O fast path.
+/// Prefer this when several operations share one precomputed absolute
+/// deadline. Avoid creating a separate timer per tiny I/O step when that shared
+/// phase deadline has the same semantics.
+/// The returned wrapper must be polled inside an active
+/// [`crate::runtime::executor::Executor::run`].
 ///
 /// # Example
 /// ```no_run

@@ -250,6 +250,11 @@ impl CompletionState {
     }
 
     /// Drops any retained payload still attached to this completion state.
+    ///
+    /// # Safety
+    ///
+    /// `pool` must be the pool that allocated the attached payload, and the
+    /// associated kernel submission must no longer be able to reference it.
     #[inline(always)]
     pub(crate) unsafe fn drop_retained_payload(&mut self, pool: &mut RetainedPayloadPool) {
         if self.retained_payload.is_null() {
@@ -294,6 +299,8 @@ impl InPlaceInit for CompletionState {
     type Args = ();
 
     fn init_at(slot: &mut MaybeUninit<Self>, _: Self::Args) {
+        // SAFETY: `slot` points to writable storage for one CompletionState;
+        // writing `empty()` initializes every field exactly once.
         unsafe {
             slot.as_mut_ptr().write(Self::empty());
         }

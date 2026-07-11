@@ -1,30 +1,22 @@
-//! Minimal runtime-owned operations used to bootstrap the executor.
+//! Development-only `io_uring` `NOP` operations.
 //!
-//! These APIs are primarily useful for runtime tests, benchmarks, and executor
-//! plumbing. They are not the normal transport fast path for applications.
-//!
-//! # Fast-Path Guidance
-//!
-//! Best fast-path choice:
-//! - Prefer [`NopSlot`] over repeatedly constructing [`Nop`] when issuing many
-//!   `NOP` operations in a benchmark or internal control loop, because the
-//!   slot object can be reused across calls.
-//!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use these APIs for real network or IPC work. Use transport
-//!   I/O under [`crate::net`] instead.
-//! - Prefer not to repeatedly construct one-shot [`Nop`] values in tight
-//!   loops. Use [`NopSlot`] instead.
+//! These APIs submit real `IORING_OP_NOP` entries so tests and benchmarks can
+//! exercise executor/reactor completion behavior without transport setup.
+//! They are compiled only for crate tests or the `test-support` feature and are
+//! not application I/O primitives.
 //!
 //! # Example
 //! ```no_run
+//! # #[cfg(feature = "test-support")]
+//! # {
 //! use flowio::runtime::executor::Executor;
-//! use flowio::runtime::io::Nop;
+//! use flowio::test_support::runtime::io::Nop;
 //!
 //! let mut executor = Executor::new()?;
 //! executor.run(async {
 //!     let _ = Nop::new().await;
 //! })?;
+//! # }
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
@@ -102,16 +94,17 @@ fn poll_nop_op(
 
 /// Reusable slot metadata for a `NOP` operation.
 ///
-/// The slot itself is reused across calls, while each submitted `NOP` still
-/// gets a fresh `CompletionState` from the reactor pool.
-///
-/// This is the lower-overhead `NOP` API when many `NOP`s are issued over
-/// time. The one-shot [`Nop`] type is the simpler, non-reused alternative.
+/// Each call borrows the slot until its [`NopFuture`] completes or is dropped,
+/// preventing overlapping submissions through the same slot. Every submitted
+/// `NOP` still receives a fresh reactor `CompletionState`; the slot does not
+/// cache operation-pool storage. Use [`Nop`] when no reusable owner is needed.
 ///
 /// # Example
 /// ```no_run
+/// # #[cfg(feature = "test-support")]
+/// # {
 /// use flowio::runtime::executor::Executor;
-/// use flowio::runtime::io::NopSlot;
+/// use flowio::test_support::runtime::io::NopSlot;
 ///
 /// let mut executor = Executor::new()?;
 /// executor.run(async {
@@ -123,6 +116,7 @@ fn poll_nop_op(
 ///         let _ = fut.await;
 ///     }
 /// })?;
+/// # }
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[doc(hidden)]
@@ -170,18 +164,21 @@ impl NopSlot {
 
 /// One-shot `IORING_OP_NOP` future with its own submitted operation state.
 ///
-/// This is the convenience `NOP` API. For repeated `NOP` submissions, prefer
-/// [`NopSlot`] so the slot metadata itself can be reused.
+/// This is the owning alternative to the borrowed [`NopFuture`] returned by
+/// [`NopSlot::nop`].
 ///
 /// # Example
 /// ```no_run
+/// # #[cfg(feature = "test-support")]
+/// # {
 /// use flowio::runtime::executor::Executor;
-/// use flowio::runtime::io::Nop;
+/// use flowio::test_support::runtime::io::Nop;
 ///
 /// let mut executor = Executor::new()?;
 /// executor.run(async {
 ///     let _ = Nop::new().await;
 /// })?;
+/// # }
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct Nop {

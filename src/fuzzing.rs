@@ -142,3 +142,20 @@ pub fn sctp_parse_assoc_addrs(data: &[u8]) {
 
     let _ = crate::net::sctp::parse_assoc_addrs(payload, addr_count, storage_len);
 }
+
+/// Fuzz entry: the DNS response prefilter (`response_is_decodable_candidate`),
+/// a distinct compression-pointer walk over the question name that runs before
+/// `parse_response_packet` in the drain loop. The query id is derived from the
+/// packet's own first two bytes so the id/QR gate passes and the name walk is
+/// actually reached; the mismatch call also covers the early-return path.
+/// Property: bounded pointer loop, no panic, no OOB.
+pub fn dns_response_prefilter(data: &[u8]) {
+    let data = maybe_decode_hex_seed(data);
+    let data = data.as_ref();
+    let query_id = u16::from_be_bytes([
+        data.first().copied().unwrap_or_default(),
+        data.get(1).copied().unwrap_or_default(),
+    ]);
+    let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id);
+    let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id ^ 0x5555);
+}

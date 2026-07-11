@@ -6,7 +6,7 @@
 //! - all other names are resolved through UDP DNS queries using FlowIO's own
 //!   transport and timer APIs
 //!
-//! DNS lookup is intentionally narrow in this first version:
+//! DNS lookup is intentionally narrow:
 //! - system configuration is read from `/etc/resolv.conf`
 //! - only A and AAAA lookups are issued
 //! - CNAME chains are followed up to a small fixed depth
@@ -15,28 +15,34 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path-adjacent choices:
+//! Preferred on setup/control paths:
 //! - Resolver APIs are setup/control-plane helpers rather than steady-state
 //!   data-plane APIs. Resolve host names once, keep the resulting
 //!   `SocketAddr` values, and pass those addresses into transport connectors
 //!   on the hot path.
 //! - Use [`DnsResolver`] when resolving repeatedly so nameserver selection and
-//!   timeout policy are constructed once and then reused.
+//!   timeout policy are constructed once and then reused. Reuse avoids
+//!   rebuilding that setup state, but each
+//!   non-local DNS query still creates a UDP socket and owned packet buffers.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to do DNS lookup in the steady-state data path. Reuse the
+//! Avoid on the fast path:
+//! - Avoid DNS lookup in the steady-state data path. Reuse the
 //!   resolved `SocketAddr` values instead.
-//! - Prefer not to construct a fresh resolver for every repeated lookup. Use
+//! - Avoid constructing a fresh resolver for every repeated lookup. Use
 //!   [`DnsResolver`] instead of the convenience [`resolve_host`] helper.
+//! - Do not call [`DnsResolver::from_system`] from an async hot path: it reads
+//!   `/etc/resolv.conf` synchronously. Non-literal lookups also inspect
+//!   `/etc/hosts` synchronously.
 //!
 //! # Example
 //! ```no_run
-//! use flowio::net::resolver::resolve_host;
+//! use flowio::net::resolver::DnsResolver;
 //! use flowio::runtime::executor::Executor;
 //!
+//! let resolver = DnsResolver::from_system()?;
 //! let mut executor = Executor::new()?;
-//! executor.run(async {
-//!     let addrs = resolve_host("localhost", 5432).await.unwrap();
+//! executor.run(async move {
+//!     let addrs = resolver.resolve_host("localhost", 5432).await.unwrap();
 //!     assert!(!addrs.is_empty());
 //! })?;
 //! # Ok::<(), std::io::Error>(())
@@ -80,7 +86,9 @@ static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
 ///
 /// Use this on setup/control-plane paths when lookups repeat and the configured
 /// nameservers/timeouts should be reused. For one-off convenience resolution,
-/// prefer [`resolve_host`].
+/// use [`resolve_host`]. Reuse does not make lookup allocation-free: DNS
+/// attempts create UDP sockets and owned query/response buffers, and non-literal
+/// names inspect `/etc/hosts` for each call.
 ///
 /// # Example
 /// ```
@@ -95,15 +103,16 @@ static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
 pub struct DnsResolver {
     /// Upstream recursive resolvers queried over UDP, in retry order.
     nameservers: Box<[SocketAddr]>,
-    /// Timeout applied to each individual upstream query attempt.
+    /// Timeout for waiting on a matching response after each UDP query send
+    /// completes.
     query_timeout: Duration,
 }
 
 impl DnsResolver {
     /// Builds a resolver from `/etc/resolv.conf`.
     ///
-    /// This reads system resolver configuration once and stores the resulting
-    /// nameserver list inside the resolver for reuse across lookups.
+    /// This performs a synchronous filesystem read. Call it during setup, then
+    /// store the resulting nameserver list for reuse across lookups.
     pub fn from_system() -> io::Result<Self> {
         let nameservers = read_resolv_conf(RESOLV_CONF_PATH)?;
         Self::new(nameservers)
@@ -127,7 +136,9 @@ impl DnsResolver {
         })
     }
 
-    /// Sets the timeout applied to each upstream DNS query attempt.
+    /// Sets the matching-response wait timeout after each UDP query is sent.
+    ///
+    /// This does not bound socket creation or the preceding async UDP send.
     pub fn set_query_timeout(&mut self, query_timeout: Duration) -> &mut Self {
         self.query_timeout = query_timeout;
         self
@@ -140,6 +151,9 @@ impl DnsResolver {
     ///
     /// This is setup/control-plane work. Keep the returned addresses and pass
     /// them to transport connectors instead of resolving on the data path.
+    /// Non-literal names synchronously inspect `/etc/hosts`; each upstream DNS
+    /// attempt creates a connected UDP socket plus owned query/response
+    /// buffers.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -276,7 +290,9 @@ impl DnsResolver {
 ///
 /// This is the convenience resolver entry point. For repeated lookups, prefer
 /// constructing and reusing a [`DnsResolver`] instead so nameserver selection
-/// and timeout policy are built once.
+/// and timeout policy are built once. This helper calls
+/// [`DnsResolver::from_system`] before resolving, so it synchronously reads
+/// `/etc/resolv.conf` even when `host` is an IP literal or `localhost`.
 pub async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     DnsResolver::from_system()?.resolve_host(host, port).await
 }
@@ -292,11 +308,14 @@ pub(crate) struct LookupResult {
     nx_domain: bool,
 }
 
+/// Next action after combining one name's A and AAAA lookup results.
 enum ResolveHostStep {
+    /// At least one address was collected for the logical lookup.
     Resolved,
-    FollowCname(String),
+    FollowCname(#[doc = "Canonical target queried in the next bounded outer step."] String),
 }
 
+/// Parsed DNS records retained while matching addresses to a CNAME chain.
 enum DnsRecord {
     Address {
         /// Owner name from the resource record.
@@ -367,6 +386,9 @@ fn fallback_query_id() -> u16 {
 }
 
 fn fallback_query_seed() -> u64 {
+    // Best-effort fallback when nonblocking OS randomness is unavailable. This
+    // mixer avoids a sequential process-wide counter but is not a cryptographic
+    // random-number generator.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
@@ -519,7 +541,12 @@ fn byte_range_eof(err: BufferRangeError) -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, err)
 }
 
-fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
+/// Performs the bounded header/question prefilter used while draining UDP
+/// responses for one query ID.
+///
+/// This validates enough structure to decide whether full parsing is useful;
+/// it does not authenticate or fully validate the response packet.
+pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
     if packet.len() < 12 {
         return false;
     }
@@ -556,18 +583,29 @@ fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
     }
 }
 
+/// Validated DNS header counts plus the optional echoed question.
 struct DnsResponseEnvelope {
+    /// Response flags containing QR, truncation, and response-code bits.
     flags: u16,
+    /// Number of answer resource records declared by the header.
     ancount: usize,
+    /// Number of authority resource records declared by the header.
     nscount: usize,
+    /// Number of additional resource records declared by the header.
     arcount: usize,
+    /// Echoed question, absent only for accepted questionless failure replies.
     question: Option<DnsResponseQuestion>,
 }
 
+/// Parsed form of the single echoed DNS question.
 struct DnsResponseQuestion {
+    /// Decoded question name.
     name: String,
+    /// Requested record type from the echoed question.
     qtype: u16,
+    /// Requested class from the echoed question.
     qclass: u16,
+    /// First packet offset after the complete question section.
     end_offset: usize,
 }
 
@@ -661,7 +699,9 @@ fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port:
     }
 }
 
+/// Order-preserving helper that filters duplicate socket addresses.
 struct SocketAddrDeduper {
+    /// Addresses already present in the destination sequence.
     seen: HashSet<SocketAddr>,
 }
 
@@ -776,6 +816,8 @@ pub(crate) fn parse_response_packet(
 
     let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;
     let max_rrs_by_packet = packet.len().saturating_sub(offset) / 11;
+    // Bound the eager allocation by the packet's minimum possible RR density;
+    // forged header counts cannot reserve independently of packet size.
     let mut records = Vec::with_capacity(total_rrs.min(max_rrs_by_packet));
     for _ in 0..total_rrs {
         let (owner, consumed) = decode_name(packet, offset, 0)?;
@@ -896,6 +938,12 @@ fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
     })
 }
 
+/// Decodes one possibly compressed DNS name and returns its encoded byte count
+/// at `offset`.
+///
+/// Compression recursion, packet bounds, backward pointers, and the maximum
+/// presentation length are validated by [`walk_dns_name`]. Label octets are
+/// converted with lossy UTF-8 for the returned presentation string.
 pub(crate) fn decode_name(
     packet: &[u8],
     offset: usize,

@@ -7,13 +7,13 @@ use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly};
 use flowio::runtime::executor::{Executor, ExecutorConfig, TrySpawnError};
-use flowio::runtime::io::{Nop, NopSlot};
-use flowio::runtime::op::CompletionState;
 use flowio::runtime::reactor::ReactorConfig;
-use flowio::runtime::task::TaskHeader;
-#[cfg(debug_assertions)]
-use flowio::runtime::test_hooks;
 use flowio::runtime::timer::{sleep, sleep_until, timeout, timeout_at};
+use flowio::test_support::runtime::io::{Nop, NopSlot};
+use flowio::test_support::runtime::op::CompletionState;
+use flowio::test_support::runtime::task::TaskHeader;
+#[cfg(debug_assertions)]
+use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io;
@@ -544,8 +544,8 @@ fn assert_kernel_write_error(err: &io::Error) {
 #[test]
 fn runtime_executor_constructs_with_custom_config() {
     let executor = new_executor_with(16, None);
-    assert_eq!(executor.process_quota, 16);
-    assert_eq!(executor.cpu_affinity, None);
+    assert_eq!(executor.test_process_quota(), 16);
+    assert_eq!(executor.test_cpu_affinity(), None);
 }
 
 #[cfg(target_os = "linux")]
@@ -555,7 +555,7 @@ fn runtime_executor_preserves_cpu_affinity_config() {
     assert!(current_cpu >= 0, "sched_getcpu failed");
 
     let executor = new_executor_with(16, Some(current_cpu as usize));
-    assert_eq!(executor.cpu_affinity, Some(current_cpu as usize));
+    assert_eq!(executor.test_cpu_affinity(), Some(current_cpu as usize));
 }
 
 #[cfg(target_os = "linux")]
@@ -1092,7 +1092,7 @@ fn runtime_kernel_error_write_completions_return_payloads_once() {
 
             let drops = Rc::new(Cell::new(0));
             let chain = tracked_chain([vec![0xA3; 32], vec![0xA4; 32]], &drops);
-            let (res, returned) = writer.writev_read_only(chain).await;
+            let (res, returned) = writer.writev(chain).await;
             let err = res.expect_err("writev to closed peer should fail");
             assert_kernel_write_error(&err);
             assert_eq!(drops.get(), 0, "writev chain dropped before return");
@@ -2069,7 +2069,7 @@ fn runtime_write_all_returns_retained_payload_on_success() {
 }
 
 #[test]
-fn runtime_writev_read_only_returns_retained_payload_on_success() {
+fn runtime_writev_readonly_chain_returns_retained_payload_on_success() {
     let mut executor = new_executor();
 
     executor
@@ -2078,8 +2078,8 @@ fn runtime_writev_read_only_returns_retained_payload_on_success() {
             let drops = Rc::new(Cell::new(0));
             let chain = tracked_chain([b"vec".to_vec(), b"tor".to_vec()], &drops);
 
-            let (res, chain) = writer.writev_read_only(chain).await;
-            assert_eq!(res.expect("writev_read_only failed"), 6);
+            let (res, chain) = writer.writev(chain).await;
+            assert_eq!(res.expect("read-only chain writev failed"), 6);
             assert_eq!(drops.get(), 0, "chain dropped before being returned");
 
             let (res, recv) = reader.read_exact(vec![0u8; 6], 6).await;
@@ -2110,7 +2110,7 @@ fn runtime_writev_read_only_returns_retained_payload_on_success() {
 }
 
 #[test]
-fn runtime_writev_all_read_only_returns_retained_payload_on_success() {
+fn runtime_writev_all_readonly_chain_returns_retained_payload_on_success() {
     let mut executor = new_executor();
 
     executor
@@ -2119,8 +2119,8 @@ fn runtime_writev_all_read_only_returns_retained_payload_on_success() {
             let drops = Rc::new(Cell::new(0));
             let chain = tracked_chain([b"write".to_vec(), b"v_all".to_vec()], &drops);
 
-            let (res, chain) = writer.writev_all_read_only(chain).await;
-            assert_eq!(res.expect("writev_all_read_only failed"), 10);
+            let (res, chain) = writer.writev_all(chain).await;
+            assert_eq!(res.expect("read-only chain writev_all failed"), 10);
             assert_eq!(drops.get(), 0, "chain dropped before being returned");
 
             let (res, recv) = reader.read_exact(vec![0u8; 10], 10).await;
@@ -2147,7 +2147,7 @@ fn runtime_writev_all_read_only_returns_retained_payload_on_success() {
 }
 
 #[test]
-fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
+fn runtime_writev_readonly_chain_512_uses_sidecar_scratch_without_heap_fallback() {
     let mut executor = new_executor();
 
     executor
@@ -2162,8 +2162,11 @@ fn runtime_writev_read_only_512_uses_sidecar_scratch_without_heap_fallback() {
                 expected.len()
             );
 
-            let (res, chain) = writer.writev_read_only(chain).await;
-            assert_eq!(res.expect("512 writev_read_only failed"), expected.len());
+            let (res, chain) = writer.writev(chain).await;
+            assert_eq!(
+                res.expect("512-segment read-only chain writev failed"),
+                expected.len()
+            );
             assert_eq!(
                 drops.load(Ordering::Relaxed),
                 0,
@@ -2297,7 +2300,7 @@ fn runtime_readv_exact_64_uses_sidecar_scratch_without_heap_fallback() {
 }
 
 #[test]
-fn runtime_writev_all_read_only_512_returns_chain_on_success() {
+fn runtime_writev_all_readonly_chain_512_returns_chain_on_success() {
     let mut executor = new_executor();
 
     executor
@@ -2312,9 +2315,9 @@ fn runtime_writev_all_read_only_512_returns_chain_on_success() {
                 expected.len()
             );
 
-            let (res, chain) = writer.writev_all_read_only(chain).await;
+            let (res, chain) = writer.writev_all(chain).await;
             assert_eq!(
-                res.expect("512 writev_all_read_only failed"),
+                res.expect("512-segment read-only chain writev_all failed"),
                 expected.len()
             );
             assert_eq!(
@@ -2353,7 +2356,7 @@ fn runtime_writev_all_read_only_512_returns_chain_on_success() {
 }
 
 #[test]
-fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
+fn runtime_writev_all_readonly_chain_large_512_advances_across_iovec_boundaries() {
     let mut executor = new_executor();
 
     executor
@@ -2378,7 +2381,7 @@ fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
             })
             .expect("spawn large 512 reader failed");
 
-            let (res, chain) = writer.writev_all_read_only(chain).await;
+            let (res, chain) = writer.writev_all(chain).await;
             assert_eq!(res.expect("large 512 writev_all failed"), total);
             assert_eq!(
                 drops.load(Ordering::Relaxed),
@@ -2400,7 +2403,7 @@ fn runtime_writev_all_read_only_large_512_advances_across_iovec_boundaries() {
 }
 
 #[test]
-fn runtime_writev_read_only_oversized_iovec_count_returns_invalid_input() {
+fn runtime_writev_readonly_chain_oversized_iovec_count_returns_invalid_input() {
     let mut executor = new_executor();
 
     executor
@@ -2413,7 +2416,7 @@ fn runtime_writev_read_only_oversized_iovec_count_returns_invalid_input() {
                 chain.len()
             );
 
-            let (res, chain) = writer.writev_read_only(chain).await;
+            let (res, chain) = writer.writev(chain).await;
             let err = res.expect_err("oversized writev should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(chain.segments(), 1025);
@@ -2726,7 +2729,7 @@ fn runtime_cancelled_write_all_retains_payload_until_original_cqe() {
 /// writev cancellation under backpressure retains the full read-only segment
 /// chain until the original CQE retires.
 #[test]
-fn runtime_cancelled_writev_read_only_retains_payload_until_original_cqe() {
+fn runtime_cancelled_writev_readonly_chain_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
 
     executor
@@ -2737,14 +2740,14 @@ fn runtime_cancelled_writev_read_only_retains_payload_until_original_cqe() {
             let drops = Rc::new(Cell::new(0));
             let chain = tracked_chain([vec![0x33; 32768], vec![0x44; 32768]], &drops);
             let result = timeout(Duration::from_millis(10), async {
-                let (res, _chain) = writer.writev_read_only(chain).await;
+                let (res, _chain) = writer.writev(chain).await;
                 res
             })
             .await;
 
             assert!(
                 result.is_err(),
-                "writev_read_only should time out under backpressure"
+                "read-only chain writev should time out under backpressure"
             );
             assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
 
@@ -2757,7 +2760,7 @@ fn runtime_cancelled_writev_read_only_retains_payload_until_original_cqe() {
 /// A manually polled writev dropped in flight keeps both read-only segments
 /// alive until the original CQE retires.
 #[test]
-fn runtime_drop_polled_writev_read_only_retains_payload_until_original_cqe() {
+fn runtime_drop_polled_writev_readonly_chain_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
 
     executor
@@ -2767,10 +2770,12 @@ fn runtime_drop_polled_writev_read_only_retains_payload_until_original_cqe() {
 
             let drops = Rc::new(Cell::new(0));
             let chain = tracked_chain([vec![0x33; 32768], vec![0x44; 32768]], &drops);
-            let mut writev = Box::pin(writer.writev_read_only(chain));
+            let mut writev = Box::pin(writer.writev(chain));
             std::future::poll_fn(|cx| match Future::poll(writev.as_mut(), cx) {
                 Poll::Pending => Poll::Ready(()),
-                Poll::Ready(_) => panic!("writev_read_only completed before cancellation point"),
+                Poll::Ready(_) => {
+                    panic!("read-only chain writev completed before cancellation point")
+                }
             })
             .await;
 
@@ -2786,7 +2791,7 @@ fn runtime_drop_polled_writev_read_only_retains_payload_until_original_cqe() {
 /// writev_all cancellation retains all segments across retry bookkeeping until
 /// the original CQE retires.
 #[test]
-fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
+fn runtime_cancelled_writev_all_readonly_chain_retains_payload_until_original_cqe() {
     let mut executor = new_executor();
 
     executor
@@ -2797,14 +2802,14 @@ fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
             let drops = Rc::new(Cell::new(0));
             let chain = tracked_chain([vec![0x55; 32768], vec![0x66; 32768]], &drops);
             let result = timeout(Duration::from_millis(10), async {
-                let (res, _chain) = writer.writev_all_read_only(chain).await;
+                let (res, _chain) = writer.writev_all(chain).await;
                 res
             })
             .await;
 
             assert!(
                 result.is_err(),
-                "writev_all_read_only should time out under backpressure"
+                "read-only chain writev_all should time out under backpressure"
             );
             assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
 
@@ -2817,7 +2822,7 @@ fn runtime_cancelled_writev_all_read_only_retains_payload_until_original_cqe() {
 /// 512-segment writev cancellation retains both payload and sidecar iovec
 /// scratch until the original CQE retires; the CQE may retire during timeout.
 #[test]
-fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_original_cqe() {
+fn runtime_cancelled_writev_readonly_chain_512_retains_payload_and_scratch_until_original_cqe() {
     let mut executor = new_executor();
 
     executor
@@ -2835,14 +2840,14 @@ fn runtime_cancelled_writev_read_only_512_retains_payload_and_scratch_until_orig
             );
 
             let result = timeout(Duration::from_millis(10), async {
-                let (res, _chain) = writer.writev_read_only(chain).await;
+                let (res, _chain) = writer.writev(chain).await;
                 res
             })
             .await;
 
             assert!(
                 result.is_err(),
-                "512 writev_read_only should time out under backpressure"
+                "512-segment read-only chain writev should time out under backpressure"
             );
             let drops_after_timeout = drops.load(Ordering::Relaxed);
             assert!(

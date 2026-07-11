@@ -88,6 +88,34 @@ pub fn make_read_chain<const N: usize>(capacities: [usize; N]) -> IoBuffVecMut<N
     chain
 }
 
+/// Repeatedly invokes one nonblocking owned-buffer write until the socket
+/// reports `WouldBlock`, retaining the source buffer between attempts.
+#[allow(dead_code)]
+pub fn fill_try_send_buffer(
+    mut try_write: impl FnMut(Vec<u8>) -> (io::Result<usize>, Vec<u8>),
+) -> (bool, Vec<u8>) {
+    let mut payload = vec![0xA5; 1024 * 1024];
+    let mut saw_partial = false;
+    for _ in 0..256 {
+        let requested = payload.len();
+        let (res, returned) = try_write(payload);
+        payload = returned;
+        match res {
+            Ok(n) if n == requested => {}
+            Ok(n) => {
+                assert!(n < requested, "short write must report partial progress");
+                saw_partial = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return (saw_partial, payload);
+            }
+            Err(err) => panic!("try_write failed unexpectedly: {err}"),
+        }
+    }
+
+    panic!("socket send buffer did not fill within bounded attempts");
+}
+
 /// Fake read-only buffer reporting a length above `u32::MAX` to exercise
 /// oversize-send rejection without allocating that much memory.
 #[allow(dead_code)]
@@ -277,5 +305,33 @@ impl<const N: usize> WritevProjection for TestProjected<N> {
             pieces.push(segment)?;
         }
         Ok(())
+    }
+}
+
+/// Projection fixture whose reported byte count disagrees with its pieces.
+#[allow(dead_code)]
+pub struct TryMismatchedProjected;
+
+impl WritevProjection for TryMismatchedProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (1, 2)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        pieces.push(b"x")
+    }
+}
+
+/// Projection fixture whose reported piece count exceeds FlowIO's iovec cap.
+#[allow(dead_code)]
+pub struct TryOversizedProjected;
+
+impl WritevProjection for TryOversizedProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (1025, 1025)
+    }
+
+    fn project_writev<'a>(&'a self, _pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        panic!("oversized try_writev_projected should fail before projection")
     }
 }

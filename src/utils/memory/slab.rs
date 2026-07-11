@@ -190,9 +190,9 @@ impl SlabPageChain {
 pub struct SlabAllocator<'a, P: super::provider::MemoryProvider> {
     /// Raw memory source from which full slab pages are requested.
     ///
-    /// This is stored as a raw pointer rather than `&'a mut P` so self-owning
-    /// pool structs can keep the provider in the same allocation without
-    /// retaining a Stacked-Borrows-invalidating mutable reference across moves.
+    /// This is stored as a raw pointer rather than a long-lived `&'a mut P` so
+    /// a provider-owning wrapper can retain ownership while this allocator
+    /// borrows the provider only for individual operations.
     provider: NonNull<P>,
     /// Ties the allocator to the caller-provided provider lifetime without
     /// storing a real Rust reference.
@@ -220,6 +220,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     /// `obj_align` is not a non-zero power of two.
     /// Returns [`SlabAllocatorConfigError::SizeOverflow`] when slab geometry
     /// overflows addressable memory.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_uninit(
         provider: &'a mut P,
         obj_size: usize,
@@ -323,6 +324,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     }
 
     /// Returns the alignment required for each slab page allocation.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_slab_alignment(&self) -> usize {
         self.slab_align
     }

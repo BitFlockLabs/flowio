@@ -134,7 +134,7 @@ fn vec_mut_push_at_capacity_returns_error() {
     let mut overflow = IoBuffMut::new(0, 8, 0);
     overflow.payload_append(b"saved").unwrap();
     let ptr = IoBuffReadOnly::as_ptr(&overflow);
-    let result = chain.try_push(overflow);
+    let result = chain.push(overflow);
     println!("  Push #3 on capacity=2: {:?}", result);
     let returned = expect_chain_full(result);
     assert_eq!(chain.segments(), 2);
@@ -225,7 +225,7 @@ fn vec_frozen_push_at_capacity_returns_error() {
     chain.push(b2.freeze()).unwrap();
     let overflow = b3.freeze();
     let ptr = overflow.bytes().as_ptr();
-    let result = chain.try_push(overflow);
+    let result = chain.push(overflow);
     let returned = expect_chain_full(result);
     assert_eq!(returned.bytes().as_ptr(), ptr);
     assert_eq!(returned.bytes(), b"c");
@@ -284,7 +284,7 @@ fn vec_read_only_push_at_capacity_returns_error() {
 
     let overflow = b"b".to_vec();
     let ptr = overflow.as_ptr();
-    let result = chain.try_push(overflow);
+    let result = chain.push(overflow);
     let returned = expect_chain_full(result);
     assert_eq!(chain.segments(), 1);
     assert_eq!(chain.len(), 1);

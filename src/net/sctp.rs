@@ -20,8 +20,8 @@
 //! - [`SctpStream::peer_addrs`]
 //! - [`SctpStream::peer_addr_params`]
 //! - [`SctpStream::set_peer_addr_params`]
-//! - [`SctpStream::set_primary_addr`]
-//! - [`SctpStream::set_peer_primary_addr`]
+//! - [`SctpStream::set_primary_dest_addr`]
+//! - [`SctpStream::request_peer_use_local_addr`]
 //! - [`SctpStream::status`]
 //! - [`SctpStream::peer_addr_info`]
 //! - [`SctpStream::primary_path_info`]
@@ -32,23 +32,32 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
-//! - For repeated outbound associations, prefer [`SctpConnector`]. It reuses
-//!   stable connect state across attempts.
+//! Preferred on the per-message data fast path:
 //! - If the socket is configured for data-only traffic without notifications
 //!   or `SCTP_RCVINFO`, prefer [`SctpStream::send`] / [`SctpStream::recv`] on
-//!   the hot path. Those are the explicit SCTP fast-path APIs in this module.
+//!   the hot path when the application guarantees receive sizing. The lean
+//!   receive does not expose EOR or truncation metadata.
+//! - If most sends use the same stream/PPID/flags, install
+//!   [`SctpSendInfo`] once with [`SctpStream::set_default_send_info`] and keep
+//!   using [`SctpStream::send`].
 //! - Use vectored SCTP APIs only when payloads are already segmented. For a
-//!   single contiguous message, the contiguous APIs stay simpler and usually
-//!   faster.
+//!   single contiguous message, the contiguous APIs avoid iovec scratch.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use [`SctpConnector::new`] when the intended workload is
-//!   data-only. Use [`SctpConnector::with_config`] plus
-//!   [`SctpSocketConfig::data`] instead.
-//! - Prefer not to use [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
+//! Avoid on the per-message data fast path:
+//! - Avoid the default rich socket configuration when the intended workload
+//!   is data-only. Use [`SctpSocketConfig::data`] instead.
+//! - Avoid [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
 //!   when metadata and notifications are not needed. Use
 //!   [`SctpStream::send`] / [`SctpStream::recv`] instead.
+//! - Do not use the lean [`SctpStream::recv`] when record boundaries,
+//!   truncation detection, or notifications are required. Use
+//!   [`SctpStream::recv_msg`] or its vectored form.
+//!
+//! On a repeated association path, reuse [`SctpConnector`] to preserve its
+//! slot wrapper. Every attempt still creates and configures a fresh SCTP
+//! socket; association establishment is not the per-message fast path. For a
+//! data-only workload, construct it with [`SctpConnector::with_config`] and
+//! [`SctpSocketConfig::data`].
 //!
 //! The examples below show message-oriented APIs because they are the most
 //! explicit in documentation. For data-only hot paths, prefer
@@ -57,11 +66,25 @@
 //! Data-only SCTP fast path:
 //! ```no_run
 //! use flowio::net::sctp::{SctpConnector, SctpInitConfig, SctpListener, SctpSocketConfig};
+//! use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 //! use flowio::runtime::executor::Executor;
 //! use std::net::{Ipv4Addr, SocketAddr};
 //!
+//! fn pool() -> IoBuffPool {
+//!     let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+//!         headroom: 0,
+//!         payload: 256,
+//!         tailroom: 0,
+//!         objs_per_slab: 8,
+//!     }).unwrap();
+//!     pool.init();
+//!     pool
+//! }
+//!
+//! let mut server_pool = pool();
+//! let mut client_pool = pool();
 //! let mut executor = Executor::new()?;
-//! executor.run(async {
+//! executor.run(async move {
 //!     let init = SctpInitConfig::diameter_default();
 //!     let config = SctpSocketConfig::data(init);
 //!     let mut listener =
@@ -70,15 +93,17 @@
 //!     let addr = listener.local_addr();
 //!     let mut connector = SctpConnector::with_config(config);
 //!
-//!     let _ = Executor::spawn(async move {
+//!     Executor::spawn(async move {
 //!         let (mut stream, _remote) = listener.accept().await.unwrap();
-//!         let (res, buf) = stream.recv(vec![0u8; 256], 5).await;
+//!         let (res, buf) = stream.recv(server_pool.alloc().unwrap(), 5).await;
 //!         let len = res.unwrap();
-//!         assert_eq!(&buf[..len], b"hello");
-//!     });
+//!         let _received = &buf.payload_bytes()[..len];
+//!     }).unwrap();
 //!
 //!     let mut stream = connector.connect(addr).unwrap().await.unwrap();
-//!     let (res, _buf) = stream.send(b"hello".to_vec()).await;
+//!     let mut send = client_pool.alloc().unwrap();
+//!     send.payload_append(b"hello").unwrap();
+//!     let (res, _buf) = stream.send(send).await;
 //!     res.unwrap();
 //! })?;
 //! # Ok::<(), std::io::Error>(())
@@ -98,11 +123,11 @@
 //!     let addr = listener.local_addr();
 //!     let mut connector = SctpConnector::new(init);
 //!
-//!     let _ = Executor::spawn(async move {
+//!     Executor::spawn(async move {
 //!         let (mut stream, _remote) = listener.accept().await.unwrap();
 //!         let (res, _buf) = stream.recv_msg(vec![0u8; 256], 256).await;
 //!         res.unwrap();
-//!     });
+//!     }).unwrap();
 //!
 //!     let mut stream = connector.connect(addr).unwrap().await.unwrap();
 //!     let (res, _buf) = stream.send_msg(b"hello".to_vec(), Default::default()).await;
@@ -122,13 +147,13 @@
 //! executor.run(async {
 //!     let init = SctpInitConfig::diameter_default();
 //!     let mut connector = SctpConnector::new(init);
-//!     let _ = connector
-//!         .connect_timeout(
-//!             SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)),
-//!             Duration::from_secs(1),
-//!         )
-//!         .unwrap()
-//!         .await;
+//!     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 3868));
+//!     for _ in 0..2 {
+//!         let _ = connector
+//!             .connect_timeout(addr, Duration::from_secs(1))
+//!             .unwrap()
+//!             .await;
+//!     }
 //! })?;
 //! # Ok::<(), std::io::Error>(())
 //! ```
@@ -149,7 +174,7 @@
 //!     let addr = listener.local_addr();
 //!     let mut connector = SctpConnector::new(init);
 //!
-//!     let _ = Executor::spawn(async move {
+//!     Executor::spawn(async move {
 //!         let (mut stream, _remote) = listener.accept().await.unwrap();
 //!         let recv = IoBuffVecMut::<2>::from_array([
 //!             IoBuffMut::new(0, 5, 0).unwrap(),
@@ -157,7 +182,7 @@
 //!         ]);
 //!         let (res, _chain) = stream.recv_msg_vectored(recv).await;
 //!         let (_len, _meta) = res.unwrap();
-//!     });
+//!     }).unwrap();
 //!
 //!     let mut stream = connector.connect(addr).unwrap().await.unwrap();
 //!     let mut seg1 = IoBuffMut::new(0, 16, 0).unwrap();
@@ -939,9 +964,9 @@ impl SctpNotification {
 pub enum SctpRecvMeta {
     /// Regular user data was received and the contained metadata came from
     /// `SCTP_RCVINFO`.
-    Data(SctpRecvInfo),
+    Data(#[doc = "Per-message receive information decoded from ancillary data."] SctpRecvInfo),
     /// An SCTP notification was received instead of user data.
-    Notification(SctpNotification),
+    Notification(#[doc = "Decoded kernel notification payload."] SctpNotification),
 }
 
 impl SctpRecvMeta {
@@ -1068,8 +1093,7 @@ impl SctpNotificationMask {
         }
     }
 
-    /// Notification set matching the crate's current signaling-oriented rich
-    /// receive behavior.
+    /// Notification set used by the signaling-oriented rich socket config.
     pub const fn signaling_default() -> Self {
         Self {
             association: true,
@@ -1095,27 +1119,43 @@ impl Default for SctpNotificationMask {
 }
 
 #[repr(C, packed(4))]
+/// Linux `sctp_prim` layout used to select the local primary destination.
 struct SctpPrimRaw {
+    /// Association selected by the socket option.
     assoc_id: libc::sctp_assoc_t,
+    /// Peer transport address to make primary locally.
     addr: libc::sockaddr_storage,
 }
 
 #[repr(C, packed(4))]
+/// Linux `sctp_setpeerprim` layout used to request the peer's primary path.
 struct SctpSetPeerPrimRaw {
+    /// Association selected by the socket option.
     assoc_id: libc::sctp_assoc_t,
+    /// Local transport address the peer is asked to make primary.
     addr: libc::sockaddr_storage,
 }
 
 #[repr(C, packed)]
+/// Modern Linux `sctp_paddrparams` socket-option layout.
 struct SctpPaddrParamsRaw {
+    /// Association selected by the parameter request.
     assoc_id: libc::sctp_assoc_t,
+    /// Specific peer path, or an all-zero family for association-wide values.
     address: libc::sockaddr_storage,
+    /// Heartbeat interval in milliseconds.
     heartbeat_interval_ms: u32,
+    /// Maximum retransmissions before the selected path is considered failed.
     path_max_retransmits: u16,
+    /// Configured path MTU in bytes.
     path_mtu: u32,
+    /// Delayed-SACK interval in milliseconds.
     sack_delay_ms: u32,
+    /// `SPP_*` option-selection and behavior bits.
     flags: u32,
+    /// IPv6 flow label selected by `SPP_IPV6_FLOWLABEL`.
     ipv6_flow_label: u32,
+    /// DSCP value selected by `SPP_DSCP`.
     dscp: u8,
 }
 
@@ -1126,15 +1166,25 @@ const fn align_sockopt_len(len: usize) -> usize {
 const SCTP_PADDR_PARAMS_RAW_OPT_LEN: usize =
     align_sockopt_len(std::mem::size_of::<SctpPaddrParamsRaw>());
 
+/// Naturally aligned mirror used while converting packed peer-path options.
 struct SctpPaddrParamsFields {
+    /// Association selected by the parameter request.
     assoc_id: libc::sctp_assoc_t,
+    /// Specific peer path, or an all-zero family for association-wide values.
     address: libc::sockaddr_storage,
+    /// Heartbeat interval in milliseconds.
     heartbeat_interval_ms: u32,
+    /// Maximum retransmissions before the selected path is considered failed.
     path_max_retransmits: u16,
+    /// Configured path MTU in bytes.
     path_mtu: u32,
+    /// Delayed-SACK interval in milliseconds.
     sack_delay_ms: u32,
+    /// `SPP_*` option-selection and behavior bits.
     flags: u32,
+    /// IPv6 flow label selected by `SPP_IPV6_FLOWLABEL`.
     ipv6_flow_label: u32,
+    /// DSCP value selected by `SPP_DSCP`.
     dscp: u8,
 }
 
@@ -1175,18 +1225,28 @@ impl SctpPaddrParamsFields {
 }
 
 #[repr(C)]
+/// Linux association/value pair used by SCTP reconfiguration options.
 struct SctpAssocValueRaw {
+    /// Association selected by the socket option.
     assoc_id: libc::sctp_assoc_t,
+    /// Option-specific reconfiguration capability or enable bitmask.
     assoc_value: u32,
 }
 
 #[repr(C, packed(4))]
+/// Linux `sctp_assocparams` layout for association policy and status.
 struct SctpAssocParamsRaw {
+    /// Association selected by the socket option.
     assoc_id: libc::sctp_assoc_t,
+    /// Maximum association-level retransmission attempts.
     assoc_max_retrans: u16,
+    /// Number of peer transport destinations reported by the kernel.
     peer_destinations: u16,
+    /// Peer-advertised receive window in bytes.
     peer_receiver_window: u32,
+    /// Local receive window in bytes.
     local_receiver_window: u32,
+    /// Association cookie lifetime in milliseconds.
     cookie_life_ms: u32,
 }
 
@@ -1221,10 +1281,15 @@ impl SctpAssocParamsRaw {
 }
 
 #[repr(C, packed(4))]
+/// Linux `sctp_rtoinfo` layout for association retransmission timers.
 struct SctpRtoInfoRaw {
+    /// Association selected by the socket option.
     assoc_id: libc::sctp_assoc_t,
+    /// Initial retransmission timeout in milliseconds.
     rto_initial_ms: u32,
+    /// Maximum retransmission timeout in milliseconds.
     rto_max_ms: u32,
+    /// Minimum retransmission timeout in milliseconds.
     rto_min_ms: u32,
 }
 
@@ -1257,16 +1322,24 @@ impl SctpRtoInfoRaw {
 }
 
 #[repr(C)]
+/// Fixed header preceding stream numbers in an `SCTP_RESET_STREAMS` request.
 struct SctpResetStreamsHeader {
+    /// Association selected by the request.
     assoc_id: libc::sctp_assoc_t,
+    /// Incoming/outgoing stream-reset direction bits.
     flags: u16,
+    /// Number of trailing stream identifiers.
     number_streams: u16,
 }
 
 #[repr(C)]
+/// Linux `sctp_add_streams` request layout.
 struct SctpAddStreamsRaw {
+    /// Association selected by the request.
     assoc_id: libc::sctp_assoc_t,
+    /// Number of inbound streams requested.
     inbound_streams: u16,
+    /// Number of outbound streams requested.
     outbound_streams: u16,
 }
 
@@ -1308,13 +1381,21 @@ impl SctpPaddrParamsRaw {
 }
 
 #[repr(C, packed(4))]
+/// Linux `sctp_paddrinfo` layout returned for one peer path.
 struct SctpPaddrInfoRaw {
+    /// Association containing the path.
     assoc_id: libc::sctp_assoc_t,
+    /// Peer transport address identifying the path.
     address: libc::sockaddr_storage,
+    /// Kernel path state.
     state: i32,
+    /// Current congestion window in bytes.
     congestion_window: u32,
+    /// Smoothed round-trip time in milliseconds.
     srtt: u32,
+    /// Current retransmission timeout in milliseconds.
     rto: u32,
+    /// Path MTU in bytes.
     mtu: u32,
 }
 
@@ -1346,15 +1427,25 @@ impl SctpPaddrInfoRaw {
 }
 
 #[repr(C, packed(4))]
+/// Linux `sctp_status` layout returned for an association.
 struct SctpStatusRaw {
+    /// Association described by this status block.
     assoc_id: libc::sctp_assoc_t,
+    /// Kernel association state.
     state: i32,
+    /// Peer-advertised receiver window in bytes.
     receiver_window: u32,
+    /// Number of unacknowledged data chunks.
     unacked_data_chunks: u16,
+    /// Number of data chunks pending transmission.
     pending_data_chunks: u16,
+    /// Negotiated inbound stream count.
     inbound_streams: u16,
+    /// Negotiated outbound stream count.
     outbound_streams: u16,
+    /// Current fragmentation threshold in bytes.
     fragmentation_point: u32,
+    /// Status of the association's current primary path.
     primary_path: SctpPaddrInfoRaw,
 }
 
@@ -1397,13 +1488,21 @@ impl SctpStatusRaw {
 }
 
 #[repr(C, packed)]
+/// Legacy Linux `sctp_paddrparams` layout without flow-label or DSCP fields.
 struct SctpPaddrParamsRawLegacy {
+    /// Association selected by the parameter request.
     assoc_id: libc::sctp_assoc_t,
+    /// Specific peer path, or an all-zero family for association-wide values.
     address: libc::sockaddr_storage,
+    /// Heartbeat interval in milliseconds.
     heartbeat_interval_ms: u32,
+    /// Maximum retransmissions before the selected path is considered failed.
     path_max_retransmits: u16,
+    /// Configured path MTU in bytes.
     path_mtu: u32,
+    /// Delayed-SACK interval in milliseconds.
     sack_delay_ms: u32,
+    /// Legacy `SPP_*` option-selection and behavior bits.
     flags: u32,
 }
 
@@ -1786,9 +1885,9 @@ impl AsRawFd for SctpListener {
 
 impl Drop for SctpListener {
     fn drop(&mut self) {
-        // Usually a no-op because the borrow held by AcceptFuture drops first.
-        // Keep it for forgotten futures so cached accept state is still
-        // orphaned/reclaimed through the reactor.
+        // Safe non-forgotten use drops AcceptFuture before this exclusive
+        // owner. The explicit cleanup handles a forgotten future whose cached
+        // accept state remains in the listener.
         self.accept_slot.drop_cached_state();
     }
 }
@@ -1833,7 +1932,9 @@ impl Default for SctpInitConfig {
 }
 
 impl SctpInitConfig {
-    /// Returns a configuration suitable for Diameter-style one-to-one associations.
+    /// Returns the crate's default one-to-one association configuration.
+    ///
+    /// This is currently equivalent to [`SctpInitConfig::default`].
     pub fn diameter_default() -> Self {
         Self::default()
     }
@@ -1868,12 +1969,12 @@ struct SctpSocketOptions {
 /// SCTP socket behavior configuration shared by listeners, connectors, and
 /// stream operations.
 ///
-/// Best fast-path choice:
+/// Preferred on the per-message data fast path:
 /// - Use [`SctpSocketConfig::data`] when the workload is data-only and does
-///   not need notifications or `SCTP_RCVINFO`.
+///   not need notifications, `SCTP_RCVINFO`, EOR, or truncation reporting.
 ///
-/// Prefer not to use on the fast path:
-/// - Prefer not to use [`SctpSocketConfig::rich`] / [`SctpSocketConfig::signaling`]
+/// Avoid on the per-message data fast path:
+/// - Avoid [`SctpSocketConfig::rich`] / [`SctpSocketConfig::signaling`]
 ///   for a data-only path. They enable richer metadata behavior for signaling
 ///   workloads rather than the leanest data path.
 ///
@@ -1916,20 +2017,19 @@ impl Default for SctpSocketConfig {
 }
 
 impl SctpSocketConfig {
-    /// Rich metadata configuration matching the current `send_msg` / `recv_msg`
-    /// defaults.
+    /// Rich metadata configuration matching [`SctpSocketConfig::default`].
     ///
-    /// Prefer not to use this on the data fast path; use
-    /// [`SctpSocketConfig::data`] instead when metadata is unnecessary.
+    /// Avoid this on the data fast path when metadata is unnecessary; use
+    /// [`SctpSocketConfig::data`] instead.
     pub fn rich(init: SctpInitConfig) -> Self {
         Self::signaling(init)
     }
 
-    /// Signaling-oriented configuration: rich metadata plus the notification
-    /// mask that current SCTP users expect.
+    /// Signaling-oriented configuration with receive metadata and the crate's
+    /// default rich notification mask.
     ///
-    /// This is the better choice for signaling-style SCTP use. Prefer
-    /// [`SctpSocketConfig::data`] instead for the leanest data fast path.
+    /// Use this when signaling consumers require metadata and notifications.
+    /// [`SctpSocketConfig::data`] disables both for a lean data path.
     pub fn signaling(init: SctpInitConfig) -> Self {
         Self {
             init,
@@ -1947,8 +2047,10 @@ impl SctpSocketConfig {
     /// Data-fast-path configuration intended for [`SctpStream::send`] /
     /// [`SctpStream::recv`].
     ///
-    /// This is the best configuration to use when the stream only carries
-    /// application data and does not need ancillary metadata or notifications.
+    /// This disables ancillary receive metadata and notifications for streams
+    /// that carry only application data. Consequently, [`SctpStream::recv`]
+    /// does not report EOR or truncation; use a rich/signaling config and
+    /// `recv_msg` when those semantics are required.
     pub fn data(init: SctpInitConfig) -> Self {
         Self {
             init,
@@ -1978,11 +2080,11 @@ impl SctpSocketConfig {
 /// SCTP connector that reuses one connect slot across attempts.
 ///
 /// Each individual connect submission still gets its own `CompletionState`
-/// from the reactor pool; the slot only holds the stable socket/address/init
-/// state needed to build the next future.
+/// from the reactor pool. The connector reuses slot storage, while each attempt
+/// creates and configures a fresh socket and prepared remote address.
 ///
-/// This is the best SCTP API to use on the repeated outbound connect fast
-/// path. For data-only associations, pair it with
+/// Reusing this type avoids rebuilding the slot wrapper across outbound
+/// attempts. For data-only associations, pair it with
 /// [`SctpSocketConfig::data`] instead of the richer default config.
 ///
 /// # Example
@@ -2025,9 +2127,8 @@ impl SctpConnector {
 
     /// Creates a connector with the provided SCTP socket configuration.
     ///
-    /// This is the best constructor when the caller wants explicit control
-    /// over whether the connector is optimized for signaling metadata or the
-    /// leaner data fast path.
+    /// This constructor gives the caller explicit control over signaling
+    /// metadata, notifications, and data-path socket options.
     pub fn with_config(config: SctpSocketConfig) -> Self {
         Self {
             connect_slot: ConnectSlot::new(),
@@ -2045,8 +2146,9 @@ impl SctpConnector {
     /// Starts connecting to the provided remote SCTP peer.
     ///
     /// Establishing an association is setup/control-plane work, not the
-    /// per-message data fast path. Reusing this connector across attempts is
-    /// the fast-path optimization; once connected, keep steady-state traffic on
+    /// per-message data fast path. Reusing this connector preserves its slot
+    /// wrapper, while each attempt still creates and configures a fresh socket.
+    /// Once connected, keep suitable steady-state traffic on
     /// [`SctpStream::send`] / [`SctpStream::recv`].
     pub fn connect(&mut self, remote_addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
         self.connect_slot
@@ -2085,9 +2187,14 @@ impl Drop for SctpConnector {
 
 type StashedSctpRecvProcessor = unsafe fn(&PollCtx, *mut CompletionState, usize, &mut bool);
 
+/// Dropped metadata receive retained by the stream until its CQE is processed.
 struct StashedSctpRecv {
+    /// In-flight or completed operation state adopted from the dropped future.
     state_ptr: *mut CompletionState,
+    /// Initialized iovec count needed by the vectored completion processor.
     iov_count: usize,
+    /// Type-specific function that consumes the retained payload and updates
+    /// record-tail discard state.
     process_completed: Option<StashedSctpRecvProcessor>,
 }
 
@@ -2118,6 +2225,14 @@ impl SctpRecvState {
         }
     }
 
+    /// Transfers an in-flight metadata receive from a dropped future into the
+    /// stream-owned recovery slot.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `*state_ptr` must be a live operation owned by this stream's
+    /// reactor, `process_completed` must match its retained payload type, and
+    /// no other receive may already be stashed.
     unsafe fn stash(
         &mut self,
         state_ptr: &mut *mut CompletionState,
@@ -2138,12 +2253,24 @@ impl SctpRecvState {
         *state_ptr = std::ptr::null_mut();
     }
 
+    /// Clears any waiter retained by the stream-owned dropped receive.
+    ///
+    /// # Safety
+    ///
+    /// A non-null stashed pointer must identify a live completion state that
+    /// this receive state exclusively owns.
     unsafe fn clear_stashed_waiter(&mut self) {
         if !self.stashed.state_ptr.is_null() {
             unsafe { (*self.stashed.state_ptr).clear_waiter() };
         }
     }
 
+    /// Polls and consumes the previously dropped metadata receive, if any.
+    ///
+    /// # Safety
+    ///
+    /// Any stashed pointer and processor must satisfy [`SctpRecvState::stash`],
+    /// and `cx` must carry the FlowIO waker for the owning reactor.
     unsafe fn poll_stashed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let state_ptr = self.stashed.state_ptr;
         if state_ptr.is_null() {
@@ -2169,6 +2296,12 @@ impl SctpRecvState {
         Poll::Ready(())
     }
 
+    /// Orphans/cancels a stashed receive during stream teardown.
+    ///
+    /// # Safety
+    ///
+    /// A non-null stashed pointer must identify the exclusively owned live
+    /// operation transferred by [`SctpRecvState::stash`].
     unsafe fn drop_stashed(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.stashed.state_ptr) };
         self.stashed.iov_count = 0;
@@ -2178,14 +2311,16 @@ impl SctpRecvState {
 
 /// One-to-one SCTP association with generic buffer support.
 ///
-/// Best fast-path choice:
+/// Preferred on the per-message data fast path:
 /// - Use [`SctpStream::send`] / [`SctpStream::recv`] when the socket was
 ///   configured for data-only traffic and the caller does not need per-message
 ///   metadata or notifications.
 ///
-/// Prefer not to use on the fast path:
-/// - Prefer not to use [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
+/// Avoid on the per-message data fast path:
+/// - Avoid [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
 ///   or the richer signaling config when the workload is just message data.
+/// - Do not use [`SctpStream::recv`] when EOR, truncation detection, receive
+///   metadata, or notifications are part of the protocol contract.
 ///
 /// # In-flight drop ownership
 ///
@@ -2234,7 +2369,14 @@ pub struct SctpStream {
 }
 
 impl SctpStream {
-    /// Wraps an already-owned SCTP socket and records its remote peer.
+    /// Takes ownership of an SCTP socket, records its remote peer, and closes
+    /// the descriptor on drop.
+    ///
+    /// The caller must transfer sole descriptor ownership to FlowIO and must
+    /// not close it or wrap the same raw descriptor in another owning handle.
+    /// Callers supplying an external descriptor are responsible for applying
+    /// nonblocking mode and socket options compatible with the data or
+    /// metadata APIs they use.
     pub fn from_raw_fd(fd: RawFd, remote_addr: SocketAddr) -> Self {
         Self {
             fd: RuntimeFd::new(fd),
@@ -2251,10 +2393,11 @@ impl SctpStream {
         current_local_addr(self.fd.as_raw_fd())
     }
 
-    /// Returns the recorded peer address associated with the stream.
+    /// Returns the peer address recorded when the association was accepted or
+    /// connected.
     ///
-    /// This is cached association metadata and does not submit SCTP data-path
-    /// I/O.
+    /// This is cached association metadata, not a live kernel query, and does
+    /// not submit SCTP data-path I/O.
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote_addr
     }
@@ -2585,7 +2728,11 @@ impl SctpStream {
         decode_peer_addr_params_sockopt(&buffer, optlen as usize)
     }
 
-    /// Applies `SCTP_PEER_ADDR_PARAMS` to the whole association or to one specific path.
+    /// Applies `SCTP_PEER_ADDR_PARAMS` to the whole association or to one
+    /// specific path.
+    ///
+    /// Use this for path-specific overrides. For guarded association-wide
+    /// defaults, use [`SctpStream::set_default_peer_addr_params`].
     ///
     /// This is path/association configuration work. Apply it during setup or
     /// reconfiguration, not per message.
@@ -2593,10 +2740,13 @@ impl SctpStream {
         apply_peer_addr_params_raw(self.fd.as_raw_fd(), params)
     }
 
-    /// Requests that the local SCTP stack use the provided peer address as primary.
+    /// Chooses which peer address this association sends to by default.
     ///
-    /// This is path control-plane work, not the per-message data fast path.
-    pub fn set_primary_addr(&self, peer_addr: SocketAddr) -> io::Result<()> {
+    /// This is a local-only primary-destination choice; it sends no request to
+    /// the peer. To ask the peer to send to a particular local address, use
+    /// [`SctpStream::request_peer_use_local_addr`]. This is path control-plane
+    /// work, not the per-message data fast path.
+    pub fn set_primary_dest_addr(&self, peer_addr: SocketAddr) -> io::Result<()> {
         let raw = SctpPrimRaw {
             assoc_id: 0,
             addr: option_socket_addr_to_storage(Some(peer_addr)),
@@ -2609,12 +2759,14 @@ impl SctpStream {
         )
     }
 
-    /// Requests that the peer use the provided local address as primary for this association.
+    /// Requests that the peer send to the provided local address by default.
     ///
-    /// Some Linux SCTP deployments reject this with `EPERM`/`EACCES` when dynamic address
-    /// reconfiguration is disabled by kernel policy or association capabilities.
-    /// This is path control-plane work, not the per-message data fast path.
-    pub fn set_peer_primary_addr(&self, local_addr: SocketAddr) -> io::Result<()> {
+    /// Unlike [`SctpStream::set_primary_dest_addr`], this sends a wire request
+    /// to the peer. Some Linux SCTP deployments reject it with `EPERM`/`EACCES`
+    /// when dynamic address reconfiguration is disabled by kernel policy or
+    /// association capabilities. This is path control-plane work, not the
+    /// per-message data fast path.
+    pub fn request_peer_use_local_addr(&self, local_addr: SocketAddr) -> io::Result<()> {
         let raw = SctpSetPeerPrimRaw {
             assoc_id: 0,
             addr: option_socket_addr_to_storage(Some(local_addr)),
@@ -2625,14 +2777,6 @@ impl SctpStream {
             libc::SCTP_SET_PEER_PRIMARY_ADDR,
             &raw,
         )
-    }
-
-    /// Alias for [`SctpStream::peer_addr`].
-    ///
-    /// This reads cached association metadata and does not submit SCTP
-    /// data-path I/O.
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
     }
 
     /// Applies default SCTP send metadata to this socket. This is used by the
@@ -2668,7 +2812,7 @@ impl SctpStream {
     /// Applies association-wide peer-address defaults.
     ///
     /// `params.address` must be `None`; use [`SctpStream::set_peer_addr_params`]
-    /// for path-specific overrides.
+    /// for path-specific overrides instead.
     ///
     /// This is association configuration work, not the per-message data fast
     /// path.
@@ -2681,6 +2825,10 @@ impl SctpStream {
     /// This path is intended for sockets configured without SCTP
     /// notifications and without `SCTP_RCVINFO`. Its result carries only the
     /// received byte count; the rental buffer is returned beside that result.
+    /// It does not expose `MSG_EOR` or truncation flags, so use it only when
+    /// application framing guarantees the supplied buffer is large enough.
+    /// Use [`SctpStream::recv_msg`] when record-boundary or truncation
+    /// correctness depends on kernel metadata.
     /// This data-only path does not drive metadata receive resynchronization;
     /// do not mix it with `recv_msg` / `recv_msg_vectored` while those paths
     /// are discarding an oversized record tail.
@@ -2920,6 +3068,10 @@ struct RetainedDataSendPayload<B: IoBuffReadOnly> {
     buffer: B,
 }
 
+// These retained recvmsg/sendmsg payloads become self-referential after their
+// msghdr points at embedded iovec, control, and address storage. Initialize
+// those pointers only after submit_retained_sqe moves the payload to its stable
+// retained address.
 struct RetainedSctpRecvPayload<B: IoBuffReadWrite> {
     /// Caller-owned destination buffer retained while recvmsg is live.
     buffer: B,
@@ -3070,6 +3222,12 @@ fn update_discarding_after_dropped_completion(
     }
 }
 
+/// Returns the received prefix visible in the first vectored destination.
+///
+/// # Safety
+///
+/// When `iov_count` is nonzero, `iovecs[0]` must be initialized and its base
+/// pointer must remain readable for `min(actual, iov_len)` bytes.
 unsafe fn sctp_vectored_first_iov_slice<const N: usize>(
     iovecs: &[MaybeUninit<libc::iovec>; N],
     iov_count: usize,
@@ -3099,6 +3257,12 @@ fn build_sctp_sendmsg_entry(fd: RawFd, msg: *const libc::msghdr, user_data: u64)
     build_sendmsg_entry(fd, msg, user_data)
 }
 
+/// Retires a dropped contiguous metadata receive and updates discard state.
+///
+/// # Safety
+///
+/// `state_ptr` must be a completed operation owned by `pctx`'s reactor with a
+/// retained `RetainedSctpRecvPayload<B>`.
 unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
     pctx: &PollCtx,
     state_ptr: *mut CompletionState,
@@ -3122,6 +3286,13 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
     unsafe { free_sctp_state(pctx, &mut state_ptr) };
 }
 
+/// Retires a dropped vectored metadata receive and updates discard state.
+///
+/// # Safety
+///
+/// `state_ptr` must be a completed operation owned by `pctx`'s reactor with a
+/// retained `RetainedSctpRecvVectoredPayload<N>`, and `iov_count` must describe
+/// its initialized iovec prefix.
 unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
     pctx: &PollCtx,
     state_ptr: *mut CompletionState,
@@ -3144,12 +3315,24 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
 }
 
 #[inline(always)]
+/// Releases one completed or unsubmitted SCTP operation slot.
+///
+/// # Safety
+///
+/// `*state_ptr` must be non-null, owned by `pctx`'s reactor, and no kernel
+/// operation may still reference its state or retained payload.
 unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
     unsafe { (*pctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
 }
 
 #[inline(always)]
+/// Takes a completed SCTP payload and releases its operation slot.
+///
+/// # Safety
+///
+/// A non-null `*state_ptr` must identify an operation owned by the FlowIO
+/// reactor encoded in `cx`'s waker, with retained payload type `T`.
 unsafe fn take_completed_sctp_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
@@ -3171,6 +3354,12 @@ unsafe fn take_completed_sctp_payload<T: 'static>(
 }
 
 #[inline(always)]
+/// Allocates the initial SCTP operation state and registers the current task.
+///
+/// # Safety
+///
+/// `*state_ptr` must be null, and `cx` must carry a valid FlowIO waker for the
+/// executor/reactor that will own the new operation.
 unsafe fn prepare_initial_sctp_state(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
@@ -4127,80 +4316,6 @@ impl Drop for ConnectFuture<'_> {
     }
 }
 
-#[doc(hidden)]
-pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()> {
-    let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-    let mut state = CompletionState::empty();
-    state.result = fd;
-    state.set_completed();
-
-    let mut slot = AcceptSlot::new();
-    slot.in_use = true;
-    slot.state_ptr = &mut state;
-
-    slot.drop_future();
-
-    if !slot.state_ptr.is_null() || slot.in_use {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    if !crate::runtime::fd::raw_fd_is_closed(fd) {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    Ok(())
-}
-
-#[doc(hidden)]
-pub fn test_accept_slot_drop_cached_state_closes_completed_fd() -> io::Result<()> {
-    let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-    let mut state = CompletionState::empty();
-    state.result = fd;
-    state.set_completed();
-
-    let mut slot = AcceptSlot::new();
-    slot.in_use = true;
-    slot.state_ptr = &mut state;
-
-    slot.drop_cached_state();
-
-    if !slot.state_ptr.is_null() || slot.in_use {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    if !crate::runtime::fd::raw_fd_is_closed(fd) {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    Ok(())
-}
-
-#[doc(hidden)]
-pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()> {
-    let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-    let mut slot = ConnectSlot::new();
-    slot.in_use = true;
-    slot.fd = fd;
-
-    slot.drop_future();
-
-    if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    if !crate::runtime::fd::raw_fd_is_closed(fd) {
-        return Err(io::Error::from(io::ErrorKind::Other));
-    }
-    Ok(())
-}
-
-#[doc(hidden)]
-pub fn test_peer_addr_params_rejects_optlen(optlen: usize) -> io::Result<()> {
-    let buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
-    match decode_peer_addr_params_sockopt(&buffer, optlen) {
-        Err(err) if err.kind() == io::ErrorKind::InvalidData => Ok(()),
-        Err(err) => Err(err),
-        Ok(_) => Err(io::Error::other(
-            "invalid SCTP_PEER_ADDR_PARAMS optlen was accepted",
-        )),
-    }
-}
-
 fn map_connect_timeout(result: Result<io::Result<SctpStream>, Elapsed>) -> io::Result<SctpStream> {
     match result {
         Ok(result) => result,
@@ -4397,8 +4512,11 @@ fn configure_sctp_socket(fd: RawFd, config: SctpSocketConfig) -> io::Result<()> 
 }
 
 #[repr(C)]
+/// Header returned before packed addresses by Linux SCTP address enumeration.
 struct SctpGetAddrsHeader {
+    /// Association whose addresses are requested.
     assoc_id: libc::sctp_assoc_t,
+    /// Number of packed addresses returned, or required capacity on retry.
     addr_num: u32,
 }
 
@@ -4531,6 +4649,10 @@ fn storage_to_option_socket_addr(
     }
 }
 
+/// Parses exactly `addr_count` packed Linux SCTP association addresses.
+///
+/// The parser accepts dense, compact IPv4, and `sockaddr_storage`-padded
+/// entries, and succeeds only when the full payload is consumed.
 pub(crate) fn parse_assoc_addrs(
     payload: &[u8],
     addr_count: usize,
@@ -4549,9 +4671,13 @@ fn byte_range_invalid_data(err: BufferRangeError) -> io::Error {
 }
 
 #[derive(Clone, Copy)]
+/// One iterative backtracking frame for packed association-address parsing.
 struct AssocAddrParseFrame {
+    /// Byte offset of the next address in the packed payload.
     offset: usize,
+    /// Number of addresses still required from this state.
     remaining: usize,
+    /// Next family-compatible entry layout to try at this offset.
     next_candidate: usize,
 }
 
@@ -4671,8 +4797,11 @@ fn parse_assoc_addrs_iter(
 }
 
 #[derive(Clone, Copy)]
+/// Candidate packed layout for one association address.
 struct AssocAddrCandidate {
+    /// Total payload bytes consumed, including any trailing storage padding.
     entry_len: usize,
+    /// Leading bytes interpreted as the concrete socket address.
     addr_len: usize,
 }
 
@@ -5132,89 +5261,176 @@ const fn local_sctp_notification_type(index: libc::c_int) -> libc::c_int {
     (1 << 15) | index
 }
 
-#[doc(hidden)]
-pub fn test_parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
-    parse_notification(buffer)
-}
+#[cfg(feature = "test-support")]
+pub(crate) mod test_support {
+    use super::*;
 
-#[doc(hidden)]
-pub fn test_parse_recv_meta(
-    control: &[u8],
-    controllen: usize,
-    msg_flags: libc::c_int,
-    data_slice: &[u8],
-) -> io::Result<SctpRecvMeta> {
-    parse_recv_meta(control, controllen, msg_flags, data_slice)
-}
+    /// Verifies dropping an accept future closes an already-completed accepted
+    /// descriptor and releases its reusable slot.
+    pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()> {
+        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
+        let mut state = CompletionState::empty();
+        state.result = fd;
+        state.set_completed();
 
-#[doc(hidden)]
-pub const fn test_assoc_change_type() -> libc::c_int {
-    LOCAL_SCTP_ASSOC_CHANGE
-}
+        let mut slot = AcceptSlot::new();
+        slot.in_use = true;
+        slot.state_ptr = &mut state;
 
-#[doc(hidden)]
-pub const fn test_adaptation_indication_type() -> libc::c_int {
-    LOCAL_SCTP_ADAPTATION_INDICATION
-}
+        slot.drop_future();
 
-#[doc(hidden)]
-pub const fn test_peer_addr_change_type() -> libc::c_int {
-    LOCAL_SCTP_PEER_ADDR_CHANGE
-}
+        if !slot.state_ptr.is_null() || slot.in_use {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        if !crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        Ok(())
+    }
 
-#[doc(hidden)]
-pub const fn test_send_failed_type() -> libc::c_int {
-    LOCAL_SCTP_SEND_FAILED
-}
+    /// Verifies listener teardown closes a completed descriptor left in a
+    /// cached accept slot by a forgotten future.
+    pub fn test_accept_slot_drop_cached_state_closes_completed_fd() -> io::Result<()> {
+        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
+        let mut state = CompletionState::empty();
+        state.result = fd;
+        state.set_completed();
 
-#[doc(hidden)]
-pub const fn test_send_failed_error_offset() -> usize {
-    SCTP_SEND_FAILED_ERROR_OFFSET
-}
+        let mut slot = AcceptSlot::new();
+        slot.in_use = true;
+        slot.state_ptr = &mut state;
 
-#[doc(hidden)]
-pub const fn test_send_failed_info_offset() -> usize {
-    SCTP_SEND_FAILED_INFO_OFFSET
-}
+        slot.drop_cached_state();
 
-#[doc(hidden)]
-pub const fn test_remote_error_type() -> libc::c_int {
-    LOCAL_SCTP_REMOTE_ERROR
-}
+        if !slot.state_ptr.is_null() || slot.in_use {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        if !crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        Ok(())
+    }
 
-#[doc(hidden)]
-pub const fn test_shutdown_event_type() -> libc::c_int {
-    LOCAL_SCTP_SHUTDOWN_EVENT
-}
+    /// Verifies dropping a connector future closes the socket owned by its
+    /// reusable connection slot.
+    pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()> {
+        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
+        let mut slot = ConnectSlot::new();
+        slot.in_use = true;
+        slot.fd = fd;
 
-#[doc(hidden)]
-pub const fn test_partial_delivery_event_type() -> libc::c_int {
-    LOCAL_SCTP_PARTIAL_DELIVERY_EVENT
-}
+        slot.drop_future();
 
-#[doc(hidden)]
-pub const fn test_sender_dry_event_type() -> libc::c_int {
-    LOCAL_SCTP_SENDER_DRY_EVENT
-}
+        if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        if !crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        Ok(())
+    }
 
-#[doc(hidden)]
-pub const fn test_stream_reset_event_type() -> libc::c_int {
-    LOCAL_SCTP_STREAM_RESET_EVENT
-}
+    /// Verifies a peer-address-parameter socket-option length is rejected as
+    /// invalid data rather than parsed through an incompatible ABI layout.
+    pub fn test_peer_addr_params_rejects_optlen(optlen: usize) -> io::Result<()> {
+        let buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
+        match decode_peer_addr_params_sockopt(&buffer, optlen) {
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => Ok(()),
+            Err(err) => Err(err),
+            Ok(_) => Err(io::Error::other(
+                "invalid SCTP_PEER_ADDR_PARAMS optlen was accepted",
+            )),
+        }
+    }
 
-#[doc(hidden)]
-pub const fn test_assoc_reset_event_type() -> libc::c_int {
-    LOCAL_SCTP_ASSOC_RESET_EVENT
-}
+    /// Runs the production SCTP notification decoder for integration tests.
+    pub fn test_parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
+        parse_notification(buffer)
+    }
 
-#[doc(hidden)]
-pub const fn test_stream_change_event_type() -> libc::c_int {
-    LOCAL_SCTP_STREAM_CHANGE_EVENT
-}
+    /// Runs production ancillary-data and notification receive decoding for
+    /// integration tests and fuzz-adjacent fixtures.
+    pub fn test_parse_recv_meta(
+        control: &[u8],
+        controllen: usize,
+        msg_flags: libc::c_int,
+        data_slice: &[u8],
+    ) -> io::Result<SctpRecvMeta> {
+        parse_recv_meta(control, controllen, msg_flags, data_slice)
+    }
 
-#[doc(hidden)]
-pub const fn test_send_failed_event_type() -> libc::c_int {
-    LOCAL_SCTP_SEND_FAILED_EVENT
+    /// Returns the local Linux ABI value for `SCTP_ASSOC_CHANGE`.
+    pub const fn test_assoc_change_type() -> libc::c_int {
+        LOCAL_SCTP_ASSOC_CHANGE
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_ADAPTATION_INDICATION`.
+    pub const fn test_adaptation_indication_type() -> libc::c_int {
+        LOCAL_SCTP_ADAPTATION_INDICATION
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_PEER_ADDR_CHANGE`.
+    pub const fn test_peer_addr_change_type() -> libc::c_int {
+        LOCAL_SCTP_PEER_ADDR_CHANGE
+    }
+
+    /// Returns the local Linux ABI value for legacy `SCTP_SEND_FAILED`.
+    pub const fn test_send_failed_type() -> libc::c_int {
+        LOCAL_SCTP_SEND_FAILED
+    }
+
+    /// Returns the error-field byte offset in the local legacy send-failed
+    /// notification layout.
+    pub const fn test_send_failed_error_offset() -> usize {
+        SCTP_SEND_FAILED_ERROR_OFFSET
+    }
+
+    /// Returns the send-info byte offset in the local legacy send-failed
+    /// notification layout.
+    pub const fn test_send_failed_info_offset() -> usize {
+        SCTP_SEND_FAILED_INFO_OFFSET
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_REMOTE_ERROR`.
+    pub const fn test_remote_error_type() -> libc::c_int {
+        LOCAL_SCTP_REMOTE_ERROR
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_SHUTDOWN_EVENT`.
+    pub const fn test_shutdown_event_type() -> libc::c_int {
+        LOCAL_SCTP_SHUTDOWN_EVENT
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_PARTIAL_DELIVERY_EVENT`.
+    pub const fn test_partial_delivery_event_type() -> libc::c_int {
+        LOCAL_SCTP_PARTIAL_DELIVERY_EVENT
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_SENDER_DRY_EVENT`.
+    pub const fn test_sender_dry_event_type() -> libc::c_int {
+        LOCAL_SCTP_SENDER_DRY_EVENT
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_STREAM_RESET_EVENT`.
+    pub const fn test_stream_reset_event_type() -> libc::c_int {
+        LOCAL_SCTP_STREAM_RESET_EVENT
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_ASSOC_RESET_EVENT`.
+    pub const fn test_assoc_reset_event_type() -> libc::c_int {
+        LOCAL_SCTP_ASSOC_RESET_EVENT
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_STREAM_CHANGE_EVENT`.
+    pub const fn test_stream_change_event_type() -> libc::c_int {
+        LOCAL_SCTP_STREAM_CHANGE_EVENT
+    }
+
+    /// Returns the local Linux ABI value for modern
+    /// `SCTP_SEND_FAILED_EVENT`.
+    pub const fn test_send_failed_event_type() -> libc::c_int {
+        LOCAL_SCTP_SEND_FAILED_EVENT
+    }
 }
 
 #[cfg(test)]

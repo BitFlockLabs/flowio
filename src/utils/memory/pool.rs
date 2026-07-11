@@ -25,6 +25,7 @@ impl std::error::Error for PoolConfigError {}
 
 /// Initializes an object directly inside pre-allocated memory.
 pub trait InPlaceInit: Sized {
+    /// Arguments consumed while constructing one slot value.
     type Args;
     /// Writes a fully initialized value into `slot`.
     fn init_at(slot: &mut MaybeUninit<Self>, args: Self::Args);
@@ -73,6 +74,7 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     /// Returns [`PoolConfigError::ObjsPerSlabZero`] when `objs_per_slab` is
     /// zero. Returns [`PoolConfigError::SizeOverflow`] if object slot or slab
     /// geometry overflows addressable memory.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_uninit(provider: &'a mut P, objs_per_slab: usize) -> Result<Self, PoolConfigError> {
         let provider = provider as *mut P;
         unsafe { Self::new_uninit_from_raw(provider, objs_per_slab) }
@@ -140,8 +142,9 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the memory provider is valid and that
-    /// the `InPlaceInit::init_at` implementation does not panic.
+    /// The raw provider captured by this pool must remain valid and uniquely
+    /// accessible, and `InPlaceInit::init_at` must initialize the complete
+    /// value without unwinding.
     pub unsafe fn alloc(&mut self, args: T::Args) -> Option<*mut T> {
         let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front() } {
             link_ptr
@@ -175,8 +178,8 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `obj` is a valid pointer to a dynamically
-    /// allocated object originally provided by this pool.
+    /// The caller must ensure that `obj` is a live object slot returned by this
+    /// pool and has not already been freed.
     pub unsafe fn free(&mut self, obj: *mut T) {
         if obj.is_null() {
             return;
@@ -222,9 +225,9 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T
             );
         }
 
-        // Live objects are intentionally not dropped: executor teardown may
-        // abandon task futures whose destructors require runtime TLS or pools
-        // that are already being torn down.
+        // Pool teardown returns whole slabs and cannot discover live objects
+        // from the free list. Callers must free live values first; any values
+        // left in release builds are abandoned without running their drops.
         unsafe { self.slab_pages.free_all(&mut self.slab_factory) };
     }
 }

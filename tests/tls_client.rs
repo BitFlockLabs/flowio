@@ -3,12 +3,12 @@ mod common;
 use common::{DropTrackedReadOnly, assert_poll_after_ready_parks};
 use flowio::net::tcp::TcpStream as FlowTcpStream;
 use flowio::net::tls::{TlsClientOptions, TlsClientStream};
-#[cfg(debug_assertions)]
-use flowio::net::tls_test_peer::{drain_available_client_hello, force_reset_on_drop};
 use flowio::runtime::executor::Executor;
 #[cfg(debug_assertions)]
 use flowio::runtime::timer::sleep;
 use flowio::runtime::timer::timeout;
+#[cfg(debug_assertions)]
+use flowio::test_support::net::tls_test_peer::{drain_available_client_hello, force_reset_on_drop};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};

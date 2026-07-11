@@ -1,16 +1,14 @@
 mod common;
 
 use common::{
-    TestIoBuffMut as IoBuffMut, TestProjected, make_payload_chain, make_read_chain,
-    make_read_only_chain, run_test,
+    TestIoBuffMut as IoBuffMut, TestProjected, TryMismatchedProjected, TryOversizedProjected,
+    fill_try_send_buffer, make_payload_chain, make_read_chain, make_read_only_chain, run_test,
 };
-use flowio::net::tcp::{
-    TcpConnector, TcpListener, TcpStream, test_accept_slot_drop_cached_state_closes_completed_fd,
-};
-use flowio::net::{WritevPieces, WritevProjection};
+use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
+use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_closes_completed_fd;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
@@ -74,62 +72,6 @@ async fn wait_for_tcp_peer_close(mut stream: std::net::TcpStream) {
         }
     }
     panic!("orphaned accept result fd was not closed");
-}
-
-/// Fills the socket send buffer with try_write until WouldBlock so callers can
-/// exercise full-socket paths.
-fn fill_try_send_buffer(stream: &mut TcpStream) -> (bool, Vec<u8>) {
-    stream
-        .set_send_buffer_size(4096)
-        .expect("set send buffer size failed");
-
-    let mut payload = vec![0xA5; 1024 * 1024];
-    let mut saw_partial = false;
-    for _ in 0..256 {
-        let requested = payload.len();
-        let (res, returned) = stream.try_write(payload);
-        payload = returned;
-        match res {
-            Ok(n) if n == requested => {}
-            Ok(n) => {
-                assert!(n < requested, "short write must report partial progress");
-                saw_partial = true;
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                return (saw_partial, payload);
-            }
-            Err(err) => panic!("try_write failed unexpectedly: {err}"),
-        }
-    }
-
-    panic!("socket send buffer did not fill within bounded attempts");
-}
-
-// Reported length disagrees with projected pieces, so try_writev_projected
-// must reject it as InvalidInput.
-struct TryMismatchedProjected;
-
-impl WritevProjection for TryMismatchedProjected {
-    fn writev_count_and_len(&self) -> (usize, usize) {
-        (1, 2)
-    }
-
-    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
-        pieces.push(b"x")
-    }
-}
-
-// Count exceeds the iovec cap and must be rejected before project_writev runs.
-struct TryOversizedProjected;
-
-impl WritevProjection for TryOversizedProjected {
-    fn writev_count_and_len(&self) -> (usize, usize) {
-        (1025, 1025)
-    }
-
-    fn project_writev<'a>(&'a self, _pieces: &mut WritevPieces<'a>) -> io::Result<()> {
-        panic!("oversized try_writev_projected should fail before projection")
-    }
 }
 
 #[test]
@@ -279,8 +221,11 @@ fn runtime_tcp_try_write_immediate_success() {
 #[test]
 fn runtime_tcp_try_write_partial_and_would_block() {
     let (mut stream, _peer) = connected_try_tcp_stream();
+    stream
+        .set_send_buffer_size(4096)
+        .expect("set send buffer size failed");
 
-    let (saw_partial, payload) = fill_try_send_buffer(&mut stream);
+    let (saw_partial, payload) = fill_try_send_buffer(|payload| stream.try_write(payload));
     assert!(
         saw_partial,
         "bounded nonblocking fill should observe at least one partial write"
@@ -1128,8 +1073,8 @@ fn runtime_tcp_vectored_empty_chain_semantics() {
         assert_eq!(res.expect("writev_all empty failed"), 0);
         assert!(chain.is_empty());
 
-        let (res, chain) = stream.writev_read_only(make_read_only_chain::<0>([])).await;
-        assert_eq!(res.expect("writev_read_only empty failed"), 0);
+        let (res, chain) = stream.writev(make_read_only_chain::<0>([])).await;
+        assert_eq!(res.expect("empty read-only chain writev failed"), 0);
         assert!(chain.is_empty());
 
         let (res, source) = stream.writev_projected(TestProjected::<0>::new([])).await;
@@ -1154,7 +1099,7 @@ fn runtime_tcp_vectored_empty_chain_semantics() {
 }
 
 #[test]
-fn runtime_tcp_writev_all_read_only_to_std_peer() {
+fn runtime_tcp_writev_all_readonly_chain_to_std_peer() {
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
@@ -1164,8 +1109,8 @@ fn runtime_tcp_writev_all_read_only_to_std_peer() {
         let (mut stream, _addr) = listener.accept().await.expect("accept failed");
 
         let chain = make_read_only_chain([&b"hello"[..], &b""[..], &b" "[..], &b"world"[..]]);
-        let (res, chain) = stream.writev_all_read_only(chain).await;
-        assert_eq!(res.expect("writev_all_read_only failed"), 11);
+        let (res, chain) = stream.writev_all(chain).await;
+        assert_eq!(res.expect("read-only chain writev_all failed"), 11);
         assert_eq!(chain.segments(), 4);
 
         let (res, buf) = stream.read_exact(vec![0u8; 3], 3).await;

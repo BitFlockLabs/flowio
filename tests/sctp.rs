@@ -8,7 +8,15 @@ use flowio::net::sctp::{
     SctpAddStreams, SctpAssocConfig, SctpAssocStatus, SctpConnector, SctpInitConfig, SctpListener,
     SctpNotification, SctpNotificationKind, SctpNotificationMask, SctpPeerAddrInfo,
     SctpPeerAddrParams, SctpReconfigFlags, SctpRecvMeta, SctpResetStreams, SctpSendInfo,
-    SctpSocketConfig, SctpStream, test_accept_slot_drop_cached_state_closes_completed_fd,
+    SctpSocketConfig, SctpStream,
+};
+use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u32_at};
+use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
+use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
+use flowio::runtime::executor::Executor;
+use flowio::runtime::timer::timeout;
+use flowio::test_support::net::sctp::{
+    test_accept_slot_drop_cached_state_closes_completed_fd,
     test_accept_slot_drop_future_closes_completed_fd, test_adaptation_indication_type,
     test_assoc_change_type, test_assoc_reset_event_type,
     test_connect_slot_drop_future_closes_socket_fd, test_parse_notification, test_parse_recv_meta,
@@ -18,11 +26,6 @@ use flowio::net::sctp::{
     test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
     test_stream_reset_event_type,
 };
-use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u32_at};
-use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
-use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
-use flowio::runtime::executor::Executor;
-use flowio::runtime::timer::timeout;
 use std::cell::Cell;
 use std::future::Future;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
@@ -926,8 +929,8 @@ fn runtime_sctp_ping_pong() {
                 .expect("connect init failed")
                 .await
                 .expect("connect failed");
-            assert_eq!(stream.peer_addr(), addr);
-            assert_eq!(stream.remote_addr(), addr);
+            let cached_peer_addr = stream.peer_addr();
+            assert_eq!(cached_peer_addr, addr);
 
             let client_local_addr = stream.local_addr().expect("client local_addr failed");
             assert_ne!(client_local_addr, addr);
@@ -936,7 +939,7 @@ fn runtime_sctp_ping_pong() {
             assert!(client_local_addrs.contains(&client_local_addr));
 
             let client_peer_addrs = stream.peer_addrs().expect("client peer_addrs failed");
-            assert!(client_peer_addrs.contains(&addr));
+            assert!(client_peer_addrs.contains(&cached_peer_addr));
 
             let status = stream.status().expect("client status failed");
             assert_eq!(status.state, SctpAssocStatus::ESTABLISHED);
@@ -988,18 +991,18 @@ fn runtime_sctp_ping_pong() {
                 .set_default_peer_addr_params(SctpPeerAddrParams::association_default())
                 .expect("set_default_peer_addr_params failed");
             stream
-                .set_primary_addr(addr)
-                .expect("set_primary_addr failed");
+                .set_primary_dest_addr(addr)
+                .expect("set_primary_dest_addr failed");
 
-            // set_peer_primary_addr may fail with EPERM/EACCES/EOPNOTSUPP depending on kernel.
-            if let Err(err) = stream.set_peer_primary_addr(client_local_addr) {
+            // The peer request may fail with EPERM/EACCES/EOPNOTSUPP depending on kernel policy.
+            if let Err(err) = stream.request_peer_use_local_addr(client_local_addr) {
                 let raw = err.raw_os_error();
                 assert!(
                     matches!(
                         raw,
                         Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::EOPNOTSUPP)
                     ),
-                    "set_peer_primary_addr failed unexpectedly: {err}"
+                    "request_peer_use_local_addr failed unexpectedly: {err}"
                 );
             }
 

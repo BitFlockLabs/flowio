@@ -12,7 +12,8 @@
 //! - [`iobuffvec::IoBuffVec`] holds frozen send/write segments
 //! - [`iobuffvec::IoBuffReadOnlyVec`] holds generic read-only send/write segments
 //!
-//! For zero-alloc steady-state reuse:
+//! For steady-state reuse without per-buffer allocator traffic once enough
+//! slab capacity has been acquired:
 //! - [`pool::IoBuffPool`] produces identically-shaped pool-backed [`IoBuffMut`] values
 //! - [`bytes`] provides checked allocation-free primitive byte reads/writes
 //!   for protocol encoders and decoders
@@ -21,33 +22,37 @@
 //! - `bytes` — checked byte-order helpers and cursors over byte slices
 //! - `iobuff` — core buffer types, traits, and error codes
 //! - `iobuffvec` — vectored I/O buffer chains
-//! - `pool` — pool allocator for zero-allocation steady-state reuse
+//! - `pool` — slab-backed allocator for fixed-shape buffer reuse
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
-//! - For fixed-shape steady-state reads and writes, prefer
-//!   [`pool::IoBuffPool`] plus [`IoBuffMut`]. That is the best buffer fast
-//!   path in this crate because it avoids heap allocation after warmup.
+//! Preferred on the fast path:
+//! - For fixed-shape steady-state reads and writes,
+//!   [`pool::IoBuffPool`] plus [`IoBuffMut`] reuses slots without per-buffer
+//!   heap allocation once sufficient slab capacity exists.
 //! - Use [`IoBuff`] when already-built bytes should be frozen once and then
 //!   reused or fanned out zero-copy.
 //! - Use [`iobuffvec::IoBuffVecMut`] / [`iobuffvec::IoBuffVec`] /
 //!   [`iobuffvec::IoBuffReadOnlyVec`] only when a protocol is already
 //!   naturally segmented.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use [`IoBuffMut::new`] for fixed-shape steady-state
+//! - Use [`IoBuff::try_mut`] when a frozen buffer is expected to be sole-owned
+//!   and must become writable without copying.
+//!
+//! Avoid on the fast path:
+//! - Avoid [`IoBuffMut::new`] for fixed-shape steady-state
 //!   buffers. Use [`pool::IoBuffPool`] instead. [`IoBuffMut::new`] is the
 //!   better fit when shapes vary or simplicity matters more than reuse.
-//! - Prefer not to use vectored chains for one contiguous payload. Use one
-//!   contiguous buffer instead because it is simpler and usually faster.
-//! - Prefer not to use [`IoBuffView`] as the primary transport buffer shape.
-//!   It is a parsing/slicing helper; keep the original structured buffer on
-//!   the hot path when later mutation or reuse matters.
+//! - Avoid [`IoBuff::make_mut`] when the buffer may be shared: that path
+//!   allocates and copies. Keep exclusive [`IoBuffMut`] ownership or use
+//!   [`IoBuff::try_mut`] when copying is not acceptable.
+//! - A vectored chain adds no value for one already-contiguous payload; one
+//!   contiguous buffer represents that layout directly.
+//! - [`IoBuffView`] exposes only a byte range. Keep an [`IoBuff`] or
+//!   [`IoBuffMut`] when later code needs the structured region metadata.
 //!
 //! # Example
 //! ```
-//! use flowio::runtime::buffer::iobuffvec::IoBuffVec;
 //! use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 //!
 //! let mut pool = IoBuffPool::new(IoBuffPoolConfig {
@@ -68,8 +73,7 @@
 //! let view = frozen.slice(2..9).unwrap();
 //! assert_eq!(view.bytes(), b"payload");
 //!
-//! let chain: IoBuffVec<1> = [frozen].into();
-//! assert_eq!(chain.len(), 11);
+//! assert_eq!(frozen.bytes(), b"H:payload:T");
 //! ```
 
 pub mod bytes;

@@ -1,14 +1,14 @@
 //! Vectored I/O buffer chains for scatter-gather operations.
 //!
-//! [`IoBuffVecMut`] holds a fixed number of [`IoBuffMut`] segments for
+//! [`IoBuffVecMut`] holds up to a fixed capacity of [`IoBuffMut`] segments for
 //! `readv`/`recvmsg` operations. [`IoBuffVec`] holds frozen [`IoBuff`]
 //! segments for `writev`/`sendmsg` operations. [`IoBuffReadOnlyVec`] is the
 //! generic send-side chain for already-owned buffers implementing
 //! [`IoBuffReadOnly`].
 //!
-//! The segment count is a const generic determined at compile time. All
-//! segment storage is inline; no heap allocation is performed by the chain
-//! itself.
+//! Segment capacity is a const generic determined at compile time. Buffer
+//! handle storage is inline; the chain itself performs no heap allocation.
+//! Individual segment implementations may own heap- or pool-backed storage.
 //!
 //! These are fixed-capacity containers. If a push would exceed capacity, the
 //! operation returns [`PushError`] with the original segment so the caller
@@ -20,18 +20,20 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
+//! Preferred on the fast path:
 //! - Use these chain types when a protocol is already naturally segmented and
 //!   that segmentation is worth preserving.
-//! - Keep `N` small and fixed to the segment count you actually need; the
-//!   chain stores handles inline and is designed for small, explicit segment
-//!   counts rather than dynamic heap-managed vectors.
+//! - Choose the smallest practical `N`: it sets both the inline handle
+//!   footprint and the maximum segment count. I/O futures materialize bounded
+//!   kernel `iovec` scratch only for active entries.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to build a vectored chain for a single contiguous payload.
-//!   Use [`IoBuffMut`] / [`IoBuff`] or another contiguous
-//!   [`IoBuffReadWrite`] / [`IoBuffReadOnly`] buffer instead because that path
-//!   is simpler and usually faster.
+//! Avoid on the fast path:
+//! - A vectored chain adds no segmentation benefit for one already-contiguous
+//!   payload; [`IoBuffMut`], [`IoBuff`], or another contiguous implementation
+//!   represents that input directly.
+//! - Do not choose a large `N` speculatively. Async transport operations reject
+//!   more than 1024 active iovecs, and larger inline arrays increase the chain
+//!   value's footprint even when only a few entries are used.
 //!
 //! # Example
 //! ```
@@ -145,6 +147,8 @@ impl<T> std::fmt::Debug for PushError<T> {
 
 #[inline(always)]
 fn uninit_inline_storage<T, const N: usize>() -> [MaybeUninit<T>; N] {
+    // SAFETY: An array of `MaybeUninit<T>` may contain arbitrary uninitialized
+    // bytes. Callers track the initialized prefix separately.
     unsafe { MaybeUninit::uninit().assume_init() }
 }
 
@@ -202,6 +206,12 @@ fn iter_inline<T, const N: usize>(
     (0..count).map(move |i| unsafe { storage[i].assume_init_ref() })
 }
 
+/// Drops the initialized prefix of inline storage.
+///
+/// # Safety
+///
+/// `count` must not exceed `storage.len()`, and exactly the entries in
+/// `storage[..count]` must contain live `T` values owned by the caller.
 unsafe fn drop_initialized_inline<T>(storage: &mut [MaybeUninit<T>], count: usize) {
     for slot in storage.iter_mut().take(count) {
         unsafe { slot.assume_init_drop() };
@@ -212,14 +222,14 @@ unsafe fn drop_initialized_inline<T>(storage: &mut [MaybeUninit<T>], count: usiz
 // IoBuffVecMut — mutable vectored buffer chain (const generic, inline)
 // ============================================================================
 
-/// Mutable vectored buffer chain with a fixed number of segments.
+/// Mutable vectored buffer chain with fixed inline segment capacity.
 ///
 /// `N` is the maximum number of buffer segments, determined at compile time.
 /// All segment-handle storage is inline and heap-free.
 ///
-/// This is the right receive-side container when the transport API is
-/// vectored and the application already wants multiple destination segments.
-/// For one contiguous read buffer, [`IoBuffMut`] is the fast-path alternative.
+/// This represents multiple writable destination segments for vectored
+/// transport operations. A single [`IoBuffMut`] represents one contiguous
+/// destination.
 ///
 /// # Example
 /// ```
@@ -251,6 +261,43 @@ impl<const N: usize> From<[IoBuffMut; N]> for IoBuffVecMut<N> {
     fn from(buffers: [IoBuffMut; N]) -> Self {
         Self::from_array(buffers)
     }
+}
+
+macro_rules! define_distribute_written {
+    ($visibility:vis) => {
+        /// Distributes `total_bytes` across the segments in order, adding to
+        /// each buffer's payload length. The kernel fills iovecs sequentially.
+        ///
+        /// # Safety
+        /// The caller must guarantee that the first `total_bytes` bytes across
+        /// the materialized iovec array have been initialized by the kernel.
+        $visibility unsafe fn distribute_written(&mut self, total_bytes: usize) {
+            let writable = self.writable_len();
+            debug_assert!(
+                total_bytes <= writable,
+                "distribute_written({}) exceeds writable capacity {}",
+                total_bytes,
+                writable
+            );
+            let mut remaining = std::cmp::min(total_bytes, writable);
+            for i in 0..self.count {
+                let buf = unsafe { self.buffers[i].assume_init_mut() };
+                let cap = buf.payload_remaining();
+                let written = if remaining >= cap { cap } else { remaining };
+                buf.payload_len += written;
+                remaining -= written;
+                if remaining == 0 {
+                    break;
+                }
+            }
+
+            debug_assert!(
+                remaining == 0,
+                "distribute_written: {} bytes left over after filling all segments",
+                remaining
+            );
+        }
+    };
 }
 
 impl<const N: usize> IoBuffVecMut<N> {
@@ -286,14 +333,6 @@ impl<const N: usize> IoBuffVecMut<N> {
     ///
     /// Returns [`PushError`] containing `buf` if the chain is at capacity.
     pub fn push(&mut self, buf: IoBuffMut) -> Result<(), PushError<IoBuffMut>> {
-        self.try_push(buf)
-    }
-
-    /// Attempts to add a buffer segment to the chain.
-    ///
-    /// Returns [`PushError`] containing the original buffer if the chain is at
-    /// capacity.
-    pub fn try_push(&mut self, buf: IoBuffMut) -> Result<(), PushError<IoBuffMut>> {
         try_push_inline(&mut self.buffers, &mut self.count, buf)
     }
 
@@ -355,38 +394,11 @@ impl<const N: usize> IoBuffVecMut<N> {
         (self.count, total)
     }
 
-    /// Distributes `total_bytes` across the segments in order, adding to each
-    /// buffer's payload length. The kernel fills iovecs sequentially.
-    ///
-    /// # Safety
-    /// The caller must guarantee that the first `total_bytes` bytes across
-    /// the materialized iovec array have been initialized by the kernel.
-    pub unsafe fn distribute_written(&mut self, total_bytes: usize) {
-        let writable = self.writable_len();
-        debug_assert!(
-            total_bytes <= writable,
-            "distribute_written({}) exceeds writable capacity {}",
-            total_bytes,
-            writable
-        );
-        let mut remaining = std::cmp::min(total_bytes, writable);
-        for i in 0..self.count {
-            let buf = unsafe { self.buffers[i].assume_init_mut() };
-            let cap = buf.payload_remaining();
-            let written = if remaining >= cap { cap } else { remaining };
-            buf.payload_len += written;
-            remaining -= written;
-            if remaining == 0 {
-                break;
-            }
-        }
+    #[cfg(feature = "test-support")]
+    define_distribute_written!(pub);
 
-        debug_assert!(
-            remaining == 0,
-            "distribute_written: {} bytes left over after filling all segments",
-            remaining
-        );
-    }
+    #[cfg(not(feature = "test-support"))]
+    define_distribute_written!(pub(crate));
 
     /// Freezes all buffer segments and returns an [`IoBuffVec`].
     /// Zero-copy.
@@ -418,16 +430,15 @@ impl<const N: usize> Drop for IoBuffVecMut<N> {
 // IoBuffVec — frozen vectored buffer chain (const generic, inline)
 // ============================================================================
 
-/// Frozen vectored buffer chain with a fixed number of segments.
+/// Frozen vectored buffer chain with fixed inline segment capacity.
 ///
 /// Created by calling [`IoBuffVecMut::freeze`]. All segments are [`IoBuff`]
 /// and cloning the chain clones each segment zero-copy. Like
 /// [`IoBuffVecMut`], it stores only segment handles; `iovec` scratch belongs
 /// to the calling I/O operation.
 ///
-/// This is the right send-side container when bytes are already segmented. For
-/// one contiguous payload, a single [`IoBuff`] or [`IoBuffMut`] is the simpler
-/// fast-path alternative.
+/// This preserves existing send-side segmentation. A single [`IoBuff`] or
+/// [`IoBuffMut`] represents one contiguous payload.
 ///
 /// # Example
 /// ```
@@ -516,14 +527,6 @@ impl<const N: usize> IoBuffVec<N> {
     ///
     /// Returns [`PushError`] containing `buf` if the chain is at capacity.
     pub fn push(&mut self, buf: IoBuff) -> Result<(), PushError<IoBuff>> {
-        self.try_push(buf)
-    }
-
-    /// Attempts to add a frozen buffer segment to the chain.
-    ///
-    /// Returns [`PushError`] containing the original buffer if the chain is at
-    /// capacity.
-    pub fn try_push(&mut self, buf: IoBuff) -> Result<(), PushError<IoBuff>> {
         try_push_inline(&mut self.buffers, &mut self.count, buf)
     }
 
@@ -687,14 +690,6 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
     ///
     /// Returns [`PushError`] containing `buf` if the chain is at capacity.
     pub fn push(&mut self, buf: B) -> Result<(), PushError<B>> {
-        self.try_push(buf)
-    }
-
-    /// Attempts to add a read-only buffer segment to the chain.
-    ///
-    /// Returns [`PushError`] containing the original buffer if the chain is at
-    /// capacity.
-    pub fn try_push(&mut self, buf: B) -> Result<(), PushError<B>> {
         try_push_inline(&mut self.buffers, &mut self.count, buf)
     }
 
@@ -745,9 +740,9 @@ impl<B: IoBuffReadOnly, const N: usize> IntoIterator for IoBuffReadOnlyVec<B, N>
     type IntoIter = IoBuffReadOnlyVecIntoIter<B, N>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        // Move the initialized segments into the iterator by bit-copying the
-        // array out, then zero `count` so this chain's Drop does not also drop
-        // the segments the iterator now owns.
+        // Transfer ownership of the storage array with `ptr::read`, then clear
+        // this chain's initialized count so its Drop does not release the
+        // segments now owned by the iterator.
         let buffers = unsafe { std::ptr::read(&self.buffers) };
         let count = self.count;
         self.count = 0;

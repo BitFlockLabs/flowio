@@ -16,15 +16,18 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! These helpers are allocation-free and check bounds before every access. Use
-//! the explicit `_be` / `_le` helpers in protocol parsers and encoders so wire
-//! byte order is visible at the call site. Use [`BufferCursor`] and
-//! [`BufferCursorMut`] for sequential frames when a cursor makes progress
-//! tracking simpler than repeated offsets.
+//! Preferred on the fast path:
+//! - These helpers are allocation-free and check bounds before every access.
+//!   Use explicit `_be` / `_le` helpers in protocol parsers and encoders so
+//!   wire byte order is visible at the call site. Use [`BufferCursor`] and
+//!   [`BufferCursorMut`] for sequential frames when a cursor makes progress
+//!   tracking simpler than repeated offsets.
 //!
-//! Prefer not to use native-endian helpers for wire or file formats. Prefer
-//! not to open-code indexing in protocol parsers when one of these checked
-//! helpers expresses the same access.
+//! Avoid on the fast path:
+//! - Do not use native-endian helpers for wire or file formats; use explicit
+//!   byte order.
+//! - Do not open-code indexing in protocol parsers when one of these checked
+//!   helpers expresses the same access without panics.
 //!
 //! # Slice Example
 //! ```

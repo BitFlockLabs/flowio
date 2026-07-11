@@ -51,12 +51,16 @@ impl Link {
     }
 
     #[inline(always)]
+    /// Returns `true` when both list pointers mark this link as detached.
     pub fn is_unlinked(&self) -> bool {
         self.next.is_null() && self.prev.is_null()
     }
 }
 
 /// A circular intrusive doubly linked list.
+///
+/// The list links but does not own or drop its containing nodes. Initialize it
+/// after final placement; a non-empty initialized list must not move.
 pub struct DList<T> {
     /// Sentinel head node anchoring the circular list.
     head: Link,
@@ -109,11 +113,10 @@ impl<T> DList<T> {
 
     /// Canonicalizes `link` to the list's authoritative `head` pointer.
     ///
-    /// Stored `next`/`prev` pointers that refer to the sentinel may not carry
-    /// the same provenance as the current `&mut self.head`, for example after
-    /// the list value was moved post-`init`. Mapping any pointer equal to
-    /// `head` back to `head` keeps relink writes targeting the real sentinel
-    /// and keeps pointer provenance consistent under Miri.
+    /// Stored `next`/`prev` pointers that numerically identify the sentinel
+    /// can carry provenance from an earlier borrow. Mapping such pointers back
+    /// to the current `head` pointer keeps relink writes based on the active
+    /// mutable borrow. This does not make a non-empty initialized list movable.
     #[inline(always)]
     fn normalize_head_ptr(link: *mut Link, head: *mut Link) -> *mut Link {
         if link == head { head } else { link }
@@ -209,6 +212,7 @@ impl<T> DList<T> {
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
     /// to a currently unlinked `Link`.
+    #[cfg(any(test, feature = "test-support"))]
     pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -313,7 +317,8 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure `offset` is the byte distance from `T` to its
-    /// embedded [`Link`], and that the list is known to contain payload nodes.
+    /// embedded [`Link`]. Each linked node must belong to a live `T` allocation
+    /// that `f` may consume after the node is detached.
     pub(crate) unsafe fn drain_all_for_drop<F>(&mut self, offset: usize, mut f: F)
     where
         F: FnMut(*mut T),
@@ -464,7 +469,8 @@ impl<T> DList<T> {
         }
     }
 
-    /// Returns a forward-walking iterator
+    /// Returns a mutable forward cursor over the list.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cursor_mut(&mut self) -> CursorMut<'_, T> {
         debug_assert_list_inited!(self);
 
@@ -481,6 +487,7 @@ impl<T> DList<T> {
     }
 
     /// Returns a backward-walking iterator.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cursor_back_mut(&mut self) -> CursorBackMut<'_, T> {
         debug_assert_list_inited!(self);
 
@@ -511,6 +518,7 @@ impl<T> Drop for DList<T> {
 }
 
 /// Mutable forward cursor over a [`DList`].
+#[cfg(any(test, feature = "test-support"))]
 pub struct CursorMut<'a, T> {
     /// Link that will be yielded on the next cursor step.
     current: *mut Link,
@@ -520,6 +528,7 @@ pub struct CursorMut<'a, T> {
     list: &'a mut DList<T>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<'a, T> CursorMut<'a, T> {
     #[inline(always)]
     /// # Safety
@@ -547,7 +556,7 @@ impl<'a, T> CursorMut<'a, T> {
     #[inline(always)]
     /// # Safety
     ///
-    /// The caller must ensure that `node_link` is a valid pointer to a `Link`
+    /// The caller must ensure that `link` is a valid pointer to a `Link`
     /// that is currently part of this specific list.
     pub unsafe fn remove_link(&mut self, link: *mut Link) {
         unsafe {
@@ -557,6 +566,7 @@ impl<'a, T> CursorMut<'a, T> {
 }
 
 /// Mutable backward cursor over a [`DList`].
+#[cfg(any(test, feature = "test-support"))]
 pub struct CursorBackMut<'a, T> {
     /// Link that will be yielded on the next backward cursor step.
     current: *mut Link,
@@ -566,6 +576,7 @@ pub struct CursorBackMut<'a, T> {
     _list: &'a mut DList<T>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<'a, T> CursorBackMut<'a, T> {
     #[inline(always)]
     /// # Safety
@@ -594,7 +605,7 @@ impl<'a, T> CursorBackMut<'a, T> {
     #[inline(always)]
     /// # Safety
     ///
-    /// The caller must ensure that `node_link` is a valid pointer to a `Link`
+    /// The caller must ensure that `link` is a valid pointer to a `Link`
     /// that is currently part of this specific list.
     pub unsafe fn remove_link(&mut self, link: *mut Link) {
         unsafe {

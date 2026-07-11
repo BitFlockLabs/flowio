@@ -45,15 +45,15 @@ pub(crate) struct RetainedPayloadVtable {
     pub(crate) free_storage: unsafe fn(*mut (), *mut RetainedPayloadPool),
 }
 
-/// Debug-only counters for asserting retained-pool behavior in tests.
-#[cfg(debug_assertions)]
+/// Debug/test-support counters for asserting retained-pool behavior in tests.
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetainedPayloadPoolStats {
     /// Retained payload allocations served by size-class slabs.
     pub(crate) pooled_allocs: usize,
     /// Pooled payload allocations served from returned blocks.
     pub(crate) pooled_reuses: usize,
-    /// Pooled payload blocks returned to size-class slabs.
+    /// Pooled payload blocks returned to size-class free lists.
     pub(crate) pooled_frees: usize,
     /// Retained payload slab pages requested from providers.
     pub(crate) slab_allocs: usize,
@@ -67,7 +67,7 @@ pub(crate) struct RetainedPayloadPoolStats {
     pub(crate) writev_scratch_pooled_allocs: usize,
     /// Pooled sidecar scratch requests served from returned blocks.
     pub(crate) writev_scratch_pooled_reuses: usize,
-    /// Pooled sidecar scratch blocks returned.
+    /// Pooled sidecar scratch blocks returned to size-class free lists.
     pub(crate) writev_scratch_pooled_frees: usize,
     /// Sidecar scratch slab pages requested from providers.
     pub(crate) writev_scratch_slab_allocs: usize,
@@ -83,8 +83,8 @@ pub(crate) struct RetainedPayloadPool {
     classes: [RetainedSizeClass; RETAINED_SIZE_CLASSES.len()],
     /// Size classes for retained sidecar `iovec` scratch arrays.
     iovec_classes: [RetainedSizeClass; RETAINED_IOVEC_SIZE_CLASSES.len()],
-    #[cfg(debug_assertions)]
-    /// Debug counters exported through runtime stats and tests.
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    /// Debug/test-support counters exported through runtime stats and tests.
     stats: RetainedPayloadPoolStats,
 }
 
@@ -110,7 +110,7 @@ impl RetainedPayloadPool {
                 RetainedSizeClass::new(iovec_class_block_size(2))?,
                 RetainedSizeClass::new(iovec_class_block_size(3))?,
             ],
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "test-support"))]
             stats: RetainedPayloadPoolStats::default(),
         })
     }
@@ -124,7 +124,7 @@ impl RetainedPayloadPool {
         match class_index_for::<T>() {
             Some(class_index) => {
                 if let Some(result) = self.classes[class_index].alloc_block() {
-                    #[cfg(debug_assertions)]
+                    #[cfg(any(debug_assertions, feature = "test-support"))]
                     {
                         self.stats.pooled_allocs += 1;
                         if result.reused {
@@ -150,7 +150,7 @@ impl RetainedPayloadPool {
 
     #[inline(always)]
     fn alloc_heap<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             self.stats.heap_fallbacks += 1;
         }
@@ -160,20 +160,32 @@ impl RetainedPayloadPool {
     }
 
     #[inline(always)]
+    /// Returns a payload block to its size-class free list.
+    ///
+    /// # Safety
+    ///
+    /// `class_index` must identify the class that allocated `ptr`, and `ptr`
+    /// must be a live block that is not already on a free list.
     unsafe fn free_pooled_block(&mut self, class_index: usize, ptr: *mut u8) {
         unsafe { self.classes[class_index].free_block(ptr) };
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             self.stats.pooled_frees += 1;
         }
     }
 
     #[inline(always)]
+    /// Releases heap backing after the stored `T` has been moved or dropped.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the live allocation returned by this pool's heap fallback
+    /// for `T`. Any initialized `T` value must already have been consumed.
     unsafe fn free_heap_storage<T>(&mut self, ptr: *mut T) {
         if std::mem::size_of::<T>() != 0 {
             unsafe { std::alloc::dealloc(ptr as *mut u8, Layout::new::<T>()) };
         }
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             self.stats.heap_frees += 1;
         }
@@ -191,7 +203,7 @@ impl RetainedPayloadPool {
         iov_count: usize,
     ) -> io::Result<RetainedIovecScratch> {
         if iov_count <= RETAINED_IOVEC_INLINE_COUNT {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "test-support"))]
             {
                 self.stats.writev_scratch_inline_allocs += 1;
             }
@@ -201,7 +213,7 @@ impl RetainedPayloadPool {
         let class_index = match iovec_class_index_for_count(iov_count) {
             Some(class_index) => class_index,
             None => {
-                #[cfg(debug_assertions)]
+                #[cfg(any(debug_assertions, feature = "test-support"))]
                 {
                     self.stats.writev_scratch_oversize_rejections += 1;
                 }
@@ -213,14 +225,14 @@ impl RetainedPayloadPool {
         };
 
         let Some(result) = self.iovec_classes[class_index].alloc_block() else {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "test-support"))]
             {
                 self.stats.writev_scratch_alloc_failures += 1;
             }
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         };
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             self.stats.writev_scratch_pooled_allocs += 1;
             if result.reused {
@@ -237,15 +249,21 @@ impl RetainedPayloadPool {
     }
 
     #[inline(always)]
+    /// Returns an iovec sidecar block to its size-class free list.
+    ///
+    /// # Safety
+    ///
+    /// `class_index` must identify the iovec class that allocated `ptr`, and
+    /// `ptr` must not already have been returned.
     unsafe fn free_iovec_scratch_block(&mut self, class_index: usize, ptr: *mut u8) {
         unsafe { self.iovec_classes[class_index].free_block(ptr) };
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             self.stats.writev_scratch_pooled_frees += 1;
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     pub(crate) fn stats(&self) -> RetainedPayloadPoolStats {
         self.stats
     }
@@ -385,16 +403,22 @@ impl<T: 'static> RetainedPayload<T> {
     }
 
     #[inline(always)]
+    /// Returns the stable address of the retained value.
     pub(crate) fn as_ptr(&self) -> *mut T {
         self.ptr.as_ptr()
     }
 
     #[inline(always)]
+    /// Returns the release hooks paired with this handle's allocation path.
     pub(crate) fn vtable(&self) -> RetainedPayloadVtable {
         self.vtable
     }
 
     #[inline(always)]
+    /// Transfers the retained pointer and release hooks to erased ownership.
+    ///
+    /// The returned parts must later be reconstructed and consumed exactly
+    /// once; this handle intentionally has no independent `Drop` path.
     pub(crate) fn into_raw_parts(self) -> (*mut (), RetainedPayloadVtable) {
         (self.ptr.as_ptr() as *mut (), self.vtable)
     }
@@ -529,6 +553,12 @@ impl RetainedSizeClass {
     }
 
     #[inline(always)]
+    /// Returns a block previously allocated by this size class to its free list.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a live block from this class and must not currently
+    /// be linked into any list.
     unsafe fn free_block(&mut self, ptr: *mut u8) {
         debug_assert!(!ptr.is_null(), "retained pool freeing null block");
         unsafe {
@@ -628,6 +658,12 @@ fn heap_vtable<T: 'static>() -> RetainedPayloadVtable {
     }
 }
 
+/// Drops a pooled value and returns its block to the matching size class.
+///
+/// # Safety
+///
+/// `ptr` must address an initialized `T` allocated from `pool` class `CLASS`,
+/// and both pointers must remain live for this call.
 unsafe fn pooled_drop_and_free<T, const CLASS: usize>(
     ptr: *mut (),
     pool: *mut RetainedPayloadPool,
@@ -638,21 +674,39 @@ unsafe fn pooled_drop_and_free<T, const CLASS: usize>(
     }
 }
 
+/// Returns pooled backing after its `T` value has already been consumed.
+///
+/// # Safety
+///
+/// `ptr` must be an unconsumed block allocated from `pool` class `CLASS`, and
+/// no initialized `T` may remain in that block.
 unsafe fn pooled_free_storage<T, const CLASS: usize>(ptr: *mut (), pool: *mut RetainedPayloadPool) {
     let _ = PhantomData::<T>;
     unsafe { (*pool).free_pooled_block(CLASS, ptr as *mut u8) };
 }
 
+/// Drops a heap-fallback value and records release in its owning pool.
+///
+/// # Safety
+///
+/// `ptr` must come from `Box<T>` in this pool's heap fallback and must still
+/// contain an initialized `T`.
 unsafe fn heap_drop_and_free<T>(ptr: *mut (), pool: *mut RetainedPayloadPool) {
     unsafe { drop(Box::from_raw(ptr as *mut T)) };
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, feature = "test-support")))]
     let _ = pool;
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     unsafe {
         (*pool).stats.heap_frees += 1;
     }
 }
 
+/// Releases heap-fallback backing after its value has been consumed.
+///
+/// # Safety
+///
+/// `ptr` must be the live heap fallback allocation for `T` owned by `pool`,
+/// with no initialized `T` remaining in the allocation.
 unsafe fn heap_free_storage<T>(ptr: *mut (), pool: *mut RetainedPayloadPool) {
     unsafe { (*pool).free_heap_storage(ptr as *mut T) };
 }
@@ -680,5 +734,7 @@ fn iovec_class_index_for_count(iov_count: usize) -> Option<usize> {
 
 #[inline(always)]
 fn uninit_iovec_inline() -> [MaybeUninit<libc::iovec>; RETAINED_IOVEC_INLINE_COUNT] {
+    // SAFETY: an array of `MaybeUninit<libc::iovec>` may be left wholly
+    // uninitialized; callers track which entries they initialize.
     unsafe { MaybeUninit::uninit().assume_init() }
 }

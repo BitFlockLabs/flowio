@@ -18,23 +18,28 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
+//! Preferred on the established-connection fast path:
 //! - Keep one [`TlsClientStream`] alive for the lifetime of the connection.
 //!   Build it once around an already-connected [`TcpStream`], then drive
 //!   [`TlsClientStream::handshake`] exactly once before application I/O.
 //! - Reuse a caller-owned [`Arc<rustls::ClientConfig>`] across connections.
 //! - After the handshake, prefer [`TlsClientStream::read`] /
 //!   [`TlsClientStream::write`] when the caller can handle partial plaintext
-//!   progress. Those are the lowest-overhead TLS data APIs in this module.
+//!   progress. Those APIs do not loop to fill or consume the caller's complete
+//!   plaintext buffer, although TLS record processing can still require
+//!   multiple raw TCP operations.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use [`TlsClientStream::read_exact`] /
+//! Avoid on the established-connection fast path:
+//! - Avoid [`TlsClientStream::read_exact`] /
 //!   [`TlsClientStream::write_all`] unless complete-buffer semantics are
 //!   required. Use [`TlsClientStream::read`] / [`TlsClientStream::write`]
 //!   instead when the caller can track progress explicitly.
-//! - Prefer not to put DNS resolution or TCP connection establishment inside
-//!   the steady-state TLS data path. The wrapper expects an already-connected
-//!   transport.
+//! - Avoid putting DNS resolution, TCP connection establishment, wrapper
+//!   construction, or [`TlsClientStream::handshake`] inside a per-message
+//!   loop. Reuse the established stream.
+//! - Do not assume the TLS data path is allocator-free: rustls owns protocol
+//!   buffers, and the wrapper's write scratch may grow beyond its configured
+//!   initial capacity.
 //!
 //! The example below uses `write_all` / `read_exact` because it makes the
 //! framing obvious. On the hot path, prefer `write` / `read` when the caller
@@ -198,15 +203,18 @@ pub struct TlsClientOptions {
 /// It does not add another plaintext staging layer beyond what rustls itself
 /// requires internally.
 ///
-/// Best fast-path choice:
+/// Preferred on the established-connection fast path:
 /// - Use one long-lived stream per connection, call [`TlsClientStream::handshake`]
 ///   once, then prefer [`TlsClientStream::read`] / [`TlsClientStream::write`]
 ///   for steady-state plaintext I/O.
 ///
-/// Prefer not to use on the fast path:
-/// - Prefer not to call [`TlsClientStream::read_exact`] /
+/// Avoid on the established-connection fast path:
+/// - Avoid [`TlsClientStream::read_exact`] /
 ///   [`TlsClientStream::write_all`] unless the protocol truly requires
 ///   complete-buffer semantics.
+/// - Do not reconstruct or re-handshake the wrapper per message. rustls owns
+///   protocol buffers, and the reusable ciphertext buffers belong to this
+///   connection.
 ///
 /// # Cancellation semantics
 /// Dropping a `handshake`, `read`, `write`, `flush`, or `shutdown` future does
@@ -232,9 +240,11 @@ pub struct TlsClientStream {
     transport_read_buffer_size: usize,
     /// Initial capacity used when collecting rustls-emitted TLS records.
     transport_write_buffer_size: usize,
-    /// Reusable ciphertext receive buffer currently owned by the stream.
+    /// Available reusable ciphertext receive buffer. This is `None` while a
+    /// pending raw read owns the buffer.
     read_tls_buffer: Option<Vec<u8>>,
-    /// Reusable ciphertext send buffer currently owned by the stream.
+    /// Available reusable ciphertext send buffer. This is `None` while a
+    /// pending raw write owns the buffer.
     write_tls_buffer: Option<Vec<u8>>,
     /// In-flight raw transport read, if a TLS record read has already been
     /// submitted.
@@ -261,9 +271,9 @@ fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]])
 /// Derives RFC 5929 `tls-server-end-point` channel-binding bytes from an
 /// end-entity certificate DER blob.
 ///
-/// Returns `None` when the certificate uses a signature algorithm that does
-/// not define a usable digest for `tls-server-end-point`, such as Ed25519 or
-/// Ed448, or when the certificate DER is malformed.
+/// Returns `None` when the certificate DER is malformed or its signature
+/// algorithm is unsupported for this derivation. Unsupported cases include
+/// algorithms without a defined binding digest, such as Ed25519 and Ed448.
 ///
 /// This allocates the returned channel-binding bytes. Call it after the TLS
 /// handshake when a protocol needs the binding value; it is not steady-state
@@ -501,8 +511,10 @@ impl TlsClientStream {
     /// still be returned; if a read needs to emit TLS records to make progress
     /// after that latch is set, it returns `BrokenPipe`.
     ///
-    /// This is the lowest-overhead TLS read API when the caller can handle
-    /// short plaintext reads.
+    /// Preferred when the caller tracks plaintext framing. This returns after
+    /// one plaintext read instead of looping to fill `len`; obtaining that
+    /// plaintext may still require processing multiple TLS records or raw TCP
+    /// operations.
     pub fn read<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> TlsReadFuture<'_, B> {
         TlsReadFuture::new(self, buffer, len)
     }
@@ -518,9 +530,9 @@ impl TlsClientStream {
     /// still be returned; if a read needs to emit TLS records to make progress
     /// after that latch is set, it returns `BrokenPipe`.
     ///
-    /// This is the complete-buffer convenience API, not the lowest-overhead
-    /// TLS read fast path. Prefer [`TlsClientStream::read`] when the caller
-    /// can handle partial progress.
+    /// This complete-buffer API loops until the requested plaintext length is
+    /// filled. Avoid that loop when exact-length semantics are unnecessary;
+    /// use [`TlsClientStream::read`] and track progress in the caller.
     pub fn read_exact<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
@@ -544,8 +556,9 @@ impl TlsClientStream {
     /// this future returns an error without a progress count; the stream is
     /// failed and callers must not retry the same plaintext on it.
     ///
-    /// This is the lowest-overhead TLS write API when the caller can handle
-    /// short plaintext writes.
+    /// Preferred when the caller tracks plaintext progress. This offers the
+    /// plaintext to rustls once and returns the accepted count after flushing
+    /// the resulting records; that flush may require multiple raw TCP writes.
     pub fn write<B: IoBuffReadOnly>(&mut self, buffer: B) -> TlsWriteFuture<'_, B> {
         TlsWriteFuture::new(self, buffer)
     }
@@ -561,9 +574,10 @@ impl TlsClientStream {
     /// as TLS records; the stream is failed and callers must not retry the
     /// same plaintext on it.
     ///
-    /// This is the complete-buffer convenience API, not the lowest-overhead
-    /// TLS write fast path. Prefer [`TlsClientStream::write`] when the caller
-    /// can handle partial progress.
+    /// This complete-buffer API repeatedly offers plaintext to rustls until
+    /// the full input is accepted. Avoid that loop when complete-buffer
+    /// semantics are unnecessary; use [`TlsClientStream::write`] and track
+    /// progress in the caller.
     pub fn write_all<B: IoBuffReadOnly>(&mut self, buffer: B) -> TlsWriteAllFuture<'_, B> {
         TlsWriteAllFuture::new(self, buffer)
     }
@@ -849,6 +863,8 @@ impl TlsClientStream {
 
 impl Drop for TlsClientStream {
     fn drop(&mut self) {
+        // Dropping the staged raw futures invokes their normal io_uring
+        // cancellation/orphan cleanup before the owned TCP descriptor drops.
         self.pending_read_tls = None;
         self.pending_write_tls = None;
     }
@@ -1125,6 +1141,8 @@ impl<B: IoBuffReadOnly> Future for TlsWriteFuture<'_, B> {
             }
 
             let buffer = unsafe { opt_ref(&this.buffer) };
+            // SAFETY: IoBuffReadOnly guarantees a stable readable range of
+            // exactly `buffer.len()` bytes for the buffer's lifetime.
             let src = unsafe { slice::from_raw_parts(buffer.as_ptr(), buffer.len()) };
             let written = match this.stream.connection.writer().write(src) {
                 Ok(written) => written,
@@ -1310,7 +1328,7 @@ impl Future for TlsShutdownFuture<'_> {
 mod tests {
     #[cfg(not(miri))]
     use super::*;
-    #[cfg(all(debug_assertions, not(miri)))]
+    #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
     #[cfg(not(miri))]
     use crate::runtime::executor::Executor;
@@ -1394,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(debug_assertions, not(miri)))]
+    #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     fn handshake_read_error_restores_transport_read_scratch() {
         let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("std bind failed");

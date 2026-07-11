@@ -13,16 +13,18 @@
 //!
 //! `CompletionState` is allocated from the reactor's pool for each active
 //! operation. Simple futures free it when their one submission retires; retry
-//! futures reuse the same slot across sequential resubmissions after each CQE
-//! has been consumed.
+//! futures reset the same slot for sequential resubmissions after each CQE has
+//! been consumed.
 //!
 //! If a future is dropped while its SQE is still in flight, the state is
 //! marked orphaned and an `ASYNC_CANCEL` SQE is submitted; the CQE path then
 //! reclaims the pool slot. Futures attach caller buffers and vectored scratch
 //! to the `CompletionState` before submission so kernel-referenced memory stays
-//! alive until the original CQE retires. If a read future is dropped before
-//! completion, any bytes consumed by a racing completion are discarded with the
-//! retained buffer when the original CQE retires.
+//! alive through every referring CQE. Retry futures retain that payload across
+//! sequential submissions until the overall operation finishes. If a read
+//! future is dropped before completion, any bytes consumed by a racing
+//! completion are discarded with the retained buffer when its final referring
+//! CQE retires.
 //! If a future is dropped after completion but before polling its result, the
 //! completed state is freed immediately from `Drop`.
 
@@ -47,9 +49,365 @@ use std::pin::Pin;
 use std::slice;
 use std::task::{Context, Poll};
 
+macro_rules! impl_stream_rw {
+    ($stream:ident, $stream_path:literal) => {
+        /// Attempts one nonblocking read syscall and returns immediately.
+        ///
+        /// This is a deadline-edge primitive for callers whose phase
+        /// timeout has already reached `Duration::ZERO`. It does not
+        /// submit an `io_uring` operation, register a waiter, park, retry,
+        /// or allocate. If no data is immediately available on the
+        /// existing nonblocking socket, it returns
+        /// [`io::ErrorKind::WouldBlock`] and returns `buffer` unchanged.
+        ///
+        /// Prefer [`Self::read`] for normal FlowIO async I/O.
+        /// Avoid polling this method as a readiness loop: `WouldBlock` does not
+        /// register a wakeup.
+        #[doc = concat!(
+            "# Example\n",
+            "```no_run\n",
+            "use ", $stream_path, ";\n\n",
+            "# fn deadline_edge_read(mut stream: ", stringify!($stream), ") {\n",
+            "let (result, buffer) = stream.try_read(vec![0u8; 1024], 1024);\n",
+            "if let Ok(n) = result {\n",
+            "    let _bytes = &buffer[..n];\n",
+            "}\n",
+            "# }\n",
+            "```"
+        )]
+        pub fn try_read<B: IoBuffReadWrite>(
+            &mut self,
+            buffer: B,
+            len: usize,
+        ) -> (io::Result<usize>, B) {
+            stream::try_read_once(self.fd.as_raw_fd(), buffer, len)
+        }
+
+        /// Attempts one nonblocking read syscall into the current payload
+        /// tail.
+        ///
+        /// On success, only the bytes actually read are appended to
+        /// `buffer`. Existing payload bytes are preserved. If no data is
+        /// immediately available, this returns
+        /// [`io::ErrorKind::WouldBlock`] and leaves the payload length
+        /// unchanged.
+        ///
+        /// This is a deadline-edge primitive, not a replacement for
+        /// [`Self::read_exact_append`] in normal async protocol flow.
+        /// `WouldBlock` does not register a wakeup; return to the async path
+        /// unless the caller is deliberately handling an expired deadline.
+        #[doc = concat!(
+            "# Example\n",
+            "```no_run\n",
+            "use ", $stream_path, ";\n",
+            "use flowio::runtime::buffer::IoBuffMut;\n\n",
+            "# fn deadline_edge_append(mut stream: ", stringify!($stream),
+            ", buffer: IoBuffMut) {\n",
+            "let (result, buffer) = stream.try_read_append(buffer, 128);\n",
+            "if result.is_err() {\n",
+            "    let _retry_later = buffer;\n",
+            "}\n",
+            "# }\n",
+            "```"
+        )]
+        pub fn try_read_append(
+            &mut self,
+            buffer: IoBuffMut,
+            len: usize,
+        ) -> (io::Result<usize>, IoBuffMut) {
+            stream::try_read_append_once(self.fd.as_raw_fd(), buffer, len)
+        }
+
+        /// Attempts one nonblocking write syscall and returns immediately.
+        ///
+        /// This sends from the initialized bytes in `buffer` with no
+        /// reactor registration and no retry. If the socket cannot accept
+        /// bytes now, it returns [`io::ErrorKind::WouldBlock`] and returns
+        /// `buffer` unchanged.
+        ///
+        /// Prefer [`Self::write`] for normal FlowIO async I/O.
+        /// Avoid polling this method as a readiness loop: `WouldBlock` does not
+        /// register a wakeup.
+        #[doc = concat!(
+            "# Example\n",
+            "```no_run\n",
+            "use ", $stream_path, ";\n\n",
+            "# fn deadline_edge_write(mut stream: ", stringify!($stream), ") {\n",
+            "let (result, buffer) = stream.try_write(b\"ping\".to_vec());\n",
+            "if result.is_err() {\n",
+            "    let _retry_later = buffer;\n",
+            "}\n",
+            "# }\n",
+            "```"
+        )]
+        pub fn try_write<B: IoBuffReadOnly + 'static>(
+            &mut self,
+            buffer: B,
+        ) -> (io::Result<usize>, B) {
+            stream::try_write_once(self.fd.as_raw_fd(), buffer)
+        }
+
+        /// Attempts one nonblocking projected gather-write syscall.
+        ///
+        /// FlowIO projects borrowed byte pieces from the owned `source`,
+        /// performs one `sendmsg`, and returns the source immediately. Up to
+        /// 16 pieces use inline stack scratch; larger projections use bounded
+        /// reusable thread-local `Vec` scratch and may allocate when capacity
+        /// must grow. Message bytes are not copied, and no retained operation
+        /// state is created. Projections above 1024 non-empty pieces are
+        /// rejected with [`io::ErrorKind::InvalidInput`].
+        ///
+        /// This is a deadline-edge primitive. Prefer
+        /// [`Self::writev_projected`] / [`Self::writev_all_projected`] for
+        /// normal FlowIO async I/O. Avoid this on an allocation-sensitive
+        /// deadline edge with more than 16 pieces unless its thread-local
+        /// scratch has already grown to the required capacity.
+        #[doc = concat!(
+            "# Example\n",
+            "```no_run\n",
+            "use ", $stream_path, ";\n",
+            "use flowio::net::{WritevPieces, WritevProjection};\n",
+            "use std::io;\n\n",
+            "struct Frame {\n",
+            "    header: [u8; 2],\n",
+            "    body: Vec<u8>,\n",
+            "}\n\n",
+            "impl WritevProjection for Frame {\n",
+            "    fn writev_count_and_len(&self) -> (usize, usize) {\n",
+            "        (2, self.header.len() + self.body.len())\n",
+            "    }\n\n",
+            "    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {\n",
+            "        pieces.push(&self.header)?;\n",
+            "        pieces.push(&self.body)?;\n",
+            "        Ok(())\n",
+            "    }\n",
+            "}\n\n",
+            "# fn deadline_edge_projected(mut stream: ", stringify!($stream), ") {\n",
+            "let frame = Frame {\n",
+            "    header: *b\"H:\",\n",
+            "    body: b\"ping\".to_vec(),\n",
+            "};\n",
+            "let (result, frame) = stream.try_writev_projected(frame);\n",
+            "if result.is_err() {\n",
+            "    let _retry_later = frame;\n",
+            "}\n",
+            "# }\n",
+            "```"
+        )]
+        pub fn try_writev_projected<T: WritevProjection>(
+            &mut self,
+            source: T,
+        ) -> (io::Result<usize>, T) {
+            stream::try_writev_projected_once(self.fd.as_raw_fd(), source)
+        }
+
+        /// Reads up to `len` bytes into `buffer`.
+        ///
+        /// The buffer is consumed and returned alongside the result on
+        /// completion (rental pattern); the actual byte count is returned
+        /// in the `Ok` variant.
+        ///
+        /// Preferred on the stream fast path when the caller tracks framing:
+        /// this performs one contiguous submission and returns short reads
+        /// directly.
+        pub fn read<B: IoBuffReadWrite>(
+            &mut self,
+            buffer: B,
+            len: usize,
+        ) -> stream::ReadFuture<'_, B, Self> {
+            stream::ReadFuture::new(self.fd.as_raw_fd(), buffer, len)
+        }
+
+        /// Writes the initialized portion of `buffer`.
+        ///
+        /// The buffer is consumed and returned alongside the result on
+        /// completion (rental pattern); the actual byte count is returned
+        /// in the `Ok` variant.
+        ///
+        /// Preferred on the stream fast path when the caller tracks progress:
+        /// this performs one contiguous submission and returns a short write
+        /// directly.
+        pub fn write<B: IoBuffReadOnly + 'static>(
+            &mut self,
+            buffer: B,
+        ) -> stream::WriteFuture<'_, B, Self> {
+            stream::WriteFuture::new(self.fd.as_raw_fd(), buffer)
+        }
+
+        /// Writes the entire buffer, handling partial writes internally.
+        ///
+        /// Returns `(Ok(n), buffer)` where `n` equals `buffer.len()` on
+        /// success. On error the buffer is returned with an unspecified
+        /// amount already written.
+        ///
+        /// This complete-buffer API may resubmit after partial writes. Avoid
+        /// that retry bookkeeping when complete-buffer semantics are not
+        /// required; use [`Self::write`] and track progress in the caller.
+        pub fn write_all<B: IoBuffReadOnly + 'static>(
+            &mut self,
+            buffer: B,
+        ) -> stream::WriteAllFuture<'_, B, Self> {
+            stream::WriteAllFuture::new(self.fd.as_raw_fd(), buffer)
+        }
+
+        /// Reads exactly `len` bytes, handling partial reads internally.
+        ///
+        /// Returns `(Ok(len), buffer)` on success. Returns `UnexpectedEof`
+        /// if the peer closes before `len` bytes arrive.
+        ///
+        /// This complete-buffer API may resubmit after partial reads. Avoid
+        /// that retry bookkeeping when exact-length semantics are not
+        /// required; use [`Self::read`] and track framing in the caller.
+        pub fn read_exact<B: IoBuffReadWrite>(
+            &mut self,
+            buffer: B,
+            len: usize,
+        ) -> stream::ReadExactFuture<'_, B, Self> {
+            stream::ReadExactFuture::new(self.fd.as_raw_fd(), buffer, len)
+        }
+
+        /// Appends exactly `len` bytes to the current payload end of
+        /// `buffer`.
+        ///
+        /// Returns `UnexpectedEof` if the peer closes before `len` bytes
+        /// arrive. On success the returned buffer payload length is the
+        /// original payload length plus `len`; on EOF or error it includes
+        /// any bytes appended before completion.
+        ///
+        /// This preserves [`Self::read_exact`] semantics while supporting
+        /// staged protocol reads into one [`IoBuffMut`].
+        ///
+        /// This complete-buffer API may resubmit after partial reads. Avoid
+        /// that retry bookkeeping when the caller already manages staged
+        /// framing; use [`Self::read`] in that case.
+        pub fn read_exact_append(
+            &mut self,
+            buffer: IoBuffMut,
+            len: usize,
+        ) -> stream::ReadExactAppendFuture<'_, Self> {
+            stream::ReadExactAppendFuture::new(self.fd.as_raw_fd(), buffer, len)
+        }
+
+        /// Scatter-read into a vectored buffer chain.
+        ///
+        /// The chain is consumed and returned alongside the result (rental
+        /// pattern). The total number of bytes read is returned in `Ok`.
+        ///
+        /// Use this when the receive path is already naturally segmented.
+        /// For a single contiguous destination buffer, prefer
+        /// [`Self::read`] to avoid iovec materialization.
+        ///
+        /// # Errors
+        /// Returns `InvalidInput` if the chain has no writable segments.
+        pub fn readv<const N: usize>(
+            &mut self,
+            buffer: IoBuffVecMut<N>,
+        ) -> stream::ReadvFuture<'_, N, Self> {
+            stream::ReadvFuture::new(self.fd.as_raw_fd(), buffer)
+        }
+
+        /// Gather-write from an owned vectored buffer chain.
+        ///
+        /// The chain is consumed and returned alongside the result (rental
+        /// pattern). The total number of bytes written is returned in
+        /// `Ok`. Empty chains complete with `Ok(0)` without submitting
+        /// kernel I/O. Both FlowIO frozen chains and generic read-only
+        /// chains are accepted.
+        ///
+        /// Use this when the send path is already naturally segmented. For
+        /// one contiguous payload, prefer [`Self::write`] to avoid iovec
+        /// materialization.
+        pub fn writev<C: WriteBufferChain<N> + 'static, const N: usize>(
+            &mut self,
+            buffer: C,
+        ) -> stream::WritevFuture<'_, C, N, Self> {
+            stream::WritevFuture::new(self.fd.as_raw_fd(), buffer)
+        }
+
+        /// Gather-write projected pieces from one compact owned source.
+        ///
+        /// FlowIO retains `source`, then projects borrowed byte slices from
+        /// that retained source into retained kernel-facing `iovec`
+        /// scratch. Projection copies only pointer/length metadata, not message
+        /// bytes. Empty projections complete with `Ok(0)` without submitting
+        /// kernel I/O.
+        ///
+        /// Use this when the send path is already naturally segmented
+        /// inside the retained carrier. For one contiguous payload, prefer
+        /// [`Self::write`] to avoid projection and iovec materialization.
+        pub fn writev_projected<T: WritevProjection>(
+            &mut self,
+            source: T,
+        ) -> stream::WritevProjectedFuture<'_, T, Self> {
+            stream::WritevProjectedFuture::new(self.fd.as_raw_fd(), source)
+        }
+
+        /// Gather-write an entire owned vectored chain, handling partial
+        /// writes.
+        ///
+        /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
+        /// success. On error the chain is returned with an unspecified
+        /// amount already written. Empty chains complete with `Ok(0)`
+        /// without submitting kernel I/O. Both FlowIO frozen chains and
+        /// generic read-only chains are accepted.
+        ///
+        /// This complete-buffer vectored API may resubmit after partial writes.
+        /// Avoid that retry bookkeeping when the caller handles partial
+        /// progress; use [`Self::writev`] instead.
+        pub fn writev_all<C: WriteBufferChain<N> + 'static, const N: usize>(
+            &mut self,
+            buffer: C,
+        ) -> stream::WritevAllFuture<'_, C, N, Self> {
+            stream::WritevAllFuture::new(self.fd.as_raw_fd(), buffer)
+        }
+
+        /// Gather-write all projected pieces from one compact owned
+        /// source.
+        ///
+        /// Returns `(Ok(n), source)` where `n` equals the projected total
+        /// byte count on success. On error the source is returned with an
+        /// unspecified amount already written. Empty projections complete
+        /// with `Ok(0)` without submitting kernel I/O.
+        ///
+        /// This complete-buffer API may resubmit after partial writes. Avoid
+        /// that retry bookkeeping when the caller can handle partial progress;
+        /// use [`Self::writev_projected`] instead.
+        pub fn writev_all_projected<T: WritevProjection>(
+            &mut self,
+            source: T,
+        ) -> stream::WritevAllProjectedFuture<'_, T, Self> {
+            stream::WritevAllProjectedFuture::new(self.fd.as_raw_fd(), source)
+        }
+
+        /// Scatter-read exactly `len` total bytes into a vectored chain.
+        ///
+        /// Returns `(Ok(len), chain)` on success. Returns `UnexpectedEof`
+        /// if the peer closes before `len` bytes arrive. A zero `len`
+        /// completes with `Ok(0)` without submitting kernel I/O.
+        ///
+        /// This complete-buffer vectored API may resubmit after partial reads.
+        /// Avoid that retry bookkeeping when the caller handles partial
+        /// progress; use [`Self::readv`] instead.
+        pub fn readv_exact<const N: usize>(
+            &mut self,
+            buffer: IoBuffVecMut<N>,
+            len: usize,
+        ) -> stream::ReadvExactFuture<'_, N, Self> {
+            stream::ReadvExactFuture::new(self.fd.as_raw_fd(), buffer, len)
+        }
+    };
+}
+
+pub(crate) use impl_stream_rw;
+
 #[inline(always)]
 /// Returns a completed result plus the retained payload, then retires the
 /// completion-state slot.
+///
+/// # Safety
+///
+/// A non-null `*state_ptr` must identify an operation allocated by the reactor
+/// encoded in `cx`'s FlowIO waker, and its retained payload type must be `T`.
 unsafe fn take_completed_result_and_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
@@ -74,6 +432,12 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
 #[inline(always)]
 /// Returns a completed result plus data extracted from the retained payload,
 /// then retires the completion-state slot.
+///
+/// # Safety
+///
+/// A non-null `*state_ptr` must identify an operation allocated by the reactor
+/// encoded in `cx`'s FlowIO waker, with retained payload type `T`. `extract`
+/// must leave no live resource in the payload that still requires destruction.
 unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
@@ -99,6 +463,11 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
 
 #[inline(always)]
 /// Frees a completed retry slot before the next sequential submission.
+///
+/// # Safety
+///
+/// `*state_ptr` must be a non-null operation owned by `pctx`'s reactor, and no
+/// kernel submission may still reference that state or its retained payload.
 unsafe fn free_retry_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
     unsafe { (*pctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
@@ -106,9 +475,10 @@ unsafe fn free_retry_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState)
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetryCqeResult {
-    KernelError(i32),
+    KernelError(#[doc = "Positive errno decoded from a negative CQE result."] i32),
+    /// A zero-byte completion, interpreted by the caller as EOF or WriteZero.
     Zero,
-    Bytes(usize),
+    Bytes(#[doc = "Positive byte count reported by the completed SQE."] usize),
 }
 
 #[inline(always)]
@@ -123,6 +493,12 @@ fn classify_retry_cqe_result(result: i32) -> RetryCqeResult {
 }
 
 #[inline(always)]
+/// Reports whether a retry operation is still pending and refreshes its waiter.
+///
+/// # Safety
+///
+/// A non-null `state_ptr` must identify a live operation associated with the
+/// FlowIO reactor and owner task encoded in `cx`'s waker.
 unsafe fn retry_state_is_in_flight(cx: &mut Context<'_>, state_ptr: *mut CompletionState) -> bool {
     if state_ptr.is_null() {
         return false;
@@ -138,6 +514,12 @@ unsafe fn retry_state_is_in_flight(cx: &mut Context<'_>, state_ptr: *mut Complet
 }
 
 #[inline(always)]
+/// Takes a retained payload and releases its completed operation state.
+///
+/// # Safety
+///
+/// `*state_ptr` must be a non-null completed operation owned by `pctx`'s
+/// reactor, and its retained payload type must be `T`.
 unsafe fn take_retained_payload_and_free_state<T: 'static>(
     pctx: &PollCtx,
     state_ptr: &mut *mut CompletionState,
@@ -150,6 +532,13 @@ unsafe fn take_retained_payload_and_free_state<T: 'static>(
 }
 
 #[inline(always)]
+/// Extracts from a retained payload and releases its completed operation state.
+///
+/// # Safety
+///
+/// `*state_ptr` must be a non-null completed operation owned by `pctx`'s
+/// reactor with payload type `T`. `extract` must account for every payload
+/// field that requires destruction before the retained allocation is released.
 unsafe fn take_retained_payload_with_and_free_state<T: 'static, R>(
     pctx: &PollCtx,
     state_ptr: &mut *mut CompletionState,
@@ -164,6 +553,11 @@ unsafe fn take_retained_payload_with_and_free_state<T: 'static, R>(
 
 #[inline(always)]
 /// Allocates or resets the retry slot and re-registers the current waiter.
+///
+/// # Safety
+///
+/// A non-null `*state_ptr` must be a completed operation owned by `pctx`'s
+/// reactor whose previous CQE has been consumed and is safe to reset.
 unsafe fn prepare_retry_state(
     pctx: &PollCtx,
     state_ptr: &mut *mut CompletionState,
@@ -231,10 +625,26 @@ unsafe fn iovec_slice_ref(iovecs: &[MaybeUninit<libc::iovec>], index: usize) -> 
     unsafe { &*(iovecs.as_ptr().add(index) as *const libc::iovec) }
 }
 
-trait WriteBufferChain<const N: usize>: Sized {
-    fn write_iovec_count_and_len(&self) -> (usize, usize);
-    fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]);
+mod write_buffer_chain_sealed {
+    use super::*;
+
+    pub trait Sealed<const N: usize>: Sized {
+        fn write_iovec_count_and_len(&self) -> (usize, usize);
+        fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]);
+    }
 }
+
+/// Sealed marker for owned buffer-chain types accepted by stream `writev`
+/// operations.
+///
+/// FlowIO implements this for [`IoBuffVec`] and [`IoBuffReadOnlyVec`]. It is
+/// public only so those types can satisfy the bound on public stream methods;
+/// downstream crates cannot implement it.
+#[doc(hidden)]
+#[allow(private_bounds)]
+pub trait WriteBufferChain<const N: usize>: write_buffer_chain_sealed::Sealed<N> {}
+
+impl<T, const N: usize> WriteBufferChain<N> for T where T: write_buffer_chain_sealed::Sealed<N> {}
 
 trait WriteBufferItem {
     fn write_ptr(&self) -> *const u8;
@@ -293,7 +703,7 @@ where
     }
 }
 
-impl<const N: usize> WriteBufferChain<N> for IoBuffVec<N> {
+impl<const N: usize> write_buffer_chain_sealed::Sealed<N> for IoBuffVec<N> {
     #[inline(always)]
     fn write_iovec_count_and_len(&self) -> (usize, usize) {
         write_iovec_count_and_len(self.iter())
@@ -305,7 +715,9 @@ impl<const N: usize> WriteBufferChain<N> for IoBuffVec<N> {
     }
 }
 
-impl<B: IoBuffReadOnly, const N: usize> WriteBufferChain<N> for IoBuffReadOnlyVec<B, N> {
+impl<B: IoBuffReadOnly, const N: usize> write_buffer_chain_sealed::Sealed<N>
+    for IoBuffReadOnlyVec<B, N>
+{
     #[inline(always)]
     fn write_iovec_count_and_len(&self) -> (usize, usize) {
         write_iovec_count_and_len(self.iter())
@@ -328,14 +740,14 @@ struct RetainedReadPayload<B: IoBuffReadWrite> {
 }
 
 struct RetainedReadvPayload<const N: usize> {
-    /// Caller-owned destination chain retained until the original CQE retires.
+    /// Caller-owned destination chain retained across every active submission.
     buffer: IoBuffVecMut<N>,
     /// Kernel-facing `iovec` array pointing into `buffer` segments.
     scratch: RetainedIovecScratch,
 }
 
 struct RetainedWritevPayload<C> {
-    /// Caller-owned source chain retained until the original CQE retires.
+    /// Caller-owned source chain retained across every active submission.
     buffer: C,
     /// Kernel-facing `iovec` array pointing into `buffer` segments.
     scratch: RetainedIovecScratch,
@@ -355,7 +767,7 @@ struct RetainedWritevCompletion<C> {
 }
 
 struct RetainedProjectedWritevPayload<T> {
-    /// Compact caller-owned source retained until the original CQE retires.
+    /// Compact caller-owned source retained across every active submission.
     source: T,
     /// Kernel-facing `iovec` array pointing into `source` projections.
     scratch: RetainedIovecScratch,
@@ -368,6 +780,13 @@ struct RetainedProjectedWritevPayload<T> {
 }
 
 #[inline(always)]
+/// Moves a readv buffer out of retained payload storage and drops its scratch.
+///
+/// # Safety
+///
+/// `payload` must point to a live, uniquely owned `RetainedReadvPayload<N>`.
+/// The caller must ensure the retained allocation will be released without
+/// subsequently dropping the moved `buffer` or the already-dropped `scratch`.
 unsafe fn take_readv_buffer_from_retained<const N: usize>(
     payload: *mut RetainedReadvPayload<N>,
 ) -> IoBuffVecMut<N> {
@@ -377,6 +796,13 @@ unsafe fn take_readv_buffer_from_retained<const N: usize>(
 }
 
 #[inline(always)]
+/// Moves writev completion data out of retained storage and drops its scratch.
+///
+/// # Safety
+///
+/// `payload` must point to a live, uniquely owned `RetainedWritevPayload<C>`.
+/// The caller must ensure the retained allocation will not later drop the
+/// moved `buffer` or the already-dropped `scratch`.
 unsafe fn take_writev_completion_from_retained<C>(
     payload: *mut RetainedWritevPayload<C>,
 ) -> RetainedWritevCompletion<C> {
@@ -1161,8 +1587,8 @@ impl<B: IoBuffReadOnly, S> Drop for WriteFuture<'_, B, S> {
 
 /// Writes the entire buffer, re-submitting on partial writes.
 ///
-/// The base buffer pointer is captured once at construction and reused for
-/// retries, avoiding repeated `as_ptr()` trait calls.  A single
+/// The base buffer pointer is captured during the initial retained submission
+/// and reused for retries, avoiding repeated `as_ptr()` trait calls. A single
 /// `poll_ctx_from_waker` extraction covers free + alloc + submit per poll.
 #[doc(hidden)]
 pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
@@ -1345,8 +1771,9 @@ impl<B: IoBuffReadOnly, S> Drop for WriteAllFuture<'_, B, S> {
 ///
 /// Returns `UnexpectedEof` if the peer closes before the target is reached.
 /// On error the buffer reflects the bytes received so far.  Like
-/// [`WriteAllFuture`], the base pointer is captured once and a single
-/// context extraction covers free + alloc + submit per poll.
+/// [`WriteAllFuture`], the base pointer is captured during the initial
+/// retained submission and one context extraction covers state handling and
+/// submission per poll.
 #[doc(hidden)]
 pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
     /// Completion state reused across sequential retry submissions.
@@ -1747,7 +2174,8 @@ pub struct ReadvFuture<'a, const N: usize, S> {
     state_ptr: *mut CompletionState,
     /// Caller-owned mutable segment chain returned on completion.
     buffer: Option<IoBuffVecMut<N>>,
-    /// Number of active segments materialized into retained scratch.
+    /// Number of initialized segment entries materialized into retained
+    /// scratch, including zero-length entries.
     iov_count: usize,
     /// Total writable capacity across all segments, cached so zero-capacity
     /// reads complete before submission and debug checks do not re-walk the
@@ -1993,47 +2421,23 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Drop for WritevFutureC
     }
 }
 
-/// Gather-write from a FlowIO frozen vectored buffer chain (rental pattern).
+/// Gather-write from an owned vectored buffer chain (rental pattern).
 #[doc(hidden)]
-pub struct WritevFuture<'a, const N: usize, S> {
-    /// Shared gather-write core specialized to a frozen FlowIO buffer chain.
-    inner: WritevFutureCore<'a, IoBuffVec<N>, N, S>,
+pub struct WritevFuture<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> {
+    /// Shared gather-write core specialized to the caller's buffer chain.
+    inner: WritevFutureCore<'a, C, N, S>,
 }
 
-impl<'a, const N: usize, S> WritevFuture<'a, N, S> {
-    pub(crate) fn new(fd: RawFd, buffer: IoBuffVec<N>) -> Self {
+impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevFuture<'a, C, N, S> {
+    pub(crate) fn new(fd: RawFd, buffer: C) -> Self {
         Self {
             inner: WritevFutureCore::new(fd, buffer),
         }
     }
 }
 
-impl<const N: usize, S> Future for WritevFuture<'_, N, S> {
-    type Output = (io::Result<usize>, IoBuffVec<N>);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
-    }
-}
-
-/// Gather-write from a generic read-only vectored buffer chain.
-#[doc(hidden)]
-pub struct WritevReadOnlyFuture<'a, B: IoBuffReadOnly + 'static, const N: usize, S> {
-    /// Shared gather-write core specialized to a generic read-only chain.
-    inner: WritevFutureCore<'a, IoBuffReadOnlyVec<B, N>, N, S>,
-}
-
-impl<'a, B: IoBuffReadOnly + 'static, const N: usize, S> WritevReadOnlyFuture<'a, B, N, S> {
-    pub(crate) fn new(fd: RawFd, buffer: IoBuffReadOnlyVec<B, N>) -> Self {
-        Self {
-            inner: WritevFutureCore::new(fd, buffer),
-        }
-    }
-}
-
-impl<B: IoBuffReadOnly + 'static, const N: usize, S> Future for WritevReadOnlyFuture<'_, B, N, S> {
-    type Output = (io::Result<usize>, IoBuffReadOnlyVec<B, N>);
+impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFuture<'_, C, N, S> {
+    type Output = (io::Result<usize>, C);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -2251,49 +2655,23 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Drop
     }
 }
 
-/// Gather-write the entire FlowIO frozen vectored chain, handling partial writes.
+/// Gather-write an entire owned vectored chain, handling partial writes.
 #[doc(hidden)]
-pub struct WritevAllFuture<'a, const N: usize, S> {
-    /// Shared gather-write-all core specialized to a frozen FlowIO buffer chain.
-    inner: WritevAllFutureCore<'a, IoBuffVec<N>, N, S>,
+pub struct WritevAllFuture<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> {
+    /// Shared gather-write-all core specialized to the caller's buffer chain.
+    inner: WritevAllFutureCore<'a, C, N, S>,
 }
 
-impl<'a, const N: usize, S> WritevAllFuture<'a, N, S> {
-    pub(crate) fn new(fd: RawFd, buffer: IoBuffVec<N>) -> Self {
+impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevAllFuture<'a, C, N, S> {
+    pub(crate) fn new(fd: RawFd, buffer: C) -> Self {
         Self {
             inner: WritevAllFutureCore::new(fd, buffer),
         }
     }
 }
 
-impl<const N: usize, S> Future for WritevAllFuture<'_, N, S> {
-    type Output = (io::Result<usize>, IoBuffVec<N>);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
-    }
-}
-
-/// Gather-write an entire generic read-only vectored chain.
-#[doc(hidden)]
-pub struct WritevAllReadOnlyFuture<'a, B: IoBuffReadOnly + 'static, const N: usize, S> {
-    /// Shared gather-write-all core specialized to a generic read-only chain.
-    inner: WritevAllFutureCore<'a, IoBuffReadOnlyVec<B, N>, N, S>,
-}
-
-impl<'a, B: IoBuffReadOnly + 'static, const N: usize, S> WritevAllReadOnlyFuture<'a, B, N, S> {
-    pub(crate) fn new(fd: RawFd, buffer: IoBuffReadOnlyVec<B, N>) -> Self {
-        Self {
-            inner: WritevAllFutureCore::new(fd, buffer),
-        }
-    }
-}
-
-impl<B: IoBuffReadOnly + 'static, const N: usize, S> Future
-    for WritevAllReadOnlyFuture<'_, B, N, S>
-{
-    type Output = (io::Result<usize>, IoBuffReadOnlyVec<B, N>);
+impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevAllFuture<'_, C, N, S> {
+    type Output = (io::Result<usize>, C);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -2599,7 +2977,8 @@ pub struct ReadvExactFuture<'a, const N: usize, S> {
     state_ptr: *mut CompletionState,
     /// Caller-owned mutable segment chain returned when the operation finishes.
     buffer: Option<IoBuffVecMut<N>>,
-    /// Number of active segments materialized into retained scratch.
+    /// Number of initialized segment entries materialized into retained
+    /// scratch, including zero-length entries.
     iov_count: usize,
     /// Total writable capacity across all segments, cached for pre-submit
     /// target validation and debug checks without re-walking the caller-owned
@@ -2613,7 +2992,8 @@ pub struct ReadvExactFuture<'a, const N: usize, S> {
     filled: usize,
     /// Index of the first still-active `iovec` entry after partial progress.
     skip: usize,
-    /// Number of initialized `iovec` entries in the clamped target window.
+    /// Size of the initial clamped `iovec` window; `skip` advances within this
+    /// fixed prefix after partial reads.
     window_iov_count: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,

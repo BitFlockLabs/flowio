@@ -8,15 +8,17 @@ use std::ops::{Deref, DerefMut};
 /// Owns a heap-allocated memory provider plus a pool that stores a raw pointer
 /// to that provider.
 ///
-/// The provider is kept as a raw `NonNull` instead of a moved `Box` so the pool
-/// never holds a Stacked-Borrows-invalidating reference into an object that is
-/// later moved. Drop order is pool first, then provider.
+/// The provider has a stable heap address, while the wrapper itself remains
+/// movable. Drop order is pool first, then provider.
 pub(crate) struct ProviderOwnedPool<T: InPlaceInit, P: MemoryProvider + 'static> {
+    /// Owns the provider allocation referenced by the pool's slab allocator.
     provider: ProviderOwner<P>,
+    /// Pool dropped manually before `provider` to preserve pointer validity.
     pool: ManuallyDrop<Pool<'static, T, P>>,
 }
 
 impl<T: InPlaceInit, P: MemoryProvider + 'static> ProviderOwnedPool<T, P> {
+    /// Creates a pool and its stable, internally owned memory provider.
     pub(crate) fn new(provider: P, objs_per_slab: usize) -> Result<Self, PoolConfigError> {
         let provider = ProviderOwner::new(provider);
         let pool = match unsafe { Pool::new_uninit_from_raw(provider.as_ptr(), objs_per_slab) } {
@@ -30,11 +32,13 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> ProviderOwnedPool<T, P> {
 
     #[cfg(debug_assertions)]
     #[inline(always)]
+    /// Borrows the backing provider for debug-only state inspection.
     pub(crate) fn provider_ref(&self) -> &P {
         self.provider.as_ref()
     }
 
     #[inline(always)]
+    /// Mutably borrows the backing provider while the wrapper is exclusive.
     pub(crate) fn provider_mut(&mut self) -> &mut P {
         self.provider.as_mut()
     }
@@ -56,6 +60,9 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> DerefMut for ProviderOwnedPool
 
 impl<T: InPlaceInit, P: MemoryProvider + 'static> Drop for ProviderOwnedPool<T, P> {
     fn drop(&mut self) {
+        // SAFETY: `pool` is initialized in `new`, has not been dropped, and
+        // must release all provider-backed slabs before field drop reaches
+        // `provider`.
         unsafe { ManuallyDrop::drop(&mut self.pool) };
     }
 }

@@ -10,6 +10,12 @@ use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
 
+/// Sends a raw-waker notification into the active executor scheduler.
+///
+/// # Safety
+///
+/// `task_ptr` must identify a live task owned by the active executor on this
+/// thread.
 unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
     unsafe { crate::runtime::executor::schedule_woken_task(task_ptr) };
 }
@@ -60,21 +66,25 @@ impl TaskHeader {
     }
 
     #[inline(always)]
+    #[cfg(test)]
     pub fn flags(&self) -> u64 {
         self.flags.get()
     }
 
     #[inline(always)]
+    #[cfg(test)]
     pub fn has_flag(&self, flag: u64) -> bool {
         (self.flags() & flag) != 0
     }
 
     #[inline(always)]
+    #[cfg(test)]
     pub fn set_flag(&self, flag: u64) {
         self.flags.set(self.flags() | flag);
     }
 
     #[inline(always)]
+    #[cfg(test)]
     pub fn clear_flag(&self, flag: u64) {
         self.flags.set(self.flags() & !flag);
     }
@@ -106,6 +116,9 @@ impl<const SIZE: usize> InPlaceInit for Task<SIZE> {
 
     fn init_at(slot: &mut MaybeUninit<Self>, _: Self::Args) {
         let header = TaskHeader::new();
+        // SAFETY: `slot` provides correctly aligned storage for Task<SIZE>;
+        // writing only the header leaves the byte payload intentionally
+        // uninitialized for the concrete task constructor.
         unsafe {
             let header_ptr = (slot.as_mut_ptr() as *mut u8)
                 .add(std::mem::offset_of!(Task<SIZE>, header))
@@ -124,6 +137,12 @@ static DUMMY_VTABLE: TaskVTable = TaskVTable {
 const RAW_WAKER_VTABLE: RawWakerVTable =
     RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref_waker, drop_waker);
 
+/// Clones one raw-waker reference to a live task.
+///
+/// # Safety
+///
+/// `ptr` must be the data pointer of a FlowIO task waker and therefore point
+/// to a live `TaskHeader` on the owning executor thread.
 unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
     unsafe {
         retain_task(ptr as *mut TaskHeader);
@@ -131,6 +150,12 @@ unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
     RawWaker::new(ptr, &RAW_WAKER_VTABLE)
 }
 
+/// Consumes one raw-waker reference after scheduling its task.
+///
+/// # Safety
+///
+/// `ptr` must own one reference to a live FlowIO task and be woken on the
+/// executor thread that owns that task.
 unsafe fn wake_waker(ptr: *const ()) {
     unsafe {
         schedule_woken_task(ptr as *mut TaskHeader);
@@ -138,12 +163,22 @@ unsafe fn wake_waker(ptr: *const ()) {
     }
 }
 
+/// Schedules a task without consuming the caller's raw-waker reference.
+///
+/// # Safety
+///
+/// `ptr` must refer to a live FlowIO task on its owning executor thread.
 unsafe fn wake_by_ref_waker(ptr: *const ()) {
     unsafe {
         schedule_woken_task(ptr as *mut TaskHeader);
     }
 }
 
+/// Releases one raw-waker reference without scheduling the task.
+///
+/// # Safety
+///
+/// `ptr` must own one reference to a live FlowIO task on its executor thread.
 unsafe fn drop_waker(ptr: *const ()) {
     unsafe {
         release_task(ptr as *mut TaskHeader);
@@ -152,6 +187,12 @@ unsafe fn drop_waker(ptr: *const ()) {
 
 #[doc(hidden)]
 /// Builds and stores the stable task-local waker once task storage is live.
+///
+/// # Safety
+///
+/// `ptr` must point to initialized, stable task storage owned by the active
+/// executor. This function must run exactly once before the cached waker is
+/// read or the task is released.
 pub unsafe fn init_cached_waker(ptr: *mut TaskHeader) {
     unsafe {
         (*ptr).cached_waker.write(Waker::from_raw(RawWaker::new(
@@ -163,6 +204,11 @@ pub unsafe fn init_cached_waker(ptr: *mut TaskHeader) {
 
 #[doc(hidden)]
 /// Returns the cached waker reference stored inside the task header.
+///
+/// # Safety
+///
+/// `ptr` must point to a live task whose cached waker has been initialized.
+/// The returned reference must not outlive that task allocation.
 pub unsafe fn cached_waker_ref<'a>(ptr: *mut TaskHeader) -> &'a Waker {
     unsafe { (&*ptr).cached_waker.assume_init_ref() }
 }
@@ -170,6 +216,10 @@ pub unsafe fn cached_waker_ref<'a>(ptr: *mut TaskHeader) -> &'a Waker {
 #[inline(always)]
 #[doc(hidden)]
 /// Increments the runtime task reference count.
+///
+/// # Safety
+///
+/// `ptr` must point to a live task owned by the current executor thread.
 pub unsafe fn retain_task(ptr: *mut TaskHeader) {
     let header = unsafe { &*ptr };
     header.refs.set(header.refs.get() + 1);
@@ -178,6 +228,11 @@ pub unsafe fn retain_task(ptr: *mut TaskHeader) {
 #[inline(always)]
 #[doc(hidden)]
 /// Decrements the runtime task reference count and destroys the task at zero.
+///
+/// # Safety
+///
+/// `ptr` must own one live task reference on the current executor thread. The
+/// caller must not access the task after releasing its final reference.
 pub unsafe fn release_task(ptr: *mut TaskHeader) {
     let header = unsafe { &*ptr };
     let prev = header.refs.get();

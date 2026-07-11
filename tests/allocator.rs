@@ -1,6 +1,6 @@
-use flowio::utils::memory::pool::*;
-use flowio::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
-use flowio::utils::memory::slab::{Slab, SlabAllocator};
+use flowio::test_support::utils::memory::pool::*;
+use flowio::test_support::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
+use flowio::test_support::utils::memory::slab::{Slab, SlabAllocator};
 use std::mem::MaybeUninit;
 
 // verbose memory provider

@@ -24,29 +24,36 @@ struct BasicAllocationHeader {
 /// custom memory sources.
 pub trait MemoryProvider {
     /// Raises the minimum alignment that future allocations must satisfy.
+    /// `required_align` must be a non-zero power of two.
     fn init(&mut self, required_align: usize);
 
     /// Returns the provider's current guaranteed alignment.
     fn alignment_guarantee(&self) -> usize;
 
-    /// Requests a block of raw memory aligned to `alignment_guarantee()`.
+    /// Requests `size` writable bytes aligned to `alignment_guarantee()`.
+    ///
+    /// A non-null returned pointer remains owned by the caller until passed
+    /// back exactly once to [`MemoryProvider::free_memory`] on this provider.
     fn request_memory(&mut self, size: usize) -> Option<*mut u8>;
 
     /// Returns a memory chunk previously allocated by `request_memory`.
     ///
     /// # Safety
     /// `ptr` must have been returned by a prior `request_memory` call on this
-    /// provider, and `size` must match the original allocation size.
+    /// provider, `size` must match the original allocation size, and no live
+    /// reference may use the allocation after this call.
     unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize);
 }
 
 /// Owns a heap-allocated memory provider whose stable raw address is handed
 /// to slab and pool allocators.
 pub(crate) struct ProviderOwner<P: MemoryProvider + 'static> {
+    /// Stable address of the provider allocation owned by this wrapper.
     provider: NonNull<P>,
 }
 
 impl<P: MemoryProvider + 'static> ProviderOwner<P> {
+    /// Moves `provider` into a stable heap allocation.
     pub(crate) fn new(provider: P) -> Self {
         let provider_ptr = Box::into_raw(Box::new(provider));
         Self {
@@ -58,24 +65,32 @@ impl<P: MemoryProvider + 'static> ProviderOwner<P> {
     }
 
     #[inline(always)]
+    /// Returns the stable provider pointer for dependent allocators.
     pub(crate) fn as_ptr(&self) -> *mut P {
         self.provider.as_ptr()
     }
 
     #[cfg(debug_assertions)]
     #[inline(always)]
+    /// Borrows the provider for debug-only state inspection.
     pub(crate) fn as_ref(&self) -> &P {
+        // SAFETY: `provider` remains owned and live for `self`'s lifetime.
         unsafe { self.provider.as_ref() }
     }
 
     #[inline(always)]
+    /// Mutably borrows the owned provider while this wrapper is exclusive.
     pub(crate) fn as_mut(&mut self) -> &mut P {
+        // SAFETY: `&mut self` excludes access through dependent owners for the
+        // duration of the returned borrow.
         unsafe { self.provider.as_mut() }
     }
 }
 
 impl<P: MemoryProvider + 'static> Drop for ProviderOwner<P> {
     fn drop(&mut self) {
+        // SAFETY: this is the unique pointer produced by `Box::into_raw` in
+        // `new`, and dependent allocators must be dropped first.
         unsafe { drop(Box::from_raw(self.provider.as_ptr())) };
     }
 }

@@ -1,8 +1,8 @@
 //! Transport implementations built on top of the runtime core.
 //!
 //! Each transport exposes generic buffer I/O through the [`IoBuffReadOnly`] /
-//! [`IoBuffReadWrite`] traits — any type that provides a stable pointer to a
-//! contiguous byte region (`Vec<u8>`, `Box<[u8]>`, etc.) can be used directly.
+//! [`IoBuffReadWrite`] traits. Types such as `Vec<u8>` and `Box<[u8]>` can be
+//! used directly because they implement the relevant stable-pointer trait.
 //!
 //! Stream transports also expose concrete vectored APIs built on
 //! [`IoBuffVec`](crate::runtime::buffer::iobuffvec::IoBuffVec) and
@@ -43,29 +43,33 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
-//! - For repeated outbound connections, prefer reusable connector types such
-//!   as [`tcp::TcpConnector`] and [`sctp::SctpConnector`] because they keep
-//!   stable connector state across attempts.
-//! - On stream transports, `read` / `write` and `readv` / `writev` are the
-//!   lowest-overhead I/O APIs when the caller can handle partial progress.
+//! Preferred on the per-message fast path:
+//! - On stream transports, `read` / `write` and `readv` / `writev` perform one
+//!   submission and expose partial progress to the caller.
 //! - For fixed-peer UDP, prefer [`udp::UdpSocket::connect`] plus `send` /
 //!   `recv` because that avoids per-datagram destination handling.
 //! - Use vectored APIs only when payloads are already segmented. For one
 //!   contiguous payload, the contiguous APIs are the simpler fast-path
 //!   alternative.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use the one-shot connect helpers in repeated outbound
-//!   loops. Use [`tcp::TcpConnector`] or [`sctp::SctpConnector`] instead.
-//! - Prefer not to use `_exact` / `_all` variants unless complete-buffer
+//! - Use projected writes when a compact owned carrier already contains
+//!   segmented fields; use ordinary owned chains when the segments are
+//!   independent buffer values.
+//!
+//! Avoid on the per-message fast path:
+//! - Avoid `_exact` / `_all` variants unless complete-buffer
 //!   semantics are required. Use partial-I/O APIs instead when the caller can
 //!   track progress explicitly.
-//! - Prefer not to use `send_to` / `recv_from` when the peer is stable. Use
+//! - Avoid `send_to` / `recv_from` when the peer is stable. Use
 //!   connected UDP `send` / `recv` instead.
-//! - Prefer not to resolve names in the steady-state data path. [`resolver`]
+//! - Avoid resolving names in the steady-state data path. [`resolver`]
 //!   is a setup/control-plane helper; resolve once and reuse the resulting
 //!   `SocketAddr` values.
+//!
+//! On the connection path, reuse [`tcp::TcpConnector`] or
+//! [`sctp::SctpConnector`] across repeated attempts. Reuse preserves the
+//! connector-owned slot wrapper, but each attempt still creates and configures
+//! a fresh socket; connection establishment is not the message data path.
 //!
 //! The examples below often use `_all` / `_exact` variants because they make
 //! protocol framing obvious in docs. On the hot path, prefer partial-I/O APIs
@@ -96,19 +100,27 @@
 //! The same transport methods also work with [`crate::runtime::buffer::IoBuffMut`]:
 //! ```no_run
 //! use flowio::net::unix::UnixStream;
-//! use flowio::runtime::buffer::IoBuffMut;
+//! use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 //! use flowio::runtime::executor::Executor;
 //!
+//! let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+//!     headroom: 0,
+//!     payload: 64,
+//!     tailroom: 0,
+//!     objs_per_slab: 8,
+//! }).unwrap();
+//! pool.init();
+//!
 //! let mut executor = Executor::new()?;
-//! executor.run(async {
+//! executor.run(async move {
 //!     let (mut left, mut right) = UnixStream::pair().unwrap();
 //!
-//!     let mut send = IoBuffMut::new(0, 64, 0).unwrap();
+//!     let mut send = pool.alloc().unwrap();
 //!     send.payload_append(b"hello").unwrap();
 //!     let (res, _send) = left.write_all(send).await;
 //!     res.unwrap();
 //!
-//!     let recv = IoBuffMut::new(0, 64, 0).unwrap();
+//!     let recv = pool.alloc().unwrap();
 //!     let (res, recv) = right.read_exact(recv, 5).await;
 //!     res.unwrap();
 //!     assert_eq!(recv.payload_bytes(), b"hello");
@@ -125,11 +137,12 @@ pub mod resolver;
 pub mod sctp;
 pub(crate) mod send_sqe;
 pub(crate) mod stream;
+#[doc(hidden)]
+pub use stream::WriteBufferChain;
 pub mod tcp;
 pub mod tls;
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub mod tls_test_peer;
+#[cfg(feature = "test-support")]
+pub(crate) mod tls_test_peer;
 pub mod udp;
 pub mod unix;
 
@@ -150,10 +163,11 @@ pub mod unix;
 /// This trait does not expose a borrowed-SQE API. Callers pass ownership of
 /// the carrier to the stream method and receive it back with the I/O result.
 ///
-/// This is a fast-path API when a protocol already owns a compact message
-/// carrier with segmented byte fields. Prefer the contiguous stream `write`
-/// APIs for one contiguous byte range, and prefer non-`_all` projected writes
-/// when the caller can track partial progress explicitly.
+/// This is a preferred fast-path API when a protocol already owns a compact
+/// message carrier with segmented byte fields: it copies pointer/length
+/// metadata, not message bytes. Use the contiguous stream `write` APIs for one
+/// contiguous byte range, and use non-`_all` projected writes when the caller
+/// can track partial progress explicitly.
 ///
 /// # Example
 /// ```no_run
@@ -202,9 +216,9 @@ pub trait WritevProjection: 'static {
 /// slices borrowed from the retained carrier; FlowIO stores only pointer/length
 /// metadata in retained scratch and never copies the slice bytes.
 ///
-/// This type belongs to the projected vectored-write fast path. It should be
-/// used only inside [`WritevProjection::project_writev`]; callers do not build
-/// it directly.
+/// This type belongs to the projected vectored-write fast path and copies only
+/// slice metadata. Use it only inside [`WritevProjection::project_writev`];
+/// callers do not construct it directly.
 ///
 /// # Example
 /// ```
@@ -290,9 +304,9 @@ impl<'a> WritevPieces<'a> {
 
 // ---------------------------------------------------------------------------
 // Shared option helpers for rental-pattern futures.
-// All I/O futures store buffers in `Option<B>` so they can move the buffer out
-// exactly once on completion or error. These helpers preserve that invariant
-// without carrying `expect()` branches in the hot path.
+// Rental futures store caller values in `Option<T>` so they can move each value
+// out exactly once on completion or error. These helpers preserve that
+// invariant without carrying `expect()` branches in the hot path.
 // ---------------------------------------------------------------------------
 
 /// # Safety
@@ -473,12 +487,22 @@ fn current_peer_addr(fd: RawFd) -> io::Result<SocketAddr> {
     socket_addr_from_c(&storage, len)
 }
 
+/// Pointer-bearing fields copied into a retained `libc::msghdr`.
+///
+/// The referenced address, iovec, and control storage must remain live and at
+/// stable addresses for every kernel operation that uses the resulting header.
 pub(super) struct MsgHdrInit {
+    /// Optional socket-address storage, or null when no address is supplied.
     pub(super) name: *mut libc::c_void,
+    /// Input capacity or prepared length of `name`, depending on the opcode.
     pub(super) namelen: libc::socklen_t,
+    /// First entry in the kernel-facing iovec array.
     pub(super) iov: *mut libc::iovec,
+    /// Number of initialized entries starting at `iov`.
     pub(super) iovlen: usize,
+    /// Optional ancillary-data buffer, or null when no control data is used.
     pub(super) control: *mut libc::c_void,
+    /// Writable capacity or initialized length of `control` for the operation.
     pub(super) controllen: usize,
 }
 
@@ -499,7 +523,7 @@ fn set_reuse_port(fd: RawFd) -> io::Result<()> {
     set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)
 }
 
-// Shared socket buffer option helpers used by TcpStream, UnixStream, and UdpSocket.
+// Shared socket-buffer option helpers used by TCP, Unix, and UDP sockets.
 
 fn sock_send_buffer_size(fd: RawFd) -> io::Result<usize> {
     let val: libc::c_int = get_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF)?;

@@ -12,35 +12,42 @@
 //!
 //! Every buffer has three regions: headroom (for prepending protocol headers),
 //! payload (the main data region), and tailroom (for appending trailers).
-//! The total backing allocation is `headroom + payload + tailroom` bytes.
+//! The trailing data region is `headroom + payload + tailroom` bytes. Heap-
+//! and pool-backed allocations also contain an [`IoBuffHeader`] before that
+//! region.
 //!
 //! Buffers can be created individually on the heap via [`IoBuffMut::new`], or
-//! from a pool via [`super::pool::IoBuffPool`] for zero-alloc fast-path operation.
+//! from a pool via [`super::pool::IoBuffPool`] for slot reuse without
+//! per-buffer heap allocation once sufficient slab capacity exists.
 //!
 //! All buffer types implement the [`IoBuffReadOnly`] and/or [`IoBuffReadWrite`] traits,
 //! which are the generic interface used by all transport operations.
 //!
-//! `IoBuff` and pool-backed buffers use non-atomic bookkeeping and are
-//! therefore intentionally thread-local today. Cross-thread transfer is
-//! deferred to a later design.
+//! The structured FlowIO buffer handles use a non-atomic reference count and
+//! are intentionally single-threaded; they do not implement `Send` or `Sync`.
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
+//! Preferred on the fast path:
 //! - For fixed-shape steady-state transport I/O, prefer
-//!   [`super::pool::IoBuffPool`] plus [`IoBuffMut`]. That is the intended
-//!   zero-allocation buffer fast path after warmup.
+//!   [`super::pool::IoBuffPool`] plus [`IoBuffMut`] to reuse slots after the
+//!   pool has acquired enough slab capacity.
 //! - Freeze into [`IoBuff`] when data should be reused or fanned out to
 //!   multiple send paths without copying.
+//! - Use [`IoBuff::try_mut`] when a sole-owned frozen buffer should become
+//!   mutable again without allocation or copying.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use [`IoBuffMut::new`] for fixed-shape steady-state
+//! Avoid on the fast path:
+//! - Avoid [`IoBuffMut::new`] for fixed-shape steady-state
 //!   buffers. It is the convenience API for heap-backed buffers and is a good
 //!   choice for setup code, tests, and variable-size workloads instead.
-//! - Prefer not to replace the primary send/receive buffer with [`IoBuffView`]
-//!   when the structured headroom/payload/tailroom layout still matters. Use
-//!   [`IoBuffView`] for parsing and slicing convenience; keep the original
-//!   [`IoBuff`] or [`IoBuffMut`] for transport reuse and later mutation.
+//! - Avoid [`IoBuff::make_mut`] when the buffer may be shared. Its shared path
+//!   allocates a new heap buffer and copies the active regions; keep
+//!   [`IoBuffMut`] exclusive or use [`IoBuff::try_mut`] when copying is not
+//!   acceptable.
+//! - [`IoBuffView`] does not preserve headroom/payload/tailroom boundaries.
+//!   Keep the original [`IoBuff`] or [`IoBuffMut`] when those boundaries or a
+//!   later zero-copy thaw are required.
 //!
 //! The examples below often use [`IoBuffMut::new`] because it keeps the code
 //! short. On the fixed-shape hot path, prefer pool-backed allocation from
@@ -246,8 +253,9 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     ///
     /// # Safety
     ///
-    /// The caller must guarantee that the first `len` bytes of the payload
-    /// region have been initialized.
+    /// The caller must guarantee that `len` does not exceed the writable
+    /// region submitted through [`IoBuffReadWrite::as_mut_ptr`] and that every
+    /// byte the implementation will expose as readable has been initialized.
     unsafe fn set_written_len(&mut self, len: usize);
 }
 
@@ -255,8 +263,8 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
 // IoBuffHeader — per-buffer metadata (heap- or pool-allocated)
 // ============================================================================
 
-/// Metadata header for the backing storage shared by [`IoBuff`] and
-/// [`IoBuffMut`] handles.
+/// Metadata header for backing storage referenced by [`IoBuffMut`], [`IoBuff`],
+/// and [`IoBuffView`] handles.
 ///
 /// Allocated with a flexible trailing byte array: the actual allocation is
 /// `size_of::<IoBuffHeader>() + headroom_capacity + payload_capacity +
@@ -441,9 +449,9 @@ pub struct IoBuffMut {
     /// Decreases when `headroom_prepend()` writes headers before the
     /// payload.  Increases when `advance()` consumes bytes from the front.
     pub(crate) offset: usize,
-    /// Number of bytes written to the payload region.  This is the
-    /// logical payload length, not the capacity.  Increased by
-    /// `payload_append()` and `payload_set_len()`.
+    /// Logical number of active payload bytes, not payload capacity. Appends
+    /// increase it, while `payload_set_len()` and front consumption can
+    /// replace or decrease it.
     pub(crate) payload_len: usize,
     /// Number of bytes written to the tailroom region.  Tailroom data
     /// is stored immediately after the last payload byte to keep the
@@ -668,8 +676,8 @@ impl IoBuffMut {
     }
 
     /// Extends the payload capacity by taking `amount` bytes from the
-    /// tailroom region.  Any existing tailroom data in the taken region is
-    /// logically discarded (tailroom_len is reset to 0).
+    /// tailroom region. Changing the region boundary discards all active
+    /// tailroom bytes (`tailroom_len` is reset to `0`).
     ///
     /// Returns an error if `amount` exceeds the current tailroom capacity.
     pub fn payload_extend_from_tailroom(&mut self, amount: usize) -> Result<(), IoBuffError> {
@@ -732,7 +740,8 @@ impl IoBuffMut {
     /// Returns the full active window as a read-only byte slice.
     /// This includes any headroom written via `headroom_prepend()`, the
     /// written payload, and any tailroom written via `tailroom_append()`.
-    /// This is the data that gets sent over the wire.
+    /// This is the range exposed through [`IoBuffReadOnly`] for transport
+    /// writes.
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         unsafe {
@@ -897,9 +906,8 @@ impl std::ops::DerefMut for IoBuffMut {
 ///
 /// Created by calling [`IoBuffMut::freeze`] on a mutable buffer.
 ///
-/// This is the right send-path representation when the same bytes need to be
-/// reused or fanned out. It is not the receive fast path; use [`IoBuffMut`]
-/// there.
+/// Cloning this type permits the same bytes to be reused or fanned out without
+/// copying. Receive operations require a writable type such as [`IoBuffMut`].
 ///
 /// # Example
 /// ```
@@ -915,8 +923,8 @@ impl std::ops::DerefMut for IoBuffMut {
 /// assert_eq!(clone2.bytes(), b"shared data");
 /// ```
 pub struct IoBuff {
-    /// Pointer to the shared `IoBuffHeader` + data allocation.  Multiple
-    /// `IoBuff` handles can point to the same header (reference-counted).
+    /// Pointer to the shared `IoBuffHeader` + data allocation. Multiple frozen
+    /// buffers and byte-range views can reference this header.
     header: NonNull<IoBuffHeader>,
     /// Byte index into the backing data region where the active window starts.
     /// This preserves any prepended headroom bytes exactly as they existed
@@ -1091,6 +1099,10 @@ impl IoBuff {
     /// conversion is zero-copy.  If the buffer is shared (refcount > 1),
     /// the active data is copied into a new heap-allocated buffer
     /// (copy-on-write).
+    ///
+    /// Avoid the shared path on allocation-sensitive fast paths. Keep the
+    /// buffer exclusively mutable, or use [`IoBuff::try_mut`] and handle the
+    /// returned frozen buffer when zero-copy conversion is required.
     ///
     /// # Example
     /// ```
@@ -1269,9 +1281,8 @@ impl std::ops::Deref for IoBuffOwnedView {
 /// structure. It is a raw byte subview and is therefore not zero-copy
 /// reversible back into [`IoBuffMut`].
 ///
-/// This is primarily a parsing helper. For steady-state transport I/O, keep
-/// the original [`IoBuff`] or [`IoBuffMut`] unless you specifically need a
-/// sliced read-only byte view.
+/// Each view owns one reference to the backing allocation and can itself be
+/// cloned or sliced without copying bytes.
 ///
 /// # Example
 /// ```
@@ -1309,13 +1320,13 @@ impl std::fmt::Debug for IoBuffView {
 }
 
 impl IoBuffView {
-    /// Returns the number of bytes visible through this borrowed view.
+    /// Returns the number of bytes visible through this shared view.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns `true` when this borrowed view contains no bytes.
+    /// Returns `true` when this shared view contains no bytes.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0

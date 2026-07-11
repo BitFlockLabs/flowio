@@ -34,6 +34,8 @@ fn is_raw_os_error(err: &io::Error, code: libc::c_int) -> bool {
 
 #[inline(always)]
 fn close_result_fd(fd: RawFd) {
+    // SAFETY: the caller transfers one owned, non-negative descriptor from a
+    // successful orphaned accept CQE; ignoring close errors is drop semantics.
     unsafe {
         libc::close(fd);
     }
@@ -144,6 +146,13 @@ fn unlink_pending_cancel(
 }
 
 #[inline(always)]
+/// Releases every resource owned by one live completion-state slot.
+///
+/// # Safety
+///
+/// `ptr` must be checked out from `op_pool`; all pool/list/accounting pointers
+/// must describe this reactor, and the original target CQE must have retired
+/// before an attached payload is released.
 unsafe fn free_op_fields(
     pending_cancel_head: &mut *mut CompletionState,
     pending_cancel_tail: &mut *mut CompletionState,
@@ -220,7 +229,9 @@ pub(crate) struct Reactor {
     pending: bool,
     /// Orphaned operations whose `ASYNC_CANCEL` SQE could not be submitted.
     pending_cancel_head: *mut CompletionState,
+    /// Tail of the FIFO cancel-retry chain, or null when the chain is empty.
     pending_cancel_tail: *mut CompletionState,
+    /// Number of completion states linked into the cancel-retry chain.
     pending_cancel_len: usize,
     /// Pool of reusable completion-state records for in-flight operations.
     op_pool: ManuallyDrop<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>,
@@ -228,8 +239,8 @@ pub(crate) struct Reactor {
     max_live_ops: usize,
     /// Number of completion-state records currently checked out.
     live_ops: usize,
-    /// Pool of pointer-stable retained payload blocks referenced by in-flight
-    /// operations after their owning futures are dropped.
+    /// Pool of pointer-stable payload blocks referenced by in-flight
+    /// operations, including operations whose owning futures were dropped.
     retained_pool: RetainedPayloadPool,
 }
 
@@ -619,6 +630,9 @@ impl Reactor {
     /// still draining. Once the budget is exhausted, no further CQEs are popped;
     /// a cancel CQE queued behind the boundary is left for the next pass rather
     /// than risking loss of a target CQE.
+    ///
+    /// `runtime_state` and `ready_queue` are executor-owned pointers for the
+    /// active run and must remain valid for the whole call.
     pub fn poll_io(
         &mut self,
         max_completions: usize,

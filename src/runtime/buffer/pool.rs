@@ -1,10 +1,11 @@
 //! Pool allocator for [`IoBuffMut`] buffers.
 //!
-//! [`IoBuffPool`] pre-allocates slab pages of identically-shaped buffer slots
-//! using the library's slab allocator and memory provider.  Allocation is O(1)
-//! (intrusive free-list pop).  When a pool-allocated buffer's last reference
-//! drops, the slot is returned to the pool's free list — zero heap
-//! alloc/dealloc on the fast path after warmup.
+//! [`IoBuffPool`] acquires slab pages of identically-shaped buffer slots lazily
+//! through the library's slab allocator and memory provider. Reused slots are
+//! obtained with an O(1) intrusive free-list pop. When a pool-allocated
+//! buffer's last reference drops, its slot returns to that free list. Once
+//! sufficient slab capacity exists, reuse performs no heap allocation or
+//! deallocation per buffer.
 //!
 //! Each pool produces buffers with a fixed headroom/payload/tailroom layout
 //! configured at creation time.
@@ -13,15 +14,14 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choice:
-//! - [`IoBuffPool`] is the intended steady-state buffer fast path for fixed
-//!   layouts because it reuses stable slots and avoids heap alloc/dealloc
-//!   after warmup.
+//! Preferred on the fast path:
+//! - [`IoBuffPool`] supports steady-state fixed-layout reuse without
+//!   per-buffer heap allocation after sufficient slab capacity is acquired.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use [`super::IoBuffMut::new`] when the same buffer
+//! Avoid on the fast path:
+//! - Avoid [`super::IoBuffMut::new`] when the same buffer
 //!   geometry repeats over time. Use [`IoBuffPool`] instead.
-//! - Prefer not to force pool-backed allocation when payload sizes or region
+//! - Do not force pool-backed allocation when payload sizes or region
 //!   layouts vary widely. In that case the heap-backed
 //!   [`super::IoBuffMut::new`] path is usually the better fit.
 
@@ -101,17 +101,16 @@ impl std::fmt::Display for IoBuffPoolConfigError {
 
 impl std::error::Error for IoBuffPoolConfigError {}
 
-/// Pool of identically-shaped [`IoBuffMut`] buffers for zero-alloc fast-path
-/// operation.
+/// Pool of identically-shaped [`IoBuffMut`] buffers backed by reusable slab
+/// slots.
 ///
 /// Each buffer allocated from the pool has the same total capacity
 /// (`headroom + payload + tailroom`) and starts with the offset positioned
 /// after the headroom region.
 ///
-/// This is the best buffer API to use in the crate's steady-state fast path
-/// when buffer geometry is fixed and reusable. For variable-shape buffers,
-/// prefer [`super::IoBuffMut::new`] instead of forcing everything through one
-/// fixed pool layout.
+/// Fixed, recurring buffer geometries can reuse acquired slots without
+/// per-buffer allocator traffic. [`super::IoBuffMut::new`] directly represents
+/// geometries that do not fit a configured pool.
 ///
 /// # Example
 /// ```no_run
@@ -126,6 +125,14 @@ impl std::error::Error for IoBuffPoolConfigError {}
 /// .unwrap();
 /// pool.init();
 ///
+/// // Setup may acquire the expected working set up front. Dropping these
+/// // handles returns their slots to the pool's free list.
+/// let mut warm = Vec::with_capacity(64);
+/// for _ in 0..64 {
+///     warm.push(pool.alloc().unwrap());
+/// }
+/// drop(warm);
+///
 /// let mut buf = pool.alloc().unwrap();
 /// buf.payload_append(b"fast path data").unwrap();
 /// buf.headroom_prepend(b"HDR:").unwrap();
@@ -133,20 +140,20 @@ impl std::error::Error for IoBuffPoolConfigError {}
 /// // buf drops → slot returned to pool's free list (no heap dealloc)
 /// ```
 pub struct IoBuffPool {
-    /// Stable heap-allocated pool state intentionally leaked from its `Box`
-    /// and later reclaimed by `IoBuffPoolInner::destroy`.
+    /// Stable heap-allocated pool state converted to a raw pointer and later
+    /// reclaimed by `IoBuffPoolInner::destroy`.
     inner: NonNull<IoBuffPoolInner>,
 }
 
 /// Stable inner pool state referenced by pool-allocated buffer headers.
 pub(crate) struct IoBuffPoolInner {
     /// Manually-dropped slab allocator that carves contiguous memory pages
-    /// into fixed-size buffer slots and is destroyed with the leaked inner.
+    /// into fixed-size buffer slots and is destroyed with the raw-owned inner.
     /// Each slot holds one `IoBuffHeader` + data region.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
-    /// Heap-allocated memory provider backing the slab allocator. Stored as a
-    /// raw pointer so constructing the self-owning pool does not move a `Box`
-    /// after `slab_factory` captures the provider address.
+    /// Owner of the stable heap allocation backing the slab allocator's raw
+    /// provider pointer. This field drops after `slab_factory` is manually
+    /// dropped.
     _provider: ProviderOwner<BasicMemoryProvider>,
     /// Stable raw pointer to this inner allocation, stored in pool-backed
     /// buffer headers for final-slot release.
@@ -254,7 +261,6 @@ impl IoBuffPoolInner {
             let slab_pages = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_pages) };
             let mut ptr = unsafe { (*slab_pages).try_alloc_current(slot_size) };
 
-            // Request new slab page if needed.
             if ptr.is_none() {
                 #[cfg(debug_assertions)]
                 if crate::runtime::test_hooks::take_iobuff_pool_slab_alloc_failure() {
@@ -364,8 +370,10 @@ impl IoBuffPool {
         })
     }
 
-    /// Initializes the pool's internal data structures.  Must be called once
-    /// after the pool reaches its final memory location.
+    /// Initializes the pool's allocator before the first allocation.
+    ///
+    /// The outer `IoBuffPool` handle may move before or after this call because
+    /// its referenced inner state has a stable heap address.
     ///
     /// This is also setup/control-plane work rather than part of steady-state
     /// allocation.
@@ -376,6 +384,9 @@ impl IoBuffPool {
     /// Allocates a buffer from the pool.  O(1) when the free list is
     /// non-empty (pop from intrusive list).  If the free list is empty,
     /// bump-allocates from the current slab or requests a new slab page.
+    ///
+    /// On an allocation-sensitive fast path, acquire and return the expected
+    /// working-set slots during setup so this method can reuse the free list.
     ///
     /// Returns `IoBuffError::PoolNotInitialized` if [`init()`](Self::init)
     /// has not been called yet.

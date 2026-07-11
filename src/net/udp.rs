@@ -7,7 +7,7 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
+//! Preferred on the per-datagram fast path:
 //! - If the peer is stable, call [`UdpSocket::connect`] once and then use
 //!   [`UdpSocket::send`] / [`UdpSocket::recv`]. That is the fixed-peer UDP
 //!   fast path in this crate. Connected [`UdpSocket::recv`] uses the kernel
@@ -18,9 +18,11 @@
 //!   [`crate::runtime::buffer::pool::IoBuffPool`] plus
 //!   [`crate::runtime::buffer::IoBuffMut`].
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to use [`UdpSocket::send_to`] / [`UdpSocket::recv_from`] when
+//! Avoid on the per-datagram fast path:
+//! - Avoid [`UdpSocket::send_to`] / [`UdpSocket::recv_from`] when
 //!   the peer is stable. Use connected UDP `send` / `recv` instead.
+//! - Avoid [`UdpSocket::recv`] when a too-large datagram must be detected;
+//!   use connected [`UdpSocket::recv_msg`] and handle `InvalidData` instead.
 //!
 //! [`IoBuffReadOnly`]: crate::runtime::buffer::IoBuffReadOnly
 //! [`IoBuffReadWrite`]: crate::runtime::buffer::IoBuffReadWrite
@@ -50,22 +52,30 @@
 //! The same single-datagram API works with [`crate::runtime::buffer::IoBuffMut`]:
 //! ```no_run
 //! use flowio::net::udp::UdpSocket;
-//! use flowio::runtime::buffer::IoBuffMut;
+//! use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 //! use flowio::runtime::executor::Executor;
 //! use std::net::{Ipv4Addr, SocketAddr};
 //!
+//! let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+//!     headroom: 0,
+//!     payload: 64,
+//!     tailroom: 0,
+//!     objs_per_slab: 8,
+//! }).unwrap();
+//! pool.init();
+//!
 //! let mut executor = Executor::new()?;
-//! executor.run(async {
+//! executor.run(async move {
 //!     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
 //!     let peer = socket.local_addr();
 //!     socket.connect(peer).unwrap();
 //!
-//!     let mut send = IoBuffMut::new(0, 64, 0).unwrap();
+//!     let mut send = pool.alloc().unwrap();
 //!     send.payload_append(b"ping").unwrap();
 //!     let (res, _send) = socket.send(send).await;
 //!     res.unwrap();
 //!
-//!     let recv = IoBuffMut::new(0, 64, 0).unwrap();
+//!     let recv = pool.alloc().unwrap();
 //!     let (res, recv) = socket.recv(recv, 4).await;
 //!     let len = res.unwrap();
 //!     assert_eq!(len, 4);
@@ -98,7 +108,7 @@ use std::task::{Context, Poll};
 /// Datagram socket with generic buffer support.
 ///
 /// On the fast path, keep the socket open and connected to a default peer if
-/// that peer is stable. Prefer not to rebuild sockets or use `send_to` /
+/// that peer is stable. Avoid rebuilding sockets or using `send_to` /
 /// `recv_from` in that case; connected `send` / `recv` is the intended
 /// fixed-peer fast path. Use `recv_msg` on connected sockets when the caller
 /// must reject truncated datagrams.
@@ -187,8 +197,8 @@ impl UdpSocket {
 
     /// Connects the socket to a default peer for `send` and `recv`.
     ///
-    /// For fixed-peer UDP traffic, this is the preferred fast-path setup
-    /// because it enables the lower-overhead connected send/recv APIs.
+    /// For fixed-peer UDP traffic, this enables connected send/recv operations
+    /// without a per-datagram destination address.
     pub fn connect(&mut self, addr: SocketAddr) -> io::Result<()> {
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
         let rc = unsafe {
@@ -263,7 +273,7 @@ impl UdpSocket {
 
     /// Starts one connected receive into the provided buffer.
     ///
-    /// This is the preferred receive API on the fixed-peer UDP fast path.
+    /// This omits per-datagram peer-address handling on a connected socket.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let mut input_error = None;
         let len = match checked_read_len(len, buffer.writable_len()) {
@@ -288,8 +298,9 @@ impl UdpSocket {
     /// This uses the connected socket peer like [`UdpSocket::recv`], but asks
     /// the kernel for message flags and rejects truncated datagrams with
     /// [`io::ErrorKind::InvalidData`]. Use it when a fixed-peer caller needs
-    /// truncation detection; keep [`UdpSocket::recv`] for the lower-overhead
-    /// fast path when buffer sizing is guaranteed by the protocol.
+    /// truncation detection; use [`UdpSocket::recv`] when protocol sizing
+    /// guarantees the buffer is large enough and the extra `msghdr`/`iovec`
+    /// metadata is unnecessary.
     pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvMsgFuture<'_, B> {
         let mut input_error = None;
         let len = match checked_read_len(len, buffer.writable_len()) {
@@ -311,7 +322,7 @@ impl UdpSocket {
 
     /// Starts one connected send from the provided buffer.
     ///
-    /// This is the preferred send API on the fixed-peer UDP fast path.
+    /// This omits per-datagram destination handling on a connected socket.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B> {
         let mut input_error = None;
         let len = match checked_send_len(buffer.len()) {
@@ -394,6 +405,10 @@ struct RetainedRecvPayload<B: IoBuffReadWrite> {
     buffer: B,
 }
 
+// The retained recvmsg/sendmsg payloads become self-referential after their
+// msghdr points at embedded iovec fields and, where needed, embedded sockaddr
+// storage. Initialize those pointers only after submit_retained_sqe has moved
+// the payload to its stable retained address.
 struct RetainedRecvMsgPayload<B: IoBuffReadWrite> {
     /// Caller-owned destination buffer retained while connected recvmsg is live.
     buffer: B,
@@ -408,11 +423,6 @@ struct RetainedSendPayload<B: IoBuffReadOnly> {
     buffer: B,
 }
 
-// These retained msg payloads become self-referential after their msghdr is
-// initialized to point at embedded iovec fields and, for address-bearing
-// operations, embedded sockaddr storage. Construct them only inside stable
-// retained storage and initialize pointers in the submit_retained_sqe closure,
-// after the payload has reached its final address.
 struct RetainedRecvFromPayload<B: IoBuffReadWrite> {
     /// Caller-owned destination buffer retained while recvmsg is live.
     buffer: B,

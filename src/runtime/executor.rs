@@ -6,18 +6,24 @@
 //!
 //! # Fast-Path Guidance
 //!
-//! Best fast-path choices:
+//! Preferred on the fast path:
 //! - Use a single executor instance to drive many tasks and I/O completions
 //!   over time.
 //! - Use [`Executor::spawn`] from inside [`Executor::run`] to add concurrent
 //!   work without rebuilding runtime state.
 //! - Use [`Executor::try_spawn`] when the caller must keep
 //!   ownership of the submitted future if the scheduler cannot accept it, such
-//!   as RPC generated-method dispatch.
+//!   as work carrying a response or cleanup obligation.
+//! - Account for task storage explicitly: each task must fit a fixed slot, but
+//!   the task pool acquires 1024-slot slabs on demand and currently has no
+//!   user-configurable total slot cap.
 //!
-//! Prefer not to use on the fast path:
-//! - Prefer not to construct a fresh [`Executor`] around each operation or
-//!   request. That is setup/teardown work, not steady-state execution.
+//! Avoid on the fast path:
+//! - Do not construct a fresh [`Executor`] or enter a new [`Executor::run`]
+//!   boundary around each operation. Spawn work inside the existing run.
+//! - Do not use [`Executor::spawn`] when admission failure must preserve the
+//!   submitted future: its `io::Error` conversion drops that future. Use
+//!   [`Executor::try_spawn`] and handle [`TrySpawnError`] instead.
 //!
 //! # Example
 //! ```no_run
@@ -61,77 +67,127 @@ const TASK_DATA_ALIGN: usize = align_of::<TaskHeader>();
 /// Number of task slots allocated per task-pool slab page.
 const TASKS_PER_SLAB: usize = 1024;
 
-/// Lightweight counters for benchmarking and scheduler inspection.
-///
-/// This is a debug-build observability snapshot, not a fast-path type. Read it
-/// out of band, for example after a run, rather than on a per-operation path.
-///
-/// # Example
-/// ```
-/// use flowio::runtime::executor::RuntimeStats;
-///
-/// let stats = RuntimeStats::default();
-/// assert_eq!(stats.task_polls, 0);
-/// ```
-#[cfg(debug_assertions)]
-#[derive(Clone, Copy, Default)]
-pub struct RuntimeStats {
-    /// Number of task slab pages requested from the memory provider.
-    pub task_slab_allocs: usize,
-    /// Number of task slab pages returned to the memory provider. Runtime
-    /// snapshots normally stay at zero; task slabs are freed during executor
-    /// teardown.
-    pub task_slab_frees: usize,
-    /// Number of task slots allocated from the task pool.
-    pub task_allocs: usize,
-    /// Number of task slots freed back to the task pool.
-    pub task_frees: usize,
-    /// Total number of times tasks were polled by the executor.
-    pub task_polls: usize,
-    /// Number of task ready-queue enqueues from wake reschedules. Initial
-    /// spawn enqueues are not counted.
-    pub task_schedules: usize,
-    /// Number of SQEs pushed to the io_uring submission queue.
-    pub sqe_submits: usize,
-    /// Number of CQEs drained from the io_uring completion queue.
-    pub cqe_completions: usize,
-    /// Number of times a waiting task was woken by a retired CQE or an
-    /// expired timer.
-    pub waiter_wakes: usize,
-    /// Number of `clock_gettime` calls for timer tick computation.
-    pub timer_now_tick_calls: usize,
-    /// Number of timer entries that expired and fired.
-    pub timer_expired: usize,
-    /// Retained operation payload allocations served by the private pool.
-    pub retained_pooled_allocs: usize,
-    /// Retained operation payload allocations served from a returned block.
-    pub retained_pooled_reuses: usize,
-    /// Retained operation payload blocks returned to the private pool.
-    pub retained_pooled_frees: usize,
-    /// Retained operation payload slab pages requested by the private pool.
-    pub retained_slab_allocs: usize,
-    /// Retained operation payloads that used the documented heap fallback.
-    pub retained_heap_fallbacks: usize,
-    /// Retained operation payload heap fallback blocks released.
-    pub retained_heap_frees: usize,
-    /// Retained vectored I/O scratch requests served by inline storage.
-    pub writev_scratch_inline_allocs: usize,
-    /// Retained vectored I/O scratch requests served by pooled sidecar storage.
-    pub writev_scratch_pooled_allocs: usize,
-    /// Retained vectored I/O scratch requests served from a returned block.
-    pub writev_scratch_pooled_reuses: usize,
-    /// Retained vectored I/O scratch sidecar blocks returned to the pool.
-    pub writev_scratch_pooled_frees: usize,
-    /// Retained vectored I/O scratch slab pages requested by the sidecar pool.
-    pub writev_scratch_slab_allocs: usize,
-    /// Vectored I/O requests rejected for exceeding the iovec limit.
-    pub writev_scratch_oversize_rejections: usize,
-    /// Vectored I/O scratch sidecar allocation failures.
-    pub writev_scratch_alloc_failures: usize,
-    /// Partial vectored-write completions that advanced retained iovec
-    /// metadata before resubmitting the remaining write window.
-    pub writev_partial_continuations: usize,
+#[allow(unused_macros)]
+macro_rules! define_runtime_stats {
+    ($vis:vis) => {
+        /// Development-only counters for scheduler and allocation regression
+        /// tests and benchmark probes.
+        ///
+        /// The type is exposed outside the crate only by `test-support`, and
+        /// its counters exist only when debug assertions are enabled. It is not
+        /// a supported production observability API.
+        ///
+        /// # Example
+        /// ```
+        /// # #[cfg(feature = "test-support")]
+        /// # {
+        /// use flowio::runtime::executor::RuntimeStats;
+        ///
+        /// let stats = RuntimeStats::default();
+        /// assert_eq!(stats.task_polls, 0);
+        /// # }
+        /// ```
+        #[derive(Clone, Copy, Default)]
+        $vis struct RuntimeStats {
+            /// Number of task slab pages requested from the memory provider.
+            #[cfg(debug_assertions)]
+            pub task_slab_allocs: usize,
+            /// Number of task slab pages returned to the memory provider.
+            /// Runtime snapshots normally stay at zero; task slabs are freed
+            /// during executor teardown.
+            #[cfg(debug_assertions)]
+            pub task_slab_frees: usize,
+            /// Number of task slots allocated from the task pool.
+            #[cfg(debug_assertions)]
+            pub task_allocs: usize,
+            /// Number of task slots freed back to the task pool.
+            #[cfg(debug_assertions)]
+            pub task_frees: usize,
+            /// Total number of times tasks were polled by the executor.
+            #[cfg(debug_assertions)]
+            pub task_polls: usize,
+            /// Number of task ready-queue enqueues from wake reschedules.
+            /// Initial spawn enqueues are not counted.
+            #[cfg(debug_assertions)]
+            pub task_schedules: usize,
+            /// Number of SQEs pushed to the io_uring submission queue.
+            #[cfg(debug_assertions)]
+            pub sqe_submits: usize,
+            /// Number of CQEs drained from the io_uring completion queue.
+            #[cfg(debug_assertions)]
+            pub cqe_completions: usize,
+            /// Number of times a waiting task was woken by a retired CQE or an
+            /// expired timer.
+            #[cfg(debug_assertions)]
+            pub waiter_wakes: usize,
+            /// Number of `clock_gettime` calls for timer tick computation.
+            #[cfg(debug_assertions)]
+            pub timer_now_tick_calls: usize,
+            /// Number of timer entries that expired and fired.
+            #[cfg(debug_assertions)]
+            pub timer_expired: usize,
+            /// Retained operation payload allocations served by the private
+            /// pool.
+            #[cfg(debug_assertions)]
+            pub retained_pooled_allocs: usize,
+            /// Retained operation payload allocations served from a returned
+            /// block.
+            #[cfg(debug_assertions)]
+            pub retained_pooled_reuses: usize,
+            /// Retained operation payload blocks returned to size-class free
+            /// lists.
+            #[cfg(debug_assertions)]
+            pub retained_pooled_frees: usize,
+            /// Retained operation payload slab pages requested by the private
+            /// pool.
+            #[cfg(debug_assertions)]
+            pub retained_slab_allocs: usize,
+            /// Retained operation payloads that used the documented heap
+            /// fallback.
+            #[cfg(debug_assertions)]
+            pub retained_heap_fallbacks: usize,
+            /// Retained operation payload heap fallback blocks released.
+            #[cfg(debug_assertions)]
+            pub retained_heap_frees: usize,
+            /// Retained vectored I/O scratch requests served by inline
+            /// storage.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_inline_allocs: usize,
+            /// Retained vectored I/O scratch requests served by pooled sidecar
+            /// storage.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_pooled_allocs: usize,
+            /// Retained vectored I/O scratch requests served from a returned
+            /// block.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_pooled_reuses: usize,
+            /// Retained vectored I/O scratch sidecar blocks returned to
+            /// size-class free lists.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_pooled_frees: usize,
+            /// Retained vectored I/O scratch slab pages requested by the
+            /// sidecar pool.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_slab_allocs: usize,
+            /// Vectored I/O requests rejected for exceeding the iovec limit.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_oversize_rejections: usize,
+            /// Vectored I/O scratch sidecar allocation failures.
+            #[cfg(debug_assertions)]
+            pub writev_scratch_alloc_failures: usize,
+            /// Partial vectored-write completions that advanced retained iovec
+            /// metadata before resubmitting the remaining write window.
+            #[cfg(debug_assertions)]
+            pub writev_partial_continuations: usize,
+        }
+    };
 }
+
+#[cfg(any(test, feature = "test-support"))]
+define_runtime_stats!(pub);
+
+#[cfg(all(debug_assertions, not(any(test, feature = "test-support"))))]
+define_runtime_stats!(pub(crate));
 
 struct ExecutorTaskMemProvider {
     /// Minimum alignment guaranteed for task slab allocations.
@@ -210,6 +266,8 @@ impl MemoryProvider for ExecutorTaskMemProvider {
         }
 
         let layout = Layout::from_size_align(size, self.alignment).ok()?;
+        // SAFETY: `layout` is validated above and any non-null result is
+        // returned with this provider's matching deallocation contract.
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             None
@@ -221,6 +279,9 @@ impl MemoryProvider for ExecutorTaskMemProvider {
 
     unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize) {
         if let Ok(layout) = Layout::from_size_align(size, self.alignment) {
+            // SAFETY: MemoryProvider callers return the exact pointer and size
+            // produced by `request_memory`; `self.alignment` is the allocation
+            // alignment used for every task slab.
             unsafe {
                 std::alloc::dealloc(ptr, layout);
             }
@@ -253,7 +314,8 @@ pub struct ExecutorConfig {
     /// io_uring reactor configuration used by the executor.
     pub reactor: ReactorConfig,
     /// Per-phase cap used to keep ready-task polling, CQE draining, and timer
-    /// processing fair within one loop pass.
+    /// processing fair within one loop pass. `0` selects
+    /// [`DEFAULT_PROCESS_QUOTA`].
     pub process_quota: usize,
     /// Optional zero-based CPU id to pin the loop thread to on Linux.
     ///
@@ -301,8 +363,7 @@ impl RuntimeState {
 }
 
 #[derive(Clone, Copy)]
-#[doc(hidden)]
-pub struct ScheduleCtx {
+pub(crate) struct ScheduleCtx {
     /// Ready queue the woken task should be pushed onto.
     pub(crate) ready_queue: *mut DList<TaskHeader>,
     /// Shared runtime state updated during wake/schedule transitions.
@@ -356,10 +417,8 @@ impl Drop for ExecutorCtxGuard {
     }
 }
 
-/// Thin handle to the executor's thread-local context, extracted from the
-/// waker without any TLS reads.  Stores a single pointer (8 bytes) instead
-/// of copying individual fields.
-#[doc(hidden)]
+/// Thin handle to the active executor context, extracted from a FlowIO task
+/// waker without a TLS read.
 pub(crate) struct PollCtx {
     /// Pointer to the executor thread context active for the current poll.
     ctx: *const ThreadCtx,
@@ -388,11 +447,12 @@ impl PollCtx {
 ///
 /// # Safety
 ///
-/// Must only be called inside a `poll` invoked by our executor.  Relies on
-/// `Waker` being laid out as `(vtable_ptr, data_ptr)` — verified at compile
-/// time by the static assert below.
+/// `cx.waker()` must be the cached FlowIO task waker currently being polled by
+/// this executor. The implementation relies on the current two-pointer
+/// `Waker` representation with the task data pointer in its second word; the
+/// compile-time assertion below verifies size only, so a standard-library
+/// representation change requires re-auditing this extraction.
 #[inline(always)]
-#[doc(hidden)]
 pub(crate) unsafe fn poll_ctx_from_waker(cx: &std::task::Context) -> PollCtx {
     let waker_ptr = cx.waker() as *const std::task::Waker as *const *const ();
     let task_ptr = unsafe { *waker_ptr.add(1) } as *mut TaskHeader;
@@ -403,7 +463,12 @@ pub(crate) unsafe fn poll_ctx_from_waker(cx: &std::task::Context) -> PollCtx {
 }
 
 #[inline(always)]
-#[doc(hidden)]
+/// Replaces an operation's waiter with the task represented by `cx`.
+///
+/// # Safety
+///
+/// `cx` must carry the active FlowIO task waker, and `state_ptr` must point to
+/// a live completion state exclusively owned by the currently polled future.
 pub(crate) unsafe fn refresh_op_waiter_from_waker(
     cx: &std::task::Context<'_>,
     state_ptr: *mut CompletionState,
@@ -420,8 +485,9 @@ pub(crate) unsafe fn refresh_op_waiter_from_waker(
     unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 }
 
-// Compile-time check: `Waker` must stay as two pointers (vtable + data) for
-// `poll_ctx_from_waker` to remain valid.
+// Size guard for the representation assumption in `poll_ctx_from_waker`.
+// This cannot verify pointer order; that remains part of the audited unsafe
+// contract above.
 const _: [(); std::mem::size_of::<std::task::Waker>()] = [(); 2 * std::mem::size_of::<*const ()>()];
 
 // ---------------------------------------------------------------------------
@@ -618,13 +684,14 @@ pub struct Executor {
     pub(crate) reactor: Reactor,
     /// Maximum number of items processed per phase (ready tasks, CQEs,
     /// timer expiries) in each executor loop iteration.
-    pub process_quota: usize,
-    /// CPU core to pin the executor thread to via `sched_setaffinity`.
+    process_quota: usize,
+    /// Logical CPU id to pin the executor thread to via `sched_setaffinity`.
     /// `None` means no pinning. On non-Linux targets, `Some(_)` is rejected
     /// as unsupported.
-    pub cpu_affinity: Option<usize>,
+    cpu_affinity: Option<usize>,
     #[cfg(debug_assertions)]
-    /// Scheduler counters captured after the most recent completed run.
+    /// Debug counters captured when the most recent run drained or reported a
+    /// stalled `WouldBlock` state.
     last_stats: RuntimeStats,
     /// Pool storing task allocations with stable addresses.
     task_pool: ManuallyDrop<ProviderOwnedPool<Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>>,
@@ -637,6 +704,20 @@ pub struct Executor {
 }
 
 impl Executor {
+    /// Returns the configured process quota for repository tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_process_quota(&self) -> usize {
+        self.process_quota
+    }
+
+    /// Returns the configured CPU affinity for repository tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_cpu_affinity(&self) -> Option<usize> {
+        self.cpu_affinity
+    }
+
     /// Constructs an executor with default configuration.
     ///
     /// This is a setup/control-plane API. Typical applications construct one
@@ -725,6 +806,16 @@ impl Executor {
     /// concurrency, this is the fast-path way to add work without rebuilding
     /// the executor.
     ///
+    /// On failure, this converts [`TrySpawnError`] to [`io::Error`] and drops
+    /// the submitted future. Use [`Executor::try_spawn`] when the caller must
+    /// recover the future to retry, reject, or release owned state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when no executor is active or the task does not
+    /// fit a fixed task slot. Returns `OutOfMemory` when the task pool's memory
+    /// provider cannot allocate another slot.
+    ///
     /// # Example
     /// ```no_run
     /// use flowio::runtime::executor::Executor;
@@ -748,15 +839,31 @@ impl Executor {
     /// failure path.
     ///
     /// This is for callers that cannot lose ownership of the task body on
-    /// scheduler pressure. For example, generated RPC method dispatch may own
-    /// an active answer inside the future; if the executor cannot accept the
-    /// work, the caller needs the future back so it can retry, reject, or clean
-    /// up explicitly.
+    /// scheduler pressure. A future may own a response, lease, or cleanup
+    /// obligation that the caller must recover so it can retry, reject, or
+    /// release explicitly.
     ///
     /// On success, ownership transfers to the executor exactly as with
     /// [`Executor::spawn`], and the returned [`JoinHandle`] yields the future's
     /// output. On failure, the future has not been polled, pinned, stored in a
     /// task slot, or dropped by the executor path.
+    ///
+    /// This is the preferred admission API on overload-sensitive fast paths
+    /// because pressure is explicit and ownership is preserved.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use flowio::runtime::executor::Executor;
+    ///
+    /// let mut executor = Executor::new()?;
+    /// executor.run(async {
+    ///     match Executor::try_spawn(async { 42 }) {
+    ///         Ok(handle) => assert_eq!(handle.await, 42),
+    ///         Err(error) => drop(error.into_future()),
+    ///     }
+    /// })?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn try_spawn<F>(future: F) -> Result<JoinHandle<F::Output>, TrySpawnError<F>>
     where
         F: Future + 'static,
@@ -791,7 +898,6 @@ impl Executor {
                 let data_ptr = (*slot_ptr).data.as_mut_ptr() as *mut JoinTask<F>;
                 std::ptr::write(data_ptr, join_task);
 
-                // Compute pointers to the result and waker slots for the JoinHandle.
                 let result_ptr = std::ptr::addr_of_mut!((*data_ptr).result);
                 let waker_ptr = std::ptr::addr_of_mut!((*data_ptr).join_waker);
 
@@ -1041,10 +1147,21 @@ impl Executor {
         self.last_stats = runtime_state.stats;
     }
 
-    /// Returns scheduler counters captured for the most recently completed run.
-    #[cfg(debug_assertions)]
+    /// Returns debug counters from the latest run that drained or reached the
+    /// stalled-work `WouldBlock` check.
+    ///
+    /// In release builds this dev-only accessor returns an empty snapshot
+    /// because the counters are not compiled in.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn last_stats(&self) -> RuntimeStats {
-        self.last_stats
+        #[cfg(debug_assertions)]
+        {
+            self.last_stats
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            RuntimeStats::default()
+        }
     }
 }
 
@@ -1062,12 +1179,18 @@ fn apply_cpu_affinity(cpu_affinity: Option<usize>) -> io::Result<()> {
         ));
     }
 
+    // SAFETY: all-zero bytes are a valid empty cpu_set_t value for the libc
+    // CPU-set helpers used below.
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    // SAFETY: `cpu` was bounded to the bit capacity of `set`, which remains
+    // exclusively borrowed for both libc operations.
     unsafe {
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
     }
 
+    // SAFETY: `set` is initialized and the supplied byte count is its exact
+    // in-memory size; pid 0 selects the calling thread.
     let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -1114,6 +1237,11 @@ impl Drop for Executor {
 /// Cancel an in-flight operation from a future's `Drop` impl.
 /// Marks the `CompletionState` as orphaned and submits `ASYNC_CANCEL`.
 /// Uses one TLS read and only runs on the cancellation path.
+///
+/// # Safety
+///
+/// `ptr` must point to a live, submitted completion state owned by the reactor
+/// in the currently active executor context.
 unsafe fn cancel_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1135,6 +1263,11 @@ unsafe fn cancel_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
 /// process teardown. Callers that own external resources, such as accepted
 /// fds in a cached accept state, must release those resources themselves before
 /// delegating here.
+///
+/// # Safety
+///
+/// `ptr` must point to a completed state allocated by the active reactor, and
+/// its result must already have been consumed or otherwise made safe to drop.
 unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1151,8 +1284,13 @@ unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
 /// Reclamation requires an active executor TLS context; without one this only
 /// clears the caller's pointer after the attempted free/cancel path.
 /// The caller's pointer is always cleared.
+///
+/// # Safety
+///
+/// A non-null `*ptr` must identify the completion state owned by this future
+/// in the active executor's reactor. The caller must not retain another owner
+/// that may free the same state.
 #[inline(always)]
-#[doc(hidden)]
 pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::CompletionState) {
     let state_ptr = *ptr;
     if state_ptr.is_null() {
@@ -1172,8 +1310,13 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
 
 /// Submit an SQE and account for one tracked in-flight operation.
 /// Consolidates the normal submission bookkeeping shared by I/O futures.
+///
+/// # Safety
+///
+/// `pctx` must refer to the active executor, and every pointer referenced by
+/// `sqe` (including its completion-state `user_data`) must remain valid until
+/// the target CQE retires.
 #[inline(always)]
-#[doc(hidden)]
 pub(crate) unsafe fn submit_tracked_sqe(
     pctx: &PollCtx,
     sqe: io_uring::squeue::Entry,
@@ -1194,8 +1337,14 @@ pub(crate) unsafe fn submit_tracked_sqe(
 ///
 /// On error the retained payload is detached and returned to the caller so
 /// the future can preserve buffer ownership and retire the completion state.
+///
+/// # Safety
+///
+/// `pctx` and `state_ptr` must belong to the same active reactor;
+/// `state_ptr` must be a live, exclusively owned state with no attached
+/// payload. `build` may expose pointers into its payload only through the SQE
+/// returned for immediate submission.
 #[inline(always)]
-#[doc(hidden)]
 pub(crate) unsafe fn submit_retained_sqe<T: 'static, F>(
     pctx: &PollCtx,
     state_ptr: *mut crate::runtime::op::CompletionState,
@@ -1226,7 +1375,6 @@ where
 }
 
 #[inline(always)]
-#[doc(hidden)]
 pub(crate) fn submit_detached_close(pctx: &PollCtx, fd: RawFd) -> io::Result<()> {
     let reactor = pctx.reactor();
     let state_ptr = unsafe { (*reactor).alloc_op() };
@@ -1251,7 +1399,6 @@ pub(crate) fn submit_detached_close(pctx: &PollCtx, fd: RawFd) -> io::Result<()>
 }
 
 #[inline(always)]
-#[doc(hidden)]
 pub(crate) fn try_submit_detached_close(fd: RawFd) -> bool {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1267,22 +1414,19 @@ pub(crate) fn try_submit_detached_close(fd: RawFd) -> bool {
 }
 
 #[inline(always)]
-#[doc(hidden)]
-pub fn note_waiter_wake() {
+pub(crate) fn note_waiter_wake() {
     #[cfg(debug_assertions)]
     record_runtime_stat(|stats| stats.waiter_wakes += 1);
 }
 
 #[inline(always)]
-#[doc(hidden)]
-pub fn note_timer_now_tick_call() {
+pub(crate) fn note_timer_now_tick_call() {
     #[cfg(debug_assertions)]
     record_runtime_stat(|stats| stats.timer_now_tick_calls += 1);
 }
 
 #[inline(always)]
-#[doc(hidden)]
-pub fn note_timer_expired() {
+pub(crate) fn note_timer_expired() {
     #[cfg(debug_assertions)]
     record_runtime_stat(|stats| stats.timer_expired += 1);
 }
@@ -1302,7 +1446,12 @@ fn record_runtime_stat(update: impl FnOnce(&mut RuntimeStats)) {
 }
 
 #[inline(always)]
-#[doc(hidden)]
+/// Returns the task currently being polled by this executor.
+///
+/// # Safety
+///
+/// Must be called during a task poll inside `Executor::run`. Outside that
+/// window the TLS context or `owner_task` pointer may be null.
 pub(crate) unsafe fn current_poll_owner_task_unchecked() -> *mut TaskHeader {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1319,8 +1468,7 @@ pub(crate) unsafe fn current_poll_owner_task_unchecked() -> *mut TaskHeader {
 /// Must be called from within `Executor::run` on the executor thread. The
 /// returned pointer is only valid while that run's TLS context is active; in
 /// release builds a missing context is UB rather than a panic.
-#[doc(hidden)]
-pub unsafe fn timers_unchecked() -> *mut TimerRuntime {
+pub(crate) unsafe fn timers_unchecked() -> *mut TimerRuntime {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
         debug_assert!(
@@ -1331,7 +1479,12 @@ pub unsafe fn timers_unchecked() -> *mut TimerRuntime {
     })
 }
 
-#[doc(hidden)]
+/// Returns the active timer runtime, or null when no executor run is active.
+///
+/// # Safety
+///
+/// A non-null result is borrowed from thread-local executor state and is valid
+/// only on this thread while the corresponding `Executor::run` remains active.
 pub(crate) unsafe fn timers_or_null() -> *mut TimerRuntime {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1348,8 +1501,7 @@ pub(crate) unsafe fn timers_or_null() -> *mut TimerRuntime {
 /// returned pointers are only valid for that run; in release builds a missing
 /// context is UB rather than a panic.
 #[inline(always)]
-#[doc(hidden)]
-pub unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
+pub(crate) unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
         debug_assert!(
@@ -1365,7 +1517,12 @@ pub unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
 }
 
 #[inline(always)]
-#[doc(hidden)]
+/// Schedules a timer-expired task at most once for `wake_epoch`.
+///
+/// # Safety
+///
+/// All three pointers must be live and owned by the same active executor.
+/// `task_ptr` must remain allocated while its intrusive link may be queued.
 pub(crate) unsafe fn schedule_timer_woken_task_unchecked(
     task_ptr: *mut TaskHeader,
     ready_list: *mut DList<TaskHeader>,
@@ -1388,8 +1545,7 @@ pub(crate) unsafe fn schedule_timer_woken_task_unchecked(
 /// during the currently active `Executor::run`; its `runtime_state` pointer is
 /// dereferenced for read and write.
 #[inline(always)]
-#[doc(hidden)]
-pub unsafe fn next_timer_wake_epoch_unchecked(schedule_ctx: ScheduleCtx) -> u64 {
+pub(crate) unsafe fn next_timer_wake_epoch_unchecked(schedule_ctx: ScheduleCtx) -> u64 {
     let current = unsafe { (*schedule_ctx.runtime_state).wake_epoch };
     let mut next = current.wrapping_add(1);
     if next == 0 {
@@ -1406,7 +1562,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    struct VTableGen<F>(std::marker::PhantomData<F>);
+    struct VTableGen<F>(#[doc = "Carries `F` without storage."] std::marker::PhantomData<F>);
 
     impl<F> VTableGen<F>
     where
@@ -1470,6 +1626,11 @@ where
     &VTableGen::<F>::VTABLE
 }
 
+/// Routes one task notification through the active executor context.
+///
+/// # Safety
+///
+/// `task_ptr` must point to a live task owned by this thread's active executor.
 unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
     EXECUTOR_CTX.with(|ctx_cell| {
         let ctx_ptr = ctx_cell.get();
@@ -1501,17 +1662,35 @@ fn task_can_enter_ready_queue(flags: u64) -> bool {
 }
 
 #[inline(always)]
+/// Reads packed scheduler flags from a live task header.
+///
+/// # Safety
+///
+/// `task_ptr` must be non-null, aligned, and live on the owning executor thread.
 unsafe fn task_flags_unchecked(task_ptr: *mut TaskHeader) -> u64 {
     unsafe { (*std::ptr::addr_of!((*task_ptr).flags)).get() }
 }
 
 #[inline(always)]
+/// Adds one scheduler flag to a live task header.
+///
+/// # Safety
+///
+/// `task_ptr` must be non-null, aligned, and exclusively scheduler-accessible
+/// on the owning executor thread.
 unsafe fn set_task_flag_unchecked(task_ptr: *mut TaskHeader, flag: u64) {
     let flags = unsafe { &*std::ptr::addr_of!((*task_ptr).flags) };
     flags.set(flags.get() | flag);
 }
 
 #[inline(always)]
+/// Records a task notification and queues it when its state permits.
+///
+/// # Safety
+///
+/// `task_ptr`, `ready_list`, and `runtime_state` must be live objects owned by
+/// the same executor. The task's ready link must be unlinked unless its flags
+/// already show it as queued.
 pub(crate) unsafe fn notify_task_into_list_unchecked(
     task_ptr: *mut TaskHeader,
     ready_list: *mut DList<TaskHeader>,
@@ -1535,6 +1714,12 @@ pub(crate) unsafe fn notify_task_into_list_unchecked(
 }
 
 #[inline(always)]
+/// Queues a previously notified task if it is idle and unqueued.
+///
+/// # Safety
+///
+/// The task, list, and runtime-state pointers must be live and owned by one
+/// executor; the task's intrusive ready link must be unlinked.
 unsafe fn enqueue_notified_task_unchecked(
     task_ptr: *mut TaskHeader,
     ready_list: *mut DList<TaskHeader>,
@@ -1552,6 +1737,12 @@ unsafe fn enqueue_notified_task_unchecked(
 }
 
 #[inline(always)]
+/// Links an eligible task at the tail of the executor ready queue.
+///
+/// # Safety
+///
+/// `task_ptr` and `ready_list` must be live and owned by the same executor.
+/// The task must not be completed, running, queued, or linked elsewhere.
 unsafe fn enqueue_ready_task_unchecked(
     task_ptr: *mut TaskHeader,
     ready_list: *mut DList<TaskHeader>,
@@ -1582,14 +1773,13 @@ unsafe fn enqueue_ready_task_unchecked(
 }
 
 #[inline(always)]
-#[doc(hidden)]
 /// # Safety
 /// - `task_ptr` must point to a live, non-freed `TaskHeader` within the
 ///   executor's task slab.
 /// - The executor TLS context (`EXECUTOR_CTX`) must be active (i.e. this must
 ///   be called from within `Executor::run`).
 /// - Must be called from the executor thread (single-threaded contract).
-pub unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
+pub(crate) unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
     unsafe {
         schedule_task(task_ptr);
     }
