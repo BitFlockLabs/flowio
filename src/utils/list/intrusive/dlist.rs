@@ -556,10 +556,17 @@ impl<'a, T> CursorMut<'a, T> {
     #[inline(always)]
     /// # Safety
     ///
-    /// The caller must ensure that `link` is a valid pointer to a `Link`
-    /// that is currently part of this specific list.
+    /// The caller must ensure that `link` is non-null and points to a live
+    /// payload `Link`, not the sentinel, that is currently part of this
+    /// cursor's specific initialized list. The containing allocation must
+    /// remain valid and unmoved through removal, with no aliased mutation of
+    /// the list or link. Removing the link that would be yielded next is
+    /// supported: that node is skipped and forward iteration continues.
     pub unsafe fn remove_link(&mut self, link: *mut Link) {
         unsafe {
+            if link == self.current {
+                self.current = DList::<T>::normalize_head_ptr((*link).next, self.head);
+            }
             self.list.remove(link);
         }
     }
@@ -605,10 +612,17 @@ impl<'a, T> CursorBackMut<'a, T> {
     #[inline(always)]
     /// # Safety
     ///
-    /// The caller must ensure that `link` is a valid pointer to a `Link`
-    /// that is currently part of this specific list.
+    /// The caller must ensure that `link` is non-null and points to a live
+    /// payload `Link`, not the sentinel, that is currently part of this
+    /// cursor's specific initialized list. The containing allocation must
+    /// remain valid and unmoved through removal, with no aliased mutation of
+    /// the list or link. Removing the link that would be yielded next is
+    /// supported: that node is skipped and backward iteration continues.
     pub unsafe fn remove_link(&mut self, link: *mut Link) {
         unsafe {
+            if link == self.current {
+                self.current = DList::<T>::normalize_head_ptr((*link).prev, self.head);
+            }
             self._list.remove(link);
         }
     }
@@ -628,6 +642,113 @@ mod tests {
     fn node_link_ptr(node: &mut Node) -> *mut Link {
         let base = node as *mut Node as *mut u8;
         unsafe { base.add(offset_of!(Node, link)) as *mut Link }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CursorDirection {
+        Forward,
+        Backward,
+    }
+
+    fn assert_cursor_removal(
+        direction: CursorDirection,
+        linked_count: usize,
+        steps_before_remove: usize,
+        remove_index: usize,
+        expected_after_remove: &[u32],
+    ) {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut nodes = [
+            Node {
+                id: 1,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 2,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 3,
+                link: Link::new_unlinked(),
+            },
+        ];
+        let links = [
+            node_link_ptr(&mut nodes[0]),
+            node_link_ptr(&mut nodes[1]),
+            node_link_ptr(&mut nodes[2]),
+        ];
+
+        unsafe {
+            for &link in links.iter().take(linked_count) {
+                list.push_back(link);
+            }
+
+            match direction {
+                CursorDirection::Forward => {
+                    let mut cursor = list.cursor_mut();
+                    for step in 0..steps_before_remove {
+                        let (node, _) = cursor
+                            .next_with_offset(offset_of!(Node, link))
+                            .expect("forward cursor should reach removal position");
+                        assert_eq!((*node).id, step as u32 + 1);
+                    }
+                    cursor.remove_link(links[remove_index]);
+                    assert!((*links[remove_index]).is_unlinked());
+                    for expected in expected_after_remove {
+                        let (node, _) = cursor
+                            .next_with_offset(offset_of!(Node, link))
+                            .expect("forward cursor ended before expected node");
+                        assert_eq!((*node).id, *expected);
+                    }
+                    assert!(
+                        cursor.next_with_offset(offset_of!(Node, link)).is_none(),
+                        "forward cursor repeated or skipped past the expected end"
+                    );
+                }
+                CursorDirection::Backward => {
+                    let mut cursor = list.cursor_back_mut();
+                    for step in 0..steps_before_remove {
+                        let (node, _) = cursor
+                            .prev_with_offset(offset_of!(Node, link))
+                            .expect("backward cursor should reach removal position");
+                        assert_eq!((*node).id, linked_count as u32 - step as u32);
+                    }
+                    cursor.remove_link(links[remove_index]);
+                    assert!((*links[remove_index]).is_unlinked());
+                    for expected in expected_after_remove {
+                        let (node, _) = cursor
+                            .prev_with_offset(offset_of!(Node, link))
+                            .expect("backward cursor ended before expected node");
+                        assert_eq!((*node).id, *expected);
+                    }
+                    assert!(
+                        cursor.prev_with_offset(offset_of!(Node, link)).is_none(),
+                        "backward cursor repeated or skipped past the expected end"
+                    );
+                }
+            }
+        }
+
+        list.unlink_all_for_drop();
+        assert!(nodes.iter().all(|node| node.link.is_unlinked()));
+    }
+
+    #[test]
+    fn cursor_remove_next_advances_before_unlinking() {
+        let forward_cases: &[(usize, usize, &[u32])] =
+            &[(0, 0, &[2, 3]), (1, 1, &[3]), (2, 2, &[]), (1, 2, &[2])];
+        for &(steps, remove_index, expected) in forward_cases {
+            assert_cursor_removal(CursorDirection::Forward, 3, steps, remove_index, expected);
+        }
+        assert_cursor_removal(CursorDirection::Forward, 1, 0, 0, &[]);
+
+        let backward_cases: &[(usize, usize, &[u32])] =
+            &[(0, 2, &[2, 1]), (1, 1, &[1]), (2, 0, &[]), (1, 0, &[2])];
+        for &(steps, remove_index, expected) in backward_cases {
+            assert_cursor_removal(CursorDirection::Backward, 3, steps, remove_index, expected);
+        }
+        assert_cursor_removal(CursorDirection::Backward, 1, 0, 0, &[]);
     }
 
     #[test]

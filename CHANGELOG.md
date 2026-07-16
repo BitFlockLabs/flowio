@@ -39,6 +39,9 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- Dev-only intrusive-list cursors now advance past a pending node before
+  unlinking it, so removing the next forward or backward node cannot leave the
+  cursor pointing at cleared links.
 - `SlabAllocator` now rejects slab acquisition before initialization and
   initializes its backing provider at most once, preventing safe code from
   formatting a slab before the provider accepts the required alignment.
