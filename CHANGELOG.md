@@ -43,6 +43,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- DNS A and AAAA outcomes are now combined without letting one family's empty,
+  recoverable-error, or contradictory NXDOMAIN result discard the other
+  family's usable address or CNAME. Ranked outcome selection is deterministic:
+  addresses win, same-rank CNAME and recoverable-error conflicts remain
+  A-first, and terminal timer/runtime failures retain their documented
+  no-address precedence.
 - TCP and Unix immediate, partial-async, and all-async projected writes now,
   after any async runtime-context validation succeeds, validate a
   declared-empty projection once instead of bypassing its stale nonempty

@@ -170,8 +170,12 @@ impl DnsResolver {
     /// Non-literal names synchronously inspect `/etc/hosts`; each upstream DNS
     /// attempt creates a connected UDP socket plus owned query/response
     /// buffers. A true query expiry advances to the next nameserver; timer
-    /// `OutOfMemory` is returned immediately without attempting another
-    /// server.
+    /// `OutOfMemory` stops that family lookup without attempting another
+    /// server. A and AAAA remain sequential, in that order. Their outcomes are
+    /// combined as: any address, a terminal local/runtime error, an A-first
+    /// CNAME, NXDOMAIN, an A-first recoverable error, then `NotFound` for two
+    /// empty answers. An A-side terminal error stops before the AAAA query; a
+    /// later AAAA-side terminal error does not discard an A address.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -278,39 +282,75 @@ impl DnsResolver {
         port: u16,
         addrs: &mut Vec<SocketAddr>,
     ) -> io::Result<ResolveHostStep> {
-        let a = self.lookup_name(current, DNS_TYPE_A).await?;
-        if a.nx_domain {
-            return Err(host_not_found(current));
-        }
-
-        extend_unique_socket_addrs(addrs, &a.addresses, port);
-        let aaaa = match self.lookup_name(current, DNS_TYPE_AAAA).await {
-            Ok(aaaa) => aaaa,
-            Err(err) => {
-                if !addrs.is_empty() {
-                    return Ok(ResolveHostStep::Resolved);
-                }
-                return Err(err);
-            }
+        let a = match self.lookup_name(current, DNS_TYPE_A).await {
+            Err(err) if is_terminal_family_lookup_error(&err) => return Err(err),
+            outcome => outcome,
         };
-        if aaaa.nx_domain {
-            if !addrs.is_empty() {
-                return Ok(ResolveHostStep::Resolved);
+        let aaaa = self.lookup_name(current, DNS_TYPE_AAAA).await;
+        finish_dns_family_lookups(current, port, addrs, a, aaaa)
+    }
+}
+
+fn is_terminal_family_lookup_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected | io::ErrorKind::OutOfMemory
+    )
+}
+
+fn finish_dns_family_lookups(
+    current: &str,
+    port: u16,
+    addrs: &mut Vec<SocketAddr>,
+    a: io::Result<LookupResult>,
+    aaaa: io::Result<LookupResult>,
+) -> io::Result<ResolveHostStep> {
+    let mut cname = None;
+    let mut saw_nx_domain = false;
+    let mut terminal_error = None;
+    let mut first_error = None;
+
+    // A stays first for output ordering, conflicting CNAME selection, and
+    // deterministic error precedence. Both outcomes are still considered
+    // before choosing the logical lookup result.
+    for outcome in [a, aaaa] {
+        match outcome {
+            Ok(result) => {
+                saw_nx_domain |= result.nx_domain;
+                extend_unique_socket_addrs(addrs, &result.addresses, port);
+                if cname.is_none() {
+                    cname = result.cname;
+                }
             }
-            return Err(host_not_found(current));
-        }
-
-        extend_unique_socket_addrs(addrs, &aaaa.addresses, port);
-        if !addrs.is_empty() {
-            return Ok(ResolveHostStep::Resolved);
-        }
-
-        if let Some(next) = a.cname.or(aaaa.cname) {
-            Ok(ResolveHostStep::FollowCname(next))
-        } else {
-            Err(host_not_found(current))
+            Err(err) => {
+                if is_terminal_family_lookup_error(&err) {
+                    if terminal_error.is_none() {
+                        terminal_error = Some(err);
+                    }
+                } else if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
         }
     }
+
+    if !addrs.is_empty() {
+        return Ok(ResolveHostStep::Resolved);
+    }
+    if let Some(err) = terminal_error {
+        return Err(err);
+    }
+    if let Some(next) = cname {
+        return Ok(ResolveHostStep::FollowCname(next));
+    }
+    if saw_nx_domain {
+        return Err(host_not_found(current));
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    Err(host_not_found(current))
 }
 
 /// Resolves a host name into socket addresses using system resolver settings.
@@ -1177,5 +1217,184 @@ mod tests {
                 SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 11), port)),
             ]
         );
+    }
+
+    #[test]
+    fn dns_family_outcomes_use_a_first_recoverable_error() {
+        let mut addrs = Vec::new();
+        let result = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "A lookup failed",
+            )),
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "AAAA lookup timed out",
+            )),
+        );
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("two recoverable family errors should not resolve"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn dns_family_outcomes_prefer_cname_then_nxdomain() {
+        let cname_result = LookupResult {
+            addresses: Vec::new(),
+            cname: Some("db.internal.test".to_owned()),
+            nx_domain: false,
+        };
+        let nx_domain_result = LookupResult {
+            addresses: Vec::new(),
+            cname: None,
+            nx_domain: true,
+        };
+        let mut addrs = Vec::new();
+        let step = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Ok(cname_result),
+            Ok(nx_domain_result),
+        )
+        .expect("usable CNAME should precede contradictory sibling NXDOMAIN");
+
+        match step {
+            ResolveHostStep::FollowCname(next) => assert_eq!(next, "db.internal.test"),
+            ResolveHostStep::Resolved => panic!("CNAME-only outcome should continue lookup"),
+        }
+    }
+
+    #[test]
+    fn dns_family_outcomes_use_a_first_conflicting_cname() {
+        let mut addrs = Vec::new();
+        let step = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Ok(LookupResult {
+                addresses: Vec::new(),
+                cname: Some("db-v4.internal.test".to_owned()),
+                nx_domain: false,
+            }),
+            Ok(LookupResult {
+                addresses: Vec::new(),
+                cname: Some("db-v6.internal.test".to_owned()),
+                nx_domain: false,
+            }),
+        )
+        .expect("A CNAME should win a conflicting sibling CNAME");
+
+        match step {
+            ResolveHostStep::FollowCname(next) => assert_eq!(next, "db-v4.internal.test"),
+            ResolveHostStep::Resolved => panic!("CNAME-only outcome should continue lookup"),
+        }
+    }
+
+    #[test]
+    fn dns_family_outcomes_prefer_nxdomain_to_recoverable_error() {
+        let nx_domain_result = LookupResult {
+            addresses: Vec::new(),
+            cname: None,
+            nx_domain: true,
+        };
+        let mut addrs = Vec::new();
+        let result = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Err(io::Error::other("A SERVFAIL")),
+            Ok(nx_domain_result),
+        );
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("NXDOMAIN without a usable sibling should not resolve"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn dns_family_outcomes_map_two_empty_answers_to_not_found() {
+        let empty_a = LookupResult {
+            addresses: Vec::new(),
+            cname: None,
+            nx_domain: false,
+        };
+        let empty_aaaa = LookupResult {
+            addresses: Vec::new(),
+            cname: None,
+            nx_domain: false,
+        };
+        let mut addrs = Vec::new();
+        let result = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Ok(empty_a),
+            Ok(empty_aaaa),
+        );
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("two empty family answers should not resolve"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn dns_family_outcomes_keep_terminal_error_ahead_of_cname() {
+        let cname_result = LookupResult {
+            addresses: Vec::new(),
+            cname: Some("db.internal.test".to_owned()),
+            nx_domain: false,
+        };
+        let mut addrs = Vec::new();
+        let result = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Ok(cname_result),
+            Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "timer allocation failed",
+            )),
+        );
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("terminal family error should stop CNAME continuation"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+    }
+
+    #[test]
+    fn dns_family_outcomes_keep_address_ahead_of_terminal_error() {
+        let address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 67));
+        let mut addrs = Vec::new();
+        let step = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Ok(LookupResult {
+                addresses: vec![address],
+                cname: None,
+                nx_domain: false,
+            }),
+            Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "timer allocation failed",
+            )),
+        )
+        .expect("usable address should survive a later terminal family error");
+
+        assert!(matches!(step, ResolveHostStep::Resolved));
+        assert_eq!(addrs, vec![SocketAddr::new(address, 5432)]);
     }
 }

@@ -24,6 +24,11 @@ fn maybe_decode_hex_seed(data: &[u8]) -> Cow<'_, [u8]> {
     let Some(hex) = data.strip_prefix(b"HEX:") else {
         return Cow::Borrowed(data);
     };
+    let hex_end = hex
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    let hex = &hex[..hex_end];
     if hex.len() % 2 != 0 {
         return Cow::Borrowed(data);
     }
@@ -158,4 +163,22 @@ pub fn dns_response_prefilter(data: &[u8]) {
     ]);
     let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id);
     let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id ^ 0x5555);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_seed_decoder_accepts_trailing_ascii_whitespace() {
+        let decoded = maybe_decode_hex_seed(b"HEX:0001aF\n\t");
+        assert_eq!(decoded.as_ref(), &[0x00, 0x01, 0xAF]);
+    }
+
+    #[test]
+    fn hex_seed_decoder_rejects_internal_non_hex_bytes() {
+        let seed = b"HEX:00 01\n";
+        let decoded = maybe_decode_hex_seed(seed);
+        assert!(matches!(decoded, Cow::Borrowed(data) if data == seed));
+    }
 }

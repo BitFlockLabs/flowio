@@ -2,8 +2,10 @@ use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
 use flowio::test_support::runtime::test_hooks;
+use std::cell::Cell;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -124,6 +126,10 @@ fn resolver_stops_nameserver_failover_on_timer_out_of_memory() {
     first_server
         .recv_from(&mut buffer)
         .expect("first nameserver did not receive the query");
+    let err = first_server
+        .recv_from(&mut buffer)
+        .expect_err("timer allocation failure should stop before the AAAA query");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 
     second_server
         .set_nonblocking(true)
@@ -231,6 +237,98 @@ fn resolve_host_keeps_a_answer_when_aaaa_is_servfail() {
 }
 
 #[test]
+fn resolve_host_keeps_aaaa_answer_across_recoverable_a_outcomes() {
+    let cases = [
+        ("empty", Some(TestAnswer::Empty), 0x60),
+        ("SERVFAIL", Some(TestAnswer::ServFail), 0x61),
+        ("NXDOMAIN", Some(TestAnswer::NxDomain), 0x62),
+        ("timeout", None, 0x63),
+    ];
+
+    for (label, a_answer, suffix) in cases {
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, suffix);
+        let addrs =
+            resolve_with_mock_dns(2, Duration::from_millis(30), move |name, qtype| {
+                match (name, qtype) {
+                    ("db.example.test", 1) => a_answer,
+                    ("db.example.test", 28) => Some(TestAnswer::Aaaa(ip)),
+                    _ => Some(TestAnswer::NxDomain),
+                }
+            })
+            .unwrap_or_else(|err| panic!("AAAA answer should survive A {label}: {err}"));
+
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::from((ip, 5432))],
+            "unexpected result after A {label}"
+        );
+    }
+}
+
+#[test]
+fn resolve_host_keeps_a_answer_when_aaaa_times_out() {
+    let ip = Ipv4Addr::new(192, 0, 2, 64);
+    let addrs = resolve_with_mock_dns(2, Duration::from_millis(30), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::A(ip)),
+            ("db.example.test", 28) => None,
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("A answer should survive AAAA timeout");
+
+    assert_eq!(addrs, vec![SocketAddr::from((ip, 5432))]);
+}
+
+#[test]
+fn resolve_host_follows_aaaa_cname_after_a_servfail() {
+    let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x65);
+    let addrs = resolve_with_mock_dns(4, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::ServFail),
+            ("db.example.test", 28) => Some(TestAnswer::Cname("db.internal.test")),
+            ("db.internal.test", 1) => Some(TestAnswer::Empty),
+            ("db.internal.test", 28) => Some(TestAnswer::Aaaa(ip)),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("AAAA CNAME should survive A SERVFAIL");
+
+    assert_eq!(addrs, vec![SocketAddr::from((ip, 5432))]);
+}
+
+#[test]
+fn resolve_host_follows_a_cname_despite_aaaa_nxdomain() {
+    let ip = Ipv4Addr::new(198, 51, 100, 66);
+    let addrs = resolve_with_mock_dns(4, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::Cname("db.internal.test")),
+            ("db.example.test", 28) => Some(TestAnswer::NxDomain),
+            ("db.internal.test", 1) => Some(TestAnswer::A(ip)),
+            ("db.internal.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("A CNAME should survive AAAA NXDOMAIN");
+
+    assert_eq!(addrs, vec![SocketAddr::from((ip, 5432))]);
+}
+
+#[test]
+fn resolve_host_prefers_authoritative_nxdomain_over_recoverable_error() {
+    let err = resolve_with_mock_dns(2, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::ServFail),
+            ("db.example.test", 28) => Some(TestAnswer::NxDomain),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect_err("NXDOMAIN should win when neither family is usable");
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
 fn resolve_host_falls_back_promptly_after_questionless_servfail() {
     let bad_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind questionless servfail dns socket");
@@ -298,10 +396,12 @@ fn resolve_host_drains_questionless_nxdomain_before_matching_response() {
             server,
             2,
             &[FirstDnsDatagram::QuestionlessNxDomain],
-            |name, qtype| match (name, qtype) {
-                ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 52)),
-                ("db.example.test", 28) => TestAnswer::Empty,
-                _ => TestAnswer::NxDomain,
+            |name, qtype| {
+                Some(match (name, qtype) {
+                    ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 52)),
+                    ("db.example.test", 28) => TestAnswer::Empty,
+                    _ => TestAnswer::NxDomain,
+                })
             },
         )
     });
@@ -502,10 +602,12 @@ fn resolve_host_drains_multiple_stale_responses_before_matching_query() {
                 FirstDnsDatagram::StaleQueryId,
                 FirstDnsDatagram::StaleQueryId,
             ],
-            |name, qtype| match (name, qtype) {
-                ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 50)),
-                ("db.example.test", 28) => TestAnswer::Empty,
-                _ => TestAnswer::NxDomain,
+            |name, qtype| {
+                Some(match (name, qtype) {
+                    ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 50)),
+                    ("db.example.test", 28) => TestAnswer::Empty,
+                    _ => TestAnswer::NxDomain,
+                })
             },
         )
     });
@@ -1053,13 +1155,47 @@ fn resolve_host_rejects_cname_rdata_overrun() {
     thread.join().expect("dns thread panicked");
 }
 
+fn resolve_with_mock_dns<F>(
+    expected_queries: usize,
+    query_timeout: Duration,
+    answer: F,
+) -> io::Result<Vec<SocketAddr>>
+where
+    F: Fn(&str, u16) -> Option<TestAnswer> + Send + 'static,
+{
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries_with_first_datagrams(server, expected_queries, &[], answer)
+    });
+
+    let result = Rc::new(Cell::new(None));
+    let task_result = Rc::clone(&result);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(query_timeout);
+            task_result.set(Some(resolver.resolve_host("db.example.test", 5432).await));
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+    result
+        .take()
+        .expect("resolver task completed without recording its result")
+}
+
 /// Mock DNS server that answers exactly `expected_queries` UDP queries, then
 /// returns. The count must match resolver behavior for the tested lookup.
 fn serve_dns_queries<F>(socket: StdUdpSocket, expected_queries: usize, answer: F)
 where
     F: Fn(&str, u16) -> TestAnswer,
 {
-    serve_dns_queries_with_first_datagrams(socket, expected_queries, &[], answer);
+    serve_dns_queries_with_first_datagrams(socket, expected_queries, &[], move |name, qtype| {
+        Some(answer(name, qtype))
+    });
 }
 
 fn serve_dns_queries_with_stale_first_response<F>(
@@ -1073,7 +1209,7 @@ fn serve_dns_queries_with_stale_first_response<F>(
         socket,
         expected_queries,
         &[FirstDnsDatagram::StaleQueryId],
-        answer,
+        move |name, qtype| Some(answer(name, qtype)),
     );
 }
 
@@ -1088,7 +1224,7 @@ fn serve_dns_queries_with_undersized_first_response<F>(
         socket,
         expected_queries,
         &[FirstDnsDatagram::Undersized],
-        answer,
+        move |name, qtype| Some(answer(name, qtype)),
     );
 }
 
@@ -1103,17 +1239,20 @@ fn serve_dns_queries_with_malformed_matching_first_response<F>(
         socket,
         expected_queries,
         &[FirstDnsDatagram::MalformedMatchingQueryId],
-        answer,
+        move |name, qtype| Some(answer(name, qtype)),
     );
 }
 
+/// Handles exactly `expected_queries`; `None` deliberately leaves a query
+/// unanswered so timeout behavior can be exercised without duplicating the
+/// mock-server loop.
 fn serve_dns_queries_with_first_datagrams<F>(
     socket: StdUdpSocket,
     expected_queries: usize,
     first_datagrams: &[FirstDnsDatagram],
     answer: F,
 ) where
-    F: Fn(&str, u16) -> TestAnswer,
+    F: Fn(&str, u16) -> Option<TestAnswer>,
 {
     socket
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1125,7 +1264,10 @@ fn serve_dns_queries_with_first_datagrams<F>(
         let query = &buffer[..len];
         let qname = parse_qname(query).expect("failed to parse dns qname");
         let qtype = parse_qtype(query).expect("failed to parse dns qtype");
-        let response = build_response(query, answer(&qname, qtype));
+        let Some(answer) = answer(&qname, qtype) else {
+            continue;
+        };
+        let response = build_response(query, answer);
         for first in first_datagrams.iter().copied() {
             send_first_dns_datagram(&socket, peer, query, &response, first);
         }
