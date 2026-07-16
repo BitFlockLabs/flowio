@@ -1,8 +1,9 @@
 mod common;
 
 use common::{
-    TestIoBuffMut as IoBuffMut, TestProjected, TryMismatchedProjected, TryOversizedProjected,
-    fill_try_send_buffer, make_payload_chain, make_read_chain, make_read_only_chain, run_test,
+    EmptyProjected, TestIoBuffMut as IoBuffMut, TestProjected, TryCountMismatchedProjected,
+    TryMismatchedProjected, TryOversizedProjected, fill_try_send_buffer, make_payload_chain,
+    make_read_chain, make_read_only_chain, run_test,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -10,11 +11,13 @@ use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
 use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_closes_completed_fd;
 use flowio::test_support::runtime::test_hooks;
+use std::cell::Cell;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -314,10 +317,17 @@ fn runtime_tcp_try_writev_projected_large_piece_count_immediate_success() {
 
 #[test]
 fn runtime_tcp_try_writev_projected_invalid_projection_returns_source() {
-    let (mut stream, _peer) = connected_try_tcp_stream();
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+
+    common::assert_empty_projected_try_cases!(stream);
 
     let (res, source) = stream.try_writev_projected(TryMismatchedProjected);
     let err = res.expect_err("mismatched projection should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let _source = source;
+
+    let (res, source) = stream.try_writev_projected(TryCountMismatchedProjected);
+    let err = res.expect_err("piece-count mismatch should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     let _source = source;
 
@@ -325,6 +335,89 @@ fn runtime_tcp_try_writev_projected_invalid_projection_returns_source() {
     let err = res.expect_err("oversized projection should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     let _source = source;
+
+    peer.set_nonblocking(true)
+        .expect("peer set_nonblocking failed");
+    let mut byte = [0u8; 1];
+    let err = peer
+        .read(&mut byte)
+        .expect_err("rejected projected writes should send no bytes");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn runtime_tcp_async_empty_projected_validation_uses_no_submission_or_retained_scratch() {
+    let (mut stream, mut peer) = connected_try_tcp_stream();
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let returned_stream = Rc::new(Cell::new(None));
+    let return_slot = Rc::clone(&returned_stream);
+
+    executor
+        .run(async move {
+            common::assert_empty_projected_async_cases!(stream, writev_projected);
+            common::assert_empty_projected_async_cases!(stream, writev_all_projected);
+
+            return_slot.set(Some(stream));
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 0);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(stats.writev_scratch_inline_allocs, 0);
+        assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+    }
+
+    let stream = returned_stream
+        .take()
+        .expect("empty projected test did not return the stream");
+
+    peer.set_nonblocking(true)
+        .expect("peer set_nonblocking failed");
+    let mut byte = [0u8; 1];
+    let err = peer
+        .read(&mut byte)
+        .expect_err("empty projected validation should send no bytes");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    drop(stream);
+}
+
+#[test]
+fn runtime_tcp_async_projected_shape_mismatches_return_source() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+
+    run_test(async move {
+        common::assert_projected_async_mismatches!(stream, writev_projected);
+        common::assert_projected_async_mismatches!(stream, writev_all_projected);
+    });
+}
+
+#[test]
+fn runtime_tcp_empty_projected_rejects_outside_run_before_projection() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let mut future = Box::pin(stream.writev_projected(EmptyProjected::valid()));
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), source)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(source.projection_calls(), 0);
+        }
+        _ => panic!("empty partial projection should reject an inactive poll context"),
+    }
+    drop(future);
+
+    let mut future = Box::pin(stream.writev_all_projected(EmptyProjected::valid()));
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), source)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(source.projection_calls(), 0);
+        }
+        _ => panic!("empty all projection should reject an inactive poll context"),
+    }
 }
 
 #[test]

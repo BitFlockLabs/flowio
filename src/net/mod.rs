@@ -157,16 +157,21 @@ pub mod unix;
 /// Safe projection interface for retained owned vectored writes.
 ///
 /// Implement this for compact owned message carriers that can expose their
-/// already-encoded byte pieces as borrowed slices. FlowIO moves the carrier
-/// into retained operation state before calling [`WritevProjection::project_writev`],
-/// so slices may safely point into inline fields or owned allocations inside
-/// the carrier. The retained carrier and FlowIO-owned `iovec` scratch remain
-/// alive until the original write CQE retires, even if the future is dropped.
+/// already-encoded byte pieces as borrowed slices. For a non-empty operation,
+/// FlowIO moves the carrier into retained operation state before calling
+/// [`WritevProjection::project_writev`], so slices may safely point into inline
+/// fields or owned allocations inside the carrier. The retained carrier and
+/// FlowIO-owned `iovec` scratch remain alive until the original write CQE
+/// retires, even if the future is dropped. Declared-empty projections are
+/// validated locally before retained state is allocated.
 ///
 /// `writev_count_and_len` must report the number of active non-empty pieces
 /// and the total byte length that `project_writev` will push. Empty pieces are
 /// ignored by [`WritevPieces::push`]. Mismatches are rejected with
-/// [`io::ErrorKind::InvalidInput`].
+/// [`io::ErrorKind::InvalidInput`]. For an otherwise valid call, FlowIO still
+/// invokes `project_writev` once when the reported shape is `(0, 0)`: a valid
+/// empty projection pushes no non-empty piece and returns `Ok(())`;
+/// implementation errors propagate.
 ///
 /// This trait does not expose a borrowed-SQE API. Callers pass ownership of
 /// the carrier to the stream method and receive it back with the I/O result.

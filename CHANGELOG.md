@@ -43,6 +43,11 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- TCP and Unix immediate, partial-async, and all-async projected writes now,
+  after any async runtime-context validation succeeds, validate a
+  declared-empty projection once instead of bypassing its stale nonempty
+  output or implementation error; valid empty writes still allocate and
+  submit nothing.
 - `ProviderOwnedPool` no longer exposes broad mutable access to either half of
   its self-referential provider/pool relation. Narrow inlined operations retain
   the existing allocation behavior while keeping pool teardown before provider

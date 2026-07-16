@@ -161,6 +161,9 @@ macro_rules! impl_stream_rw {
         /// must grow. Message bytes are not copied, and no retained operation
         /// state is created. Projections above 1024 non-empty pieces are
         /// rejected with [`io::ErrorKind::InvalidInput`].
+        /// A declared-empty projection is still invoked once for contract
+        /// validation; a valid empty projection completes with `Ok(0)` and no
+        /// syscall.
         ///
         /// This is a deadline-edge primitive. Prefer
         /// [`Self::writev_projected`] / [`Self::writev_all_projected`] for
@@ -345,8 +348,10 @@ macro_rules! impl_stream_rw {
         /// FlowIO retains `source`, then projects borrowed byte slices from
         /// that retained source into retained kernel-facing `iovec`
         /// scratch. Projection copies only pointer/length metadata, not message
-        /// bytes. Empty projections complete with `Ok(0)` without submitting
-        /// kernel I/O.
+        /// bytes. After runtime-context validation succeeds, declared-empty
+        /// projections are still invoked once for contract validation; valid
+        /// empty projections complete with `Ok(0)` without submitting kernel
+        /// I/O.
         ///
         /// Use this when the send path is already naturally segmented
         /// inside the retained carrier. For one contiguous payload, prefer
@@ -382,8 +387,10 @@ macro_rules! impl_stream_rw {
         ///
         /// Returns `(Ok(n), source)` where `n` equals the projected total
         /// byte count on success. On error the source is returned with an
-        /// unspecified amount already written. Empty projections complete
-        /// with `Ok(0)` without submitting kernel I/O.
+        /// unspecified amount already written. After runtime-context
+        /// validation succeeds, declared-empty projections are still invoked
+        /// once for contract validation; valid empty projections complete with
+        /// `Ok(0)` without submitting kernel I/O.
         ///
         /// This complete-buffer API may resubmit after partial writes. Avoid
         /// that retry bookkeeping when the caller can handle partial progress;
@@ -1101,6 +1108,18 @@ fn validate_try_projected_count_and_len(iov_count: usize, total: usize) -> io::R
     Ok(())
 }
 
+/// Validates a projection that declared no active pieces and no bytes.
+#[inline]
+fn validate_empty_projected_writev<T: WritevProjection>(source: &T) -> io::Result<()> {
+    let mut scratch: [MaybeUninit<libc::iovec>; 0] = [];
+    let mut pieces = WritevPieces::new(&mut scratch);
+    source.project_writev(&mut pieces)?;
+    if pieces.count() != 0 || pieces.total() != 0 {
+        return Err(invalid_input_kind());
+    }
+    Ok(())
+}
+
 #[inline]
 fn project_retained_writev_payload<T: WritevProjection>(
     payload: &mut RetainedProjectedWritevPayload<T>,
@@ -1338,7 +1357,8 @@ pub(crate) fn try_writev_projected_once<T: WritevProjection>(
         return (Err(err), source);
     }
     if total == 0 {
-        return (Ok(0), source);
+        let result = validate_empty_projected_writev(&source).map(|()| 0);
+        return (result, source);
     }
     if iov_count > TRY_WRITEV_MAX_IOVECS {
         return (Err(invalid_input_kind()), source);
@@ -2990,8 +3010,11 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
         }
 
         if this.total == 0 {
+            let result = validate_local_io_result(cx, Ok(())).and_then(|()| {
+                validate_empty_projected_writev(unsafe { opt_ref(&this.source) }).map(|()| 0)
+            });
             let source = unsafe { opt_take(&mut this.source) };
-            return Poll::Ready((validate_local_io_result(cx, Ok(0)), source));
+            return Poll::Ready((result, source));
         }
 
         if this.state_ptr.is_null() {
@@ -3083,8 +3106,11 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
                 return Poll::Ready((result, source));
             }
             if this.total == 0 {
+                let result = validate_local_io_result(cx, Ok(())).and_then(|()| {
+                    validate_empty_projected_writev(unsafe { opt_ref(&this.source) }).map(|()| 0)
+                });
                 let source = unsafe { opt_take(&mut this.source) };
-                return Poll::Ready((validate_local_io_result(cx, Ok(0)), source));
+                return Poll::Ready((result, source));
             }
         }
 

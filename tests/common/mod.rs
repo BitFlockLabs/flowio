@@ -374,6 +374,132 @@ impl<const N: usize> WritevProjection for TestProjected<N> {
     }
 }
 
+/// Declared-empty projection fixture with selectable validation behavior.
+#[allow(dead_code)]
+pub struct EmptyProjected {
+    behavior: EmptyProjectionBehavior,
+    projection_calls: Cell<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum EmptyProjectionBehavior {
+    Valid,
+    StaleNonempty,
+    Error,
+}
+
+impl EmptyProjected {
+    #[allow(dead_code)]
+    pub fn valid() -> Self {
+        Self::new(EmptyProjectionBehavior::Valid)
+    }
+
+    #[allow(dead_code)]
+    pub fn stale_nonempty() -> Self {
+        Self::new(EmptyProjectionBehavior::StaleNonempty)
+    }
+
+    #[allow(dead_code)]
+    pub fn failing() -> Self {
+        Self::new(EmptyProjectionBehavior::Error)
+    }
+
+    fn new(behavior: EmptyProjectionBehavior) -> Self {
+        Self {
+            behavior,
+            projection_calls: Cell::new(0),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn projection_calls(&self) -> usize {
+        self.projection_calls.get()
+    }
+}
+
+impl WritevProjection for EmptyProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        self.projection_calls
+            .set(self.projection_calls.get().saturating_add(1));
+        match self.behavior {
+            EmptyProjectionBehavior::Valid => pieces.push(b""),
+            EmptyProjectionBehavior::StaleNonempty => pieces.push(b"stale"),
+            EmptyProjectionBehavior::Error => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        }
+    }
+}
+
+/// Asserts one declared-empty projection result and exact source return.
+#[allow(dead_code)]
+pub fn assert_empty_projection(
+    output: (io::Result<usize>, EmptyProjected),
+    expected_error: Option<io::ErrorKind>,
+) {
+    let (result, source) = output;
+    match expected_error {
+        Some(kind) => assert_eq!(
+            result
+                .expect_err("malformed empty projection should fail")
+                .kind(),
+            kind
+        ),
+        None => assert_eq!(result.expect("valid empty projection should succeed"), 0),
+    }
+    assert_eq!(source.projection_calls(), 1);
+}
+
+/// Exercises declared-empty validation on the immediate projected-write API.
+#[allow(unused_macros)]
+macro_rules! assert_empty_projected_try_cases {
+    ($stream:ident) => {{
+        $crate::common::assert_empty_projection(
+            $stream.try_writev_projected($crate::common::EmptyProjected::valid()),
+            None,
+        );
+        $crate::common::assert_empty_projection(
+            $stream.try_writev_projected($crate::common::EmptyProjected::stale_nonempty()),
+            Some(std::io::ErrorKind::InvalidInput),
+        );
+        $crate::common::assert_empty_projection(
+            $stream.try_writev_projected($crate::common::EmptyProjected::failing()),
+            Some(std::io::ErrorKind::PermissionDenied),
+        );
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_empty_projected_try_cases;
+
+/// Exercises declared-empty validation on one async projected-write API.
+#[allow(unused_macros)]
+macro_rules! assert_empty_projected_async_cases {
+    ($stream:ident, $method:ident) => {{
+        $crate::common::assert_empty_projection(
+            $stream
+                .$method($crate::common::EmptyProjected::valid())
+                .await,
+            None,
+        );
+        $crate::common::assert_empty_projection(
+            $stream
+                .$method($crate::common::EmptyProjected::stale_nonempty())
+                .await,
+            Some(std::io::ErrorKind::InvalidInput),
+        );
+        $crate::common::assert_empty_projection(
+            $stream
+                .$method($crate::common::EmptyProjected::failing())
+                .await,
+            Some(std::io::ErrorKind::PermissionDenied),
+        );
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_empty_projected_async_cases;
+
 /// Projection fixture whose reported byte count disagrees with its pieces.
 #[allow(dead_code)]
 pub struct TryMismatchedProjected;
@@ -387,6 +513,50 @@ impl WritevProjection for TryMismatchedProjected {
         pieces.push(b"x")
     }
 }
+
+/// Projection fixture whose reported piece count disagrees with its pieces.
+#[allow(dead_code)]
+pub struct TryCountMismatchedProjected;
+
+impl WritevProjection for TryCountMismatchedProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (2, 2)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        pieces.push(b"xx")
+    }
+}
+
+/// Exercises piece-count and byte-total mismatch validation on one async API.
+#[allow(unused_macros)]
+macro_rules! assert_projected_async_mismatches {
+    ($stream:ident, $method:ident) => {{
+        let (result, source) = $stream
+            .$method($crate::common::TryCountMismatchedProjected)
+            .await;
+        assert_eq!(
+            result
+                .expect_err("projected piece-count mismatch should fail")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let _source = source;
+
+        let (result, source) = $stream
+            .$method($crate::common::TryMismatchedProjected)
+            .await;
+        assert_eq!(
+            result
+                .expect_err("projected byte-total mismatch should fail")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let _source = source;
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_projected_async_mismatches;
 
 /// Projection fixture whose reported piece count exceeds FlowIO's iovec cap.
 #[allow(dead_code)]
