@@ -139,7 +139,7 @@ fn next_distinctive_test_fd_floor(fd: RawFd) -> RawFd {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), not(miri)))]
 fn soft_open_fd_limit() -> Option<RawFd> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -154,6 +154,13 @@ fn soft_open_fd_limit() -> Option<RawFd> {
         return Some(RawFd::MAX);
     }
     RawFd::try_from(limit.rlim_cur).ok()
+}
+
+#[cfg(all(any(test, feature = "test-support"), miri))]
+fn soft_open_fd_limit() -> Option<RawFd> {
+    // Miri does not emulate getrlimit. Falling back to the socketpair fd keeps
+    // close-ownership coverage while avoiding an unsupported host query.
+    None
 }
 
 #[cfg(all(test, not(miri)))]
