@@ -43,6 +43,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- Malformed matching-ID DNS datagrams are now rejected by the shared
+  candidate/full-parser name walker without constructing and then discarding
+  an `io::Error`. Full parsing preserves the same error kinds and messages,
+  while candidate rejection performs no heap allocation.
 - DNS resolution now accepts CNAME and address data only from the Answer
   section. Authority and Additional records remain structurally parsed but
   cannot seed or extend resolution; an Answer CNAME without an Answer address

@@ -79,6 +79,7 @@ enum FirstDnsDatagram {
     StaleQueryId,
     Undersized,
     MalformedMatchingQueryId,
+    MalformedQuestionPointerLoop,
     QuestionlessNxDomain,
 }
 
@@ -763,6 +764,45 @@ fn resolve_host_drains_malformed_matching_datagram_before_response() {
             assert_eq!(
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 49), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_drains_matching_question_pointer_loop_before_response() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries_with_first_datagrams(
+            server,
+            2,
+            &[FirstDnsDatagram::MalformedQuestionPointerLoop],
+            |name, qtype| {
+                Some(match (name, qtype) {
+                    ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 50)),
+                    ("db.example.test", 28) => TestAnswer::Empty,
+                    _ => TestAnswer::NxDomain,
+                })
+            },
+        )
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("resolver should drain the malformed question and use the real response");
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 50), 5432))]
             );
         })
         .expect("executor run failed");
@@ -1674,6 +1714,18 @@ fn send_first_dns_datagram(
             socket
                 .send_to(malformed, peer)
                 .expect("dns send_to malformed matching response failed");
+        }
+        FirstDnsDatagram::MalformedQuestionPointerLoop => {
+            let query_id = query
+                .get(..2)
+                .expect("test query ID should exist for malformed response");
+            let mut malformed = [0u8; 20];
+            malformed[..2].copy_from_slice(query_id);
+            malformed[2..6].copy_from_slice(&[0x81, 0x80, 0x00, 0x01]);
+            malformed[12..].copy_from_slice(&[0x01, b'x', 0xc0, 0x0c, 0, 1, 0, 1]);
+            socket
+                .send_to(&malformed, peer)
+                .expect("dns send_to malformed question response failed");
         }
         FirstDnsDatagram::QuestionlessNxDomain => {
             let questionless_nxdomain = build_response(query, TestAnswer::QuestionlessNxDomain);

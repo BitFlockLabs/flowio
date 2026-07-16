@@ -70,6 +70,10 @@ pub mod runtime {
 }
 
 pub mod net {
+    pub mod resolver {
+        pub use crate::net::resolver::test_support::response_is_decodable_candidate;
+    }
+
     pub mod tcp {
         pub use crate::net::tcp::test_support::test_accept_slot_drop_cached_state_closes_completed_fd;
     }

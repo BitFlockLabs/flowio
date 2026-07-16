@@ -1,79 +1,18 @@
+#[path = "common/counting_allocator.rs"]
+mod counting_allocator;
+
+use counting_allocator::{AllocationSnapshot, CountingAllocator};
 use flowio::net::sctp::{SctpConnector, SctpInitConfig, SctpListener, SctpSocketConfig};
 use flowio::net::tcp::TcpStream;
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-struct CountingAllocator;
-
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static DEALLOCS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) };
-        DEALLOCS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !ptr.is_null() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            DEALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        ptr
-    }
-}
-
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
-
-#[derive(Clone, Copy)]
-struct AllocationSnapshot {
-    allocs: usize,
-    deallocs: usize,
-}
-
-impl AllocationSnapshot {
-    fn current() -> Self {
-        Self {
-            allocs: ALLOCS.load(Ordering::Relaxed),
-            deallocs: DEALLOCS.load(Ordering::Relaxed),
-        }
-    }
-
-    fn assert_unchanged_since(self, before: Self) {
-        assert_eq!(
-            self.allocs, before.allocs,
-            "steady-state path performed heap allocations"
-        );
-        assert_eq!(
-            self.deallocs, before.deallocs,
-            "steady-state path performed heap deallocations"
-        );
-    }
-}
 
 fn sctp_unsupported(err: &std::io::Error) -> bool {
     matches!(

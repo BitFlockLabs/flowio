@@ -5,9 +5,10 @@
 //! crate (a separate package) can reach parsers that are otherwise
 //! crate-private. Not a stable API; do not depend on this module.
 //!
-//! Each wrapper takes raw bytes and discards the result — the fuzzers assert
-//! the contract by *not crashing* (no panic, no OOB read, bounded termination)
-//! across arbitrary input.
+//! Each wrapper takes raw bytes and exercises an internal parser. All targets
+//! enforce no panic, out-of-bounds access, or unbounded termination; the DNS
+//! prefilter target also asserts differential structural-acceptance parity
+//! with the full response-envelope parser.
 
 use std::borrow::Cow;
 
@@ -152,11 +153,12 @@ pub fn sctp_parse_assoc_addrs(data: &[u8]) {
 }
 
 /// Fuzz entry: the DNS response prefilter (`response_is_decodable_candidate`),
-/// a distinct compression-pointer walk over the question name that runs before
-/// `parse_response_packet` in the drain loop. The query id is derived from the
-/// packet's own first two bytes so the id/QR gate passes and the name walk is
-/// actually reached; the mismatch call also covers the early-return path.
-/// Property: bounded pointer loop, no panic, no OOB.
+/// which uses the non-materializing mode of the shared question-name walker
+/// before `parse_response_packet` in the drain loop. The query id is derived
+/// from the packet's first two bytes so the id/QR gate passes and the name walk
+/// is reached; the mismatch call also covers the early-return path. Property:
+/// candidate and full-envelope structural acceptance stay identical, pointer
+/// recursion stays bounded, and arbitrary input cannot panic or read OOB.
 pub fn dns_response_prefilter(data: &[u8]) {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
@@ -164,7 +166,12 @@ pub fn dns_response_prefilter(data: &[u8]) {
         data.first().copied().unwrap_or_default(),
         data.get(1).copied().unwrap_or_default(),
     ]);
-    let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id);
+    let candidate = crate::net::resolver::response_is_decodable_candidate(data, query_id);
+    let envelope = crate::net::resolver::response_envelope_is_decodable(data, query_id);
+    assert_eq!(
+        candidate, envelope,
+        "DNS candidate prefilter and full envelope parser diverged"
+    );
     let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id ^ 0x5555);
 }
 

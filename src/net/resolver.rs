@@ -770,6 +770,11 @@ fn parse_response_envelope(packet: &[u8], query_id: u16) -> io::Result<DnsRespon
     })
 }
 
+#[cfg(feature = "fuzzing")]
+pub(crate) fn response_envelope_is_decodable(packet: &[u8], query_id: u16) -> bool {
+    parse_response_envelope(packet, query_id).is_ok()
+}
+
 #[inline(always)]
 fn dns_rcode(flags: u16) -> u8 {
     (flags & DNS_RCODE_MASK) as u8
@@ -1082,9 +1087,73 @@ pub(crate) fn decode_name(
     depth: usize,
 ) -> io::Result<(String, usize)> {
     let mut labels = Vec::new();
-    let (consumed, _) = walk_dns_name(packet, offset, depth, Some(&mut labels))?;
+    let (consumed, _) = walk_dns_name(packet, offset, depth, Some(&mut labels))
+        .map_err(DnsNameWalkError::into_io_error)?;
     let name = labels.join(".");
     Ok((name, consumed))
+}
+
+/// Allocation-free failure status used by the shared DNS name walker.
+///
+/// The UDP candidate prefilter discards this status directly. Full decoding
+/// converts it to the historical `io::Error` kind and message at its boundary.
+#[derive(Clone, Copy)]
+enum DnsNameWalkError {
+    CompressionDepthExceeded,
+    OffsetExceededPacket,
+    NameExceededPacket,
+    CompressionPointerTruncated,
+    CompressionPointerNotBackward,
+    NameLengthOverflow,
+    UnsupportedLabelEncoding,
+    NameTooLong,
+    PacketArithmeticOverflow,
+    PacketEndedUnexpectedly,
+}
+
+impl DnsNameWalkError {
+    fn into_io_error(self) -> io::Error {
+        let (kind, message) = match self {
+            Self::CompressionDepthExceeded => (
+                io::ErrorKind::InvalidData,
+                "DNS name compression exceeded maximum depth",
+            ),
+            Self::OffsetExceededPacket => (
+                io::ErrorKind::UnexpectedEof,
+                "DNS name offset exceeded packet length",
+            ),
+            Self::NameExceededPacket => (
+                io::ErrorKind::UnexpectedEof,
+                "DNS name exceeded packet length",
+            ),
+            Self::CompressionPointerTruncated => (
+                io::ErrorKind::UnexpectedEof,
+                "DNS compression pointer ended unexpectedly",
+            ),
+            Self::CompressionPointerNotBackward => (
+                io::ErrorKind::InvalidData,
+                "DNS compression pointer did not point backward",
+            ),
+            Self::NameLengthOverflow => (io::ErrorKind::InvalidData, "DNS name length overflowed"),
+            Self::UnsupportedLabelEncoding => (
+                io::ErrorKind::InvalidData,
+                "DNS label used an unsupported length encoding",
+            ),
+            Self::NameTooLong => (
+                io::ErrorKind::InvalidData,
+                "DNS name exceeded maximum length",
+            ),
+            Self::PacketArithmeticOverflow => (
+                io::ErrorKind::InvalidData,
+                "DNS packet arithmetic overflowed",
+            ),
+            Self::PacketEndedUnexpectedly => (
+                io::ErrorKind::UnexpectedEof,
+                "DNS packet ended unexpectedly",
+            ),
+        };
+        io::Error::new(kind, message)
+    }
 }
 
 fn walk_dns_name(
@@ -1092,18 +1161,12 @@ fn walk_dns_name(
     offset: usize,
     depth: usize,
     mut labels: Option<&mut Vec<String>>,
-) -> io::Result<(usize, usize)> {
+) -> Result<(usize, usize), DnsNameWalkError> {
     if depth > MAX_CNAME_DEPTH + 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS name compression exceeded maximum depth",
-        ));
+        return Err(DnsNameWalkError::CompressionDepthExceeded);
     }
     if offset >= packet.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "DNS name offset exceeded packet length",
-        ));
+        return Err(DnsNameWalkError::OffsetExceededPacket);
     }
 
     let mut pos = offset;
@@ -1111,39 +1174,30 @@ fn walk_dns_name(
     let mut presentation_len = 0usize;
 
     loop {
-        let len = *packet.get(pos).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "DNS name exceeded packet length",
-            )
-        })?;
+        let len = *packet
+            .get(pos)
+            .ok_or(DnsNameWalkError::NameExceededPacket)?;
         if len & 0xC0 == 0xC0 {
-            let next = checked_add(pos, 1, packet.len())?;
-            let next_byte = *packet.get(next).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "DNS compression pointer ended unexpectedly",
-                )
-            })?;
+            let next = checked_add_name_offset(pos, 1, packet.len())?;
+            let next_byte = *packet
+                .get(next)
+                .ok_or(DnsNameWalkError::CompressionPointerTruncated)?;
             let pointer = (((len & 0x3F) as usize) << 8) | next_byte as usize;
             if pointer >= pos {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "DNS compression pointer did not point backward",
-                ));
+                return Err(DnsNameWalkError::CompressionPointerNotBackward);
             }
             consumed += 2;
             let child_labels = labels.as_deref_mut();
             let (_, suffix_len) = walk_dns_name(packet, pointer, depth + 1, child_labels)?;
             if suffix_len != 0 {
                 if presentation_len != 0 {
-                    presentation_len = presentation_len.checked_add(1).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
-                    })?;
+                    presentation_len = presentation_len
+                        .checked_add(1)
+                        .ok_or(DnsNameWalkError::NameLengthOverflow)?;
                 }
-                presentation_len = presentation_len.checked_add(suffix_len).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
-                })?;
+                presentation_len = presentation_len
+                    .checked_add(suffix_len)
+                    .ok_or(DnsNameWalkError::NameLengthOverflow)?;
             }
             break;
         }
@@ -1154,23 +1208,20 @@ fn walk_dns_name(
         }
 
         if len & 0xC0 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "DNS label used an unsupported length encoding",
-            ));
+            return Err(DnsNameWalkError::UnsupportedLabelEncoding);
         }
 
         let label_len = len as usize;
-        let label_start = checked_add(pos, 1, packet.len())?;
-        let label_end = checked_add(label_start, label_len, packet.len())?;
+        let label_start = checked_add_name_offset(pos, 1, packet.len())?;
+        let label_end = checked_add_name_offset(label_start, label_len, packet.len())?;
         if presentation_len != 0 {
-            presentation_len = presentation_len.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
-            })?;
+            presentation_len = presentation_len
+                .checked_add(1)
+                .ok_or(DnsNameWalkError::NameLengthOverflow)?;
         }
-        presentation_len = presentation_len.checked_add(label_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "DNS name length overflowed")
-        })?;
+        presentation_len = presentation_len
+            .checked_add(label_len)
+            .ok_or(DnsNameWalkError::NameLengthOverflow)?;
         if let Some(labels) = labels.as_mut() {
             labels.push(String::from_utf8_lossy(&packet[label_start..label_end]).into_owned());
         }
@@ -1181,10 +1232,7 @@ fn walk_dns_name(
     // DNS name limits are defined on raw label octets plus separators. Keep
     // this check independent of the lossy UTF-8 string used by decode callers.
     if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS name exceeded maximum length",
-        ));
+        return Err(DnsNameWalkError::NameTooLong);
     }
 
     Ok((consumed, presentation_len))
@@ -1192,6 +1240,20 @@ fn walk_dns_name(
 
 fn skip_dns_name(packet: &[u8], offset: usize, depth: usize) -> Option<(usize, usize)> {
     walk_dns_name(packet, offset, depth, None).ok()
+}
+
+fn checked_add_name_offset(
+    base: usize,
+    add: usize,
+    limit: usize,
+) -> Result<usize, DnsNameWalkError> {
+    let value = base
+        .checked_add(add)
+        .ok_or(DnsNameWalkError::PacketArithmeticOverflow)?;
+    if value > limit {
+        return Err(DnsNameWalkError::PacketEndedUnexpectedly);
+    }
+    Ok(value)
 }
 
 fn dns_name_eq(left: &str, right: &str) -> bool {
@@ -1226,6 +1288,14 @@ fn read_u16_be_candidate(packet: &[u8], offset: usize) -> Option<u16> {
     let end = offset.checked_add(2)?;
     let bytes = packet.get(offset..end)?;
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) mod test_support {
+    /// Repository-only seam for the DNS candidate allocation fixture.
+    pub fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
+        super::response_is_decodable_candidate(packet, query_id)
+    }
 }
 
 #[cfg(test)]
@@ -1356,6 +1426,212 @@ mod tests {
         let err = decode_name(&packet, invalid_offset, 0)
             .expect_err("254-byte compressed name should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn candidate_prefilter_and_envelope_parser_share_structural_acceptance() {
+        const QUERY_ID: u16 = 0x1234;
+
+        let mut cases = vec![
+            (
+                "valid uncompressed question",
+                response_with_question_name(QUERY_ID, b"\x07example\x03com\0"),
+                true,
+            ),
+            (
+                "valid compressed root question",
+                response_with_question_name(QUERY_ID, b"\xc0\x04"),
+                true,
+            ),
+            (
+                "questionless SERVFAIL",
+                response_header(QUERY_ID, DNS_FLAG_QR | DNS_RCODE_SERVFAIL as u16, 0),
+                true,
+            ),
+            (
+                "questionless NXDOMAIN",
+                response_header(QUERY_ID, DNS_FLAG_QR | DNS_RCODE_NXDOMAIN as u16, 0),
+                false,
+            ),
+            (
+                "questionless NOERROR",
+                response_header(QUERY_ID, DNS_FLAG_QR, 0),
+                false,
+            ),
+            ("short header", vec![0x12, 0x34, 0x81], false),
+            (
+                "wrong query ID",
+                response_with_question_name(QUERY_ID.wrapping_add(1), b"\0"),
+                false,
+            ),
+            (
+                "query rather than response",
+                response_header(QUERY_ID, 0, 1),
+                false,
+            ),
+            (
+                "two questions",
+                response_header(QUERY_ID, DNS_FLAG_QR, 2),
+                false,
+            ),
+        ];
+
+        let mut truncated_label = response_header(QUERY_ID, DNS_FLAG_QR, 1);
+        truncated_label.extend_from_slice(&[3, b'x']);
+        cases.push(("truncated label", truncated_label, false));
+
+        let mut unsupported_label = response_header(QUERY_ID, DNS_FLAG_QR, 1);
+        unsupported_label.push(0x40);
+        cases.push(("unsupported label encoding", unsupported_label, false));
+
+        cases.push((
+            "forward compression pointer",
+            response_with_question_name(QUERY_ID, b"\xc0\x0c"),
+            false,
+        ));
+        cases.push((
+            "backward compression pointer loop",
+            response_with_question_name(QUERY_ID, b"\x01x\xc0\x0c"),
+            false,
+        ));
+
+        let mut overlong_name = Vec::new();
+        for label_len in [63usize, 63, 63, 62] {
+            overlong_name.push(label_len as u8);
+            overlong_name.extend(std::iter::repeat_n(b'x', label_len));
+        }
+        overlong_name.push(0);
+        cases.push((
+            "overlong expanded name",
+            response_with_question_name(QUERY_ID, &overlong_name),
+            false,
+        ));
+
+        for (case, packet, expected) in cases {
+            assert_eq!(
+                response_is_decodable_candidate(&packet, QUERY_ID),
+                expected,
+                "candidate result for {case}"
+            );
+            assert_eq!(
+                parse_response_envelope(&packet, QUERY_ID).is_ok(),
+                expected,
+                "envelope result for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn materializing_and_non_materializing_name_walks_share_acceptance() {
+        let mut overlong_name = Vec::new();
+        for label_len in [63usize, 63, 63, 62] {
+            overlong_name.push(label_len as u8);
+            overlong_name.extend(std::iter::repeat_n(b'x', label_len));
+        }
+        overlong_name.push(0);
+
+        let cases = [
+            ("root", vec![0], 0usize, true),
+            ("plain", b"\x03www\x07example\x03com\0".to_vec(), 0, true),
+            ("compressed root", vec![0, 0xc0, 0], 1, true),
+            ("truncated pointer", vec![0xc0], 0, false),
+            ("forward pointer", vec![0xc0, 0], 0, false),
+            ("backward pointer loop", vec![1, b'x', 0xc0, 0], 0, false),
+            ("unsupported label", vec![0x40], 0, false),
+            ("overlong name", overlong_name, 0, false),
+        ];
+
+        for (case, packet, offset, expected) in cases {
+            let materialized = decode_name(&packet, offset, 0);
+            let skipped = walk_dns_name(&packet, offset, 0, None);
+            assert_eq!(materialized.is_ok(), expected, "decoder result for {case}");
+            assert_eq!(skipped.is_ok(), expected, "skip result for {case}");
+            if let (Ok((_, decoded_consumed)), Ok((skipped_consumed, _))) = (materialized, skipped)
+            {
+                assert_eq!(
+                    decoded_consumed, skipped_consumed,
+                    "consumed bytes for {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dns_name_walk_error_conversion_preserves_parser_contract() {
+        let cases = [
+            (
+                DnsNameWalkError::CompressionDepthExceeded,
+                io::ErrorKind::InvalidData,
+                "DNS name compression exceeded maximum depth",
+            ),
+            (
+                DnsNameWalkError::OffsetExceededPacket,
+                io::ErrorKind::UnexpectedEof,
+                "DNS name offset exceeded packet length",
+            ),
+            (
+                DnsNameWalkError::NameExceededPacket,
+                io::ErrorKind::UnexpectedEof,
+                "DNS name exceeded packet length",
+            ),
+            (
+                DnsNameWalkError::CompressionPointerTruncated,
+                io::ErrorKind::UnexpectedEof,
+                "DNS compression pointer ended unexpectedly",
+            ),
+            (
+                DnsNameWalkError::CompressionPointerNotBackward,
+                io::ErrorKind::InvalidData,
+                "DNS compression pointer did not point backward",
+            ),
+            (
+                DnsNameWalkError::NameLengthOverflow,
+                io::ErrorKind::InvalidData,
+                "DNS name length overflowed",
+            ),
+            (
+                DnsNameWalkError::UnsupportedLabelEncoding,
+                io::ErrorKind::InvalidData,
+                "DNS label used an unsupported length encoding",
+            ),
+            (
+                DnsNameWalkError::NameTooLong,
+                io::ErrorKind::InvalidData,
+                "DNS name exceeded maximum length",
+            ),
+            (
+                DnsNameWalkError::PacketArithmeticOverflow,
+                io::ErrorKind::InvalidData,
+                "DNS packet arithmetic overflowed",
+            ),
+            (
+                DnsNameWalkError::PacketEndedUnexpectedly,
+                io::ErrorKind::UnexpectedEof,
+                "DNS packet ended unexpectedly",
+            ),
+        ];
+
+        for (walk_error, kind, message) in cases {
+            let error = walk_error.into_io_error();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    fn response_header(query_id: u16, flags: u16, qdcount: u16) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(12);
+        for field in [query_id, flags, qdcount, 0, 0, 0] {
+            packet.extend_from_slice(&field.to_be_bytes());
+        }
+        packet
+    }
+
+    fn response_with_question_name(query_id: u16, name: &[u8]) -> Vec<u8> {
+        let mut packet = response_header(query_id, DNS_FLAG_QR, 1);
+        packet.extend_from_slice(name);
+        packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        packet
     }
 
     fn query_name_with_final_label(final_label_len: usize) -> String {
