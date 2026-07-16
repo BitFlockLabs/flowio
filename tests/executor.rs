@@ -1812,11 +1812,15 @@ fn runtime_clean_runs_reset_generation_task_counters() {
     let first = executor.last_stats();
     assert_eq!(first.task_allocs, 1);
     assert_eq!(first.task_frees, 1);
+    assert_eq!(first.task_slab_allocs, 1);
+    assert_eq!(first.task_slab_frees, 0);
 
     executor.run(async {}).expect("second clean run failed");
     let second = executor.last_stats();
     assert_eq!(second.task_allocs, 1);
     assert_eq!(second.task_frees, 1);
+    assert_eq!(second.task_slab_allocs, 0);
+    assert_eq!(second.task_slab_frees, 0);
 }
 
 #[cfg(debug_assertions)]

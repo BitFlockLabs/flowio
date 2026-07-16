@@ -3,7 +3,24 @@
 use super::pool::{InPlaceInit, Pool, PoolConfigError};
 use super::provider::{MemoryProvider, ProviderOwner};
 use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
+
+/// Narrow provider controls that are safe while a dependent pool is live.
+///
+/// # Safety
+///
+/// Implementations must not move or replace the provider, change allocation
+/// geometry, invalidate a live allocation, or otherwise break the paired
+/// [`MemoryProvider`] relationship. Controls may update observability state or
+/// future allocation-admission policy only.
+pub(crate) unsafe trait ProviderOwnedPoolControl {
+    /// Clears provider observability counters without changing allocations.
+    fn reset_debug_counts(&mut self);
+
+    /// Sets a test-only cap on future provider requests.
+    #[cfg(all(test, not(miri)))]
+    fn set_max_request_count(&mut self, max_request_count: Option<usize>);
+}
 
 /// Owns a heap-allocated memory provider plus a pool that stores a raw pointer
 /// to that provider.
@@ -30,6 +47,33 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> ProviderOwnedPool<T, P> {
         Ok(Self { provider, pool })
     }
 
+    /// Initializes the dependent pool without exposing it for replacement.
+    #[inline(always)]
+    pub(crate) fn init(&mut self) {
+        self.pool.init();
+    }
+
+    /// Allocates and initializes one pool slot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold [`Pool::alloc`]'s object-initialization contract.
+    #[inline(always)]
+    pub(crate) unsafe fn alloc(&mut self, args: T::Args) -> Option<*mut T> {
+        unsafe { self.pool.alloc(args) }
+    }
+
+    /// Drops and returns one live object to this pool.
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be null or a live slot returned by this exact pool and not
+    /// already freed.
+    #[inline(always)]
+    pub(crate) unsafe fn free(&mut self, obj: *mut T) {
+        unsafe { self.pool.free(obj) };
+    }
+
     #[cfg(debug_assertions)]
     #[inline(always)]
     /// Borrows the backing provider for debug-only state inspection.
@@ -37,10 +81,25 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> ProviderOwnedPool<T, P> {
         self.provider.as_ref()
     }
 
+    /// Resets provider counters through a relation-preserving narrow control.
     #[inline(always)]
-    /// Mutably borrows the backing provider while the wrapper is exclusive.
-    pub(crate) fn provider_mut(&mut self) -> &mut P {
-        self.provider.as_mut()
+    pub(crate) fn reset_provider_debug_counts(&mut self)
+    where
+        P: ProviderOwnedPoolControl,
+    {
+        self.provider.as_mut().reset_debug_counts();
+    }
+
+    /// Sets the test-only provider request limit without exposing the provider.
+    #[cfg(all(test, not(miri)))]
+    #[inline(always)]
+    pub(crate) fn set_provider_max_request_count(&mut self, max_request_count: Option<usize>)
+    where
+        P: ProviderOwnedPoolControl,
+    {
+        self.provider
+            .as_mut()
+            .set_max_request_count(max_request_count);
     }
 }
 
@@ -49,12 +108,6 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> Deref for ProviderOwnedPool<T,
 
     fn deref(&self) -> &Self::Target {
         &self.pool
-    }
-}
-
-impl<T: InPlaceInit, P: MemoryProvider + 'static> DerefMut for ProviderOwnedPool<T, P> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.pool
     }
 }
 
@@ -72,20 +125,33 @@ mod tests {
     use super::{InPlaceInit, ProviderOwnedPool};
     use crate::utils::memory::pool::PoolConfigError;
     use crate::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::mem::MaybeUninit;
     use std::rc::Rc;
 
+    trait AmbiguousIfDerefMut<A> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfDerefMut<()> for T {}
+    impl<T: ?Sized + std::ops::DerefMut> AmbiguousIfDerefMut<u8> for T {}
+
     struct DropCountingProvider {
         drops: Rc<Cell<usize>>,
+        events: Rc<RefCell<Vec<&'static str>>>,
         provider: BasicMemoryProvider,
         live: Option<(*mut u8, usize)>,
     }
 
     impl DropCountingProvider {
         fn new(drops: Rc<Cell<usize>>) -> Self {
+            Self::with_events(drops, Rc::new(RefCell::new(Vec::new())))
+        }
+
+        fn with_events(drops: Rc<Cell<usize>>, events: Rc<RefCell<Vec<&'static str>>>) -> Self {
             Self {
                 drops,
+                events,
                 provider: BasicMemoryProvider::new(),
                 live: None,
             }
@@ -99,6 +165,7 @@ mod tests {
                 // not returned before unwinding reached provider drop.
                 unsafe { self.provider.free_memory(ptr, size) };
             }
+            self.events.borrow_mut().push("provider_drop");
             self.drops.set(self.drops.get() + 1);
         }
     }
@@ -122,6 +189,7 @@ mod tests {
             }
             let ptr = self.provider.request_memory(size)?;
             self.live = Some((ptr, size));
+            self.events.borrow_mut().push("request_memory");
             Some(ptr)
         }
 
@@ -133,6 +201,7 @@ mod tests {
             debug_assert_eq!(live_ptr, ptr);
             debug_assert_eq!(live_size, size);
             unsafe { self.provider.free_memory(ptr, size) };
+            self.events.borrow_mut().push("free_memory");
         }
     }
 
@@ -147,6 +216,100 @@ mod tests {
         fn init_at(slot: &mut MaybeUninit<Self>, value: Self::Args) {
             slot.write(Self { value });
         }
+    }
+
+    struct DropTrackedSlot {
+        value: usize,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl InPlaceInit for DropTrackedSlot {
+        type Args = (usize, Rc<Cell<usize>>);
+
+        fn init_at(slot: &mut MaybeUninit<Self>, (value, drops): Self::Args) {
+            slot.write(Self { value, drops });
+        }
+    }
+
+    impl Drop for DropTrackedSlot {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn provider_owned_pool_has_no_broad_mutable_deref() {
+        let _ =
+            <ProviderOwnedPool<TestSlot, BasicMemoryProvider> as AmbiguousIfDerefMut<_>>::marker;
+    }
+
+    #[test]
+    fn provider_owned_pool_allocates_frees_and_reuses_through_narrow_api() {
+        let mut pool = ProviderOwnedPool::<TestSlot, _>::new(BasicMemoryProvider::new(), 1)
+            .expect("provider-owned pool construction failed");
+        pool.init();
+
+        let first = unsafe { pool.alloc(7).expect("first pool slot allocation failed") };
+        unsafe {
+            assert_eq!((*first).value, 7);
+            pool.free(first);
+        }
+
+        let reused = unsafe { pool.alloc(11).expect("reused pool slot allocation failed") };
+        assert_eq!(reused, first);
+        unsafe {
+            assert_eq!((*reused).value, 11);
+            pool.free(reused);
+        }
+    }
+
+    #[test]
+    fn provider_owned_pool_keeps_relation_across_move_and_drops_pool_first() {
+        let provider_drops = Rc::new(Cell::new(0));
+        let slot_drops = Rc::new(Cell::new(0));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let provider =
+            DropCountingProvider::with_events(Rc::clone(&provider_drops), Rc::clone(&events));
+        let pool = ProviderOwnedPool::<DropTrackedSlot, _>::new(provider, 2)
+            .expect("provider-owned pool construction failed");
+        let mut moved_pool = pool;
+        moved_pool.init();
+
+        let first = unsafe {
+            moved_pool
+                .alloc((7, Rc::clone(&slot_drops)))
+                .expect("first pool slot allocation failed")
+        };
+        let second = unsafe {
+            moved_pool
+                .alloc((11, Rc::clone(&slot_drops)))
+                .expect("second pool slot allocation failed")
+        };
+        assert_eq!(events.borrow().as_slice(), &["request_memory"]);
+
+        unsafe { moved_pool.free(first) };
+        assert_eq!(slot_drops.get(), 1);
+        assert_eq!(events.borrow().as_slice(), &["request_memory"]);
+
+        let reused = unsafe {
+            moved_pool
+                .alloc((13, Rc::clone(&slot_drops)))
+                .expect("freed pool slot should be reused")
+        };
+        assert_eq!(reused, first);
+        unsafe {
+            assert_eq!((*reused).value, 13);
+            moved_pool.free(second);
+            moved_pool.free(reused);
+        }
+        assert_eq!(slot_drops.get(), 3);
+
+        drop(moved_pool);
+        assert_eq!(provider_drops.get(), 1);
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["request_memory", "free_memory", "provider_drop"]
+        );
     }
 
     #[test]

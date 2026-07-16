@@ -6,7 +6,6 @@ use crate::runtime::op::CompletionState;
 use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::retained::{RetainedIovecScratch, RetainedPayload, RetainedPayloadPool};
 use crate::runtime::task::release_task;
-use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use io_uring::{IoUring, opcode, types};
@@ -229,7 +228,7 @@ impl PendingCancelQueue {
 unsafe fn free_op_fields(
     pending_cancels: &mut PendingCancelQueue,
     retained_pool: &mut RetainedPayloadPool,
-    op_pool: &mut Pool<'static, CompletionState, BasicMemoryProvider>,
+    op_pool: &mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
     live_registry: &mut Vec<*mut CompletionState>,
     ptr: *mut CompletionState,
 ) -> io::Result<()> {

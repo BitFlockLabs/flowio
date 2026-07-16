@@ -51,7 +51,7 @@ use crate::runtime::task::{
     TaskHeader, clear_task_ref, release_task, replace_task_ref, take_task_ref,
 };
 use crate::utils::list::intrusive::dlist::{DList, Link};
-use crate::utils::memory::pool::{InPlaceInit, Pool};
+use crate::utils::memory::pool::InPlaceInit;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use std::array;
@@ -977,7 +977,7 @@ impl Drop for TimerRuntime {
 
 fn free_timer_bucket_entries(
     bucket: &mut DList<TimerEntry>,
-    timer_pool: &mut Pool<'static, TimerEntry, BasicMemoryProvider>,
+    timer_pool: &mut ProviderOwnedPool<TimerEntry, BasicMemoryProvider>,
 ) {
     unsafe {
         bucket.drain_all_for_drop(TimerEntry::LINK_OFFSET, |entry| {

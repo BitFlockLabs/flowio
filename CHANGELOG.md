@@ -39,6 +39,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- `ProviderOwnedPool` no longer exposes broad mutable access to either half of
+  its self-referential provider/pool relation. Narrow inlined operations retain
+  the existing allocation behavior while keeping pool teardown before provider
+  teardown.
 - Dev-only intrusive-list cursors now advance past a pending node before
   unlinking it, so removing the next forward or backward node cannot leave the
   cursor pointing at cleared links.

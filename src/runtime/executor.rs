@@ -47,7 +47,7 @@ use crate::runtime::task::{
 use crate::runtime::timer::TimerRuntime;
 use crate::utils::list::intrusive::dlist::DList;
 use crate::utils::memory::provider::MemoryProvider;
-use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
+use crate::utils::memory::provider_owned_pool::{ProviderOwnedPool, ProviderOwnedPoolControl};
 use io_uring::{opcode, squeue, types};
 use std::alloc::{Layout, alloc};
 use std::cell::{Cell, UnsafeCell};
@@ -207,7 +207,7 @@ struct ExecutorTaskMemProvider {
     #[cfg(debug_assertions)]
     /// Number of task slab frees issued since the last debug reset.
     free_count: usize,
-    #[cfg(test)]
+    #[cfg(all(test, not(miri)))]
     /// Optional task slab request cap used by executor allocation-failure tests.
     max_request_count: Option<usize>,
 }
@@ -220,7 +220,7 @@ impl ExecutorTaskMemProvider {
             request_count: 0,
             #[cfg(debug_assertions)]
             free_count: 0,
-            #[cfg(test)]
+            #[cfg(all(test, not(miri)))]
             max_request_count: None,
         }
     }
@@ -254,6 +254,22 @@ impl ExecutorTaskMemProvider {
     }
 }
 
+// SAFETY: these controls only reset observability counters or, in tests, cap
+// future slab requests. They do not move/replace the provider, change its
+// alignment, or invalidate any live task-slab allocation.
+unsafe impl ProviderOwnedPoolControl for ExecutorTaskMemProvider {
+    #[inline(always)]
+    fn reset_debug_counts(&mut self) {
+        ExecutorTaskMemProvider::reset_debug_counts(self);
+    }
+
+    #[cfg(all(test, not(miri)))]
+    #[inline(always)]
+    fn set_max_request_count(&mut self, max_request_count: Option<usize>) {
+        self.max_request_count = max_request_count;
+    }
+}
+
 // SAFETY: this private provider is owned by exactly one task
 // ProviderOwnedPool. Its SlabAllocator initializes the alignment once before
 // the first request and never changes it while task slabs are live. Each
@@ -273,7 +289,7 @@ unsafe impl MemoryProvider for ExecutorTaskMemProvider {
             return None;
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, not(miri)))]
         {
             if self
                 .max_request_count
@@ -1238,7 +1254,7 @@ impl Executor {
         if starts_clean {
             unsafe {
                 (*state_ptr).runtime_state = RuntimeState::new();
-                (*state_ptr).task_pool.provider_mut().reset_debug_counts();
+                (*state_ptr).task_pool.reset_provider_debug_counts();
             }
         }
 
@@ -2280,8 +2296,7 @@ mod tests {
         unsafe {
             (*executor.owner.state_ptr())
                 .task_pool
-                .provider_mut()
-                .max_request_count = Some(1);
+                .set_provider_max_request_count(Some(1));
         }
         executor
     }
