@@ -187,6 +187,10 @@ impl DnsResolver {
     /// malformed unless its encoded (possibly compressed) name consumes its
     /// declared RDATA length exactly; malformed responses participate in the
     /// existing nameserver and address-family error selection.
+    /// Every present echoed question is matched by name, type, and class before
+    /// its response code is applied. Questionless FORMERR, SERVFAIL, NOTIMP,
+    /// and REFUSED replies remain prompt nameserver-failover results, while a
+    /// questionless NXDOMAIN is drained as an unrelated datagram.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -885,6 +889,21 @@ pub(crate) fn parse_response_packet(
         ));
     }
 
+    if let Some(question) = envelope.question.as_ref() {
+        if !dns_name_eq(&question.name, query_host) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response question name did not match query",
+            ));
+        }
+        if question.qtype != qtype || question.qclass != DNS_CLASS_IN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response question type/class did not match query",
+            ));
+        }
+    }
+
     let rcode = dns_rcode(flags);
     if rcode == DNS_RCODE_NXDOMAIN {
         return Ok(LookupResult {
@@ -905,18 +924,6 @@ pub(crate) fn parse_response_packet(
             "DNS response question count did not match query",
         ));
     };
-    if !dns_name_eq(&question.name, query_host) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response question name did not match query",
-        ));
-    }
-    if question.qtype != qtype || question.qclass != DNS_CLASS_IN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response question type/class did not match query",
-        ));
-    }
     let mut offset = question.end_offset;
 
     let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;

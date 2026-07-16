@@ -43,6 +43,11 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- DNS responses with an echoed question now match its name, type, and class
+  before applying NXDOMAIN or another nonzero response code. Mismatched
+  negative responses fail over instead of terminating the logical lookup;
+  questionless failover-class responses and questionless-NXDOMAIN draining
+  retain their existing behavior.
 - DNS lookup now rejects normalized query names over 253 presentation bytes,
   encoded names over 255 bytes, and labels over 63 bytes with `InvalidInput`
   before allocating or sending a query packet. CNAME RDATA must consume its

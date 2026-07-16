@@ -37,9 +37,23 @@ enum TestAnswer {
     CnameRdataTrailingBytes,
     Empty,
     NxDomain,
+    NegativeQuestionMismatch(QuestionMismatch, NegativeRcode),
     QuestionlessNxDomain,
     ServFail,
     QuestionlessServFail,
+}
+
+#[derive(Clone, Copy)]
+enum QuestionMismatch {
+    Name,
+    Type,
+    Class,
+}
+
+#[derive(Clone, Copy)]
+enum NegativeRcode {
+    NxDomain,
+    ServFail,
 }
 
 #[derive(Clone, Copy)]
@@ -1037,6 +1051,71 @@ fn resolve_host_rejects_cyclic_in_response_cname_chain() {
 }
 
 #[test]
+fn resolve_host_validates_negative_response_questions_before_rcode() {
+    let cases = [
+        (
+            "NXDOMAIN wrong name",
+            TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Name, NegativeRcode::NxDomain),
+            "question name",
+        ),
+        (
+            "NXDOMAIN wrong type",
+            TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Type, NegativeRcode::NxDomain),
+            "question type/class",
+        ),
+        (
+            "NXDOMAIN wrong class",
+            TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Class, NegativeRcode::NxDomain),
+            "question type/class",
+        ),
+        (
+            "SERVFAIL wrong name",
+            TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Name, NegativeRcode::ServFail),
+            "question name",
+        ),
+        (
+            "SERVFAIL wrong type",
+            TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Type, NegativeRcode::ServFail),
+            "question type/class",
+        ),
+        (
+            "SERVFAIL wrong class",
+            TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Class, NegativeRcode::ServFail),
+            "question type/class",
+        ),
+    ];
+
+    for (label, answer, expected_message) in cases {
+        let err = resolve_with_mock_dns(2, Duration::from_millis(200), move |_name, _qtype| {
+            Some(answer)
+        })
+        .expect_err(label);
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{label}");
+        assert!(
+            err.to_string().contains(expected_message),
+            "{label} returned unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn resolve_host_applies_matching_negative_response_codes() {
+    let nxdomain = resolve_with_mock_dns(2, Duration::from_millis(200), |_name, _qtype| {
+        Some(TestAnswer::NxDomain)
+    })
+    .expect_err("matching NXDOMAIN should remain authoritative");
+    assert_eq!(nxdomain.kind(), io::ErrorKind::NotFound);
+
+    let servfail = resolve_with_mock_dns(2, Duration::from_millis(200), |_name, _qtype| {
+        Some(TestAnswer::ServFail)
+    })
+    .expect_err("matching SERVFAIL should remain a recoverable server error");
+    assert_eq!(servfail.kind(), io::ErrorKind::Other);
+    assert!(servfail.to_string().contains("response code 2"));
+}
+
+#[test]
 fn resolve_host_rejects_question_type_mismatch() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
@@ -1529,13 +1608,18 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::QuestionClassMismatch
         | TestAnswer::Empty
         | TestAnswer::NxDomain
+        | TestAnswer::NegativeQuestionMismatch(_, _)
         | TestAnswer::QuestionlessNxDomain
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => 0u16,
     };
     let flags = match answer {
-        TestAnswer::NxDomain | TestAnswer::QuestionlessNxDomain => 0x8183u16,
-        TestAnswer::ServFail | TestAnswer::QuestionlessServFail => 0x8182u16,
+        TestAnswer::NegativeQuestionMismatch(_, NegativeRcode::NxDomain)
+        | TestAnswer::NxDomain
+        | TestAnswer::QuestionlessNxDomain => 0x8183u16,
+        TestAnswer::NegativeQuestionMismatch(_, NegativeRcode::ServFail)
+        | TestAnswer::ServFail
+        | TestAnswer::QuestionlessServFail => 0x8182u16,
         _ => 0x8180u16,
     };
     let include_question = !matches!(
@@ -1554,13 +1638,28 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         response.extend_from_slice(&query[12..question_end]);
     }
     match answer {
-        TestAnswer::QuestionTypeMismatch => {
+        TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Name, _) => {
+            let first_label_octet = response
+                .get_mut(13)
+                .expect("test question name should contain a label octet");
+            *first_label_octet = if first_label_octet.eq_ignore_ascii_case(&b'x') {
+                b'y'
+            } else {
+                b'x'
+            };
+        }
+        TestAnswer::QuestionTypeMismatch
+        | TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Type, _) => {
             let qtype_offset = response.len() - 4;
+            let current_qtype =
+                read_u16_be_at(&response, qtype_offset).expect("test question type should exist");
+            let mismatched_qtype = if current_qtype == 1 { 28 } else { 1 };
             response
-                .write_u16_be_at(qtype_offset, 28)
+                .write_u16_be_at(qtype_offset, mismatched_qtype)
                 .expect("test question type rewrite should fit");
         }
-        TestAnswer::QuestionClassMismatch => {
+        TestAnswer::QuestionClassMismatch
+        | TestAnswer::NegativeQuestionMismatch(QuestionMismatch::Class, _) => {
             let qclass_offset = response.len() - 2;
             response
                 .write_u16_be_at(qclass_offset, 3)
@@ -1834,6 +1933,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         }
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch
+        | TestAnswer::NegativeQuestionMismatch(_, _)
         | TestAnswer::Empty
         | TestAnswer::NxDomain
         | TestAnswer::QuestionlessNxDomain
