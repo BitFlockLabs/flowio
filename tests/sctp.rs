@@ -30,6 +30,7 @@ use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::future::Future;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
@@ -64,7 +65,10 @@ fn raw_sctp_stream_or_skip(test_name: &str) -> Option<SctpStream> {
         )
     };
     if fd >= 0 {
-        return Some(SctpStream::from_raw_fd(
+        // SAFETY: a successful socket call returns one descriptor owned only
+        // by this helper; it is immediately moved into the FlowIO stream.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        return Some(SctpStream::from_owned_fd(
             fd,
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         ));

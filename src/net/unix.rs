@@ -119,7 +119,7 @@ use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::fd::RuntimeFd;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// Connected Unix stream.
 ///
@@ -172,19 +172,66 @@ impl UnixStream {
             return Err(io::Error::last_os_error());
         }
 
-        Ok((Self::from_raw_fd(fds[0]), Self::from_raw_fd(fds[1])))
+        // SAFETY: successful socketpair returns two distinct descriptors owned
+        // solely by this call. Each is immediately moved into one FlowIO owner.
+        let left = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: same socketpair ownership proof as `left` above.
+        let right = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((Self::from_owned_fd(left), Self::from_owned_fd(right)))
     }
 
-    /// Takes ownership of a Unix stream descriptor and closes it on drop.
+    /// Safely takes ownership of a Unix stream descriptor.
     ///
-    /// The caller must transfer sole descriptor ownership to FlowIO and must
-    /// not close it or wrap the same raw descriptor in another owning handle.
+    /// The descriptor is closed exactly once when the FlowIO stream is
+    /// dropped. `OwnedFd` proves unique close ownership, but does not validate
+    /// the socket type or configuration. Deadline-edge `try_*` methods require
+    /// the supplied stream socket to be nonblocking.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use flowio::net::unix::UnixStream;
+    /// use std::os::fd::OwnedFd;
+    ///
+    /// let (standard, _peer) = std::os::unix::net::UnixStream::pair()?;
+    /// standard.set_nonblocking(true)?;
+    /// let owned: OwnedFd = standard.into();
+    /// let _stream = UnixStream::from_owned_fd(owned);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// Safe code cannot adopt the same owner twice:
+    /// ```compile_fail
+    /// use flowio::net::unix::UnixStream;
+    /// use std::os::fd::OwnedFd;
+    ///
+    /// let owned: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    /// let _first = UnixStream::from_owned_fd(owned);
+    /// let _second = UnixStream::from_owned_fd(owned);
+    /// ```
+    pub fn from_owned_fd(fd: OwnedFd) -> Self {
+        Self { fd: fd.into() }
+    }
+
+    /// Takes ownership of a bare Unix stream descriptor.
+    ///
     /// The descriptor must refer to a valid stream socket. Deadline-edge
     /// `try_*` methods additionally require it to be nonblocking.
-    pub fn from_raw_fd(fd: RawFd) -> Self {
-        Self {
-            fd: RuntimeFd::new(fd),
-        }
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid open descriptor for which the caller owns the sole
+    /// close responsibility. After this call, the caller must not close `fd`,
+    /// reuse it, or create another owning wrapper for the same descriptor.
+    ///
+    /// Calling raw adoption without an explicit safety boundary is rejected:
+    /// ```compile_fail
+    /// use flowio::net::unix::UnixStream;
+    ///
+    /// let _stream = UnixStream::from_raw_fd(3);
+    /// ```
+    pub unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        // SAFETY: the caller promises sole ownership of this valid descriptor.
+        Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     stream::impl_stream_rw!(UnixStream, "flowio::net::unix::UnixStream");

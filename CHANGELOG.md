@@ -10,6 +10,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** `TcpStream::from_raw_fd`, `UnixStream::from_raw_fd`, and
+  `SctpStream::from_raw_fd` now require an unsafe sole-ownership proof. Prefer
+  the new safe `from_owned_fd` constructors, which consume `OwnedFd` and make a
+  second safe close owner unrepresentable.
 - **Breaking (`test-support` only):** custom `MemoryProvider` implementations
   must now use an audited `unsafe impl` and uphold the documented alignment,
   provenance, size, uniqueness, lifetime, and exact-free contract. Raw `Slab`

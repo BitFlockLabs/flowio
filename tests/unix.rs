@@ -11,7 +11,7 @@ use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
 use std::cell::Cell;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 /// Returns a FlowIO UnixStream wrapping one nonblocking socketpair endpoint
@@ -21,7 +21,38 @@ fn connected_try_unix_stream() -> (UnixStream, std::os::unix::net::UnixStream) {
     stream
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
-    (UnixStream::from_raw_fd(stream.into_raw_fd()), peer)
+    (UnixStream::from_owned_fd(stream.into()), peer)
+}
+
+#[test]
+fn runtime_unix_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
+    let (standard, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair failed");
+    standard
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+
+    let raw = standard.as_raw_fd();
+    let owned: OwnedFd = standard.into();
+    let stream = UnixStream::from_owned_fd(owned);
+    assert_eq!(stream.as_raw_fd(), raw);
+    let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    assert!(status >= 0, "F_GETFL failed for adopted Unix fd");
+    assert_ne!(
+        status & libc::O_NONBLOCK,
+        0,
+        "adopted Unix fd became blocking"
+    );
+
+    drop(stream);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .expect("set_read_timeout failed");
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        peer.read(&mut byte)
+            .expect("peer read after owner drop failed"),
+        0,
+        "adopted Unix descriptor stayed open after owner drop"
+    );
 }
 
 #[test]

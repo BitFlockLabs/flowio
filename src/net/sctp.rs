@@ -220,7 +220,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -1564,6 +1564,21 @@ fn decode_peer_addr_params_sockopt(
     ))
 }
 
+/// Adopts one successful accept result and applies connected-socket policy.
+fn finish_accepted_stream(
+    accepted_fd: OwnedFd,
+    addr: &libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
+    config: SctpSocketConfig,
+) -> io::Result<(SctpStream, SocketAddr)> {
+    let remote_addr = socket_addr_from_c(addr, addrlen)?;
+    apply_sctp_connected_socket_config(accepted_fd.as_raw_fd(), config)?;
+    Ok((
+        SctpStream::from_owned_fd(accepted_fd, remote_addr),
+        remote_addr,
+    ))
+}
+
 /// Reusable accept-side submission state kept by [`SctpListener`].
 struct AcceptSlot {
     /// Completion state for the current or last accept submission.
@@ -1694,7 +1709,10 @@ impl ConnectSlot {
     fn take_stream(&mut self, remote_addr: SocketAddr) -> SctpStream {
         let fd = self.fd;
         self.fd = -1;
-        SctpStream::from_raw_fd(fd, remote_addr)
+        // SAFETY: this connect slot owns the successfully created socket, and
+        // clearing the sentinel above prevents later slot cleanup from closing
+        // the transferred descriptor.
+        SctpStream::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) }, remote_addr)
     }
 
     fn drop_future(&mut self) {
@@ -2381,20 +2399,67 @@ pub struct SctpStream {
 }
 
 impl SctpStream {
-    /// Takes ownership of an SCTP socket, records its remote peer, and closes
-    /// the descriptor on drop.
+    /// Safely takes ownership of an SCTP socket and records its remote peer.
     ///
-    /// The caller must transfer sole descriptor ownership to FlowIO and must
-    /// not close it or wrap the same raw descriptor in another owning handle.
-    /// Callers supplying an external descriptor are responsible for applying
-    /// nonblocking mode and socket options compatible with the data or
-    /// metadata APIs they use.
-    pub fn from_raw_fd(fd: RawFd, remote_addr: SocketAddr) -> Self {
+    /// The descriptor is closed exactly once when the FlowIO stream is
+    /// dropped. `OwnedFd` proves unique close ownership, but does not validate
+    /// the socket type, supplied peer address, or configuration. The caller is
+    /// responsible for nonblocking mode and socket options compatible with the
+    /// data or metadata APIs it uses.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use flowio::net::sctp::SctpStream;
+    /// use std::net::SocketAddr;
+    /// use std::os::fd::OwnedFd;
+    ///
+    /// fn adopt_configured_socket(fd: OwnedFd, peer: SocketAddr) -> SctpStream {
+    ///     SctpStream::from_owned_fd(fd, peer)
+    /// }
+    /// ```
+    ///
+    /// Safe code cannot adopt the same owner twice:
+    /// ```compile_fail
+    /// use flowio::net::sctp::SctpStream;
+    /// use std::net::{Ipv4Addr, SocketAddr};
+    /// use std::os::fd::OwnedFd;
+    ///
+    /// let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3868));
+    /// let owned: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    /// let _first = SctpStream::from_owned_fd(owned, peer);
+    /// let _second = SctpStream::from_owned_fd(owned, peer);
+    /// ```
+    pub fn from_owned_fd(fd: OwnedFd, remote_addr: SocketAddr) -> Self {
         Self {
-            fd: RuntimeFd::new(fd),
+            fd: fd.into(),
             remote_addr,
             recv_state: SctpRecvState::new(),
         }
+    }
+
+    /// Takes ownership of a bare SCTP socket descriptor and records its peer.
+    ///
+    /// Callers supplying an external descriptor are responsible for applying
+    /// nonblocking mode and socket options compatible with the data or
+    /// metadata APIs they use.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid open descriptor for which the caller owns the sole
+    /// close responsibility. After this call, the caller must not close `fd`,
+    /// reuse it, or create another owning wrapper for the same descriptor.
+    ///
+    /// Calling raw adoption without an explicit safety boundary is rejected:
+    /// ```compile_fail
+    /// use flowio::net::sctp::SctpStream;
+    /// use std::net::{Ipv4Addr, SocketAddr};
+    ///
+    /// let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3868));
+    /// let _stream = SctpStream::from_raw_fd(3, peer);
+    /// ```
+    pub unsafe fn from_raw_fd(fd: RawFd, remote_addr: SocketAddr) -> Self {
+        // SAFETY: the caller promises sole ownership of this valid descriptor.
+        Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) }, remote_addr)
     }
 
     /// Returns the local address currently assigned to the association socket.
@@ -4227,22 +4292,16 @@ impl Future for AcceptFuture<'_> {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
 
-                let fd = result as RawFd;
-                return match socket_addr_from_c(&payload.addr, payload.addrlen) {
-                    Ok(remote_addr) => {
-                        if let Err(err) =
-                            apply_sctp_connected_socket_config(fd, this.accepted_config)
-                        {
-                            close_fd(fd);
-                            return Poll::Ready(Err(err));
-                        }
-                        Poll::Ready(Ok((SctpStream::from_raw_fd(fd, remote_addr), remote_addr)))
-                    }
-                    Err(err) => {
-                        close_fd(fd);
-                        Poll::Ready(Err(err))
-                    }
-                };
+                // SAFETY: a successful accept CQE transfers one new descriptor
+                // to this slot. No other owner exists, and all later error
+                // paths let `OwnedFd` close it exactly once.
+                let accepted_fd = unsafe { OwnedFd::from_raw_fd(result as RawFd) };
+                return Poll::Ready(finish_accepted_stream(
+                    accepted_fd,
+                    &payload.addr,
+                    payload.addrlen,
+                    this.accepted_config,
+                ));
             }
         }
 
@@ -5531,6 +5590,43 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::net::send_sqe::test_support::sqe_prefix;
+
+    #[test]
+    fn sctp_owned_fd_adoption_transfers_exact_close_ownership() {
+        let raw = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("distinctive fd creation failed");
+        // SAFETY: the test helper returned one descriptor owned only here.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3868));
+        let stream = SctpStream::from_owned_fd(owned, peer);
+
+        assert_eq!(stream.as_raw_fd(), raw);
+        assert_eq!(stream.peer_addr(), peer);
+        drop(stream);
+        assert!(
+            crate::runtime::fd::raw_fd_is_closed(raw),
+            "SCTP OwnedFd transfer did not close exactly once"
+        );
+    }
+
+    #[test]
+    fn accepted_owned_fd_closes_when_peer_address_decode_fails() {
+        let raw = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("distinctive fd creation failed");
+        // SAFETY: the test helper returned one descriptor owned only here.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: all-zero socket-address storage is valid initialized bytes;
+        // the zero length makes decoding fail before its family is consulted.
+        let addr = unsafe { std::mem::zeroed() };
+
+        if finish_accepted_stream(owned, &addr, 0, SctpSocketConfig::default()).is_ok() {
+            panic!("zero-length accepted address should fail");
+        }
+        assert!(
+            crate::runtime::fd::raw_fd_is_closed(raw),
+            "accepted SCTP fd leaked on address decode failure"
+        );
+    }
 
     #[test]
     fn sctp_cqe_result_maps_error_zero_and_progress() {

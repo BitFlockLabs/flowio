@@ -8,7 +8,7 @@
 use crate::runtime::executor::try_submit_detached_close;
 #[cfg(any(test, feature = "test-support"))]
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -39,6 +39,13 @@ impl RuntimeFd {
         let fd = self.fd;
         self.fd = Self::INVALID;
         fd
+    }
+}
+
+impl From<OwnedFd> for RuntimeFd {
+    #[inline(always)]
+    fn from(fd: OwnedFd) -> Self {
+        Self::new(fd.into_raw_fd())
     }
 }
 

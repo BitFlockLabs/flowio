@@ -13,7 +13,7 @@ use flowio::test_support::runtime::test_hooks;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -47,7 +47,41 @@ fn connected_try_tcp_stream() -> (TcpStream, std::net::TcpStream) {
     stream
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
-    (TcpStream::from_raw_fd(stream.into_raw_fd()), peer)
+    (TcpStream::from_owned_fd(stream.into()), peer)
+}
+
+#[test]
+fn runtime_tcp_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let mut peer = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let (standard, _) = listener.accept().expect("std accept failed");
+    standard
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+
+    let raw = standard.as_raw_fd();
+    let owned: OwnedFd = standard.into();
+    let stream = TcpStream::from_owned_fd(owned);
+    assert_eq!(stream.as_raw_fd(), raw);
+    let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    assert!(status >= 0, "F_GETFL failed for adopted TCP fd");
+    assert_ne!(
+        status & libc::O_NONBLOCK,
+        0,
+        "adopted TCP fd became blocking"
+    );
+
+    drop(stream);
+    peer.set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set_read_timeout failed");
+    let mut byte = [0u8; 1];
+    match peer.read(&mut byte) {
+        Ok(0) => {}
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        result => panic!("adopted TCP descriptor was not closed exactly once: {result:?}"),
+    }
 }
 
 /// Asserts that the runtime closed an orphaned accepted fd by observing EOF or

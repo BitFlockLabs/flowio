@@ -198,7 +198,7 @@ use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -206,6 +206,15 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // AcceptSlot / ConnectSlot
 // ---------------------------------------------------------------------------
+
+fn finish_accepted_stream(
+    accepted_fd: OwnedFd,
+    addr: &libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let remote_addr = socket_addr_from_c(addr, addrlen)?;
+    Ok((TcpStream::from_owned_fd(accepted_fd), remote_addr))
+}
 
 /// Reusable accept-side submission state kept by [`TcpListener`].
 struct AcceptSlot {
@@ -279,14 +288,15 @@ impl AcceptSlot {
                 if result < 0 {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
-                let remote_addr = match socket_addr_from_c(&payload.addr, payload.addrlen) {
-                    Ok(addr) => addr,
-                    Err(err) => {
-                        close_fd(result as RawFd);
-                        return Poll::Ready(Err(err));
-                    }
-                };
-                return Poll::Ready(Ok((TcpStream::from_raw_fd(result as RawFd), remote_addr)));
+                // SAFETY: a successful accept CQE transfers one new descriptor
+                // to this slot. No other owner exists, and all later error
+                // paths let `OwnedFd` close it exactly once.
+                let accepted_fd = unsafe { OwnedFd::from_raw_fd(result as RawFd) };
+                return Poll::Ready(finish_accepted_stream(
+                    accepted_fd,
+                    &payload.addr,
+                    payload.addrlen,
+                ));
             }
         }
 
@@ -383,7 +393,10 @@ impl ConnectSlot {
     fn take_stream(&mut self) -> TcpStream {
         let fd = self.fd;
         self.fd = -1;
-        TcpStream::from_raw_fd(fd)
+        // SAFETY: this connect slot owns the successfully created socket, and
+        // clearing the sentinel above prevents later slot cleanup from closing
+        // the transferred descriptor.
+        TcpStream::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     fn drop_future(&mut self) {
@@ -558,17 +571,63 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    /// Takes ownership of an already-connected socket and closes it on drop.
+    /// Safely takes ownership of an already-connected socket.
     ///
-    /// The caller must transfer sole descriptor ownership to FlowIO and must
-    /// not close it or wrap the same raw descriptor in another owning handle.
+    /// The descriptor is closed exactly once when the FlowIO stream is
+    /// dropped. `OwnedFd` proves unique close ownership, but does not validate
+    /// the socket type or configuration. The descriptor must refer to a valid
+    /// connected TCP stream and must be nonblocking when using the `try_*`
+    /// deadline-edge APIs.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use flowio::net::tcp::TcpStream;
+    /// use std::net::{Ipv4Addr, SocketAddr};
+    /// use std::os::fd::OwnedFd;
+    ///
+    /// let standard = std::net::TcpStream::connect(
+    ///     SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
+    /// )?;
+    /// standard.set_nonblocking(true)?;
+    /// let owned: OwnedFd = standard.into();
+    /// let _stream = TcpStream::from_owned_fd(owned);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// Safe code cannot adopt the same owner twice:
+    /// ```compile_fail
+    /// use flowio::net::tcp::TcpStream;
+    /// use std::os::fd::OwnedFd;
+    ///
+    /// let owned: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    /// let _first = TcpStream::from_owned_fd(owned);
+    /// let _second = TcpStream::from_owned_fd(owned);
+    /// ```
+    pub fn from_owned_fd(fd: OwnedFd) -> Self {
+        Self { fd: fd.into() }
+    }
+
+    /// Takes ownership of a bare connected-socket descriptor.
+    ///
     /// FlowIO-created TCP sockets are nonblocking. Callers that pass an
     /// external descriptor must preserve that invariant; the `try_*`
     /// deadline-edge APIs rely on the fd already being nonblocking.
-    pub fn from_raw_fd(fd: RawFd) -> Self {
-        Self {
-            fd: RuntimeFd::new(fd),
-        }
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid open descriptor for which the caller owns the sole
+    /// close responsibility. After this call, the caller must not close `fd`,
+    /// reuse it, or create another owning wrapper for the same descriptor.
+    ///
+    /// Calling raw adoption without an explicit safety boundary is rejected:
+    /// ```compile_fail
+    /// use flowio::net::tcp::TcpStream;
+    ///
+    /// let _stream = TcpStream::from_raw_fd(3);
+    /// ```
+    pub unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        // SAFETY: the caller promises sole ownership of this valid descriptor.
+        Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Returns the local address of this socket.
@@ -593,7 +652,9 @@ impl TcpStream {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self::from_raw_fd(fd))
+        // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned only by this
+        // call; no other owning wrapper has been constructed for it.
+        Ok(Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     /// Returns the peer address of this socket.
@@ -1119,7 +1180,9 @@ impl OwnedConnectFuture {
     fn take_stream(&mut self) -> TcpStream {
         let fd = self.fd;
         self.fd = -1;
-        TcpStream::from_raw_fd(fd)
+        // SAFETY: this future owns the successfully created socket, and the
+        // cleared sentinel prevents its drop path from closing it again.
+        TcpStream::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
 
@@ -1226,5 +1289,29 @@ impl Future for OwnedConnectTimeoutFuture {
             Poll::Ready(result) => Poll::Ready(map_connect_timeout(result)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_owned_fd_closes_when_peer_address_decode_fails() {
+        let raw = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("distinctive fd creation failed");
+        // SAFETY: the test helper returned one descriptor owned only here.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: all-zero socket-address storage is valid initialized bytes;
+        // the zero length makes decoding fail before its family is consulted.
+        let addr = unsafe { std::mem::zeroed() };
+
+        if finish_accepted_stream(owned, &addr, 0).is_ok() {
+            panic!("zero-length accepted address should fail");
+        }
+        assert!(
+            crate::runtime::fd::raw_fd_is_closed(raw),
+            "accepted TCP fd leaked on address decode failure"
+        );
     }
 }
