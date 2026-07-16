@@ -43,6 +43,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- DNS lookup now rejects normalized query names over 253 presentation bytes,
+  encoded names over 255 bytes, and labels over 63 bytes with `InvalidInput`
+  before allocating or sending a query packet. CNAME RDATA must consume its
+  declared length exactly, so both overruns and trailing bytes are treated as
+  malformed responses while valid compressed and uncompressed names remain
+  accepted.
 - DNS A and AAAA outcomes are now combined without letting one family's empty,
   recoverable-error, or contradictory NXDOMAIN result discard the other
   family's usable address or CNAME. Ranked outcome selection is deterministic:

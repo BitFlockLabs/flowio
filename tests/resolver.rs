@@ -21,6 +21,7 @@ enum TestAnswer {
     AFor(&'static str, Ipv4Addr),
     Cname(&'static str),
     CnameWithA(&'static str, Ipv4Addr),
+    CompressedCnameWithA(Ipv4Addr),
     CnameWithAAndSpoof(&'static str, Ipv4Addr, &'static str, Ipv4Addr),
     CnameWithQueryOwnerA(&'static str, Ipv4Addr, Ipv4Addr),
     CnameWithAaaa(&'static str, Ipv6Addr),
@@ -31,7 +32,9 @@ enum TestAnswer {
     QuestionClassMismatch,
     MalformedCnamePointer,
     ForwardCnamePointer,
+    CnamePointerLoop,
     CnameRdataOverrun,
+    CnameRdataTrailingBytes,
     Empty,
     NxDomain,
     QuestionlessNxDomain,
@@ -81,6 +84,42 @@ fn resolve_host_rejects_empty_host_name() {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn resolve_host_rejects_overlong_name_without_sending_dns() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    server
+        .set_nonblocking(true)
+        .expect("failed to make test dns socket nonblocking");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let host = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(62),
+    ]
+    .join(".");
+    assert_eq!(host.len(), 254);
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            let err = resolver
+                .resolve_host(&host, 5432)
+                .await
+                .expect_err("overlong host should fail before DNS send");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        })
+        .expect("executor run failed");
+
+    let mut packet = [0u8; 512];
+    let err = server
+        .recv_from(&mut packet)
+        .expect_err("invalid host should not emit a DNS packet");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 }
 
 #[test]
@@ -734,7 +773,7 @@ fn resolve_host_follows_cname_to_address() {
 }
 
 #[test]
-fn resolve_host_accepts_bundled_cname_address() {
+fn resolve_host_accepts_exact_uncompressed_cname_rdata() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
@@ -765,6 +804,21 @@ fn resolve_host_accepts_bundled_cname_address() {
         .expect("executor run failed");
 
     thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_accepts_exact_compressed_cname_rdata() {
+    let ip = Ipv4Addr::new(198, 51, 100, 89);
+    let addrs = resolve_with_mock_dns(2, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::CompressedCnameWithA(ip)),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("exact compressed CNAME should resolve");
+
+    assert_eq!(addrs, vec![SocketAddr::from((ip, 5432))]);
 }
 
 #[test]
@@ -1128,13 +1182,41 @@ fn resolve_host_rejects_forward_compression_pointer() {
 }
 
 #[test]
+fn resolve_host_rejects_cname_compression_pointer_loop() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1 | 28) => TestAnswer::CnamePointerLoop,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let err = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect_err("CNAME compression pointer loop should fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
 fn resolve_host_rejects_cname_rdata_overrun() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
     let thread = thread::spawn(move || {
-        serve_dns_queries(server, 1, |name, qtype| match (name, qtype) {
-            ("db.example.test", 1) => TestAnswer::CnameRdataOverrun,
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1 | 28) => TestAnswer::CnameRdataOverrun,
             _ => TestAnswer::NxDomain,
         })
     });
@@ -1148,6 +1230,34 @@ fn resolve_host_rejects_cname_rdata_overrun() {
                 .resolve_host("db.example.test", 5432)
                 .await
                 .expect_err("CNAME RDATA overrun should fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_rejects_cname_rdata_trailing_bytes() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1 | 28) => TestAnswer::CnameRdataTrailingBytes,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let err = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect_err("CNAME RDATA trailing bytes should fail");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         })
         .expect("executor run failed");
@@ -1397,6 +1507,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
     let question_end = question_end(query).expect("invalid dns question");
     let answer_count = match answer {
         TestAnswer::CnameWithA(_, _)
+        | TestAnswer::CompressedCnameWithA(_)
         | TestAnswer::CnameWithAaaa(_, _)
         | TestAnswer::CnameWithOutOfOrderA(_, _) => 2u16,
         TestAnswer::CnameWithAAndSpoof(_, _, _, _) | TestAnswer::CnameWithQueryOwnerA(_, _, _) => {
@@ -1411,7 +1522,9 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::Cname(_)
         | TestAnswer::MalformedCnamePointer
         | TestAnswer::ForwardCnamePointer
-        | TestAnswer::CnameRdataOverrun => 1u16,
+        | TestAnswer::CnamePointerLoop
+        | TestAnswer::CnameRdataOverrun
+        | TestAnswer::CnameRdataTrailingBytes => 1u16,
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch
         | TestAnswer::Empty
@@ -1513,6 +1626,26 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             response.extend_from_slice(&encoded);
 
             push_name(&mut response, target);
+            push_u16_be(&mut response, 1);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 4);
+            response.extend_from_slice(&ip.octets());
+        }
+        TestAnswer::CompressedCnameWithA(ip) => {
+            let first_label_len = query[12] as usize;
+            let suffix_offset = 13 + first_label_len;
+            assert!(suffix_offset < 0x4000, "test suffix pointer should fit");
+            let suffix_pointer = 0xC000 | suffix_offset as u16;
+
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 2);
+            push_u16_be(&mut response, suffix_pointer);
+
+            push_u16_be(&mut response, suffix_pointer);
             push_u16_be(&mut response, 1);
             push_u16_be(&mut response, 1);
             push_u32_be(&mut response, 60);
@@ -1669,6 +1802,17 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             let forward_target = response.len() + 2;
             push_u16_be(&mut response, 0xC000 | forward_target as u16);
         }
+        TestAnswer::CnamePointerLoop => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 4);
+            let rdata_offset = response.len();
+            response.push(1);
+            response.push(b'x');
+            push_u16_be(&mut response, 0xC000 | rdata_offset as u16);
+        }
         TestAnswer::CnameRdataOverrun => {
             push_u16_be(&mut response, 0xC00C);
             push_u16_be(&mut response, 5);
@@ -1678,6 +1822,15 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             response.push(3);
             response.extend_from_slice(b"bad");
             response.push(0);
+        }
+        TestAnswer::CnameRdataTrailingBytes => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 3);
+            push_u16_be(&mut response, 0xC00F);
+            response.push(0xA5);
         }
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch

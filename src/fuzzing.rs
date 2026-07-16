@@ -53,6 +53,9 @@ pub fn dns_decode_name(data: &[u8]) {
     if data.is_empty() {
         return;
     }
+    if let Ok(host) = std::str::from_utf8(data) {
+        let _ = crate::net::resolver::validate_query_name(host);
+    }
     let offset = data[0] as usize % data.len();
     let _ = crate::net::resolver::decode_name(data, 0, 0);
     let _ = crate::net::resolver::decode_name(data, offset, 0);

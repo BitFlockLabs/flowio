@@ -74,6 +74,7 @@ const DNS_RCODE_NXDOMAIN: u8 = 3;
 const DNS_RCODE_NOTIMP: u8 = 4;
 const DNS_RCODE_REFUSED: u8 = 5;
 const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
+const DNS_MAX_NAME_WIRE_LEN: usize = 255;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CNAME_DEPTH: usize = 4;
 const DNS_UDP_RESPONSE_BUFFER_SIZE: usize = 2048;
@@ -176,6 +177,16 @@ impl DnsResolver {
     /// CNAME, NXDOMAIN, an A-first recoverable error, then `NotFound` for two
     /// empty answers. An A-side terminal error stops before the AAAA query; a
     /// later AAAA-side terminal error does not discard an A address.
+    ///
+    /// Surrounding whitespace and trailing dots are removed before lookup;
+    /// root-only input is rejected. A non-literal DNS query name must contain
+    /// only non-empty labels of at most 63 bytes, fit within 253 bytes in
+    /// normalized dotted form, and encode to at most 255 bytes including label
+    /// lengths and the terminal root. Invalid names return `InvalidInput`
+    /// before a query packet is allocated or sent. A CNAME response is
+    /// malformed unless its encoded (possibly compressed) name consumes its
+    /// declared RDATA length exactly; malformed responses participate in the
+    /// existing nameserver and address-family error selection.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -360,6 +371,7 @@ fn finish_dns_family_lookups(
 /// and timeout policy are built once. This helper calls
 /// [`DnsResolver::from_system`] before resolving, so it synchronously reads
 /// `/etc/resolv.conf` even when `host` is an IP literal or `localhost`.
+/// See [`DnsResolver::resolve_host`] for name validation and error semantics.
 pub async fn resolve_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     DnsResolver::from_system()?.resolve_host(host, port).await
 }
@@ -495,6 +507,7 @@ fn normalize_host(host: &str) -> io::Result<&str> {
             "resolver host name was empty",
         ));
     }
+    validate_query_name(host)?;
     Ok(host)
 }
 
@@ -789,6 +802,8 @@ impl SocketAddrDeduper {
 }
 
 fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+    validate_query_name(host)?;
+
     let mut packet = Vec::with_capacity(512);
     let mut header = [0u8; 12];
     {
@@ -803,6 +818,30 @@ fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<
     packet.extend_from_slice(&header);
 
     for label in host.split('.') {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+
+    packet.push(0);
+    let start = packet.len();
+    packet.resize(start + 4, 0);
+    write_u16_be_at(&mut packet, start, qtype).map_err(byte_range_eof)?;
+    write_u16_be_at(&mut packet, start + 2, DNS_CLASS_IN).map_err(byte_range_eof)?;
+    Ok(packet)
+}
+
+pub(crate) fn validate_query_name(host: &str) -> io::Result<()> {
+    if host.len() > DNS_MAX_NAME_PRESENTATION_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host name exceeded 253 presentation bytes",
+        ));
+    }
+
+    // Include the terminal root octet before adding each label's length octet
+    // and payload. This pass intentionally precedes query-packet allocation.
+    let mut wire_len = 1usize;
+    for label in host.split('.') {
         if label.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -816,16 +855,19 @@ fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<
             ));
         }
 
-        packet.push(label.len() as u8);
-        packet.extend_from_slice(label.as_bytes());
+        wire_len = wire_len
+            .checked_add(1 + label.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host name overflowed"))?;
     }
 
-    packet.push(0);
-    let start = packet.len();
-    packet.resize(start + 4, 0);
-    write_u16_be_at(&mut packet, start, qtype).map_err(byte_range_eof)?;
-    write_u16_be_at(&mut packet, start + 2, DNS_CLASS_IN).map_err(byte_range_eof)?;
-    Ok(packet)
+    if wire_len > DNS_MAX_NAME_WIRE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host name exceeded 255 encoded bytes",
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn parse_response_packet(
@@ -912,10 +954,10 @@ pub(crate) fn parse_response_packet(
             }
             DNS_TYPE_CNAME => {
                 let (target, consumed) = decode_name(packet, rr.data_offset, 0)?;
-                if consumed > rr.rdlength as usize {
+                if consumed != rr.rdlength as usize {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "DNS CNAME RDATA exceeded declared length",
+                        "DNS CNAME RDATA did not consume its declared length",
                     ));
                 }
                 records.push(DnsRecord::Cname { owner, target });
@@ -1189,6 +1231,122 @@ mod tests {
             read_u16_be_at(&packet, 0).expect("encoded query ID should fit"),
             0xBEEF
         );
+    }
+
+    #[test]
+    fn query_name_limits_accept_253_presentation_and_255_wire_bytes() {
+        let host = query_name_with_final_label(61);
+        assert_eq!(host.len(), DNS_MAX_NAME_PRESENTATION_LEN);
+
+        let packet = encode_query_packet(0xBEEF, &host, DNS_TYPE_A)
+            .expect("maximum-length query name should encode");
+        assert_eq!(packet.len(), 12 + DNS_MAX_NAME_WIRE_LEN + 4);
+    }
+
+    #[test]
+    fn query_name_limits_reject_254_presentation_and_256_wire_bytes() {
+        let host = query_name_with_final_label(62);
+        assert_eq!(host.len(), DNS_MAX_NAME_PRESENTATION_LEN + 1);
+
+        let err = encode_query_packet(0xBEEF, &host, DNS_TYPE_A)
+            .expect_err("overlong query name should fail before encoding");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn query_name_limits_retain_the_63_byte_label_boundary() {
+        let valid = "a".repeat(63);
+        encode_query_packet(0xBEEF, &valid, DNS_TYPE_A).expect("63-byte DNS label should encode");
+
+        let invalid = "a".repeat(64);
+        let err = encode_query_packet(0xBEEF, &invalid, DNS_TYPE_A)
+            .expect_err("64-byte DNS label should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        for host in ["", ".example.test", "example..test", "example.test."] {
+            let err = encode_query_packet(0xBEEF, host, DNS_TYPE_A)
+                .expect_err("empty DNS label should fail at the encoder boundary");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn query_name_limits_apply_after_trailing_dot_normalization() {
+        assert_eq!(
+            normalize_host("db.example.test.").expect("trailing dot should normalize"),
+            "db.example.test"
+        );
+        assert_eq!(
+            normalize_host(".")
+                .expect_err("root-only input should remain unsupported")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let max_host = query_name_with_final_label(61);
+        let dotted = format!("{max_host}.");
+        let normalized =
+            normalize_host(&dotted).expect("maximum name plus root dot should normalize");
+        encode_query_packet(0xBEEF, normalized, DNS_TYPE_A)
+            .expect("normalized maximum-length name should encode");
+
+        let overlong = query_name_with_final_label(62);
+        let overlong_dotted = format!("{overlong}.");
+        let err = normalize_host(&overlong_dotted)
+            .expect_err("overlong name should remain invalid after root-dot normalization");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn decoded_root_name_remains_structurally_valid() {
+        let (name, consumed) = decode_name(&[0], 0, 0).expect("wire root should decode");
+        assert!(name.is_empty());
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn compressed_name_expansion_enforces_253_byte_boundary() {
+        let suffix = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(59),
+        ]
+        .join(".");
+        assert_eq!(suffix.len(), 251);
+
+        let mut packet = Vec::new();
+        push_test_wire_name(&mut packet, &suffix);
+        let valid_offset = packet.len();
+        packet.extend_from_slice(&[1, b'x', 0xC0, 0x00]);
+        let (name, consumed) =
+            decode_name(&packet, valid_offset, 0).expect("253-byte compressed name should decode");
+        assert_eq!(name.len(), DNS_MAX_NAME_PRESENTATION_LEN);
+        assert_eq!(consumed, 4);
+
+        let invalid_offset = packet.len();
+        packet.extend_from_slice(&[2, b'x', b'x', 0xC0, 0x00]);
+        let err = decode_name(&packet, invalid_offset, 0)
+            .expect_err("254-byte compressed name should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn query_name_with_final_label(final_label_len: usize) -> String {
+        [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(final_label_len),
+        ]
+        .join(".")
+    }
+
+    fn push_test_wire_name(packet: &mut Vec<u8>, name: &str) {
+        for label in name.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
     }
 
     #[test]
