@@ -44,17 +44,49 @@ pub const SLAB_LINK_ALIGN: usize = std::mem::align_of::<utils::list::intrusive::
 ///
 /// A slab starts out as a simple bump allocator over its payload region. Once
 /// individual objects are freed, their slots are tracked by the higher-level
-/// pool free list instead.
+/// pool free list instead. Its raw cursor and link fields are intentionally
+/// opaque so safe feature consumers cannot forge allocator state.
+///
+/// The type remains available for alignment and pointer-based test support:
+///
+/// ```
+/// use flowio::test_support::utils::memory::slab::Slab;
+///
+/// assert!(std::mem::align_of::<Slab>().is_power_of_two());
+/// ```
+///
+/// Raw cursor state cannot be inspected through safe code:
+///
+/// ```compile_fail
+/// use flowio::test_support::utils::memory::slab::Slab;
+///
+/// fn bump_cursor(slab: &Slab) -> *mut u8 {
+///     slab.bump_ptr
+/// }
+/// ```
+///
+/// Nor can safe code construct a forged slab header:
+///
+/// ```compile_fail
+/// use flowio::test_support::utils::list::intrusive::slist::Link;
+/// use flowio::test_support::utils::memory::slab::Slab;
+///
+/// let _forged = Slab {
+///     link: Link::new_unlinked(),
+///     bump_ptr: std::ptr::null_mut(),
+///     end_ptr: std::ptr::null_mut(),
+/// };
+/// ```
 #[repr(C)]
 pub struct Slab {
     /// Intrusive link used to chain slabs in a singly-linked list.
     /// This must stay at offset 0 because other code reinterprets a slab as
     /// its link head when chaining pages.
-    pub link: utils::list::intrusive::slist::Link,
+    link: utils::list::intrusive::slist::Link,
     /// Current bump-allocation cursor inside the slab payload area.
-    pub bump_ptr: *mut u8,
+    bump_ptr: *mut u8,
     /// End of the slab payload area.
-    pub end_ptr: *mut u8,
+    end_ptr: *mut u8,
 }
 
 impl Slab {
@@ -205,6 +237,8 @@ pub struct SlabAllocator<'a, P: super::provider::MemoryProvider> {
     payload_bytes: usize,
     /// Alignment required for the slab allocation as a whole.
     slab_align: usize,
+    /// Whether the provider has accepted this allocator's alignment contract.
+    initialized: bool,
 }
 
 impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
@@ -290,21 +324,49 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
             header_padded_size,
             payload_bytes,
             slab_align,
+            initialized: false,
         })
     }
 
     /// Applies the allocator's computed alignment requirement to the backing
-    /// memory provider.
+    /// memory provider once.
+    ///
+    /// Repeated calls are no-ops so an initialized provider is never
+    /// reconfigured while slab allocations remain live.
     pub fn init(&mut self) {
+        if self.initialized {
+            return;
+        }
+
         debug_assert!(self.slab_align.is_power_of_two());
 
         // Raise the provider's minimum alignment to the slab alignment for all
         // future slab-page allocations.
         unsafe { self.provider.as_mut() }.init(self.slab_align);
+        #[cfg(debug_assertions)]
+        {
+            let provider_align = unsafe { self.provider.as_ref() }.alignment_guarantee();
+            debug_assert!(
+                provider_align.is_power_of_two(),
+                "MemoryProvider returned an invalid alignment guarantee"
+            );
+            debug_assert!(
+                provider_align >= self.slab_align,
+                "MemoryProvider::init did not raise its alignment guarantee"
+            );
+        }
+        self.initialized = true;
     }
 
     /// Requests, formats, and returns a fresh slab page.
+    ///
+    /// Returns `None` before [`SlabAllocator::init`] or when the provider
+    /// cannot supply the required memory.
     pub fn provide_slab(&mut self) -> Option<*mut Slab> {
+        if !self.initialized {
+            return None;
+        }
+
         // Request raw memory already aligned for this slab page.
         let raw_mem = unsafe { self.provider.as_mut() }.request_memory(self.total_slab_size)?;
 
@@ -353,6 +415,7 @@ mod tests {
 
     #[derive(Default)]
     struct CountingStats {
+        inits: Cell<usize>,
         requests: Cell<usize>,
         frees: Cell<usize>,
     }
@@ -365,14 +428,19 @@ mod tests {
     impl CountingProvider {
         fn new(stats: Rc<CountingStats>) -> Self {
             Self {
-                alignment: std::mem::align_of::<usize>(),
+                alignment: 1,
                 stats,
             }
         }
     }
 
-    impl MemoryProvider for CountingProvider {
+    // SAFETY: this private fixture is used only through SlabAllocator, which
+    // initializes it once before requesting storage. Each request uses a valid
+    // Layout with the then-stable alignment, global-allocator allocations are
+    // disjoint, and free reconstructs the same Layout from the exact size.
+    unsafe impl MemoryProvider for CountingProvider {
         fn init(&mut self, required_align: usize) {
+            self.stats.inits.set(self.stats.inits.get() + 1);
             self.alignment = std::cmp::max(self.alignment, required_align);
         }
 
@@ -381,6 +449,10 @@ mod tests {
         }
 
         fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
+            if size == 0 {
+                return None;
+            }
+
             let layout = Layout::from_size_align(size, self.alignment).ok()?;
             let ptr = unsafe { alloc(layout) };
             if ptr.is_null() {
@@ -394,8 +466,36 @@ mod tests {
             self.stats.frees.set(self.stats.frees.get() + 1);
             let layout = Layout::from_size_align(size, self.alignment)
                 .expect("test provider layout should be valid");
+            // SAFETY: the caller returns the exact live pointer and size from
+            // this provider, and allocator initialization is idempotent.
             unsafe { dealloc(ptr, layout) };
         }
+    }
+
+    #[test]
+    fn slab_allocator_rejects_preinit_and_initializes_provider_once() {
+        let stats = Rc::new(CountingStats::default());
+        let mut provider = CountingProvider::new(Rc::clone(&stats));
+        let mut allocator = SlabAllocator::new_uninit(&mut provider, 1, 1, 1)
+            .expect("slab allocator config should be valid");
+
+        assert!(
+            allocator.provide_slab().is_none(),
+            "pre-init slab acquisition must fail safely"
+        );
+        assert_eq!(stats.requests.get(), 0, "provider must not be consulted");
+
+        allocator.init();
+        allocator.init();
+        assert_eq!(stats.inits.get(), 1, "provider init must be idempotent");
+
+        let slab = allocator
+            .provide_slab()
+            .expect("initialized allocator should provide one slab");
+        assert_eq!((slab as usize) % std::mem::align_of::<Slab>(), 0);
+        unsafe { allocator.free_slab(slab.cast::<u8>()) };
+        assert_eq!(stats.requests.get(), 1);
+        assert_eq!(stats.frees.get(), 1);
     }
 
     #[test]
@@ -405,6 +505,7 @@ mod tests {
         let mut allocator = SlabAllocator::new_uninit(&mut provider, 16, 8, 2)
             .expect("slab allocator config should be valid");
         allocator.init();
+        assert_eq!(stats.inits.get(), 1);
 
         let mut chain = SlabPageChain::new();
 

@@ -22,7 +22,91 @@ struct BasicAllocationHeader {
 /// This keeps allocator policy separate from the global heap so callers can
 /// substitute hugepages, mmap-backed regions, NUMA-aware allocators, or other
 /// custom memory sources.
-pub trait MemoryProvider {
+///
+/// # Safety
+///
+/// Safe slab and pool code trusts every implementation to uphold all of these
+/// requirements for the allocator call sequence:
+///
+/// - [`MemoryProvider::alignment_guarantee`] returns a non-zero power of two.
+/// - After [`MemoryProvider::init`] receives a valid required alignment, the
+///   reported guarantee is at least that value and every later successful
+///   allocation satisfies the reported guarantee.
+/// - A successful [`MemoryProvider::request_memory`] returns a non-null pointer
+///   with valid provenance for one stable, writable allocation of at least the
+///   requested size. The complete range must support in-allocation pointer
+///   arithmetic.
+/// - Until it is returned, the caller has exclusive access to the complete
+///   allocation: neither the provider nor another actor may read or write it
+///   through an unrelated pointer or reference. Simultaneously live
+///   allocations do not overlap or alias the provider itself, and remain valid
+///   across other allocation requests.
+/// - [`MemoryProvider::free_memory`] accepts the exact pointer and size from one
+///   successful request exactly once and invalidates no other live allocation.
+///
+/// [`SlabAllocator`](super::slab::SlabAllocator) initializes its provider once
+/// before making requests, then returns every slab with the original size. An
+/// implementation may rely on that sequencing, but must document any stronger
+/// private invariants in its `unsafe impl` safety rationale.
+///
+/// A provider implementation must therefore be explicitly audited:
+///
+/// ```
+/// use flowio::test_support::utils::memory::provider::MemoryProvider;
+///
+/// struct EmptyProvider {
+///     alignment: usize,
+/// }
+///
+/// // SAFETY: this provider never returns storage, and maintains a valid
+/// // power-of-two alignment guarantee.
+/// unsafe impl MemoryProvider for EmptyProvider {
+///     fn init(&mut self, required_align: usize) {
+///         self.alignment = self.alignment.max(required_align);
+///     }
+///
+///     fn alignment_guarantee(&self) -> usize {
+///         self.alignment
+///     }
+///
+///     fn request_memory(&mut self, _size: usize) -> Option<*mut u8> {
+///         None
+///     }
+///
+///     unsafe fn free_memory(&mut self, _ptr: *mut u8, _size: usize) {
+///         unreachable!("EmptyProvider never allocates")
+///     }
+/// }
+///
+/// let mut provider = EmptyProvider { alignment: 1 };
+/// provider.init(8);
+/// assert_eq!(provider.alignment_guarantee(), 8);
+/// ```
+///
+/// A safe implementation is rejected before its unvetted pointer can reach
+/// the allocator:
+///
+/// ```compile_fail
+/// use flowio::test_support::utils::memory::provider::MemoryProvider;
+/// use std::ptr::NonNull;
+///
+/// struct DanglingProvider;
+///
+/// impl MemoryProvider for DanglingProvider {
+///     fn init(&mut self, _required_align: usize) {}
+///
+///     fn alignment_guarantee(&self) -> usize {
+///         1
+///     }
+///
+///     fn request_memory(&mut self, _size: usize) -> Option<*mut u8> {
+///         Some(NonNull::<u8>::dangling().as_ptr())
+///     }
+///
+///     unsafe fn free_memory(&mut self, _ptr: *mut u8, _size: usize) {}
+/// }
+/// ```
+pub unsafe trait MemoryProvider {
     /// Raises the minimum alignment that future allocations must satisfy.
     /// `required_align` must be a non-zero power of two.
     fn init(&mut self, required_align: usize);
@@ -116,7 +200,11 @@ impl Default for BasicMemoryProvider {
     }
 }
 
-impl MemoryProvider for BasicMemoryProvider {
+// SAFETY: every allocation carries its original base, size, alignment, and
+// requested size in an adjacent header. Requests use a validated Layout,
+// successful payloads are disjoint global-allocator allocations, and exact
+// frees reconstruct the allocation-time Layout even after later `init` calls.
+unsafe impl MemoryProvider for BasicMemoryProvider {
     fn init(&mut self, required_align: usize) {
         self.alignment = std::cmp::max(self.alignment, required_align);
     }

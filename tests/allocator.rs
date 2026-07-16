@@ -12,6 +12,10 @@ struct VerboseProvider {
 
 impl VerboseProvider {
     fn new(size: usize, align: usize) -> Self {
+        assert!(
+            align.is_power_of_two(),
+            "test provider alignment must be valid"
+        );
         Self {
             buffer: vec![0u8; size],
             offset: 0,
@@ -20,11 +24,14 @@ impl VerboseProvider {
     }
 }
 
-impl MemoryProvider for VerboseProvider {
+// SAFETY: the backing Vec is fully materialized once and never resized, so
+// returned pointers retain stable Vec provenance. Checked bump allocation
+// produces disjoint ranges aligned to the current power-of-two guarantee; the
+// no-op free never invalidates another live range.
+unsafe impl MemoryProvider for VerboseProvider {
     fn init(&mut self, required_align: usize) {
         // Escalation: The provider adapts to the stricter requirement
         self.alignment = core::cmp::max(self.alignment, required_align);
-        self.offset = 0;
         println!(
             "  [Step] Provider: Initialized with Alignment Guarantee: {}",
             self.alignment
@@ -36,12 +43,20 @@ impl MemoryProvider for VerboseProvider {
     }
 
     fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
-        let base = self.buffer.as_mut_ptr() as usize;
-        let current = base + self.offset;
-        let aligned = (current + self.alignment - 1) & !(self.alignment - 1);
-        let padding = aligned - current;
+        if size == 0 {
+            return None;
+        }
 
-        if self.offset + padding + size > self.buffer.len() {
+        // SAFETY: `offset` advances only to a checked end within `buffer` and
+        // the Vec is never resized.
+        let current = unsafe { self.buffer.as_mut_ptr().add(self.offset) };
+        let padding = current.align_offset(self.alignment);
+        if padding == usize::MAX {
+            return None;
+        }
+        let end = self.offset.checked_add(padding)?.checked_add(size)?;
+
+        if end > self.buffer.len() {
             println!(
                 "  [Actual] Provider: Failed to allocate {} bytes (OOM)",
                 size
@@ -49,8 +64,10 @@ impl MemoryProvider for VerboseProvider {
             return None;
         }
 
-        self.offset += padding + size;
-        let ptr = aligned as *mut u8;
+        self.offset = end;
+        // SAFETY: the checked `end` proves `padding` stays within the same Vec
+        // allocation and leaves `size` bytes available from the result.
+        let ptr = unsafe { current.add(padding) };
         println!(
             "  [Actual] Provider: Allocated {} bytes at {:p} (Padding: {} bytes)",
             size, ptr, padding
@@ -141,6 +158,36 @@ fn pool_drop_allows_balanced_raw_slots() {
 
     let task = unsafe { pool.alloc(900).expect("task allocation failed") };
     unsafe { pool.free(task) };
+}
+
+#[test]
+fn pool_provider_exhaustion_still_reuses_returned_slot() {
+    let unrounded_slab_size = std::mem::size_of::<Slab>() + 2 * std::mem::size_of::<usize>();
+    let slab_size = (unrounded_slab_size + 7) & !7;
+    // Leave enough base-alignment slack for exactly one slab on both 32- and
+    // 64-bit targets, while making a second provider request fail.
+    let mut provider = VerboseProvider::new(slab_size + 7, 8);
+    let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 2).unwrap();
+    pool.init();
+
+    let first = unsafe { pool.alloc(1).expect("first slot should allocate") };
+    let second = unsafe { pool.alloc(2).expect("second slot should allocate") };
+    assert!(
+        unsafe { pool.alloc(3) }.is_none(),
+        "provider exhaustion must be reported"
+    );
+
+    unsafe { pool.free(first) };
+    let reused = unsafe {
+        pool.alloc(4)
+            .expect("a returned slot must remain reusable after exhaustion")
+    };
+    assert_eq!(reused, first);
+
+    unsafe {
+        pool.free(second);
+        pool.free(reused);
+    }
 }
 
 #[cfg(debug_assertions)]

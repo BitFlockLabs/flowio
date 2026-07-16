@@ -10,6 +10,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking (`test-support` only):** custom `MemoryProvider` implementations
+  must now use an audited `unsafe impl` and uphold the documented alignment,
+  provenance, size, uniqueness, lifetime, and exact-free contract. Raw `Slab`
+  fields are now opaque and can be constructed only by allocator internals.
 - `IoBuffReadWrite` now provides `initialized_writable_slice` for userspace
   producers that require `&mut [u8]`. Its default initializes exactly the
   requested writable prefix; `Vec`, `Box<[u8]>`, and `IoBuffMut` specialize the
@@ -35,6 +39,9 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- `SlabAllocator` now rejects slab acquisition before initialization and
+  initializes its backing provider at most once, preventing safe code from
+  formatting a slab before the provider accepts the required alignment.
 - Pooled retained iovec scratch now keeps its heap-stable sidecar pool alive
   until block return. Parent-pool movement, detached projected-write payloads,
   and parent-first teardown can no longer leave scratch Drop with a dangling

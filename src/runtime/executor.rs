@@ -254,7 +254,12 @@ impl ExecutorTaskMemProvider {
     }
 }
 
-impl MemoryProvider for ExecutorTaskMemProvider {
+// SAFETY: this private provider is owned by exactly one task
+// ProviderOwnedPool. Its SlabAllocator initializes the alignment once before
+// the first request and never changes it while task slabs are live. Each
+// successful request is a distinct global-allocator allocation using that
+// stable Layout, and pool teardown returns the exact pointer and slab size.
+unsafe impl MemoryProvider for ExecutorTaskMemProvider {
     fn init(&mut self, required_align: usize) {
         self.alignment = std::cmp::max(self.alignment, required_align);
     }
@@ -264,6 +269,10 @@ impl MemoryProvider for ExecutorTaskMemProvider {
     }
 
     fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
+        if size == 0 {
+            return None;
+        }
+
         #[cfg(test)]
         {
             if self

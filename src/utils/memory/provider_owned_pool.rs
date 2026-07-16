@@ -71,52 +71,69 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> Drop for ProviderOwnedPool<T, 
 mod tests {
     use super::{InPlaceInit, ProviderOwnedPool};
     use crate::utils::memory::pool::PoolConfigError;
-    use crate::utils::memory::provider::MemoryProvider;
+    use crate::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
     use std::cell::Cell;
     use std::mem::MaybeUninit;
     use std::rc::Rc;
 
     struct DropCountingProvider {
         drops: Rc<Cell<usize>>,
-        storage: Box<[usize; 128]>,
-        used: bool,
+        provider: BasicMemoryProvider,
+        live: Option<(*mut u8, usize)>,
     }
 
     impl DropCountingProvider {
         fn new(drops: Rc<Cell<usize>>) -> Self {
             Self {
                 drops,
-                storage: Box::new([0; 128]),
-                used: false,
+                provider: BasicMemoryProvider::new(),
+                live: None,
             }
         }
     }
 
     impl Drop for DropCountingProvider {
         fn drop(&mut self) {
+            if let Some((ptr, size)) = self.live.take() {
+                // SAFETY: `live` records the sole successful request that was
+                // not returned before unwinding reached provider drop.
+                unsafe { self.provider.free_memory(ptr, size) };
+            }
             self.drops.set(self.drops.get() + 1);
         }
     }
 
-    impl MemoryProvider for DropCountingProvider {
-        fn init(&mut self, _required_align: usize) {
-            self.used = false;
+    // SAFETY: this fixture delegates every provider operation to the audited
+    // BasicMemoryProvider without changing pointers, sizes, or lifetimes. It
+    // permits at most one live allocation, records the exact pair, and reclaims
+    // that pair if the pool's intentional drop panic bypasses normal teardown.
+    unsafe impl MemoryProvider for DropCountingProvider {
+        fn init(&mut self, required_align: usize) {
+            self.provider.init(required_align);
         }
 
         fn alignment_guarantee(&self) -> usize {
-            std::mem::align_of::<usize>()
+            self.provider.alignment_guarantee()
         }
 
         fn request_memory(&mut self, size: usize) -> Option<*mut u8> {
-            let capacity = self.storage.len() * std::mem::size_of::<usize>();
-            if self.used || size > capacity {
+            if self.live.is_some() {
                 return None;
             }
-            self.used = true;
-            Some(self.storage.as_mut_ptr().cast::<u8>())
+            let ptr = self.provider.request_memory(size)?;
+            self.live = Some((ptr, size));
+            Some(ptr)
         }
 
-        unsafe fn free_memory(&mut self, _ptr: *mut u8, _size: usize) {}
+        unsafe fn free_memory(&mut self, ptr: *mut u8, size: usize) {
+            let Some((live_ptr, live_size)) = self.live.take() else {
+                debug_assert!(false, "test provider freed without a live allocation");
+                return;
+            };
+            debug_assert_eq!(live_ptr, ptr);
+            debug_assert_eq!(live_size, size);
+            unsafe { self.provider.free_memory(ptr, size) };
+        }
     }
 
     struct TestSlot {
