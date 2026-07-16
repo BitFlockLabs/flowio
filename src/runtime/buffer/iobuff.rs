@@ -65,7 +65,9 @@
 //! | `&'static [u8]` | yes | — |
 
 use super::pool::IoBuffPoolInner;
+use crate::runtime::refcount::increment_refcount;
 use std::cell::Cell;
+use std::mem::MaybeUninit;
 use std::ops::RangeBounds;
 use std::ptr::NonNull;
 
@@ -114,6 +116,8 @@ pub enum IoBuffError {
     SliceOutOfBounds,
     /// Requested segment index is outside the initialized chain length.
     IndexOutOfBounds,
+    /// Safe payload growth would expose bytes not known to be initialized.
+    PayloadUninitialized,
 }
 
 #[inline(always)]
@@ -170,14 +174,18 @@ fn payload_capacity_after_advance(
 /// A buffer that can be read by the runtime for write/send operations.
 ///
 /// The runtime uses `as_ptr()` and `len()` to obtain the data to send over
-/// the network.  The pointer must remain valid and stable across await points.
+/// the network. Every nonempty pointer range must remain valid and stable
+/// across await points.
 ///
 /// # Safety
 ///
-/// `as_ptr()` must return a pointer that remains valid for at least `len()`
-/// bytes for the entire lifetime of the buffer value.  The pointer must not
-/// be invalidated by moves of the buffer value (i.e. the backing storage must
-/// be heap- or pool-allocated, not inline).
+/// When `len()` is nonzero, `as_ptr()` must return a non-null, suitably aligned
+/// pointer to `len()` initialized bytes in one allocation, and that range must
+/// support forming an immutable byte slice. The range must not exceed
+/// `isize::MAX` bytes. The pointer and range must remain valid for the entire
+/// lifetime of the buffer value and must not be invalidated by moves of that
+/// value (i.e. nonempty backing storage must be heap- or pool-allocated, not
+/// inline). When `len()` is zero, `as_ptr()` may return null.
 ///
 /// # Example
 /// ```
@@ -202,25 +210,54 @@ pub unsafe trait IoBuffReadOnly: Unpin + 'static {
     }
 }
 
+/// Returns the readable buffer range without constructing a slice from a
+/// potentially null empty pointer.
+#[inline(always)]
+pub(crate) fn readable_slice<B: IoBuffReadOnly>(buffer: &B) -> &[u8] {
+    let len = buffer.len();
+    if len == 0 {
+        return &[];
+    }
+
+    // SAFETY: the unsafe trait contract guarantees that every nonempty range
+    // is a valid initialized immutable slice in one stable allocation.
+    unsafe { std::slice::from_raw_parts(buffer.as_ptr(), len) }
+}
+
 /// A buffer that can be written into by the runtime for read/recv operations.
 ///
 /// The runtime uses `as_mut_ptr()` and `writable_len()` to determine where
-/// and how much the kernel can write. After a kernel read completes, the
-/// runtime calls `set_written_len()` to publish the initialized bytes in the
-/// returned buffer.
+/// and how much the kernel can write. It snapshots `write_base_len()` before
+/// the operation and, after positive read progress, calls `set_written_len()`
+/// with that base plus the initialized byte count.
 ///
 /// Implementations choose what their writable region means. [`IoBuffMut`]
 /// writes into its unwritten payload region and updates structured payload
 /// length. `Vec<u8>` exposes its full allocation starting at index 0 and
-/// `set_written_len()` replaces its logical length with the number of bytes
-/// written there. `Box<[u8]>` exposes its fixed slice and ignores
-/// `set_written_len()` because there is no separate logical length to update.
+/// `write_base_len()` remains zero, so `set_written_len()` replaces its
+/// logical length with the number of bytes written there. `Box<[u8]>` exposes
+/// its fixed slice and ignores `set_written_len()` because there is no separate
+/// logical length to update.
 ///
 /// # Safety
 ///
-/// `as_mut_ptr()` must return a pointer that remains valid and writable for
-/// at least `writable_len()` bytes for the entire lifetime of the buffer
-/// value.  The pointer must not be invalidated by moves of the buffer value.
+/// When `writable_len()` is nonzero, `as_mut_ptr()` must return a non-null,
+/// suitably aligned pointer to one allocation containing that complete
+/// writable range, which must not exceed `isize::MAX` bytes and must support
+/// exclusive writes. The pointer and range must remain valid for the entire
+/// lifetime of the buffer value and must not be invalidated by moves of that
+/// value. When `writable_len()` is zero, `as_mut_ptr()` may return null. Until
+/// another buffer operation changes the writable window, repeated
+/// `as_mut_ptr()` calls must identify the same writable base. A prefix made
+/// initialized through [`IoBuffReadWrite::initialized_writable_slice`] must
+/// remain initialized at that base after the returned borrow ends; writing
+/// through that borrow may change byte values but not their initialization.
+/// [`IoBuffReadWrite::write_base_len`] must identify the logical publication
+/// length immediately before that writable base. It must remain stable with
+/// the writable window, and adding any value through `writable_len()` to it
+/// must not overflow `usize`. Calling `set_written_len(write_base_len() + n)`
+/// after the first `n` writable bytes are initialized must preserve the
+/// already-readable prefix and publish exactly those `n` new bytes.
 ///
 /// # Example
 /// ```
@@ -241,21 +278,75 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     /// [`IoBuffReadWrite::as_mut_ptr`].
     fn writable_len(&self) -> usize;
 
+    /// Returns the logical length immediately before the writable region.
+    ///
+    /// The runtime snapshots this value before a contiguous receive and adds
+    /// the relative completion byte count when publishing positive progress.
+    /// The default is zero, preserving overwrite-style behavior for flat and
+    /// existing custom buffers. Structured append-style buffers override it
+    /// with the length of the readable prefix preceding `as_mut_ptr()`.
+    #[inline(always)]
+    fn write_base_len(&self) -> usize {
+        0
+    }
+
+    /// Returns an initialized mutable slice over the writable prefix.
+    ///
+    /// This operation is for userspace producers, such as a TLS library, that
+    /// require `&mut [u8]` rather than raw writable storage. The provided
+    /// implementation initializes the requested prefix to zero before forming
+    /// the slice. Implementations may avoid rewriting bytes they already know
+    /// are initialized, but must preserve the same postconditions.
+    ///
+    /// Kernel read paths should continue using [`IoBuffReadWrite::as_mut_ptr`]
+    /// and [`IoBuffReadWrite::writable_len`] directly so fresh capacity does
+    /// not acquire a mandatory initialization pass.
+    ///
+    /// This does not publish bytes or change the buffer's logical readable
+    /// length.
+    ///
+    /// # Safety
+    ///
+    /// `len` must be nonzero and no greater than [`Self::writable_len`]. The
+    /// implementation must return exactly that writable prefix with every byte
+    /// initialized as a valid `u8`, without touching bytes outside the prefix,
+    /// changing the writable base, or publishing a new logical length. After
+    /// the returned borrow ends, the prefix must remain initialized and
+    /// reachable at the same base through later
+    /// [`IoBuffReadWrite::as_mut_ptr`] calls until another buffer operation
+    /// changes the writable window.
+    #[inline(always)]
+    unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+        debug_assert!(len != 0, "initialized writable slices must be nonempty");
+        debug_assert!(
+            len <= self.writable_len(),
+            "initialized writable length {len} exceeds capacity {}",
+            self.writable_len()
+        );
+        let ptr = self.as_mut_ptr();
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, len);
+            std::slice::from_raw_parts_mut(ptr, len)
+        }
+    }
+
     /// Called by the runtime after the kernel has written data into the
     /// buffer.
     ///
     /// Structured buffers use this to set the total payload length (absolute,
-    /// not additive). `Vec<u8>` uses this as a replacement length for bytes
-    /// written from index 0; existing contents beyond `len` are logically
-    /// discarded. Fixed-size flat buffers such as `Box<[u8]>` may treat this
-    /// as a no-op because their exposed slice length is not adjusted by
-    /// FlowIO.
+    /// not additive). The runtime passes
+    /// `write_base_len() + relative_written_bytes`. `Vec<u8>` uses this as a
+    /// replacement length for bytes written from index 0; existing contents
+    /// beyond `len` are logically discarded after positive progress.
+    /// Fixed-size flat buffers such as `Box<[u8]>` may treat this as a no-op
+    /// because their exposed slice length is not adjusted by FlowIO.
     ///
     /// # Safety
     ///
-    /// The caller must guarantee that `len` does not exceed the writable
-    /// region submitted through [`IoBuffReadWrite::as_mut_ptr`] and that every
-    /// byte the implementation will expose as readable has been initialized.
+    /// The caller must guarantee that `len` is no greater than
+    /// `write_base_len() + writable_len()`, that the readable prefix before
+    /// `write_base_len()` remains initialized, and that every newly exposed
+    /// byte through `len` has been initialized.
     unsafe fn set_written_len(&mut self, len: usize);
 }
 
@@ -368,7 +459,7 @@ impl IoBuffHeader {
 
     #[inline(always)]
     fn retain(&self) {
-        self.refcount.set(self.refcount.get() + 1);
+        increment_refcount(&self.refcount);
     }
 
     /// Decrements refcount and returns true if this was the last reference.
@@ -453,6 +544,10 @@ pub struct IoBuffMut {
     /// increase it, while `payload_set_len()` and front consumption can
     /// replace or decrease it.
     pub(crate) payload_len: usize,
+    /// Payload bytes known to be initialized from the current payload start.
+    /// This can exceed `payload_len` after a safe truncation, allowing safe
+    /// regrowth without exposing uninitialized storage.
+    pub(crate) payload_initialized_len: usize,
     /// Number of bytes written to the tailroom region.  Tailroom data
     /// is stored immediately after the last payload byte to keep the
     /// active window (headroom + payload + tailroom) contiguous.
@@ -474,6 +569,7 @@ impl IoBuffMut {
             header,
             offset: headroom,
             payload_len: 0,
+            payload_initialized_len: 0,
             tailroom_len: 0,
         })
     }
@@ -609,10 +705,13 @@ impl IoBuffMut {
         }
     }
 
-    /// Returns the unwritten portion of the payload region as a mutable
-    /// slice.  After writing directly into this slice, call
-    /// [`payload_set_len()`](Self::payload_set_len) with the new total
-    /// payload length (absolute, not additive) to update the buffer state.
+    /// Returns the unpublished portion of the payload region as potentially
+    /// uninitialized storage. After initializing bytes in this slice, call
+    /// [`payload_set_len_initialized()`](Self::payload_set_len_initialized)
+    /// with the new total payload length (absolute, not additive) to publish
+    /// them. Borrowing this storage discards initialization knowledge beyond
+    /// the visible payload because safe code may write `MaybeUninit::uninit()`
+    /// into any returned slot.
     ///
     /// # Example
     /// ```
@@ -620,15 +719,21 @@ impl IoBuffMut {
     ///
     /// let mut buf = IoBuffMut::new(0, 64, 0).unwrap();
     /// let spare = buf.payload_unwritten_mut();
-    /// spare[..5].copy_from_slice(b"hello");
-    /// buf.payload_set_len(5).unwrap();
+    /// for (slot, byte) in spare[..5].iter_mut().zip(b"hello") {
+    ///     slot.write(*byte);
+    /// }
+    /// // SAFETY: the first five unpublished payload bytes were initialized
+    /// // above, and 5 is within the payload capacity.
+    /// unsafe { buf.payload_set_len_initialized(5).unwrap() };
     /// assert_eq!(buf.payload_bytes(), b"hello");
     /// ```
     #[inline(always)]
-    pub fn payload_unwritten_mut(&mut self) -> &mut [u8] {
+    pub fn payload_unwritten_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.payload_initialized_len = self.payload_len;
         unsafe {
             let ptr = IoBuffHeader::headroom_ptr_from_raw(self.header.as_ptr())
-                .add(self.payload_start_offset() + self.payload_len);
+                .add(self.payload_start_offset() + self.payload_len)
+                .cast::<MaybeUninit<u8>>();
             std::slice::from_raw_parts_mut(ptr, self.payload_remaining())
         }
     }
@@ -651,19 +756,21 @@ impl IoBuffMut {
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         self.payload_len += data.len();
+        self.payload_initialized_len = self.payload_initialized_len.max(self.payload_len);
         Ok(())
     }
 
-    /// Sets the total written payload length (absolute, not additive).
+    /// Sets the total visible payload length within initialized bytes.
     ///
-    /// This is typically called after writing directly into the pointer
-    /// returned by [`payload_unwritten_mut()`](Self::payload_unwritten_mut)
-    /// or after the runtime's kernel read fills the payload via
-    /// [`IoBuffReadWrite::set_written_len()`].
+    /// This can shrink the visible payload or regrow it only as far as the
+    /// buffer's initialized frontier. To publish newly initialized spare
+    /// bytes, use
+    /// [`payload_set_len_initialized()`](Self::payload_set_len_initialized).
     ///
     /// Returns an error if `new_len` exceeds the payload capacity, or if
     /// tailroom data has already been written and the requested length would
-    /// change the payload size.
+    /// change the payload size. Returns [`IoBuffError::PayloadUninitialized`]
+    /// if `new_len` would expose bytes beyond the initialized frontier.
     pub fn payload_set_len(&mut self, new_len: usize) -> Result<(), IoBuffError> {
         if self.tailroom_len != 0 && new_len != self.payload_len {
             return Err(IoBuffError::PayloadSealed);
@@ -671,8 +778,58 @@ impl IoBuffMut {
         if new_len > self.payload_capacity_after_advance() {
             return Err(IoBuffError::PayloadFull);
         }
+        if new_len > self.payload_initialized_len {
+            return Err(IoBuffError::PayloadUninitialized);
+        }
         self.payload_len = new_len;
         Ok(())
+    }
+
+    /// Publishes a total payload length after initializing newly exposed bytes.
+    ///
+    /// `new_len` is absolute, not additive. It may advance the initialized
+    /// frontier, shrink the visible payload, or regrow within bytes initialized
+    /// by an earlier publication.
+    ///
+    /// # Safety
+    ///
+    /// Every payload byte before `new_len` that was not already inside the
+    /// initialized frontier must have been initialized before this call. The
+    /// caller must not retain references into the unpublished payload while
+    /// changing the visible length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IoBuffError::PayloadFull`] when `new_len` exceeds the remaining
+    /// payload capacity, or [`IoBuffError::PayloadSealed`] when active tailroom
+    /// prevents changing the payload length. Errors leave the buffer unchanged.
+    #[inline(always)]
+    pub unsafe fn payload_set_len_initialized(
+        &mut self,
+        new_len: usize,
+    ) -> Result<(), IoBuffError> {
+        if self.tailroom_len != 0 && new_len != self.payload_len {
+            return Err(IoBuffError::PayloadSealed);
+        }
+        if new_len > self.payload_capacity_after_advance() {
+            return Err(IoBuffError::PayloadFull);
+        }
+        unsafe { self.publish_initialized_len_unchecked(new_len) };
+        Ok(())
+    }
+
+    /// Publishes an already validated, initialized absolute payload length.
+    ///
+    /// # Safety
+    ///
+    /// `new_len` must fit the current payload capacity, obey the active
+    /// tailroom seal, and cover only bytes already initialized by the caller.
+    #[inline(always)]
+    pub(crate) unsafe fn publish_initialized_len_unchecked(&mut self, new_len: usize) {
+        debug_assert!(self.tailroom_len == 0 || new_len == self.payload_len);
+        debug_assert!(new_len <= self.payload_capacity_after_advance());
+        self.payload_initialized_len = self.payload_initialized_len.max(new_len);
+        self.payload_len = new_len;
     }
 
     /// Extends the payload capacity by taking `amount` bytes from the
@@ -800,6 +957,7 @@ impl IoBuffMut {
         if count > self.active_len() {
             return Err(IoBuffError::AdvanceOutOfBounds);
         }
+        let old_payload_start = self.payload_start_offset();
         // Consume the active window in structural order: headroom, payload,
         // then tailroom.
         let headroom_len = self.headroom_len();
@@ -822,6 +980,13 @@ impl IoBuffMut {
         self.offset += count;
         self.payload_len -= payload_consumed;
         self.tailroom_len -= tailroom_consumed;
+        let payload_start_advance = self
+            .payload_start_offset()
+            .saturating_sub(old_payload_start);
+        self.payload_initialized_len = self
+            .payload_initialized_len
+            .saturating_sub(payload_start_advance)
+            .min(self.payload_capacity_after_advance());
         Ok(())
     }
 
@@ -832,6 +997,7 @@ impl IoBuffMut {
         let headroom = unsafe { self.header.as_ref().headroom_capacity };
         self.offset = headroom;
         self.payload_len = 0;
+        self.payload_initialized_len = 0;
         self.tailroom_len = 0;
     }
 
@@ -1083,6 +1249,7 @@ impl IoBuff {
             header: self.header,
             offset: self.offset,
             payload_len: self.payload_len,
+            payload_initialized_len: self.payload_len,
             tailroom_len: self.tailroom_len,
         };
         std::mem::forget(self);
@@ -1465,7 +1632,9 @@ unsafe impl IoBuffReadOnly for IoBuffMut {
     }
 }
 
-// SAFETY: IoBuffMut has exclusive ownership — mutable pointer is valid.
+// SAFETY: IoBuffMut has exclusive, pointer-stable backing. Its writable base is
+// derived only from explicit window state, and the initialized frontier
+// preserves userspace initialization until another operation changes it.
 unsafe impl IoBuffReadWrite for IoBuffMut {
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -1478,6 +1647,34 @@ unsafe impl IoBuffReadWrite for IoBuffMut {
     #[inline(always)]
     fn writable_len(&self) -> usize {
         self.payload_remaining()
+    }
+
+    #[inline(always)]
+    fn write_base_len(&self) -> usize {
+        self.payload_len
+    }
+
+    #[inline(always)]
+    unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+        let writable = self.payload_remaining();
+        debug_assert!(len != 0, "initialized writable slices must be nonempty");
+        debug_assert!(
+            len <= writable,
+            "initialized writable length {len} exceeds capacity {writable}"
+        );
+        let len = len.min(writable);
+        let already_initialized = self
+            .payload_initialized_len
+            .saturating_sub(self.payload_len)
+            .min(len);
+        let ptr = self.as_mut_ptr();
+        if already_initialized != len {
+            unsafe {
+                std::ptr::write_bytes(ptr.add(already_initialized), 0, len - already_initialized)
+            };
+        }
+        self.payload_initialized_len = self.payload_initialized_len.max(self.payload_len + len);
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 
     #[inline(always)]
@@ -1496,7 +1693,9 @@ unsafe impl IoBuffReadWrite for IoBuffMut {
         if self.tailroom_len != 0 && len != self.payload_len {
             return;
         }
-        self.payload_len = std::cmp::min(len, capacity);
+        let len = std::cmp::min(len, capacity);
+        let result = unsafe { self.payload_set_len_initialized(len) };
+        debug_assert!(result.is_ok(), "validated written length must publish");
     }
 }
 
@@ -1519,7 +1718,8 @@ unsafe impl IoBuffReadOnly for Vec<u8> {
     }
 }
 
-// SAFETY: Same heap stability.
+// SAFETY: Vec's allocation base is stable because these trait operations never
+// reserve. Logical-length changes preserve initialized bytes in the allocation.
 unsafe impl IoBuffReadWrite for Vec<u8> {
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -1529,6 +1729,23 @@ unsafe impl IoBuffReadWrite for Vec<u8> {
     #[inline(always)]
     fn writable_len(&self) -> usize {
         Vec::capacity(self)
+    }
+
+    #[inline(always)]
+    unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+        let capacity = Vec::capacity(self);
+        debug_assert!(len != 0, "initialized writable slices must be nonempty");
+        debug_assert!(
+            len <= capacity,
+            "initialized writable length {len} exceeds capacity {capacity}"
+        );
+        let len = len.min(capacity);
+        let initialized = Vec::len(self).min(len);
+        let ptr = Vec::as_mut_ptr(self);
+        if initialized != len {
+            unsafe { std::ptr::write_bytes(ptr.add(initialized), 0, len - initialized) };
+        }
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 
     #[inline(always)]
@@ -1560,7 +1777,8 @@ unsafe impl IoBuffReadOnly for Box<[u8]> {
     }
 }
 
-// SAFETY: Same heap stability.
+// SAFETY: Box has a fixed, pointer-stable allocation whose entire writable
+// window remains initialized for its lifetime.
 unsafe impl IoBuffReadWrite for Box<[u8]> {
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -1570,6 +1788,17 @@ unsafe impl IoBuffReadWrite for Box<[u8]> {
     #[inline(always)]
     fn writable_len(&self) -> usize {
         <[u8]>::len(self)
+    }
+
+    #[inline(always)]
+    unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+        let capacity = <[u8]>::len(self);
+        debug_assert!(len != 0, "initialized writable slices must be nonempty");
+        debug_assert!(
+            len <= capacity,
+            "initialized writable length {len} exceeds capacity {capacity}"
+        );
+        &mut self[..len.min(capacity)]
     }
 
     #[inline(always)]
@@ -1590,5 +1819,87 @@ unsafe impl IoBuffReadOnly for &'static [u8] {
     #[inline(always)]
     fn len(&self) -> usize {
         <[u8]>::len(self)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
+
+    pub(crate) fn trigger_iobuff_refcount_overflow() {
+        let frozen = IoBuffMut::new(0, 1, 0)
+            .expect("allocate overflow-test buffer")
+            .freeze();
+        unsafe { frozen.header.as_ref().refcount.set(usize::MAX) };
+
+        let clone = frozen.clone();
+        std::mem::forget(clone);
+        std::mem::forget(frozen);
+    }
+
+    struct NullEmptyReadOnly {
+        pointer_calls: Cell<usize>,
+    }
+
+    // SAFETY: this buffer exposes no readable bytes, so the trait contract
+    // permits its pointer to be null. Its zero-length window is stable.
+    unsafe impl IoBuffReadOnly for NullEmptyReadOnly {
+        fn as_ptr(&self) -> *const u8 {
+            self.pointer_calls.set(self.pointer_calls.get() + 1);
+            std::ptr::null()
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn readable_slice_accepts_null_empty_custom_buffer_without_pointer_access() {
+        let buffer = NullEmptyReadOnly {
+            pointer_calls: Cell::new(0),
+        };
+
+        assert!(readable_slice(&buffer).is_empty());
+        assert_eq!(buffer.pointer_calls.get(), 0);
+    }
+
+    #[test]
+    fn iobuff_refcount_immediately_below_limit_keeps_pool_slot_live() {
+        let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+            headroom: 0,
+            payload: 8,
+            tailroom: 0,
+            objs_per_slab: 1,
+        })
+        .expect("valid overflow-test pool");
+        pool.init();
+
+        let mut buffer = pool.alloc().expect("allocate overflow-test pool slot");
+        buffer
+            .payload_append(b"retained")
+            .expect("fill overflow-test buffer");
+        let frozen = buffer.freeze();
+        let slot = frozen.header;
+        unsafe { slot.as_ref().refcount.set(usize::MAX - 1) };
+
+        let clone = frozen.clone();
+        assert_eq!(unsafe { slot.as_ref().ref_count() }, usize::MAX);
+        assert_eq!(clone.bytes(), b"retained");
+        drop(clone);
+
+        assert_eq!(unsafe { slot.as_ref().ref_count() }, usize::MAX - 1);
+        assert_eq!(pool.live_slots_for_test(), 1);
+        assert_eq!(frozen.bytes(), b"retained");
+
+        // Restore the synthetic count to the sole real handle before dropping
+        // it, then prove final release returns this exact slot to the pool.
+        unsafe { slot.as_ref().refcount.set(1) };
+        drop(frozen);
+        assert_eq!(pool.live_slots_for_test(), 0);
+
+        let reused = pool.alloc().expect("reuse released overflow-test slot");
+        assert_eq!(reused.header, slot);
     }
 }

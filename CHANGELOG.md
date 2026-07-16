@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Alpha prereleases carry no compatibility guarantee.
 
+## [Unreleased]
+
+### Changed
+
+- `IoBuffReadWrite` now provides `initialized_writable_slice` for userspace
+  producers that require `&mut [u8]`. Its default initializes exactly the
+  requested writable prefix; `Vec`, `Box<[u8]>`, and `IoBuffMut` specialize the
+  operation to preserve bytes already known to be initialized.
+- `IoBuffReadWrite` now provides `write_base_len` for relative contiguous-read
+  publication. Its default remains zero for overwrite-style flat/custom
+  buffers; `IoBuffMut` reports its current payload length so reads append to
+  existing payload data.
+- The unsafe `IoBuffReadOnly` and `IoBuffReadWrite` contracts now explicitly
+  permit a null pointer only for an empty window. Every positive-length range
+  must be non-null, suitably aligned, contained in one stable allocation, and
+  satisfy the documented initialization and access requirements.
+- **Breaking:** `IoBuffMut::payload_unwritten_mut` now exposes spare payload
+  capacity as `MaybeUninit<u8>`. Callers initialize the intended prefix and
+  publish it with unsafe `payload_set_len_initialized`; safe
+  `payload_set_len` cannot expose bytes beyond the tracked initialized
+  frontier.
+- **Breaking:** `timeout` and `timeout_at` now return `TimeoutError`, whose
+  `Elapsed` and `Runtime(io::Error)` variants distinguish deadline expiry from
+  timer allocation or runtime failure. The former unit `Elapsed` error type is
+  removed. TCP/SCTP connect-timeout helpers preserve runtime errors and map
+  only actual expiry to `TimedOut`.
+
+### Fixed
+
+- Pooled retained iovec scratch now keeps its heap-stable sidecar pool alive
+  until block return. Parent-pool movement, detached projected-write payloads,
+  and parent-first teardown can no longer leave scratch Drop with a dangling
+  owner pointer.
+- TLS partial writes accept a custom read-only buffer whose empty window uses
+  a null pointer, returning zero without consulting that pointer or forming a
+  raw slice from it.
+- TLS partial and exact reads initialize their caller-owned plaintext
+  destination before forming a mutable byte slice. Each nonempty destination
+  that reaches plaintext polling is initialized once, while kernel read paths
+  continue writing directly into raw spare capacity without a mandatory
+  zeroing pass.
+- Contiguous stream, UDP, SCTP, and TLS reads preserve existing logical buffer
+  contents on zero progress and publish positive progress from the captured
+  destination base. Exact-read EOF/errors and datagram metadata/truncation
+  errors publish any bytes actually received before returning the error.
+- Debug builds assert that standard task wakers are cloned, woken, and dropped
+  only on their owner thread; release builds retain the zero-cost
+  single-threaded waker path.
+- Fresh and reused `IoBuffMut` capacity cannot become readable through safe
+  length growth before the caller initializes it.
+
 ## [0.2.0-alpha.1]
 
 A pre-1.0 release that tightens the public API and clarifies several SCTP

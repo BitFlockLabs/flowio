@@ -2,7 +2,7 @@ mod common;
 
 use common::{DropTrackedReadOnly, TestIoBuffMut as IoBuffMut};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut, PushError};
-use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly};
+use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly, IoBuffReadWrite};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -26,6 +26,48 @@ fn expect_chain_full<T>(result: Result<(), PushError<T>>) -> T {
     let (error, value) = err.into_parts();
     assert_eq!(error, IoBuffError::ChainFull);
     value
+}
+
+/// Materializes the chain's current writable regions as kernel-facing iovecs
+/// and initializes their first `total_bytes` bytes with a deterministic
+/// pattern. The returned bytes are the exact prefix safe to publish with
+/// `distribute_written`.
+fn initialize_materialized_iovec_prefix<const N: usize>(
+    chain: &mut IoBuffVecMut<N>,
+    total_bytes: usize,
+) -> Vec<u8> {
+    assert!(total_bytes <= chain.writable_len());
+
+    let mut iovecs = Vec::with_capacity(chain.segments());
+    for index in 0..chain.segments() {
+        let buffer = chain
+            .get_mut(index)
+            .expect("active vectored segment in test");
+        iovecs.push(libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.writable_len(),
+        });
+    }
+
+    let mut expected = Vec::with_capacity(total_bytes);
+    let mut remaining = total_bytes;
+    for iovec in iovecs {
+        let initialized = remaining.min(iovec.iov_len);
+        for offset in 0..initialized {
+            let byte = (expected.len() as u8).wrapping_mul(17).wrapping_add(3);
+            // SAFETY: each materialized iovec describes a live segment's
+            // writable region, and `initialized` does not exceed its length.
+            unsafe { (iovec.iov_base.cast::<u8>()).add(offset).write(byte) };
+            expected.push(byte);
+        }
+        remaining -= initialized;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    assert_eq!(remaining, 0);
+    expected
 }
 
 // ============================================================================
@@ -450,12 +492,16 @@ fn vec_mut_distribute_written_single_segment() {
     let mut chain = IoBuffVecMut::<1>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
 
+    let expected = initialize_materialized_iovec_prefix(&mut chain, 20);
+    // SAFETY: the helper initialized the first 20 bytes of the materialized
+    // iovec chain above.
     unsafe { chain.distribute_written(20) };
     println!(
         "  After 20 bytes: payload_len={}",
         seg!(chain, 0).payload_len()
     );
     assert_eq!(seg!(chain, 0).payload_len(), 20);
+    assert_eq!(seg!(chain, 0).payload_bytes(), expected);
     assert_eq!(chain.len(), 20);
 }
 
@@ -467,7 +513,10 @@ fn vec_mut_distribute_written_across_multiple() {
     chain.push(IoBuffMut::new(0, 4096, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
 
-    // Simulate kernel writing 2000 bytes: fills seg0 (64), seg1 (1936), seg2 (0)
+    // Simulate kernel writing 2000 bytes: fills seg0 (64), seg1 (1936), seg2 (0).
+    let expected = initialize_materialized_iovec_prefix(&mut chain, 2000);
+    // SAFETY: the helper initialized exactly the first 2000 bytes across the
+    // materialized iovec chain above.
     unsafe { chain.distribute_written(2000) };
 
     println!("  seg0: payload_len={}", seg!(chain, 0).payload_len());
@@ -477,6 +526,8 @@ fn vec_mut_distribute_written_across_multiple() {
     assert_eq!(seg!(chain, 0).payload_len(), 64);
     assert_eq!(seg!(chain, 1).payload_len(), 2000 - 64);
     assert_eq!(seg!(chain, 2).payload_len(), 0);
+    assert_eq!(seg!(chain, 0).payload_bytes(), &expected[..64]);
+    assert_eq!(seg!(chain, 1).payload_bytes(), &expected[64..]);
     assert_eq!(chain.len(), 2000);
 }
 
@@ -488,11 +539,17 @@ fn vec_mut_distribute_written_fills_all() {
     chain.push(IoBuffMut::new(0, 20, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 30, 0)).unwrap();
 
+    let expected = initialize_materialized_iovec_prefix(&mut chain, 60);
+    // SAFETY: the helper initialized every byte in the materialized iovec
+    // chain above.
     unsafe { chain.distribute_written(60) };
 
     assert_eq!(seg!(chain, 0).payload_len(), 10);
     assert_eq!(seg!(chain, 1).payload_len(), 20);
     assert_eq!(seg!(chain, 2).payload_len(), 30);
+    assert_eq!(seg!(chain, 0).payload_bytes(), &expected[..10]);
+    assert_eq!(seg!(chain, 1).payload_bytes(), &expected[10..30]);
+    assert_eq!(seg!(chain, 2).payload_bytes(), &expected[30..]);
     assert_eq!(chain.len(), 60);
     println!("  All segments filled exactly: OK");
 }
@@ -686,13 +743,18 @@ fn vec_mut_writable_len_and_distribute_written() {
     assert_eq!(writable, 192);
     assert_eq!(segs, 2);
 
-    // Simulate kernel readv
+    // Simulate a partial kernel readv into the materialized writable regions.
+    let expected = initialize_materialized_iovec_prefix(&mut chain, 100);
+    // SAFETY: the helper initialized exactly the first 100 bytes across the
+    // materialized iovec chain above.
     unsafe { chain.distribute_written(100) };
     println!("  After distribute_written(100):");
     println!("    seg0 payload_len={}", seg!(chain, 0).payload_len());
     println!("    seg1 payload_len={}", seg!(chain, 1).payload_len());
     assert_eq!(seg!(chain, 0).payload_len(), 64);
     assert_eq!(seg!(chain, 1).payload_len(), 36);
+    assert_eq!(seg!(chain, 0).payload_bytes(), &expected[..64]);
+    assert_eq!(seg!(chain, 1).payload_bytes(), &expected[64..]);
 }
 
 // ============================================================================
@@ -815,11 +877,15 @@ fn vec_distribute_written_partial_first_segment() {
     chain.push(IoBuffMut::new(0, 200, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 300, 0)).unwrap();
 
+    let expected = initialize_materialized_iovec_prefix(&mut chain, 50);
+    // SAFETY: the helper initialized exactly the first 50 bytes of the first
+    // materialized iovec above.
     unsafe { chain.distribute_written(50) };
 
     assert_eq!(seg!(chain, 0).payload_len(), 50);
     assert_eq!(seg!(chain, 1).payload_len(), 0);
     assert_eq!(seg!(chain, 2).payload_len(), 0);
+    assert_eq!(seg!(chain, 0).payload_bytes(), expected);
     println!("  Partial first segment: OK");
 }
 

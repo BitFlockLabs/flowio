@@ -52,7 +52,7 @@ use crate::net::udp::UdpSocket;
 use crate::runtime::buffer::bytes::{
     BufferCursorMut, BufferRangeError, read_u16_be_at, write_u16_be_at,
 };
-use crate::runtime::timer::{Elapsed, timeout};
+use crate::runtime::timer::{TimeoutError, timeout};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -81,6 +81,22 @@ const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const HOSTS_PATH: &str = "/etc/hosts";
 
 static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
+
+enum QueryAttemptError {
+    Io(io::Error),
+    Timeout(TimeoutError),
+}
+
+impl QueryAttemptError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Io(err) | Self::Timeout(TimeoutError::Runtime(err)) => err,
+            Self::Timeout(TimeoutError::Elapsed) => {
+                io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
+            }
+        }
+    }
+}
 
 /// Reusable DNS resolver built on FlowIO UDP sockets.
 ///
@@ -153,7 +169,9 @@ impl DnsResolver {
     /// them to transport connectors instead of resolving on the data path.
     /// Non-literal names synchronously inspect `/etc/hosts`; each upstream DNS
     /// attempt creates a connected UDP socket plus owned query/response
-    /// buffers.
+    /// buffers. A true query expiry advances to the next nameserver; timer
+    /// `OutOfMemory` is returned immediately without attempting another
+    /// server.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -194,7 +212,12 @@ impl DnsResolver {
                     Ok(result) => return Ok(result),
                     Err(err) => last_err = Some(err),
                 },
-                Err(err) => last_err = Some(err),
+                Err(QueryAttemptError::Timeout(TimeoutError::Runtime(err)))
+                    if err.kind() == io::ErrorKind::OutOfMemory =>
+                {
+                    return Err(err);
+                }
+                Err(err) => last_err = Some(err.into_io_error()),
             }
         }
 
@@ -211,13 +234,14 @@ impl DnsResolver {
         nameserver: SocketAddr,
         packet: &[u8],
         query_id: u16,
-    ) -> io::Result<Vec<u8>> {
-        let mut socket = UdpSocket::bind(unspecified_addr(nameserver))?;
-        socket.connect(nameserver)?;
+    ) -> Result<Vec<u8>, QueryAttemptError> {
+        let mut socket =
+            UdpSocket::bind(unspecified_addr(nameserver)).map_err(QueryAttemptError::Io)?;
+        socket.connect(nameserver).map_err(QueryAttemptError::Io)?;
 
         let (send_result, _) = socket.send(packet.to_vec()).await;
-        send_result?;
-        timeout(self.query_timeout, async {
+        send_result.map_err(QueryAttemptError::Io)?;
+        match timeout(self.query_timeout, async {
             let mut recv = vec![0u8; DNS_UDP_RESPONSE_BUFFER_SIZE];
             loop {
                 let (recv_result, returned) = socket.recv(recv, DNS_UDP_RESPONSE_BUFFER_SIZE).await;
@@ -242,7 +266,10 @@ impl DnsResolver {
             }
         })
         .await
-        .map_err(timeout_error)?
+        {
+            Ok(result) => result.map_err(QueryAttemptError::Io),
+            Err(err) => Err(QueryAttemptError::Timeout(err)),
+        }
     }
 
     async fn gather_dns_addresses(
@@ -527,10 +554,6 @@ fn unspecified_addr(nameserver: SocketAddr) -> SocketAddr {
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     }
-}
-
-fn timeout_error(_: Elapsed) -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
 }
 
 fn host_not_found(host: &str) -> io::Error {

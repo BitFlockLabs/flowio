@@ -24,6 +24,13 @@
 //! - `iobuffvec` — vectored I/O buffer chains
 //! - `pool` — slab-backed allocator for fixed-shape buffer reuse
 //!
+//! [`IoBuffMut::payload_unwritten_mut`] exposes spare payload capacity as
+//! `MaybeUninit<u8>`. Initialize only the bytes the caller intends to publish,
+//! then use [`IoBuffMut::payload_set_len_initialized`] with its documented
+//! unsafe proof obligation. Safe [`IoBuffMut::payload_set_len`] changes the
+//! visible length only within bytes already known to be initialized. Borrowing
+//! spare capacity discards initialization knowledge beyond the visible length.
+//!
 //! # Fast-Path Guidance
 //!
 //! Preferred on the fast path:
@@ -78,6 +85,8 @@
 
 pub mod bytes;
 mod iobuff;
+#[cfg(test)]
+pub(crate) use iobuff::tests::trigger_iobuff_refcount_overflow;
 pub mod iobuffvec;
 pub mod pool;
 

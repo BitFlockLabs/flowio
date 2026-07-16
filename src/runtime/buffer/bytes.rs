@@ -968,8 +968,9 @@ impl<T: AsRef<[u8]> + ?Sized> ByteReadAt for T {
 ///
 /// For `IoBuffMut`, these methods write into the active initialized byte
 /// window exposed by `bytes_mut()` / `AsMut<[u8]>`. To encode into spare
-/// unwritten payload capacity, write through `payload_unwritten_mut()` and
-/// then commit the initialized length with `payload_set_len()`.
+/// unwritten payload capacity, initialize the `MaybeUninit<u8>` slots returned
+/// by `payload_unwritten_mut()` and then publish them with the unsafe
+/// `payload_set_len_initialized()` operation.
 ///
 /// Fast-path: allocation-free and bounds-checked; suitable for per-packet
 /// encode paths.

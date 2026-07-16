@@ -4,6 +4,10 @@
 //! for one thread. It is intended to be long-lived: construct it once, then
 //! run application tasks inside it.
 //!
+//! The runtime is single-threaded: a task's [`Waker`] is only cloned, woken, or
+//! dropped on the executor thread that owns the task. The future and all runtime
+//! state stay on that thread.
+//!
 //! # Fast-Path Guidance
 //!
 //! Preferred on the fast path:
@@ -38,21 +42,22 @@ use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::{Reactor, ReactorConfig, ReactorSubmitStatus};
 use crate::runtime::task::{
     Task, TaskHeader, TaskVTable, cached_waker_ref, init_cached_waker, release_task,
+    task_ptr_from_waker,
 };
 use crate::runtime::timer::TimerRuntime;
 use crate::utils::list::intrusive::dlist::DList;
-use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::MemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use io_uring::{opcode, squeue, types};
 use std::alloc::{Layout, alloc};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
-use std::mem::{ManuallyDrop, align_of, size_of};
+use std::mem::{align_of, size_of};
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 /// Default per-phase cap for one executor loop pass.
@@ -66,6 +71,10 @@ const TASK_POOL_SIZE: usize = 4096;
 const TASK_DATA_ALIGN: usize = align_of::<TaskHeader>();
 /// Number of task slots allocated per task-pool slab page.
 const TASKS_PER_SLAB: usize = 1024;
+/// The owner pointer and all-task link consume prior padding at the fixed
+/// payload boundary, so 64-bit task slots retain their pre-slice geometry.
+#[cfg(target_pointer_width = "64")]
+const _: [(); 4224] = [(); size_of::<Task<TASK_POOL_SIZE>>()];
 
 #[allow(unused_macros)]
 macro_rules! define_runtime_stats {
@@ -339,7 +348,7 @@ impl Default for ExecutorConfig {
 }
 
 pub(crate) struct RuntimeState {
-    /// Number of live tasks currently owned by the executor.
+    /// Number of unfinished tasks currently owned by the executor.
     pub(crate) live_tasks: usize,
     /// Number of submitted operations that have not retired yet.
     pub(crate) inflight_ops: usize,
@@ -370,105 +379,279 @@ pub(crate) struct ScheduleCtx {
     pub(crate) runtime_state: *mut RuntimeState,
 }
 
-/// Per-thread executor context stored as a raw pointer in thread-local storage.
-///
-/// The struct lives on the stack of [`Executor::run`] and a `*mut ThreadCtx` is
-/// placed in the TLS cell.  All runtime-internal functions read through this
-/// pointer — a single 8-byte TLS load — instead of copying the full struct.
-/// `owner_task` is set/cleared via raw pointer write around each task poll so
-/// that I/O futures can capture their owning task without an additional TLS
-/// lookup.
-#[derive(Clone, Copy)]
-struct ThreadCtx {
-    /// Main ready queue for runnable tasks.
-    ready_queue: *mut DList<TaskHeader>,
-    /// Reactor used for SQE submission and CQE polling.
-    reactor: *mut Reactor,
-    /// Pool from which runtime task storage is allocated.
-    task_pool: *mut Pool<'static, Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>,
-    /// Shared executor counters and lifecycle state.
-    runtime_state: *mut RuntimeState,
-    /// Runtime-owned timer subsystem for sleeps and deadlines.
-    timers: *mut TimerRuntime,
-    /// The task currently being polled. Set before `vtable.poll()`, cleared
-    /// after. I/O futures access this through `TaskHeader.ctx` -> `ThreadCtx`
-    /// to register themselves as the waiter for the submitted operation.
+/// Heap-stable state shared by one executor and every task, operation, or timer
+/// slot that can outlive its public [`Executor`] handle.
+struct ExecutorState {
+    /// Reactor driving kernel-visible I/O for this owner.
+    reactor: Reactor,
+    /// Pool storing pointer-stable task allocations.
+    task_pool: ProviderOwnedPool<Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>,
+    /// Main queue of runnable tasks.
+    ready_queue: DList<TaskHeader>,
+    /// Intrusive registry of every allocated task slot.
+    all_tasks: DList<TaskHeader>,
+    /// Runtime timer subsystem shared by all sleeps and deadlines.
+    timers: TimerRuntime,
+    /// Persistent counters and run lifecycle state.
+    runtime_state: RuntimeState,
+    /// Task currently being polled, or null outside a task poll.
     owner_task: *mut TaskHeader,
+    /// Set after one-time intrusive/runtime initialization is complete.
+    initialized: bool,
+    /// Prevents teardown wakeups from re-entering the ready queue.
+    shutting_down: bool,
+}
+
+/// Stable origin identity retained by runtime-owned slots.
+///
+/// The runtime is single-threaded, so `Rc` strong-count operations and every
+/// task-waker action stay confined to the owner thread.
+pub(crate) struct ExecutorOwner {
+    /// Interior-mutability boundary for the owner-thread-only runtime state.
+    state: UnsafeCell<ExecutorState>,
+    /// Thread that constructed and owns this executor. Used only by the
+    /// debug-only task-waker owner-thread guard.
+    #[cfg(debug_assertions)]
+    owner_thread: std::thread::ThreadId,
+}
+
+impl ExecutorOwner {
+    #[inline(always)]
+    fn state_ptr(&self) -> *mut ExecutorState {
+        self.state.get()
+    }
+
+    /// Debug-only check that a task waker is used on this executor's owner
+    /// thread. The runtime is single-threaded, so this always holds; the guard
+    /// exists to catch accidental off-thread waker use during development.
+    #[cfg(debug_assertions)]
+    #[inline(always)]
+    pub(crate) fn debug_assert_owner_thread(&self) {
+        debug_assert_eq!(
+            std::thread::current().id(),
+            self.owner_thread,
+            "FlowIO task waker used off its executor owner thread; the runtime is single-threaded"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub(crate) fn debug_assert_owner_thread(&self) {}
+
+    #[inline(always)]
+    pub(crate) fn reactor_ptr(&self) -> *mut Reactor {
+        unsafe { std::ptr::addr_of_mut!((*self.state_ptr()).reactor) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn timers_ptr(&self) -> *mut TimerRuntime {
+        unsafe { std::ptr::addr_of_mut!((*self.state_ptr()).timers) }
+    }
+
+    /// Clones the `Rc` represented by a live owner pointer.
+    ///
+    /// # Safety
+    ///
+    /// `owner` must come from `Rc::as_ptr` and retain at least one strong count
+    /// for the duration of this call. This operation must run on the owner
+    /// thread; escaped standard wakers never clone this `Rc`.
+    #[inline(always)]
+    pub(crate) unsafe fn clone_rc(owner: *const Self) -> Rc<Self> {
+        unsafe {
+            Rc::increment_strong_count(owner);
+            Rc::from_raw(owner)
+        }
+    }
 }
 
 thread_local! {
-    static EXECUTOR_CTX: Cell<*mut ThreadCtx> = const { Cell::new(std::ptr::null_mut()) };
+    static EXECUTOR_CTX: Cell<*const ExecutorOwner> = const { Cell::new(std::ptr::null()) };
 }
 
-struct ExecutorCtxGuard;
+struct ExecutorCtxGuard {
+    owner: *const ExecutorOwner,
+}
 
 impl ExecutorCtxGuard {
     #[inline(always)]
-    fn set(ctx_ptr: *mut ThreadCtx) -> Self {
-        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(ctx_ptr));
-        Self
+    fn reject_if_active() -> io::Result<()> {
+        EXECUTOR_CTX.with(|ctx_cell| {
+            if ctx_cell.get().is_null() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "nested or reentrant Executor::run is not supported",
+                ))
+            }
+        })
+    }
+
+    #[inline(always)]
+    fn install(owner: *const ExecutorOwner) -> io::Result<Self> {
+        Self::reject_if_active()?;
+        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(owner));
+        Ok(Self { owner })
     }
 }
 
 impl Drop for ExecutorCtxGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(std::ptr::null_mut()));
+        EXECUTOR_CTX.with(|ctx_cell| {
+            if ctx_cell.get() == self.owner {
+                ctx_cell.set(std::ptr::null());
+            }
+        });
     }
 }
 
-/// Thin handle to the active executor context, extracted from a FlowIO task
-/// waker without a TLS read.
+/// Thin handle to a validated active executor poll context.
+#[derive(Clone, Copy)]
 pub(crate) struct PollCtx {
-    /// Pointer to the executor thread context active for the current poll.
-    ctx: *const ThreadCtx,
+    /// Stable owner encoded in the task currently being polled.
+    owner: *const ExecutorOwner,
+    /// Task encoded in the validated FlowIO waker, or null for owner-only
+    /// internal contexts that never register a waiter.
+    task: *mut TaskHeader,
 }
 
 impl PollCtx {
     #[inline(always)]
     pub fn reactor(&self) -> *mut Reactor {
-        unsafe { (*self.ctx).reactor }
+        unsafe { (*self.owner).reactor_ptr() }
     }
 
     #[inline(always)]
     pub fn runtime_state(&self) -> *mut RuntimeState {
-        unsafe { (*self.ctx).runtime_state }
+        unsafe { std::ptr::addr_of_mut!((*(*self.owner).state_ptr()).runtime_state) }
+    }
+
+    #[inline(always)]
+    pub fn timers(&self) -> *mut TimerRuntime {
+        unsafe { (*self.owner).timers_ptr() }
     }
 
     #[inline(always)]
     pub fn owner_task(&self) -> *mut TaskHeader {
-        unsafe { (*self.ctx).owner_task }
+        debug_assert!(!self.task.is_null(), "poll context has no waiter task");
+        self.task
     }
-}
 
-/// Extract reactor and task pointers for use in I/O future poll paths.
-/// Zero TLS reads — extracts the TaskHeader pointer from the waker's internal
-/// layout, then reads the `ctx` field set by the executor before each poll.
-///
-/// # Safety
-///
-/// `cx.waker()` must be the cached FlowIO task waker currently being polled by
-/// this executor. The implementation relies on the current two-pointer
-/// `Waker` representation with the task data pointer in its second word; the
-/// compile-time assertion below verifies size only, so a standard-library
-/// representation change requires re-auditing this extraction.
-#[inline(always)]
-pub(crate) unsafe fn poll_ctx_from_waker(cx: &std::task::Context) -> PollCtx {
-    let waker_ptr = cx.waker() as *const std::task::Waker as *const *const ();
-    let task_ptr = unsafe { *waker_ptr.add(1) } as *mut TaskHeader;
-    let raw_ctx = unsafe { (*task_ptr).ctx.get() };
-    PollCtx {
-        ctx: raw_ctx as *const ThreadCtx,
+    #[inline(always)]
+    pub(crate) fn owner_ptr(&self) -> *const ExecutorOwner {
+        self.owner
     }
 }
 
 #[inline(always)]
-/// Replaces an operation's waiter with the task represented by `cx`.
+fn inactive_poll_context_error() -> io::Error {
+    io::Error::from(ErrorKind::NotConnected)
+}
+
+/// Validates and extracts the FlowIO task and active executor represented by
+/// one future poll.
+#[inline(always)]
+pub(crate) fn poll_ctx_from_waker(cx: &std::task::Context<'_>) -> io::Result<PollCtx> {
+    let task = task_ptr_from_waker(cx.waker()).ok_or_else(inactive_poll_context_error)?;
+    let owner = unsafe { (*task).owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr) };
+    let active_owner = EXECUTOR_CTX.with(Cell::get);
+    if owner.is_null() || active_owner != owner {
+        return Err(inactive_poll_context_error());
+    }
+
+    Ok(PollCtx { owner, task })
+}
+
+/// Validates the current FlowIO poll context before an I/O future completes
+/// locally without allocating or submitting an operation.
+#[inline(always)]
+pub(crate) fn validate_local_io_result<T>(
+    cx: &std::task::Context<'_>,
+    result: io::Result<T>,
+) -> io::Result<T> {
+    poll_ctx_from_waker(cx)?;
+    result
+}
+
+/// Origin-bound context used to retire a completed operation safely even when
+/// its current poll context is invalid.
+pub(crate) struct CompletedOpCtx {
+    origin: PollCtx,
+    current: Option<PollCtx>,
+    context_rejected: bool,
+}
+
+impl CompletedOpCtx {
+    #[inline(always)]
+    pub(crate) fn reactor(&self) -> *mut Reactor {
+        self.origin.reactor()
+    }
+
+    #[inline(always)]
+    pub(crate) fn origin_poll_ctx(&self) -> &PollCtx {
+        &self.origin
+    }
+
+    #[inline(always)]
+    pub(crate) fn context_rejected(&self) -> bool {
+        self.context_rejected
+    }
+
+    #[inline(always)]
+    pub(crate) fn matching_poll_ctx(&self) -> Option<PollCtx> {
+        if self.context_rejected {
+            None
+        } else {
+            self.current
+        }
+    }
+}
+
+/// Records current-poll misuse and returns the operation's origin reactor for
+/// completion cleanup.
 ///
 /// # Safety
 ///
-/// `cx` must carry the active FlowIO task waker, and `state_ptr` must point to
-/// a live completion state exclusively owned by the currently polled future.
+/// `state_ptr` must identify a live completed state allocated by a FlowIO
+/// reactor. Such states always retain a non-null executor owner.
+#[inline(always)]
+pub(crate) unsafe fn completed_op_ctx_from_waker(
+    cx: &std::task::Context<'_>,
+    state_ptr: *mut CompletionState,
+) -> CompletedOpCtx {
+    debug_assert!(!state_ptr.is_null(), "completed operation state is missing");
+    let state = unsafe { &mut *state_ptr };
+    debug_assert!(state.is_completed(), "operation has not completed");
+    let owner = state.owner_ptr();
+    debug_assert!(!owner.is_null(), "completed operation has no origin owner");
+
+    let current = poll_ctx_from_waker(cx).ok();
+    let current_matches = current.is_some_and(|current| current.owner_ptr() == owner);
+    if !current_matches {
+        state.set_context_rejected();
+    }
+
+    CompletedOpCtx {
+        origin: PollCtx {
+            owner,
+            task: std::ptr::null_mut(),
+        },
+        current,
+        context_rejected: state.is_context_rejected(),
+    }
+}
+
+#[inline(always)]
+/// Replaces an in-flight operation's waiter with a validated FlowIO task.
+/// Invalid or foreign polls are remembered so completion returns
+/// `NotConnected`; a valid foreign FlowIO task may still be registered so the
+/// original reactor can notify it after the CQE.
+///
+/// # Safety
+///
+/// `state_ptr` must point to a live, incomplete completion state exclusively
+/// owned by the currently polled future.
 pub(crate) unsafe fn refresh_op_waiter_from_waker(
     cx: &std::task::Context<'_>,
     state_ptr: *mut CompletionState,
@@ -481,14 +664,21 @@ pub(crate) unsafe fn refresh_op_waiter_from_waker(
         return;
     }
 
-    let pctx = unsafe { poll_ctx_from_waker(cx) };
-    unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+    let state = unsafe { &mut *state_ptr };
+    debug_assert!(
+        !state.is_completed(),
+        "cannot refresh a completed operation"
+    );
+    match poll_ctx_from_waker(cx) {
+        Ok(pctx) => {
+            if state.owner_ptr() != pctx.owner_ptr() {
+                state.set_context_rejected();
+            }
+            unsafe { state.register_waiter(pctx.owner_task()) };
+        }
+        Err(_) => state.set_context_rejected(),
+    }
 }
-
-// Size guard for the representation assumption in `poll_ctx_from_waker`.
-// This cannot verify pointer order; that remains part of the audited unsafe
-// contract above.
-const _: [(); std::mem::size_of::<std::task::Waker>()] = [(); 2 * std::mem::size_of::<*const ()>()];
 
 // ---------------------------------------------------------------------------
 // JoinHandle
@@ -500,12 +690,29 @@ const _: [(); std::mem::size_of::<std::task::Waker>()] = [(); 2 * std::mem::size
 struct JoinTask<F: Future> {
     /// Spawned future until it completes and is dropped.
     future: Option<F>,
-    /// Completed task output, taken by the join handle.
-    result: Option<F::Output>,
+    /// Completed output or shutdown cancellation, taken by the join handle.
+    result: Option<Result<F::Output, JoinError>>,
     /// Last join-handle waker registered while waiting for the result. Woken
     /// once when the spawned future stores its output.
     join_waker: Option<Waker>,
 }
+
+/// Error returned when a spawned task cannot produce its output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinError {
+    /// The owning executor was dropped before the task completed.
+    Cancelled,
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("spawned task was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
 
 /// Error returned by [`Executor::try_spawn`].
 ///
@@ -597,15 +804,15 @@ impl<F> std::fmt::Display for TrySpawnError<F> {
 
 impl<F> std::error::Error for TrySpawnError<F> {}
 
-/// Handle returned by [`Executor::spawn`] that can be `.await`ed to obtain
-/// the spawned task's return value.
+/// Handle returned by [`Executor::spawn`] that resolves to the spawned task's
+/// return value or an explicit cancellation error.
 ///
 /// Awaiting or dropping a handle is part of the steady-state task path, as the
 /// await side of [`Executor::spawn`] / [`Executor::try_spawn`]. It does not
 /// allocate.
 ///
-/// Dropping the handle without awaiting detaches the task — it continues
-/// running but its result is discarded.
+/// Dropping the handle without awaiting detaches the task while its executor is
+/// alive. Dropping the executor cancels any unfinished detached task.
 ///
 /// # Example
 /// ```no_run
@@ -614,15 +821,15 @@ impl<F> std::error::Error for TrySpawnError<F> {}
 /// let mut executor = Executor::new()?;
 /// executor.run(async {
 ///     let handle = Executor::spawn(async { 42 }).unwrap();
-///     assert_eq!(handle.await, 42);
+///     assert_eq!(handle.await.unwrap(), 42);
 /// })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct JoinHandle<T: 'static> {
     /// Owning task header kept alive while the handle exists.
     task_ptr: *mut TaskHeader,
-    /// Pointer to the `Option<T>` result slot inside the task's JoinTask.
-    result_ptr: *mut Option<T>,
+    /// Pointer to the join result slot inside the task's `JoinTask`.
+    result_ptr: *mut Option<Result<T, JoinError>>,
     /// Pointer to the `Option<Waker>` join_waker slot inside the task's JoinTask.
     waker_ptr: *mut Option<Waker>,
 }
@@ -636,9 +843,9 @@ impl<T: 'static> JoinHandle<T> {
 }
 
 impl<T: 'static> Future for JoinHandle<T> {
-    type Output = T;
+    type Output = Result<T, JoinError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         let result_slot = unsafe { &mut *this.result_ptr };
 
@@ -680,8 +887,8 @@ impl<T: 'static> Drop for JoinHandle<T> {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct Executor {
-    /// Reactor driving all kernel-visible I/O submissions and completions.
-    pub(crate) reactor: Reactor,
+    /// Heap-stable owner retained by task, operation, and timer slots.
+    owner: Rc<ExecutorOwner>,
     /// Maximum number of items processed per phase (ready tasks, CQEs,
     /// timer expiries) in each executor loop iteration.
     process_quota: usize,
@@ -693,14 +900,6 @@ pub struct Executor {
     /// Debug counters captured when the most recent run drained or reported a
     /// stalled `WouldBlock` state.
     last_stats: RuntimeStats,
-    /// Pool storing task allocations with stable addresses.
-    task_pool: ManuallyDrop<ProviderOwnedPool<Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>>,
-    /// Main queue of runnable tasks.
-    ready_queue: ManuallyDrop<DList<TaskHeader>>,
-    /// Runtime timer subsystem shared by all sleeps and deadlines.
-    timers: ManuallyDrop<TimerRuntime>,
-    /// Set after one-time intrusive/runtime initialization is complete.
-    initialized: bool,
 }
 
 impl Executor {
@@ -761,11 +960,29 @@ impl Executor {
         let task_pool = ProviderOwnedPool::new(ExecutorTaskMemProvider::new(), TASKS_PER_SLAB)
             .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
         let ready_queue = DList::new_uninit();
+        let all_tasks = DList::new_uninit();
         let reactor = Reactor::new_with_config(config.reactor)?;
         let timers = TimerRuntime::new()?;
 
+        let owner = Rc::new(ExecutorOwner {
+            state: UnsafeCell::new(ExecutorState {
+                reactor,
+                task_pool,
+                ready_queue,
+                all_tasks,
+                timers,
+                runtime_state: RuntimeState::new(),
+                owner_task: std::ptr::null_mut(),
+                initialized: false,
+                shutting_down: false,
+            }),
+            // The owner is constructed on the executor's owner thread.
+            #[cfg(debug_assertions)]
+            owner_thread: std::thread::current().id(),
+        });
+
         Ok(Self {
-            reactor,
+            owner,
             process_quota: if config.process_quota == 0 {
                 DEFAULT_PROCESS_QUOTA
             } else {
@@ -774,33 +991,34 @@ impl Executor {
             cpu_affinity: config.cpu_affinity,
             #[cfg(debug_assertions)]
             last_stats: RuntimeStats::default(),
-            task_pool: ManuallyDrop::new(task_pool),
-            ready_queue: ManuallyDrop::new(ready_queue),
-            timers: ManuallyDrop::new(timers),
-            initialized: false,
         })
     }
 
     /// Performs one-time initialization for the executor's intrusive
     /// structures and runtime-owned subsystems.
     fn init(&mut self) -> io::Result<()> {
-        if self.initialized {
+        let owner_ptr = Rc::as_ptr(&self.owner);
+        let state = unsafe { &mut *self.owner.state_ptr() };
+        if state.initialized {
             return Ok(());
         }
 
-        self.task_pool.init();
-        self.ready_queue.init();
-        self.timers.init()?;
-        self.reactor.init();
-        self.initialized = true;
+        state.task_pool.init();
+        state.ready_queue.init();
+        state.all_tasks.init();
+        state.timers.init()?;
+        state.timers.bind_owner(owner_ptr);
+        state.reactor.init();
+        state.reactor.bind_owner(owner_ptr);
+        state.initialized = true;
         Ok(())
     }
 
     /// Spawns a task onto the currently-running executor, returning a
-    /// [`JoinHandle`] that can be `.await`ed to obtain the task's result.
+    /// [`JoinHandle`] that resolves to the task output or [`JoinError`].
     ///
-    /// Dropping the handle without awaiting detaches the task — it continues
-    /// running but its return value is discarded.
+    /// Dropping the handle without awaiting detaches the task while the owning
+    /// executor remains alive. Dropping that executor cancels unfinished work.
     ///
     /// This must be called from within [`Executor::run`]. For steady-state
     /// concurrency, this is the fast-path way to add work without rebuilding
@@ -823,7 +1041,7 @@ impl Executor {
     /// let mut executor = Executor::new()?;
     /// executor.run(async {
     ///     let handle = Executor::spawn(async { 42 }).unwrap();
-    ///     assert_eq!(handle.await, 42);
+    ///     assert_eq!(handle.await.unwrap(), 42);
     /// })?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
@@ -844,9 +1062,10 @@ impl Executor {
     /// release explicitly.
     ///
     /// On success, ownership transfers to the executor exactly as with
-    /// [`Executor::spawn`], and the returned [`JoinHandle`] yields the future's
-    /// output. On failure, the future has not been polled, pinned, stored in a
-    /// task slot, or dropped by the executor path.
+    /// [`Executor::spawn`], and the returned [`JoinHandle`] yields
+    /// `Ok(future_output)` or [`JoinError::Cancelled`] if executor shutdown wins.
+    /// On failure, the future has not been polled, pinned, stored in a task slot,
+    /// or dropped by the executor path.
     ///
     /// This is the preferred admission API on overload-sensitive fast paths
     /// because pressure is explicit and ownership is preserved.
@@ -858,7 +1077,7 @@ impl Executor {
     /// let mut executor = Executor::new()?;
     /// executor.run(async {
     ///     match Executor::try_spawn(async { 42 }) {
-    ///         Ok(handle) => assert_eq!(handle.await, 42),
+    ///         Ok(handle) => assert_eq!(handle.await.unwrap(), 42),
     ///         Err(error) => drop(error.into_future()),
     ///     }
     /// })?;
@@ -870,11 +1089,10 @@ impl Executor {
         F::Output: 'static,
     {
         EXECUTOR_CTX.with(|ctx_cell| {
-            let ctx_ptr = ctx_cell.get();
-            if ctx_ptr.is_null() {
+            let owner_ptr = ctx_cell.get();
+            if owner_ptr.is_null() {
                 return Err(TrySpawnError::NoExecutor { future });
             }
-            let ctx = unsafe { &*ctx_ptr };
 
             if size_of::<JoinTask<F>>() > TASK_POOL_SIZE
                 || align_of::<JoinTask<F>>() > TASK_DATA_ALIGN
@@ -882,8 +1100,13 @@ impl Executor {
                 return Err(TrySpawnError::TaskTooLarge { future });
             }
 
+            let state_ptr = unsafe { (*owner_ptr).state_ptr() };
+            if unsafe { (*state_ptr).shutting_down } {
+                return Err(TrySpawnError::NoExecutor { future });
+            }
+
             unsafe {
-                let slot_ptr = match (*ctx.task_pool).alloc(()) {
+                let slot_ptr = match (*state_ptr).task_pool.alloc(()) {
                     Some(ptr) => ptr,
                     None => {
                         return Err(TrySpawnError::AtCapacity { future });
@@ -903,6 +1126,9 @@ impl Executor {
 
                 (*slot_ptr).header.ready_link =
                     crate::utils::list::intrusive::dlist::Link::new_unlinked();
+                (*slot_ptr).header.all_link =
+                    crate::utils::list::intrusive::dlist::Link::new_unlinked();
+                (*slot_ptr).header.owner = Some(ExecutorOwner::clone_rc(owner_ptr));
                 // Start with refcount 2: one for the executor, one for the JoinHandle.
                 (*slot_ptr).header.refs.set(2);
                 (*slot_ptr)
@@ -913,12 +1139,16 @@ impl Executor {
                 init_cached_waker(&mut (*slot_ptr).header as *mut _);
                 (*slot_ptr).header.vtable = join_task_vtable_for::<F>();
 
-                (*ctx.runtime_state).live_tasks += 1;
+                (*state_ptr).runtime_state.live_tasks += 1;
                 #[cfg(debug_assertions)]
                 {
-                    (*ctx.runtime_state).stats.task_allocs += 1;
+                    (*state_ptr).runtime_state.stats.task_allocs += 1;
                 }
-                (*ctx.ready_queue)
+                (*state_ptr)
+                    .all_tasks
+                    .push_back_unchecked(&mut (*slot_ptr).header.all_link as *mut _);
+                (*state_ptr)
+                    .ready_queue
                     .push_back_unchecked(&mut (*slot_ptr).header.ready_link as *mut _);
 
                 Ok(JoinHandle {
@@ -931,17 +1161,19 @@ impl Executor {
     }
 
     #[inline(always)]
-    fn poll_io_and_process_timers(&mut self, runtime_state: &mut RuntimeState) -> io::Result<()> {
-        let _ = self.reactor.poll_io(
+    fn poll_io_and_process_timers(&self) -> io::Result<()> {
+        let state_ptr = self.owner.state_ptr();
+        let runtime_state = unsafe { std::ptr::addr_of_mut!((*state_ptr).runtime_state) };
+        let ready_queue = unsafe { std::ptr::addr_of_mut!((*state_ptr).ready_queue) };
+        let _ = unsafe { &mut (*state_ptr).reactor }.poll_io(
             self.process_quota,
-            runtime_state as *mut RuntimeState,
-            &mut *self.ready_queue as *mut DList<TaskHeader>,
+            runtime_state,
+            ready_queue,
         )?;
-        if self.timers.has_pending() {
-            let now_tick = self.timers.now_tick()?;
-            let _ = self
-                .timers
-                .process_at_with_budget(now_tick, self.process_quota)?;
+        let timers = unsafe { &mut (*state_ptr).timers };
+        if timers.has_pending() {
+            let now_tick = timers.now_tick()?;
+            let _ = timers.process_at_with_budget(now_tick, self.process_quota)?;
         }
         Ok(())
     }
@@ -954,9 +1186,18 @@ impl Executor {
     ///
     /// # Errors
     ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if another executor run is
+    /// already active on this thread. Nested and reentrant runs are not
+    /// supported. Futures submitted or armed by one executor must remain on
+    /// that executor; polling them outside an active run or through another
+    /// executor's task waker returns [`io::ErrorKind::NotConnected`].
+    ///
     /// Returns [`io::ErrorKind::WouldBlock`] if live runtime work remains but
     /// there are no ready tasks, in-flight I/O operations, or timers that can
-    /// make progress. Reactor and timer I/O errors are propagated. Signal
+    /// make progress. Those tasks remain owned by this executor; a later call
+    /// resumes them together with its new root future. Dropping the executor
+    /// instead cancels and drops every unfinished future exactly once. Reactor
+    /// and timer I/O errors are propagated. Signal
     /// interruptions of the `io_uring` wait are retried internally; use a
     /// runtime-visible fd such as `signalfd` or `eventfd` for signal-driven
     /// shutdown instead of relying on `EINTR`.
@@ -968,26 +1209,31 @@ impl Executor {
     /// let mut executor = Executor::new()?;
     /// executor.run(async {
     ///     let handle = Executor::spawn(async { 1 + 1 }).unwrap();
-    ///     assert_eq!(handle.await, 2);
+    ///     assert_eq!(handle.await.unwrap(), 2);
     /// })?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn run<F: Future<Output = ()> + 'static>(&mut self, initial_task: F) -> io::Result<()> {
+        ExecutorCtxGuard::reject_if_active()?;
         self.init()?;
-        self.task_pool.provider_mut().reset_debug_counts();
         apply_cpu_affinity(self.cpu_affinity)?;
 
-        let mut runtime_state = RuntimeState::new();
-        let mut thread_ctx = ThreadCtx {
-            ready_queue: &mut *self.ready_queue as *mut _,
-            reactor: &mut self.reactor as *mut _,
-            task_pool: &mut **self.task_pool as *mut _,
-            runtime_state: &mut runtime_state as *mut _,
-            timers: &mut *self.timers as *mut _,
-            owner_task: std::ptr::null_mut(),
+        let owner_ptr = Rc::as_ptr(&self.owner);
+        let state_ptr = self.owner.state_ptr();
+        let starts_clean = unsafe {
+            (*state_ptr).runtime_state.live_tasks == 0
+                && (*state_ptr).runtime_state.inflight_ops == 0
+                && (*state_ptr).ready_queue.is_empty()
+                && !(*state_ptr).timers.has_pending()
         };
-        let ctx_ptr = &mut thread_ctx as *mut ThreadCtx;
-        let _ctx_guard = ExecutorCtxGuard::set(ctx_ptr);
+        if starts_clean {
+            unsafe {
+                (*state_ptr).runtime_state = RuntimeState::new();
+                (*state_ptr).task_pool.provider_mut().reset_debug_counts();
+            }
+        }
+
+        let _ctx_guard = ExecutorCtxGuard::install(owner_ptr)?;
 
         match Self::spawn(initial_task) {
             Ok(_handle) => { /* drop JoinHandle — root task is detached */ }
@@ -997,11 +1243,14 @@ impl Executor {
         }
 
         'run_loop: loop {
-            self.timers.begin_executor_pass();
+            unsafe { (*state_ptr).timers.begin_executor_pass() };
             let mut polled = 0usize;
             while polled < self.process_quota {
-                let header_ptr =
-                    unsafe { self.ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
+                let header_ptr = unsafe {
+                    (*state_ptr)
+                        .ready_queue
+                        .pop_front(TaskHeader::READY_LINK_OFFSET)
+                };
                 let Some(header_ptr) = header_ptr else {
                     break;
                 };
@@ -1012,15 +1261,14 @@ impl Executor {
                     (header.flags.get() & !(TaskHeader::FLAG_QUEUED | TaskHeader::FLAG_NOTIFIED))
                         | TaskHeader::FLAG_RUNNING,
                 );
-                unsafe { std::ptr::addr_of_mut!((*ctx_ptr).owner_task).write(header_ptr) };
-                header.ctx.set(ctx_ptr as *mut ());
+                unsafe { std::ptr::addr_of_mut!((*state_ptr).owner_task).write(header_ptr) };
                 #[cfg(debug_assertions)]
-                {
-                    runtime_state.stats.task_polls += 1;
+                unsafe {
+                    (*state_ptr).runtime_state.stats.task_polls += 1;
                 }
                 let poll_res = unsafe { (header.vtable.poll)(header_ptr) };
                 unsafe {
-                    std::ptr::addr_of_mut!((*ctx_ptr).owner_task).write(std::ptr::null_mut())
+                    std::ptr::addr_of_mut!((*state_ptr).owner_task).write(std::ptr::null_mut())
                 };
                 if let Poll::Ready(()) = poll_res {
                     // Batch: clear RUNNING+NOTIFIED+QUEUED, set COMPLETED.
@@ -1032,19 +1280,20 @@ impl Executor {
                             | TaskHeader::FLAG_COMPLETED,
                     );
                     unsafe {
+                        debug_assert!((*state_ptr).runtime_state.live_tasks > 0);
+                        (*state_ptr).runtime_state.live_tasks -= 1;
                         (header.vtable.finish)(header_ptr);
                         release_task(header_ptr);
                     }
                 } else {
                     let flags = header.flags.get();
-                    // Clear RUNNING. If NOTIFIED was set during poll, re-enqueue.
                     header.flags.set(flags & !TaskHeader::FLAG_RUNNING);
                     if (flags & TaskHeader::FLAG_NOTIFIED) != 0 {
                         unsafe {
                             enqueue_notified_task_unchecked(
                                 header_ptr,
-                                &mut *self.ready_queue,
-                                &mut runtime_state,
+                                std::ptr::addr_of_mut!((*state_ptr).ready_queue),
+                                std::ptr::addr_of_mut!((*state_ptr).runtime_state),
                             );
                         }
                     }
@@ -1053,36 +1302,39 @@ impl Executor {
                 polled += 1;
             }
 
-            if self.reactor.flush_sqes()? == ReactorSubmitStatus::Busy {
-                self.poll_io_and_process_timers(&mut runtime_state)?;
+            if unsafe { &mut (*state_ptr).reactor }.flush_sqes()? == ReactorSubmitStatus::Busy {
+                self.poll_io_and_process_timers()?;
                 continue;
             }
-            let completed = self.reactor.poll_io(
+            let completed = unsafe { &mut (*state_ptr).reactor }.poll_io(
                 self.process_quota,
-                &mut runtime_state as *mut RuntimeState,
-                &mut *self.ready_queue as *mut DList<TaskHeader>,
+                unsafe { std::ptr::addr_of_mut!((*state_ptr).runtime_state) },
+                unsafe { std::ptr::addr_of_mut!((*state_ptr).ready_queue) },
             )?;
-            let timers_pending = self.timers.has_pending();
+            let timers_pending = unsafe { (*state_ptr).timers.has_pending() };
             let mut now_tick = None;
             let timer_budget_exhausted = if timers_pending {
-                let tick = self.timers.now_tick()?;
+                let tick = unsafe { (*state_ptr).timers.now_tick()? };
                 now_tick = Some(tick);
-                self.timers
-                    .process_at_with_budget(tick, self.process_quota)?
+                unsafe {
+                    (*state_ptr)
+                        .timers
+                        .process_at_with_budget(tick, self.process_quota)?
+                }
             } else {
                 false
             };
-            let queue_empty = self.ready_queue.is_empty();
-            let timers_pending_after = self.timers.has_pending();
-            let drained = runtime_state.live_tasks == 0
-                && runtime_state.inflight_ops == 0
+            let queue_empty = unsafe { (*state_ptr).ready_queue.is_empty() };
+            let timers_pending_after = unsafe { (*state_ptr).timers.has_pending() };
+            let drained = unsafe { (*state_ptr).runtime_state.live_tasks == 0 }
+                && unsafe { (*state_ptr).runtime_state.inflight_ops == 0 }
                 && !timers_pending_after
                 && queue_empty;
 
             if drained {
                 #[cfg(debug_assertions)]
                 {
-                    self.snapshot_stats(&mut runtime_state);
+                    self.snapshot_stats();
                 }
                 return Ok(());
             }
@@ -1092,21 +1344,20 @@ impl Executor {
             }
 
             let timer_wait = match now_tick {
-                Some(tick) => self.timers.next_wait_duration(tick),
+                Some(tick) => unsafe { (*state_ptr).timers.next_wait_duration(tick) },
                 None => None,
             };
 
-            if runtime_state.inflight_ops == 0 && timer_wait.is_none() {
+            if unsafe { (*state_ptr).runtime_state.inflight_ops == 0 } && timer_wait.is_none() {
                 #[cfg(debug_assertions)]
                 {
-                    self.snapshot_stats(&mut runtime_state);
+                    self.snapshot_stats();
                 }
                 return Err(io::Error::from(ErrorKind::WouldBlock));
             }
 
             if matches!(timer_wait, Some(duration) if duration.is_zero()) {
-                let _ = self
-                    .timers
+                let _ = unsafe { &mut (*state_ptr).timers }
                     // SAFETY: now_tick is Some when timer_wait is Some (set in the
                     // has_pending() branch above).
                     .process_at_with_budget(
@@ -1116,20 +1367,24 @@ impl Executor {
                 continue;
             }
 
-            if self.reactor.wait_for_events(timer_wait)? == ReactorSubmitStatus::Busy {
-                self.poll_io_and_process_timers(&mut runtime_state)?;
+            if unsafe { &mut (*state_ptr).reactor }.wait_for_events(timer_wait)?
+                == ReactorSubmitStatus::Busy
+            {
+                self.poll_io_and_process_timers()?;
                 continue 'run_loop;
             }
-            self.poll_io_and_process_timers(&mut runtime_state)?;
+            self.poll_io_and_process_timers()?;
         }
     }
 
     #[cfg(debug_assertions)]
-    fn snapshot_stats(&mut self, runtime_state: &mut RuntimeState) {
-        let provider = self.task_pool.provider_ref();
+    fn snapshot_stats(&mut self) {
+        let state = unsafe { &mut *self.owner.state_ptr() };
+        let runtime_state = &mut state.runtime_state;
+        let provider = state.task_pool.provider_ref();
         runtime_state.stats.task_slab_allocs = provider.request_count;
         runtime_state.stats.task_slab_frees = provider.free_count;
-        let retained = self.reactor.retained_payload_stats();
+        let retained = state.reactor.retained_payload_stats();
         runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
         runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
         runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
@@ -1161,6 +1416,74 @@ impl Executor {
         #[cfg(not(debug_assertions))]
         {
             RuntimeStats::default()
+        }
+    }
+
+    /// Cancels every unfinished task while leaving completed slots available
+    /// to escaped join handles.
+    fn shutdown_tasks(&mut self) {
+        let state_ptr = self.owner.state_ptr();
+        unsafe {
+            (*state_ptr).shutting_down = true;
+        }
+
+        loop {
+            let task_ptr = unsafe {
+                (*state_ptr)
+                    .all_tasks
+                    .pop_front(TaskHeader::ALL_LINK_OFFSET)
+            };
+            let Some(task_ptr) = task_ptr else {
+                break;
+            };
+
+            let header = unsafe { &*task_ptr };
+            if !header.ready_link.is_unlinked() {
+                unsafe {
+                    (*state_ptr)
+                        .ready_queue
+                        .remove(std::ptr::addr_of_mut!((*task_ptr).ready_link));
+                }
+            }
+
+            let flags = header.flags.get();
+            header.flags.set(
+                (flags
+                    & !(TaskHeader::FLAG_RUNNING
+                        | TaskHeader::FLAG_NOTIFIED
+                        | TaskHeader::FLAG_QUEUED))
+                    | TaskHeader::FLAG_COMPLETED,
+            );
+            if task_is_completed(flags) {
+                continue;
+            }
+
+            unsafe {
+                debug_assert!((*state_ptr).runtime_state.live_tasks > 0);
+                (*state_ptr).runtime_state.live_tasks -= 1;
+                (header.vtable.cancel)(task_ptr);
+                release_task(task_ptr);
+            }
+        }
+
+        unsafe {
+            (*state_ptr).owner_task = std::ptr::null_mut();
+            (*state_ptr).ready_queue.unlink_all_for_drop();
+        }
+    }
+
+    fn shutdown_owner(&mut self) {
+        let state_ptr = self.owner.state_ptr();
+        if unsafe { !(*state_ptr).initialized || (*state_ptr).shutting_down } {
+            return;
+        }
+
+        self.shutdown_tasks();
+        unsafe {
+            (*state_ptr).timers.cancel_all_for_shutdown();
+            let runtime_state = std::ptr::addr_of_mut!((*state_ptr).runtime_state);
+            let ready_queue = std::ptr::addr_of_mut!((*state_ptr).ready_queue);
+            (*state_ptr).reactor.shutdown(runtime_state, ready_queue);
         }
     }
 }
@@ -1210,85 +1533,48 @@ fn apply_cpu_affinity(cpu_affinity: Option<usize>) -> io::Result<()> {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // `ready_queue` is `new_uninit` until `init()` runs, so it may only be
-        // unlinked/dropped once `initialized` is set. The task pool owns its
-        // provider even before init, so the wrapper is dropped on every path.
-        if self.initialized {
-            unsafe {
-                self.ready_queue.unlink_all_for_drop();
-                ManuallyDrop::drop(&mut self.ready_queue);
-                #[cfg(debug_assertions)]
-                self.task_pool.abandon_live_slots_for_drop();
-            }
-        }
-        unsafe {
-            ManuallyDrop::drop(&mut self.task_pool);
-        }
-        // `timers` is always fully constructed by `new_with_config`; its own
-        // Drop handles its internal uninitialized pool. Drop it on every path
-        // so constructing an executor and never running it does not leak timer
-        // state.
-        unsafe {
-            ManuallyDrop::drop(&mut self.timers);
-        }
+        self.shutdown_owner();
     }
 }
 
 /// Cancel an in-flight operation from a future's `Drop` impl.
 /// Marks the `CompletionState` as orphaned and submits `ASYNC_CANCEL`.
-/// Uses one TLS read and only runs on the cancellation path.
+/// Reclaims through the completion state's recorded origin owner.
 ///
 /// # Safety
 ///
-/// `ptr` must point to a live, submitted completion state owned by the reactor
-/// in the currently active executor context.
+/// `ptr` must point to a live, submitted completion state.
 unsafe fn cancel_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
-            return;
-        }
-        let ctx = unsafe { &*ctx_ptr };
-        unsafe { (*ctx.reactor).cancel_op(ptr) };
-    });
+    let Some(owner) = (unsafe { (*ptr).clone_owner() }) else {
+        return;
+    };
+    unsafe { (*owner.reactor_ptr()).cancel_op(ptr) };
 }
 
 /// Free a completed `CompletionState` from a future's `Drop` impl when the
 /// CQE has already been consumed but the future is dropped before polling the
-/// result. Uses one TLS read and only runs on that drop-after-complete path.
-///
-/// Pool-slot and retained-payload reclamation require an active executor TLS
-/// context. If this is called after the executor context has been cleared, it
-/// cannot reach the reactor and therefore leaves operation-pool reclamation to
-/// process teardown. Callers that own external resources, such as accepted
-/// fds in a cached accept state, must release those resources themselves before
-/// delegating here.
+/// result. Reclamation uses the state owner and therefore remains valid after a
+/// run boundary or public `Executor` teardown.
 ///
 /// # Safety
 ///
-/// `ptr` must point to a completed state allocated by the active reactor, and
-/// its result must already have been consumed or otherwise made safe to drop.
+/// `ptr` must point to a completed state, and its result must already have been
+/// consumed or otherwise made safe to drop.
 unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
-            return;
-        }
-        let ctx = unsafe { &*ctx_ptr };
-        unsafe { (*ctx.reactor).free_op(ptr) };
-    });
+    let Some(owner) = (unsafe { (*ptr).clone_owner() }) else {
+        return;
+    };
+    unsafe { (*owner.reactor_ptr()).free_op(ptr) };
 }
 
 /// Release a future-owned `CompletionState` pointer from `Drop`.
 /// Completed ops are freed immediately; pending ops are orphaned and cancelled.
-/// Reclamation requires an active executor TLS context; without one this only
-/// clears the caller's pointer after the attempted free/cancel path.
 /// The caller's pointer is always cleared.
 ///
 /// # Safety
 ///
 /// A non-null `*ptr` must identify the completion state owned by this future
-/// in the active executor's reactor. The caller must not retain another owner
+/// in its recorded origin reactor. The caller must not retain another owner
 /// that may free the same state.
 #[inline(always)]
 pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::CompletionState) {
@@ -1401,13 +1687,14 @@ pub(crate) fn submit_detached_close(pctx: &PollCtx, fd: RawFd) -> io::Result<()>
 #[inline(always)]
 pub(crate) fn try_submit_detached_close(fd: RawFd) -> bool {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
+        let owner = ctx_cell.get();
+        if owner.is_null() {
             return false;
         }
 
         let pctx = PollCtx {
-            ctx: ctx_ptr as *const ThreadCtx,
+            owner,
+            task: std::ptr::null_mut(),
         };
         submit_detached_close(&pctx, fd).is_ok()
     })
@@ -1435,64 +1722,14 @@ pub(crate) fn note_timer_expired() {
 #[inline(always)]
 fn record_runtime_stat(update: impl FnOnce(&mut RuntimeStats)) {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
+        let owner = ctx_cell.get();
+        if owner.is_null() {
             return;
         }
         unsafe {
-            update(&mut (*(*ctx_ptr).runtime_state).stats);
+            update(&mut (*(*owner).state_ptr()).runtime_state.stats);
         }
     });
-}
-
-#[inline(always)]
-/// Returns the task currently being polled by this executor.
-///
-/// # Safety
-///
-/// Must be called during a task poll inside `Executor::run`. Outside that
-/// window the TLS context or `owner_task` pointer may be null.
-pub(crate) unsafe fn current_poll_owner_task_unchecked() -> *mut TaskHeader {
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        debug_assert!(
-            !ctx_ptr.is_null(),
-            "runtime poll owner requested outside task poll context"
-        );
-        unsafe { (*ctx_ptr).owner_task }
-    })
-}
-
-/// # Safety
-///
-/// Must be called from within `Executor::run` on the executor thread. The
-/// returned pointer is only valid while that run's TLS context is active; in
-/// release builds a missing context is UB rather than a panic.
-pub(crate) unsafe fn timers_unchecked() -> *mut TimerRuntime {
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        debug_assert!(
-            !ctx_ptr.is_null(),
-            "runtime timers_unchecked requested outside executor context"
-        );
-        unsafe { (*ctx_ptr).timers }
-    })
-}
-
-/// Returns the active timer runtime, or null when no executor run is active.
-///
-/// # Safety
-///
-/// A non-null result is borrowed from thread-local executor state and is valid
-/// only on this thread while the corresponding `Executor::run` remains active.
-pub(crate) unsafe fn timers_or_null() -> *mut TimerRuntime {
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
-            return std::ptr::null_mut();
-        }
-        unsafe { (*ctx_ptr).timers }
-    })
 }
 
 /// # Safety
@@ -1503,15 +1740,15 @@ pub(crate) unsafe fn timers_or_null() -> *mut TimerRuntime {
 #[inline(always)]
 pub(crate) unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
+        let owner = ctx_cell.get();
         debug_assert!(
-            !ctx_ptr.is_null(),
+            !owner.is_null(),
             "runtime schedule_ctx_unchecked requested outside executor context"
         );
-        let ctx = unsafe { &*ctx_ptr };
+        let state = unsafe { (*owner).state_ptr() };
         ScheduleCtx {
-            ready_queue: ctx.ready_queue,
-            runtime_state: ctx.runtime_state,
+            ready_queue: unsafe { std::ptr::addr_of_mut!((*state).ready_queue) },
+            runtime_state: unsafe { std::ptr::addr_of_mut!((*state).runtime_state) },
         }
     })
 }
@@ -1583,7 +1820,7 @@ where
                 match fut_pin.as_mut().poll(&mut cx) {
                     Poll::Ready(value) => {
                         jt.future = None;
-                        jt.result = Some(value);
+                        jt.result = Some(Ok(value));
                         if let Some(join_waker) = jt.join_waker.take() {
                             join_waker.wake();
                         }
@@ -1600,25 +1837,34 @@ where
                 // when the last reference (executor or JoinHandle) is released.
                 jt.future = None;
             },
+            cancel: |ptr| unsafe {
+                let slot = &mut *(ptr as *mut Task<TASK_POOL_SIZE>);
+                let jt = &mut *(slot.data.as_mut_ptr() as *mut JoinTask<F>);
+                jt.future = None;
+                jt.result = Some(Err(JoinError::Cancelled));
+                if let Some(join_waker) = jt.join_waker.take() {
+                    join_waker.wake();
+                }
+            },
             destroy: |ptr| unsafe {
+                let owner = (*ptr).owner.clone();
                 // Drop any remaining JoinTask fields (unclaimed result, waker).
                 let slot = &mut *(ptr as *mut Task<TASK_POOL_SIZE>);
                 let jt = &mut *(slot.data.as_mut_ptr() as *mut JoinTask<F>);
                 std::ptr::drop_in_place(jt);
 
-                EXECUTOR_CTX.with(|ctx_cell| {
-                    let ctx_ptr = ctx_cell.get();
-                    if ctx_ptr.is_null() {
-                        return;
+                if let Some(owner) = owner {
+                    let state = owner.state_ptr();
+                    let all_link = std::ptr::addr_of_mut!((*ptr).all_link);
+                    if !(*all_link).is_unlinked() {
+                        (*state).all_tasks.remove(all_link);
                     }
-                    let ctx = &*ctx_ptr;
-                    (*ctx.task_pool).free(ptr as *mut Task<TASK_POOL_SIZE>);
-                    (*ctx.runtime_state).live_tasks -= 1;
                     #[cfg(debug_assertions)]
                     {
-                        (*ctx.runtime_state).stats.task_frees += 1;
+                        (*state).runtime_state.stats.task_frees += 1;
                     }
-                });
+                    (*state).task_pool.free(ptr as *mut Task<TASK_POOL_SIZE>);
+                }
             },
         };
     }
@@ -1626,21 +1872,27 @@ where
     &VTableGen::<F>::VTABLE
 }
 
-/// Routes one task notification through the active executor context.
+/// Routes one task notification through the task's stable executor owner.
 ///
 /// # Safety
 ///
-/// `task_ptr` must point to a live task owned by this thread's active executor.
+/// `task_ptr` must point to a live task and run on its owner thread.
 unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
-    EXECUTOR_CTX.with(|ctx_cell| {
-        let ctx_ptr = ctx_cell.get();
-        if ctx_ptr.is_null() {
-            return;
-        }
-        let ctx = unsafe { &*ctx_ptr };
+    let Some(owner) = (unsafe { (*task_ptr).owner.as_ref() }) else {
+        return;
+    };
+    let state = owner.state_ptr();
+    if unsafe { (*state).shutting_down } {
+        return;
+    }
 
-        unsafe { notify_task_into_list_unchecked(task_ptr, ctx.ready_queue, ctx.runtime_state) };
-    });
+    unsafe {
+        notify_task_into_list_unchecked(
+            task_ptr,
+            std::ptr::addr_of_mut!((*state).ready_queue),
+            std::ptr::addr_of_mut!((*state).runtime_state),
+        );
+    }
 }
 
 const TASK_READY_BLOCKING_FLAGS: u64 =
@@ -1776,8 +2028,6 @@ unsafe fn enqueue_ready_task_unchecked(
 /// # Safety
 /// - `task_ptr` must point to a live, non-freed `TaskHeader` within the
 ///   executor's task slab.
-/// - The executor TLS context (`EXECUTOR_CTX`) must be active (i.e. this must
-///   be called from within `Executor::run`).
 /// - Must be called from the executor thread (single-threaded contract).
 pub(crate) unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
     unsafe {
@@ -1927,15 +2177,12 @@ mod tests {
 
         let drops = Rc::new(Cell::new(0usize));
         let polls = Rc::new(Cell::new(0usize));
-        let mut ctx = ThreadCtx {
-            ready_queue: std::ptr::null_mut(),
-            reactor: std::ptr::null_mut(),
-            task_pool: std::ptr::null_mut(),
-            runtime_state: std::ptr::null_mut(),
-            timers: std::ptr::null_mut(),
-            owner_task: std::ptr::null_mut(),
-        };
-        let _guard = ExecutorCtxGuard::set(&mut ctx);
+        // The over-aligned branch returns before dereferencing the non-null
+        // owner pointer; this keeps the layout regression runnable under Miri
+        // without constructing an io_uring-backed executor.
+        let owner = std::ptr::NonNull::<ExecutorOwner>::dangling().as_ptr();
+        let _guard = ExecutorCtxGuard::install(owner)
+            .expect("test executor context should install on an idle thread");
 
         let future = OveralignedSpawnFuture::new(313, &drops, &polls);
         let returned = match Executor::try_spawn(future) {
@@ -1957,7 +2204,7 @@ mod tests {
 
     #[test]
     fn join_handle_pending_poll_reuses_same_waker() {
-        let mut result = None::<usize>;
+        let mut result = None::<Result<usize, JoinError>>;
         let mut waker_slot = None::<Waker>;
         let mut handle = ManuallyDrop::new(JoinHandle {
             task_ptr: std::ptr::null_mut(),
@@ -2020,8 +2267,13 @@ mod tests {
 
     #[cfg(not(miri))]
     fn executor_with_one_task_slab() -> Executor {
-        let mut executor = Executor::new().expect("failed to construct executor");
-        executor.task_pool.provider_mut().max_request_count = Some(1);
+        let executor = Executor::new().expect("failed to construct executor");
+        unsafe {
+            (*executor.owner.state_ptr())
+                .task_pool
+                .provider_mut()
+                .max_request_count = Some(1);
+        }
         executor
     }
 
@@ -2155,7 +2407,7 @@ mod tests {
 
         let mut header = TaskHeader::new();
         unsafe {
-            executor
+            (*executor.owner.state_ptr())
                 .ready_queue
                 .push_back(&mut header.ready_link as *mut _);
         }

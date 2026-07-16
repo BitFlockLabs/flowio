@@ -199,6 +199,72 @@ impl DropTrackedReadWrite {
     }
 }
 
+/// Uninitialized writable buffer that records userspace initialization.
+///
+/// TLS tests use the counters to prove a userspace destination is initialized
+/// once across repeated polls. Kernel-read tests prove the same hook remains
+/// untouched when the kernel writes directly into raw capacity.
+#[allow(dead_code)]
+pub struct InitializationTrackedReadWrite {
+    /// Writable allocation whose logical length starts at zero.
+    bytes: Vec<u8>,
+    /// Number of userspace-initialization hook calls.
+    initialization_calls: Rc<Cell<usize>>,
+    /// Total byte count requested through the initialization hook.
+    initialized_bytes: Rc<Cell<usize>>,
+}
+
+impl InitializationTrackedReadWrite {
+    #[allow(dead_code)]
+    pub fn new(
+        capacity: usize,
+        initialization_calls: &Rc<Cell<usize>>,
+        initialized_bytes: &Rc<Cell<usize>>,
+    ) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+            initialization_calls: Rc::clone(initialization_calls),
+            initialized_bytes: Rc::clone(initialized_bytes),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+// SAFETY: `bytes` owns pointer-stable writable capacity across moves. Both
+// publication and userspace initialization clamp defensively to that capacity;
+// valid runtime callers already report a bounded length.
+unsafe impl IoBuffReadWrite for InitializationTrackedReadWrite {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    fn writable_len(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+        let len = len.min(self.bytes.capacity());
+        self.initialization_calls
+            .set(self.initialization_calls.get() + 1);
+        self.initialized_bytes
+            .set(self.initialized_bytes.get() + len);
+        let ptr = self.bytes.as_mut_ptr();
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, len);
+            std::slice::from_raw_parts_mut(ptr, len)
+        }
+    }
+
+    unsafe fn set_written_len(&mut self, len: usize) {
+        let len = len.min(self.bytes.capacity());
+        unsafe { self.bytes.set_len(len) };
+    }
+}
+
 impl Drop for DropTrackedReadWrite {
     fn drop(&mut self) {
         self.drops.set(self.drops.get() + 1);

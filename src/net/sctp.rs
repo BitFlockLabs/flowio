@@ -197,9 +197,9 @@
 //! ```
 
 use super::{
-    MsgHdrInit, checked_read_len, checked_send_len, close_fd, close_if_valid, current_local_addr,
-    invalid_input, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
-    socket_domain, write_msghdr,
+    MsgHdrInit, checked_read_len, checked_send_len, close_fd, close_if_valid,
+    complete_read_with_progress, current_local_addr, invalid_input, set_reuse_addr, set_sock_opt,
+    socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::bytes::{
@@ -208,12 +208,12 @@ use crate::runtime::buffer::bytes::{
 use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
-    submit_retained_sqe,
+    PollCtx, completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_retained_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
-use crate::runtime::timer::{Elapsed, Timeout, timeout};
+use crate::runtime::timer::{Timeout, TimeoutError, timeout};
 use io_uring::{opcode, squeue, types};
 use std::future::Future;
 use std::io;
@@ -2162,7 +2162,8 @@ impl SctpConnector {
     /// Starts connecting to the provided remote SCTP peer with a deadline.
     ///
     /// Returns `TimedOut` if the association does not complete before the
-    /// provided duration elapses.
+    /// provided duration elapses. Timer-runtime failures, including
+    /// `OutOfMemory`, propagate with their original [`io::ErrorKind`].
     ///
     /// This is a setup/control-plane convenience wrapper, not a fast path: it
     /// pairs an outbound connect with a per-attempt timeout. Resolve and
@@ -2271,10 +2272,10 @@ impl SctpRecvState {
     ///
     /// Any stashed pointer and processor must satisfy [`SctpRecvState::stash`],
     /// and `cx` must carry the FlowIO waker for the owning reactor.
-    unsafe fn poll_stashed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    unsafe fn poll_stashed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let state_ptr = self.stashed.state_ptr;
         if state_ptr.is_null() {
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
 
         if unsafe { !(*state_ptr).is_completed() } {
@@ -2282,7 +2283,7 @@ impl SctpRecvState {
             return Poll::Pending;
         }
 
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let op_ctx = unsafe { completed_op_ctx_from_waker(cx, state_ptr) };
         let process_completed = self.stashed.process_completed.take();
         debug_assert!(
             process_completed.is_some(),
@@ -2292,8 +2293,19 @@ impl SctpRecvState {
         let iov_count = self.stashed.iov_count;
         self.stashed.state_ptr = std::ptr::null_mut();
         self.stashed.iov_count = 0;
-        unsafe { process_completed(&pctx, state_ptr, iov_count, &mut self.discarding_tail) };
-        Poll::Ready(())
+        unsafe {
+            process_completed(
+                op_ctx.origin_poll_ctx(),
+                state_ptr,
+                iov_count,
+                &mut self.discarding_tail,
+            )
+        };
+        if op_ctx.context_rejected() {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)))
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     /// Orphans/cancels a stashed receive during stream teardown.
@@ -2829,6 +2841,10 @@ impl SctpStream {
     /// application framing guarantees the supplied buffer is large enough.
     /// Use [`SctpStream::recv_msg`] when record-boundary or truncation
     /// correctness depends on kernel metadata.
+    /// Positive progress appends to an `IoBuffMut` payload; buffers that keep
+    /// the provided zero write base publish from their beginning. A zero-byte
+    /// completion preserves existing logical contents, and the returned count
+    /// is relative to this receive.
     /// This data-only path does not drive metadata receive resynchronization;
     /// do not mix it with `recv_msg` / `recv_msg_vectored` while those paths
     /// are discarding an oversized record tail.
@@ -2840,6 +2856,7 @@ impl SctpStream {
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> DataRecvFuture<'_, B> {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
@@ -2852,6 +2869,7 @@ impl SctpStream {
             fd: self.fd.as_raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
+            write_base_len,
             len,
             input_error,
             _marker: PhantomData,
@@ -2908,8 +2926,15 @@ impl SctpStream {
     /// active. Kernel receive errors are returned as `io::Error` values from
     /// the completed operation.
     ///
+    /// Positive delivered bytes append to an `IoBuffMut` payload; buffers that
+    /// keep the provided zero write base publish from their beginning. Bytes
+    /// copied before a metadata/truncation error remain published. Clean EOF,
+    /// no-progress errors, and internally discarded record tails preserve the
+    /// caller-visible prefix. Returned byte counts remain relative.
+    ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match checked_sctp_metadata_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
@@ -2922,6 +2947,7 @@ impl SctpStream {
             fd: self.fd.as_raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
+            write_base_len,
             len,
             input_error,
             recv_state: &mut self.recv_state,
@@ -3331,12 +3357,12 @@ unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) 
 ///
 /// # Safety
 ///
-/// A non-null `*state_ptr` must identify an operation owned by the FlowIO
-/// reactor encoded in `cx`'s waker, with retained payload type `T`.
+/// A non-null `*state_ptr` must identify a completed FlowIO operation with
+/// retained payload type `T`. Cleanup uses its recorded origin reactor.
 unsafe fn take_completed_sctp_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
-) -> Option<(io::Result<usize>, T)> {
+) -> Option<(io::Result<usize>, T, bool)> {
     if (*state_ptr).is_null() {
         return None;
     }
@@ -3347,10 +3373,10 @@ unsafe fn take_completed_sctp_payload<T: 'static>(
     }
 
     let result = sctp_cqe_result(state.result);
-    let pctx = unsafe { poll_ctx_from_waker(cx) };
-    let payload = unsafe { (*pctx.reactor()).take_retained_payload::<T>(*state_ptr) };
-    unsafe { free_sctp_state(&pctx, state_ptr) };
-    Some((result, payload))
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
+    unsafe { free_sctp_state(op_ctx.origin_poll_ctx(), state_ptr) };
+    Some((result, payload, op_ctx.context_rejected()))
 }
 
 #[inline(always)]
@@ -3368,7 +3394,7 @@ unsafe fn prepare_initial_sctp_state(
         (*state_ptr).is_null(),
         "SCTP operation state already allocated"
     );
-    let pctx = unsafe { poll_ctx_from_waker(cx) };
+    let pctx = poll_ctx_from_waker(cx)?;
     let new_state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
     if new_state_ptr.is_null() {
         return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -3387,6 +3413,8 @@ pub struct DataRecvFuture<'a, B: IoBuffReadWrite> {
     state_ptr: *mut CompletionState,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Logical buffer length captured before the receive writable window formed.
+    write_base_len: usize,
     /// Maximum bytes requested from the kernel.
     len: u32,
     /// Deferred validation error returned before any SQE submission.
@@ -3404,22 +3432,28 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_sctp_payload::<RetainedDataRecvPayload<B>>(cx, &mut this.state_ptr)
         } {
-            let mut buffer = payload.buffer;
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             match result {
                 Err(err) => return Poll::Ready((Err(err), buffer)),
                 Ok(actual) => {
-                    unsafe { buffer.set_written_len(actual) };
-                    return Poll::Ready((Ok(actual), buffer));
+                    let completed = unsafe {
+                        complete_read_with_progress(buffer, this.write_base_len, actual, Ok(actual))
+                    };
+                    return Poll::Ready(completed);
                 }
             }
         }
@@ -3488,17 +3522,21 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_sctp_payload::<RetainedDataSendPayload<B>>(cx, &mut this.state_ptr)
         } {
             let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             return Poll::Ready((result, buffer));
         }
 
@@ -3552,6 +3590,8 @@ pub struct RecvFuture<'a, B: IoBuffReadWrite> {
     state_ptr: *mut CompletionState,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Logical buffer length captured before the receive writable window formed.
+    write_base_len: usize,
     /// Maximum message bytes requested from the kernel.
     len: u32,
     /// Deferred validation error returned before any SQE submission.
@@ -3568,24 +3608,36 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if unsafe { this.recv_state.poll_stashed(cx) }.is_pending() {
-            return Poll::Pending;
+        match unsafe { this.recv_state.poll_stashed(cx) } {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Err(err), buffer));
+            }
+            Poll::Ready(Ok(())) => {}
         }
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_sctp_payload::<RetainedSctpRecvPayload<B>>(cx, &mut this.state_ptr)
         } {
             let mut payload = payload;
+            if context_rejected {
+                return Poll::Ready((
+                    Err(io::Error::from(io::ErrorKind::NotConnected)),
+                    payload.buffer,
+                ));
+            }
             let actual = match result {
                 Ok(actual) => actual,
                 Err(err) => return Poll::Ready((Err(err), payload.buffer)),
@@ -3596,11 +3648,15 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             let msg = unsafe { payload.msghdr.assume_init_ref() };
             if sctp_msg_clean_eof(actual, msg) {
                 this.recv_state.discarding_tail = false;
-                let mut buffer = payload.buffer;
-                unsafe {
-                    buffer.set_written_len(0);
-                }
-                return Poll::Ready((Ok((0, sctp_eof_recv_meta())), buffer));
+                let completed = unsafe {
+                    complete_read_with_progress(
+                        payload.buffer,
+                        this.write_base_len,
+                        0,
+                        Ok((0, sctp_eof_recv_meta())),
+                    )
+                };
+                return Poll::Ready(completed);
             }
 
             if this.recv_state.discarding_tail {
@@ -3610,13 +3666,12 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                     sctp_discarding_after_completion(msg, data_slice)
                 };
                 this.recv_state.discarding_tail = discard_next;
-                let mut buffer = payload.buffer;
-                unsafe {
-                    buffer.set_written_len(0);
-                }
-                // Non-vectored discard has no reusable iovec scratch to
-                // refill: the next poll builds a fresh single-iovec
-                // `RetainedSctpRecvPayload` from this restored buffer.
+                let (_, buffer) = unsafe {
+                    complete_read_with_progress(payload.buffer, this.write_base_len, 0, Ok(()))
+                };
+                // Non-vectored discard has no reusable iovec scratch to refill:
+                // the next poll builds a fresh single-iovec payload at the same
+                // unchanged caller-visible writable tail.
                 this.buffer = Some(buffer);
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -3634,20 +3689,14 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 data_slice,
             );
 
-            let mut buffer = payload.buffer;
-            unsafe {
-                buffer.set_written_len(actual);
+            if meta.is_err() && partial_nonempty {
+                this.recv_state.discarding_tail = true;
             }
-
-            return match meta {
-                Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
-                Err(err) => {
-                    if partial_nonempty {
-                        this.recv_state.discarding_tail = true;
-                    }
-                    Poll::Ready((Err(err), buffer))
-                }
+            let result = meta.map(|meta| (actual, meta));
+            let completed = unsafe {
+                complete_read_with_progress(payload.buffer, this.write_base_len, actual, result)
             };
+            return Poll::Ready(completed);
         }
 
         if this.state_ptr.is_null() {
@@ -3746,17 +3795,21 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_sctp_payload::<RetainedSctpSendPayload<B>>(cx, &mut this.state_ptr)
         } {
             let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             return Poll::Ready((result, buffer));
         }
 
@@ -3851,27 +3904,39 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if unsafe { this.recv_state.poll_stashed(cx) }.is_pending() {
-            return Poll::Pending;
+        match unsafe { this.recv_state.poll_stashed(cx) } {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Err(err), buffer));
+            }
+            Poll::Ready(Ok(())) => {}
         }
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
 
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_sctp_payload::<RetainedSctpRecvVectoredPayload<N>>(
                 cx,
                 &mut this.state_ptr,
             )
         } {
+            if context_rejected {
+                return Poll::Ready((
+                    Err(io::Error::from(io::ErrorKind::NotConnected)),
+                    payload.buffer,
+                ));
+            }
             let actual = match result {
                 Ok(actual) => actual,
                 Err(err) => return Poll::Ready((Err(err), payload.buffer)),
@@ -4040,19 +4105,22 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_sctp_payload::<RetainedSctpSendVectoredPayload<N>>(
                 cx,
                 &mut this.state_ptr,
             )
         } {
             let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             return Poll::Ready((result, buffer));
         }
 
         if this.iov_count == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Ok(0), buffer));
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
         if this.state_ptr.is_null() {
@@ -4133,22 +4201,28 @@ impl Future for AcceptFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         if let Some(err) = this.input_error.take() {
-            return Poll::Ready(Err(err));
+            return Poll::Ready(validate_local_io_result(cx, Err(err)));
         }
 
         if !this.slot.state_ptr.is_null() {
             let state = unsafe { &*this.slot.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
+                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, this.slot.state_ptr) };
                 let payload = unsafe {
-                    (*pctx.reactor())
+                    (*op_ctx.reactor())
                         .take_retained_payload::<RetainedAcceptAddr>(this.slot.state_ptr)
                 };
-                unsafe { (*pctx.reactor()).free_op(this.slot.state_ptr) };
+                unsafe { (*op_ctx.reactor()).free_op(this.slot.state_ptr) };
                 this.slot.state_ptr = std::ptr::null_mut();
                 this.slot.in_use = false;
 
+                if op_ctx.context_rejected() {
+                    if result >= 0 {
+                        close_fd(result as RawFd);
+                    }
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+                }
                 if result < 0 {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
@@ -4173,7 +4247,13 @@ impl Future for AcceptFuture<'_> {
         }
 
         if this.slot.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    this.slot.in_use = false;
+                    return Poll::Ready(Err(err));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 this.slot.in_use = false;
@@ -4239,11 +4319,15 @@ impl Future for ConnectFuture<'_> {
             let state = unsafe { &*this.slot.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                unsafe { (*pctx.reactor()).free_op(this.slot.state_ptr) };
+                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, this.slot.state_ptr) };
+                unsafe { (*op_ctx.reactor()).free_op(this.slot.state_ptr) };
                 this.slot.state_ptr = std::ptr::null_mut();
                 this.slot.in_use = false;
 
+                if op_ctx.context_rejected() {
+                    this.slot.cleanup_fd();
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+                }
                 if result < 0 {
                     let err = io::Error::from_raw_os_error(-result);
                     this.slot.cleanup_fd();
@@ -4261,7 +4345,14 @@ impl Future for ConnectFuture<'_> {
         }
 
         if this.slot.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    this.slot.in_use = false;
+                    this.slot.cleanup_fd();
+                    return Poll::Ready(Err(err));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 this.slot.in_use = false;
@@ -4316,10 +4407,13 @@ impl Drop for ConnectFuture<'_> {
     }
 }
 
-fn map_connect_timeout(result: Result<io::Result<SctpStream>, Elapsed>) -> io::Result<SctpStream> {
+fn map_connect_timeout(
+    result: Result<io::Result<SctpStream>, TimeoutError>,
+) -> io::Result<SctpStream> {
     match result {
         Ok(result) => result,
-        Err(_) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        Err(TimeoutError::Elapsed) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        Err(TimeoutError::Runtime(err)) => Err(err),
     }
 }
 

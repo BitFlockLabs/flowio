@@ -22,11 +22,13 @@ use crate::utils::list::intrusive::slist::{Link, SList};
 use crate::utils::memory::provider::{BasicMemoryProvider, ProviderOwner};
 use crate::utils::memory::slab::{SlabAllocator, SlabAllocatorConfigError, SlabPageChain};
 use std::alloc::Layout;
+use std::cell::UnsafeCell;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::slice;
 
 const RETAINED_BLOCK_ALIGN: usize = 64;
@@ -77,12 +79,144 @@ pub(crate) struct RetainedPayloadPoolStats {
     pub(crate) writev_scratch_alloc_failures: usize,
 }
 
+/// Scratch-only counters stored with the heap-stable iovec sidecar owner.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RetainedIovecScratchStats {
+    writev_scratch_inline_allocs: usize,
+    writev_scratch_pooled_allocs: usize,
+    writev_scratch_pooled_reuses: usize,
+    writev_scratch_pooled_frees: usize,
+    writev_scratch_slab_allocs: usize,
+    writev_scratch_oversize_rejections: usize,
+    writev_scratch_alloc_failures: usize,
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+impl RetainedIovecScratchStats {
+    fn apply_to(self, stats: &mut RetainedPayloadPoolStats) {
+        stats.writev_scratch_inline_allocs = self.writev_scratch_inline_allocs;
+        stats.writev_scratch_pooled_allocs = self.writev_scratch_pooled_allocs;
+        stats.writev_scratch_pooled_reuses = self.writev_scratch_pooled_reuses;
+        stats.writev_scratch_pooled_frees = self.writev_scratch_pooled_frees;
+        stats.writev_scratch_slab_allocs = self.writev_scratch_slab_allocs;
+        stats.writev_scratch_oversize_rejections = self.writev_scratch_oversize_rejections;
+        stats.writev_scratch_alloc_failures = self.writev_scratch_alloc_failures;
+    }
+}
+
+/// Heap-stable owner for pooled iovec scratch classes.
+///
+/// The runtime is single-threaded. `UnsafeCell` permits a pooled scratch lease
+/// to return its block after the outer retained-payload pool has moved or been
+/// dropped; every such lease owns an `Rc` that keeps this allocation alive.
+struct RetainedIovecScratchPool {
+    state: UnsafeCell<RetainedIovecScratchPoolState>,
+}
+
+struct RetainedIovecScratchPoolState {
+    classes: [RetainedSizeClass; RETAINED_IOVEC_SIZE_CLASSES.len()],
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    stats: RetainedIovecScratchStats,
+}
+
+impl RetainedIovecScratchPool {
+    fn new() -> io::Result<Rc<Self>> {
+        Ok(Rc::new(Self {
+            state: UnsafeCell::new(RetainedIovecScratchPoolState {
+                classes: [
+                    RetainedSizeClass::new(iovec_class_block_size(0))?,
+                    RetainedSizeClass::new(iovec_class_block_size(1))?,
+                    RetainedSizeClass::new(iovec_class_block_size(2))?,
+                    RetainedSizeClass::new(iovec_class_block_size(3))?,
+                ],
+                #[cfg(any(debug_assertions, feature = "test-support"))]
+                stats: RetainedIovecScratchStats::default(),
+            }),
+        }))
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[inline(always)]
+    fn record_inline_alloc(&self) {
+        // SAFETY: FlowIO confines the retained pool and every scratch lease to
+        // one executor owner thread, and this synchronous update does not
+        // overlap another access to the sidecar state.
+        unsafe {
+            (*self.state.get()).stats.writev_scratch_inline_allocs += 1;
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[inline(always)]
+    fn record_oversize_rejection(&self) {
+        // SAFETY: same owner-thread-only access invariant as
+        // `record_inline_alloc`.
+        unsafe {
+            (*self.state.get()).stats.writev_scratch_oversize_rejections += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn alloc_block(&self, class_index: usize) -> Option<ClassAllocResult> {
+        // SAFETY: allocation is synchronous on the executor owner thread. No
+        // scratch Drop can re-enter while this exclusive state access is live.
+        let state = unsafe { &mut *self.state.get() };
+        let Some(result) = state.classes[class_index].alloc_block() else {
+            #[cfg(any(debug_assertions, feature = "test-support"))]
+            {
+                state.stats.writev_scratch_alloc_failures += 1;
+            }
+            return None;
+        };
+
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        {
+            state.stats.writev_scratch_pooled_allocs += 1;
+            if result.reused {
+                state.stats.writev_scratch_pooled_reuses += 1;
+            }
+            if result.new_slab {
+                state.stats.writev_scratch_slab_allocs += 1;
+            }
+        }
+
+        Some(result)
+    }
+
+    #[inline(always)]
+    /// Returns an iovec sidecar block to its size-class free list.
+    ///
+    /// # Safety
+    ///
+    /// `class_index` must identify the class that allocated `ptr`, and `ptr`
+    /// must not already have been returned.
+    unsafe fn free_block(&self, class_index: usize, ptr: *mut u8) {
+        // SAFETY: Drop runs synchronously on the executor owner thread, the
+        // lease's Rc keeps this state alive, and the caller supplies the exact
+        // class/block pair recorded at allocation.
+        let state = unsafe { &mut *self.state.get() };
+        unsafe { state.classes[class_index].free_block(ptr) };
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        {
+            state.stats.writev_scratch_pooled_frees += 1;
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    fn stats(&self) -> RetainedIovecScratchStats {
+        // SAFETY: snapshots are taken synchronously on the owner thread and do
+        // not overlap allocation or release.
+        unsafe { (*self.state.get()).stats }
+    }
+}
+
 /// Raw, size-classed pool for retained operation payloads.
 pub(crate) struct RetainedPayloadPool {
     /// Size classes for retained operation payload structs.
     classes: [RetainedSizeClass; RETAINED_SIZE_CLASSES.len()],
-    /// Size classes for retained sidecar `iovec` scratch arrays.
-    iovec_classes: [RetainedSizeClass; RETAINED_IOVEC_SIZE_CLASSES.len()],
+    /// Heap-stable owner for retained sidecar `iovec` scratch arrays.
+    iovec_pool: Rc<RetainedIovecScratchPool>,
     #[cfg(any(debug_assertions, feature = "test-support"))]
     /// Debug/test-support counters exported through runtime stats and tests.
     stats: RetainedPayloadPoolStats,
@@ -104,12 +238,7 @@ impl RetainedPayloadPool {
                 RetainedSizeClass::new(RETAINED_SIZE_CLASSES[9])?,
                 RetainedSizeClass::new(RETAINED_SIZE_CLASSES[10])?,
             ],
-            iovec_classes: [
-                RetainedSizeClass::new(iovec_class_block_size(0))?,
-                RetainedSizeClass::new(iovec_class_block_size(1))?,
-                RetainedSizeClass::new(iovec_class_block_size(2))?,
-                RetainedSizeClass::new(iovec_class_block_size(3))?,
-            ],
+            iovec_pool: RetainedIovecScratchPool::new()?,
             #[cfg(any(debug_assertions, feature = "test-support"))]
             stats: RetainedPayloadPoolStats::default(),
         })
@@ -204,9 +333,7 @@ impl RetainedPayloadPool {
     ) -> io::Result<RetainedIovecScratch> {
         if iov_count <= RETAINED_IOVEC_INLINE_COUNT {
             #[cfg(any(debug_assertions, feature = "test-support"))]
-            {
-                self.stats.writev_scratch_inline_allocs += 1;
-            }
+            self.iovec_pool.record_inline_alloc();
             return Ok(RetainedIovecScratch::inline(iov_count));
         }
 
@@ -214,9 +341,7 @@ impl RetainedPayloadPool {
             Some(class_index) => class_index,
             None => {
                 #[cfg(any(debug_assertions, feature = "test-support"))]
-                {
-                    self.stats.writev_scratch_oversize_rejections += 1;
-                }
+                self.iovec_pool.record_oversize_rejection();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "active iovec count exceeds retained scratch capacity",
@@ -224,48 +349,25 @@ impl RetainedPayloadPool {
             }
         };
 
-        let Some(result) = self.iovec_classes[class_index].alloc_block() else {
-            #[cfg(any(debug_assertions, feature = "test-support"))]
-            {
-                self.stats.writev_scratch_alloc_failures += 1;
-            }
+        let Some(result) = self.iovec_pool.alloc_block(class_index) else {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         };
 
-        #[cfg(any(debug_assertions, feature = "test-support"))]
-        {
-            self.stats.writev_scratch_pooled_allocs += 1;
-            if result.reused {
-                self.stats.writev_scratch_pooled_reuses += 1;
-            }
-            if result.new_slab {
-                self.stats.writev_scratch_slab_allocs += 1;
-            }
-        }
-
         Ok(unsafe {
-            RetainedIovecScratch::pooled(result.ptr, iov_count, class_index, self as *mut Self)
+            RetainedIovecScratch::pooled(
+                result.ptr,
+                iov_count,
+                class_index,
+                Rc::clone(&self.iovec_pool),
+            )
         })
-    }
-
-    #[inline(always)]
-    /// Returns an iovec sidecar block to its size-class free list.
-    ///
-    /// # Safety
-    ///
-    /// `class_index` must identify the iovec class that allocated `ptr`, and
-    /// `ptr` must not already have been returned.
-    unsafe fn free_iovec_scratch_block(&mut self, class_index: usize, ptr: *mut u8) {
-        unsafe { self.iovec_classes[class_index].free_block(ptr) };
-        #[cfg(any(debug_assertions, feature = "test-support"))]
-        {
-            self.stats.writev_scratch_pooled_frees += 1;
-        }
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]
     pub(crate) fn stats(&self) -> RetainedPayloadPoolStats {
-        self.stats
+        let mut stats = self.stats;
+        self.iovec_pool.stats().apply_to(&mut stats);
+        stats
     }
 }
 
@@ -273,10 +375,11 @@ impl RetainedPayloadPool {
 ///
 /// This type is move-safe: inline storage is addressed from the enum field on
 /// every access, while sidecar storage carries a stable slab pointer. The
-/// sidecar pointer remains valid until the scratch handle is dropped, which is
-/// tied to the retained vectored I/O payload lifetime. Pooled scratch still
-/// carries the inline array so the handle remains one simple move-safe value;
-/// the extra bytes are a deliberate tradeoff for cancellation-path simplicity.
+/// sidecar pointer remains valid until the scratch handle is dropped because
+/// every pooled handle retains the heap-stable sidecar owner. Pooled scratch
+/// still carries the inline array so the handle remains one simple move-safe
+/// value; the extra bytes are a deliberate tradeoff for cancellation-path
+/// simplicity.
 pub(crate) struct RetainedIovecScratch {
     /// Active iovec count visible through this scratch handle.
     len: usize,
@@ -294,8 +397,8 @@ enum RetainedIovecScratchStorage {
         ptr: NonNull<MaybeUninit<libc::iovec>>,
         /// Size-class index used to return `ptr` to the right free list.
         class_index: usize,
-        /// Retained pool that owns the sidecar block.
-        pool: *mut RetainedPayloadPool,
+        /// Heap-stable sidecar pool that owns the block.
+        owner: Rc<RetainedIovecScratchPool>,
     },
 }
 
@@ -312,14 +415,14 @@ impl RetainedIovecScratch {
 
     /// # Safety
     ///
-    /// `ptr` must be a block allocated from `pool.iovec_classes[class_index]`
-    /// and large enough for `len` `libc::iovec` values.
+    /// `ptr` must be a block allocated from `owner` class `class_index`, and it
+    /// must be large enough for `len` `libc::iovec` values.
     #[inline(always)]
     unsafe fn pooled(
         ptr: *mut u8,
         len: usize,
         class_index: usize,
-        pool: *mut RetainedPayloadPool,
+        owner: Rc<RetainedIovecScratchPool>,
     ) -> Self {
         debug_assert!(len > RETAINED_IOVEC_INLINE_COUNT);
         debug_assert!(len <= RETAINED_IOVEC_SIZE_CLASSES[class_index]);
@@ -329,7 +432,7 @@ impl RetainedIovecScratch {
             storage: RetainedIovecScratchStorage::Pooled {
                 ptr: unsafe { NonNull::new_unchecked(ptr as *mut MaybeUninit<libc::iovec>) },
                 class_index,
-                pool,
+                owner,
             },
         }
     }
@@ -365,15 +468,18 @@ impl Drop for RetainedIovecScratch {
         if let RetainedIovecScratchStorage::Pooled {
             ptr,
             class_index,
-            pool,
+            owner,
         } = &self.storage
         {
-            let pool_ptr = *pool;
-            debug_assert!(!pool_ptr.is_null(), "iovec scratch pool pointer is null");
-            unsafe { (*pool_ptr).free_iovec_scratch_block(*class_index, ptr.as_ptr() as *mut u8) };
+            unsafe { owner.free_block(*class_index, ptr.as_ptr() as *mut u8) };
         }
     }
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: [(); 288] = [(); std::mem::size_of::<RetainedIovecScratch>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 24] = [(); std::mem::size_of::<RetainedIovecScratchStorage>()];
 
 #[must_use = "retained payload handles own storage and must be consumed"]
 pub(crate) struct RetainedPayload<T: 'static> {
@@ -737,4 +843,85 @@ fn uninit_iovec_inline() -> [MaybeUninit<libc::iovec>; RETAINED_IOVEC_INLINE_COU
     // SAFETY: an array of `MaybeUninit<libc::iovec>` may be left wholly
     // uninitialized; callers track which entries they initialize.
     unsafe { MaybeUninit::uninit().assume_init() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScratchPayload {
+        _scratch: RetainedIovecScratch,
+    }
+
+    #[test]
+    fn pooled_iovec_scratch_survives_parent_move_inside_retained_payload() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let scratch = pool
+            .alloc_iovec_scratch(512)
+            .expect("pooled scratch allocation failed");
+        let payload = pool.alloc(ScratchPayload { _scratch: scratch });
+
+        let mut moved_pool = pool;
+        unsafe { payload.drop_and_free(&mut moved_pool) };
+
+        let stats = moved_pool.stats();
+        assert_eq!(stats.writev_scratch_pooled_allocs, 1);
+        assert_eq!(stats.writev_scratch_pooled_frees, 1);
+        assert_eq!(stats.pooled_allocs, 1);
+        assert_eq!(stats.pooled_frees, 1);
+    }
+
+    #[test]
+    fn pooled_iovec_scratch_owner_outlives_dropped_parent_pool() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let owner = Rc::downgrade(&pool.iovec_pool);
+        let mut scratch = pool
+            .alloc_iovec_scratch(512)
+            .expect("pooled scratch allocation failed");
+        scratch.as_uninit_slice_mut()[0].write(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 7,
+        });
+        scratch.as_uninit_slice_mut()[511].write(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 11,
+        });
+
+        drop(pool);
+        assert!(owner.upgrade().is_some());
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[0].assume_init_ref() }.iov_len,
+            7
+        );
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[511].assume_init_ref() }.iov_len,
+            11
+        );
+
+        drop(scratch);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn pooled_iovec_scratch_releases_before_parent_pool() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let owner = Rc::downgrade(&pool.iovec_pool);
+        let scratch = pool
+            .alloc_iovec_scratch(512)
+            .expect("pooled scratch allocation failed");
+
+        drop(scratch);
+        assert!(owner.upgrade().is_some());
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 1);
+
+        drop(pool);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn retained_iovec_scratch_layout_remains_fixed() {
+        assert_eq!(std::mem::size_of::<RetainedIovecScratch>(), 288);
+        assert_eq!(std::mem::size_of::<RetainedIovecScratchStorage>(), 24);
+    }
 }

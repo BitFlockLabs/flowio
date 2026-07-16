@@ -1,10 +1,11 @@
 //! `io_uring` reactor: SQE submission, CQE completion, and operation lifecycle.
 
-use crate::runtime::executor::RuntimeState;
+use crate::runtime::executor::{ExecutorOwner, RuntimeState};
 use crate::runtime::op::CompletionState;
 #[cfg(debug_assertions)]
 use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::retained::{RetainedIovecScratch, RetainedPayload, RetainedPayloadPool};
+use crate::runtime::task::release_task;
 use crate::utils::memory::pool::Pool;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
@@ -42,8 +43,11 @@ fn close_result_fd(fd: RawFd) {
 }
 
 #[inline(always)]
-fn close_orphan_result_fd_if_needed(state: &CompletionState) {
-    if state.is_orphaned() && state.closes_result_fd_on_orphan() && state.result >= 0 {
+fn close_unclaimed_result_fd_if_needed(state: &CompletionState) {
+    if (state.is_orphaned() || state.is_runtime_shutdown())
+        && state.closes_result_fd_on_orphan()
+        && state.result >= 0
+    {
         close_result_fd(state.result as RawFd);
     }
 }
@@ -90,58 +94,127 @@ fn retire_tracked_completion(runtime_state: &mut RuntimeState) -> io::Result<()>
     Ok(())
 }
 
-fn unlink_pending_cancel(
-    pending_cancel_head: &mut *mut CompletionState,
-    pending_cancel_tail: &mut *mut CompletionState,
-    pending_cancel_len: &mut usize,
-    ptr: *mut CompletionState,
-) {
-    debug_assert!(
-        !ptr.is_null(),
-        "reactor unlink_pending_cancel called with null pointer"
-    );
-    unsafe {
-        if !(*ptr).is_cancel_pending() {
-            return;
+/// Owner-thread FIFO of operations awaiting another `ASYNC_CANCEL` attempt.
+///
+/// The queue is bounded by the reactor's live-operation cap and allocates no
+/// nodes. An orphaned state's released waiter word stores the previous link;
+/// `CompletionState::cancel_next` stores the next link.
+struct PendingCancelQueue {
+    head: *mut CompletionState,
+    tail: *mut CompletionState,
+    len: usize,
+}
+
+impl PendingCancelQueue {
+    const fn new() -> Self {
+        Self {
+            head: std::ptr::null_mut(),
+            tail: std::ptr::null_mut(),
+            len: 0,
         }
     }
 
-    let mut prev: *mut CompletionState = std::ptr::null_mut();
-    let mut current = *pending_cancel_head;
-    while !current.is_null() {
-        let next = unsafe { (*current).cancel_next };
-        if current == ptr {
-            if prev.is_null() {
-                *pending_cancel_head = next;
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.head.is_null()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Appends one orphaned state unless it is already queued or completed.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must identify a live completion state owned by this reactor. Its
+    /// waiter reference must have been released before this call.
+    unsafe fn push_back(&mut self, ptr: *mut CompletionState) {
+        debug_assert!(
+            !ptr.is_null(),
+            "pending-cancel push called with null pointer"
+        );
+        unsafe {
+            if (*ptr).is_cancel_pending() || (*ptr).is_completed() {
+                return;
+            }
+            debug_assert!(
+                (*ptr).is_orphaned() || (*ptr).is_runtime_shutdown(),
+                "only orphaned or shutdown-owned ops can queue cancel retry"
+            );
+            (*ptr).link_pending_cancel_after(self.tail);
+
+            if self.tail.is_null() {
+                debug_assert!(self.head.is_null());
+                self.head = ptr;
             } else {
-                unsafe { (*prev).cancel_next = next };
+                (*self.tail).cancel_next = ptr;
             }
-            if *pending_cancel_tail == current {
-                *pending_cancel_tail = prev;
-            }
-            debug_assert!(*pending_cancel_len > 0);
-            *pending_cancel_len -= 1;
-            unsafe {
-                (*current).cancel_next = std::ptr::null_mut();
-                (*current).clear_cancel_pending();
-            }
-            if (*pending_cancel_head).is_null() {
-                debug_assert!((*pending_cancel_tail).is_null());
-                *pending_cancel_tail = std::ptr::null_mut();
-            }
-            return;
+            self.tail = ptr;
+            self.len += 1;
         }
-        prev = current;
-        current = next;
     }
 
-    debug_assert_eq!(
-        current, ptr,
-        "cancel-pending flag set but completion state is not queued"
-    );
-    unsafe {
-        (*ptr).cancel_next = std::ptr::null_mut();
-        (*ptr).clear_cancel_pending();
+    /// Removes a known queued state in constant time.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must identify a live completion state owned by this reactor.
+    unsafe fn unlink(&mut self, ptr: *mut CompletionState) -> bool {
+        debug_assert!(
+            !ptr.is_null(),
+            "pending-cancel unlink called with null pointer"
+        );
+        unsafe {
+            if !(*ptr).is_cancel_pending() {
+                return false;
+            }
+
+            let previous = (*ptr).cancel_prev();
+            let next = (*ptr).cancel_next;
+            if previous.is_null() {
+                debug_assert_eq!(self.head, ptr);
+                self.head = next;
+            } else {
+                debug_assert_eq!((*previous).cancel_next, ptr);
+                (*previous).cancel_next = next;
+            }
+
+            if next.is_null() {
+                debug_assert_eq!(self.tail, ptr);
+                self.tail = previous;
+            } else {
+                debug_assert_eq!((*next).cancel_prev(), ptr);
+                (*next).set_cancel_prev(previous);
+            }
+
+            debug_assert!(self.len > 0);
+            self.len -= 1;
+            (*ptr).clear_pending_cancel_links();
+
+            if self.head.is_null() {
+                debug_assert!(self.tail.is_null());
+                debug_assert_eq!(self.len, 0);
+                self.tail = std::ptr::null_mut();
+            }
+            true
+        }
+    }
+
+    /// Pops the oldest retry candidate.
+    ///
+    /// # Safety
+    ///
+    /// Every linked state must remain live and owned by this reactor.
+    unsafe fn pop_front(&mut self) -> Option<*mut CompletionState> {
+        let ptr = self.head;
+        if ptr.is_null() {
+            return None;
+        }
+        let removed = unsafe { self.unlink(ptr) };
+        debug_assert!(removed);
+        Some(ptr)
     }
 }
 
@@ -154,28 +227,39 @@ fn unlink_pending_cancel(
 /// must describe this reactor, and the original target CQE must have retired
 /// before an attached payload is released.
 unsafe fn free_op_fields(
-    pending_cancel_head: &mut *mut CompletionState,
-    pending_cancel_tail: &mut *mut CompletionState,
-    pending_cancel_len: &mut usize,
+    pending_cancels: &mut PendingCancelQueue,
     retained_pool: &mut RetainedPayloadPool,
     op_pool: &mut Pool<'static, CompletionState, BasicMemoryProvider>,
-    live_ops: &mut usize,
+    live_registry: &mut Vec<*mut CompletionState>,
     ptr: *mut CompletionState,
 ) -> io::Result<()> {
-    if *live_ops == 0 {
+    if live_registry.is_empty() {
         return Err(io::Error::other(
             "reactor freed more operations than it allocated",
         ));
     }
 
-    unlink_pending_cancel(
-        pending_cancel_head,
-        pending_cancel_tail,
-        pending_cancel_len,
-        ptr,
-    );
+    let registry_index = unsafe { (*ptr).registry_index as usize };
+    if registry_index >= live_registry.len() || live_registry[registry_index] != ptr {
+        return Err(io::Error::other(
+            "completion state missing from reactor live registry",
+        ));
+    }
+    let removed = live_registry.swap_remove(registry_index);
+    debug_assert_eq!(removed, ptr);
+    if registry_index < live_registry.len() {
+        let moved = live_registry[registry_index];
+        unsafe {
+            (*moved).registry_index = registry_index as u32;
+        }
+    }
+    unsafe {
+        (*ptr).registry_index = u32::MAX;
+    }
+
+    unsafe { pending_cancels.unlink(ptr) };
+    unsafe { (*ptr).clear_waiter() };
     unsafe { (*ptr).drop_retained_payload(retained_pool) };
-    *live_ops -= 1;
     unsafe { op_pool.free(ptr) };
     Ok(())
 }
@@ -223,22 +307,21 @@ impl Default for ReactorConfig {
 #[doc(hidden)]
 pub(crate) struct Reactor {
     /// Owned io_uring instance used for submission and completion handling.
-    pub(crate) ring: IoUring,
+    ring: Option<IoUring>,
+    /// Stable owner containing this reactor, or null in standalone unit tests.
+    owner: *const ExecutorOwner,
     /// True when SQEs have been queued in userspace but not flushed to the
     /// kernel yet.
     pending: bool,
-    /// Orphaned operations whose `ASYNC_CANCEL` SQE could not be submitted.
-    pending_cancel_head: *mut CompletionState,
-    /// Tail of the FIFO cancel-retry chain, or null when the chain is empty.
-    pending_cancel_tail: *mut CompletionState,
-    /// Number of completion states linked into the cancel-retry chain.
-    pending_cancel_len: usize,
+    /// Bounded FIFO of orphaned operations whose `ASYNC_CANCEL` SQE could not
+    /// be submitted.
+    pending_cancels: PendingCancelQueue,
     /// Pool of reusable completion-state records for in-flight operations.
     op_pool: ManuallyDrop<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>,
     /// Maximum number of live completion-state records.
     max_live_ops: usize,
-    /// Number of completion-state records currently checked out.
-    live_ops: usize,
+    /// Bounded registry of checked-out completion states used during teardown.
+    live_registry: Vec<*mut CompletionState>,
     /// Pool of pointer-stable payload blocks referenced by in-flight
     /// operations, including operations whose owning futures were dropped.
     retained_pool: RetainedPayloadPool,
@@ -252,22 +335,36 @@ impl Reactor {
         let op_pool = ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let retained_pool = RetainedPayloadPool::new()?;
+        let mut live_registry = Vec::new();
+        live_registry
+            .try_reserve_exact(config.ring_entries as usize)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
 
         Ok(Self {
-            ring,
+            ring: Some(ring),
+            owner: std::ptr::null(),
             pending: false,
-            pending_cancel_head: std::ptr::null_mut(),
-            pending_cancel_tail: std::ptr::null_mut(),
-            pending_cancel_len: 0,
+            pending_cancels: PendingCancelQueue::new(),
             op_pool: ManuallyDrop::new(op_pool),
             max_live_ops: config.ring_entries as usize,
-            live_ops: 0,
+            live_registry,
             retained_pool,
         })
     }
 
     pub fn init(&mut self) {
         self.op_pool.init();
+    }
+
+    pub(crate) fn bind_owner(&mut self, owner: *const ExecutorOwner) {
+        self.owner = owner;
+    }
+
+    #[inline(always)]
+    fn ring_mut(&mut self) -> io::Result<&mut IoUring> {
+        self.ring
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
     }
 
     /// Allocate a fresh `CompletionState` for one SQE submission.
@@ -278,13 +375,22 @@ impl Reactor {
             return std::ptr::null_mut();
         }
 
-        if self.live_ops >= self.max_live_ops {
+        if self.live_registry.len() >= self.max_live_ops {
             return std::ptr::null_mut();
         }
 
         let ptr = unsafe { self.op_pool.alloc(()).unwrap_or(std::ptr::null_mut()) };
         if !ptr.is_null() {
-            self.live_ops += 1;
+            let owner = if self.owner.is_null() {
+                None
+            } else {
+                Some(unsafe { ExecutorOwner::clone_rc(self.owner) })
+            };
+            let registry_index = self.live_registry.len() as u32;
+            unsafe {
+                (*ptr).bind_owner(owner, registry_index);
+            }
+            self.live_registry.push(ptr);
         }
         ptr
     }
@@ -348,7 +454,7 @@ impl Reactor {
 
     #[inline(always)]
     fn has_pending_cancels(&self) -> bool {
-        !self.pending_cancel_head.is_null()
+        !self.pending_cancels.is_empty()
     }
 
     #[inline(always)]
@@ -358,13 +464,15 @@ impl Reactor {
             return Err(err);
         }
 
-        self.ring.submit()
+        self.ring_mut()?.submit()
     }
 
     #[inline(always)]
     fn refresh_completion_queue_view_after_submit_busy(&mut self) {
-        let mut cq = self.ring.completion();
-        cq.sync();
+        if let Some(ring) = self.ring.as_mut() {
+            let mut cq = ring.completion();
+            cq.sync();
+        }
     }
 
     #[inline(always)]
@@ -387,50 +495,25 @@ impl Reactor {
     }
 
     fn queue_pending_cancel(&mut self, ptr: *mut CompletionState) {
-        debug_assert!(
-            !ptr.is_null(),
-            "reactor queue_pending_cancel called with null pointer"
-        );
-        unsafe {
-            if (*ptr).is_cancel_pending() || (*ptr).is_completed() {
-                return;
-            }
-            debug_assert!(
-                (*ptr).is_orphaned(),
-                "only orphaned ops can be queued for cancel retry"
-            );
-            (*ptr).set_cancel_pending();
-            (*ptr).cancel_next = std::ptr::null_mut();
-
-            if self.pending_cancel_tail.is_null() {
-                debug_assert!(self.pending_cancel_head.is_null());
-                self.pending_cancel_head = ptr;
-            } else {
-                (*self.pending_cancel_tail).cancel_next = ptr;
-            }
-            self.pending_cancel_tail = ptr;
-            self.pending_cancel_len += 1;
-        }
+        unsafe { self.pending_cancels.push_back(ptr) };
     }
 
     fn retry_pending_cancels(&mut self) {
-        let mut current = self.pending_cancel_head;
-        self.pending_cancel_head = std::ptr::null_mut();
-        self.pending_cancel_tail = std::ptr::null_mut();
-        self.pending_cancel_len = 0;
+        // Capture one pass's work budget before retrying. Failed submissions
+        // append at the tail and are not attempted again until the next pass.
+        let retry_budget = self.pending_cancels.len();
+        for _ in 0..retry_budget {
+            let Some(current) = (unsafe { self.pending_cancels.pop_front() }) else {
+                break;
+            };
 
-        while !current.is_null() {
-            let next = unsafe { (*current).cancel_next };
-            unsafe {
-                (*current).cancel_next = std::ptr::null_mut();
-                (*current).clear_cancel_pending();
-            }
-
-            let should_retry = unsafe { (*current).is_orphaned() && !(*current).is_completed() };
+            let should_retry = unsafe {
+                ((*current).is_orphaned() || (*current).is_runtime_shutdown())
+                    && !(*current).is_completed()
+            };
             if should_retry && self.submit_cancel_sqe(current).is_err() {
                 self.queue_pending_cancel(current);
             }
-            current = next;
         }
     }
 
@@ -445,7 +528,9 @@ impl Reactor {
             return Err(err);
         }
 
-        self.ring.submitter().submit_with_args(min_complete, args)
+        self.ring_mut()?
+            .submitter()
+            .submit_with_args(min_complete, args)
     }
 
     #[inline(always)]
@@ -455,7 +540,7 @@ impl Reactor {
             return Err(err);
         }
 
-        self.ring.submit_and_wait(min_complete)
+        self.ring_mut()?.submit_and_wait(min_complete)
     }
 
     /// Return a retired `CompletionState` to the pool.
@@ -468,12 +553,10 @@ impl Reactor {
         debug_assert!(!ptr.is_null(), "reactor free_op called with null pointer");
         unsafe {
             free_op_fields(
-                &mut self.pending_cancel_head,
-                &mut self.pending_cancel_tail,
-                &mut self.pending_cancel_len,
+                &mut self.pending_cancels,
                 &mut self.retained_pool,
                 &mut self.op_pool,
-                &mut self.live_ops,
+                &mut self.live_registry,
                 ptr,
             )
         }
@@ -493,6 +576,10 @@ impl Reactor {
         unsafe { (*ptr).set_orphaned() };
         unsafe { (*ptr).clear_waiter() };
 
+        self.request_cancel(ptr);
+    }
+
+    fn request_cancel(&mut self, ptr: *mut CompletionState) {
         // Submit ASYNC_CANCEL targeting the original user_data (the state ptr).
         // The cancel SQE's own user_data is 0 so poll_io silently skips its CQE.
         // If submission fails, keep the orphaned op on a reactor-owned retry
@@ -511,12 +598,12 @@ impl Reactor {
             return Err(err);
         }
 
-        let mut sq = self.ring.submission();
+        let mut sq = self.ring_mut()?.submission();
         if sq.is_full() {
             drop(sq);
             self.submit_ring_for_sqe_capacity()?;
             self.pending = false;
-            sq = self.ring.submission();
+            sq = self.ring_mut()?.submission();
         }
         unsafe {
             if sq.push(&sqe).is_err() {
@@ -622,6 +709,102 @@ impl Reactor {
         }
     }
 
+    fn prepare_shutdown(&mut self) {
+        let mut index = 0usize;
+        while index < self.live_registry.len() {
+            let state = self.live_registry[index];
+            unsafe {
+                if (*state).is_orphaned() || (*state).is_detached() {
+                    index += 1;
+                    continue;
+                }
+
+                debug_assert!(!(*state).is_cancel_pending());
+                (*state).clear_waiter();
+                (*state).set_runtime_shutdown();
+                if (*state).is_completed() {
+                    close_unclaimed_result_fd_if_needed(&*state);
+                    (*state).result = -libc::ECANCELED;
+                } else {
+                    self.request_cancel(state);
+                }
+            }
+            index += 1;
+        }
+    }
+
+    /// Retires kernel-visible submissions and closes the ring while preserving
+    /// completed state still owned by escaped futures.
+    pub(crate) fn shutdown(
+        &mut self,
+        runtime_state: *mut RuntimeState,
+        ready_queue: *mut crate::utils::list::intrusive::dlist::DList<
+            crate::runtime::task::TaskHeader,
+        >,
+    ) {
+        if self.ring.is_none() {
+            return;
+        }
+
+        self.prepare_shutdown();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { (*runtime_state).inflight_ops > 0 } && Instant::now() < deadline {
+            if self.flush_sqes().is_err() {
+                break;
+            }
+            if self
+                .poll_io(usize::MAX, runtime_state, ready_queue)
+                .is_err()
+            {
+                break;
+            }
+            if unsafe { (*runtime_state).inflight_ops == 0 } {
+                break;
+            }
+            if self
+                .wait_for_events(Some(Duration::from_millis(10)))
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        if unsafe { (*runtime_state).inflight_ops > 0 } {
+            // Closing the ring is the bounded fallback that ends all remaining
+            // kernel access before retained payloads or state slots are touched.
+            drop(self.ring.take());
+            unsafe {
+                (*runtime_state).inflight_ops = 0;
+            }
+
+            let mut index = 0usize;
+            while index < self.live_registry.len() {
+                let state = self.live_registry[index];
+                unsafe {
+                    self.pending_cancels.unlink(state);
+                    if !(*state).is_completed() {
+                        (*state).result = -libc::ECANCELED;
+                        (*state).cqe_flags = 0;
+                        (*state).set_completed();
+                    }
+                }
+
+                if unsafe { (*state).is_orphaned() || (*state).is_detached() } {
+                    self.free_op(state);
+                } else {
+                    index += 1;
+                }
+            }
+            debug_assert!(self.pending_cancels.is_empty());
+            self.pending_cancels = PendingCancelQueue::new();
+            self.pending = false;
+            return;
+        }
+
+        drop(self.ring.take());
+        self.pending = false;
+    }
+
     /// Drains completed CQEs, updates `CompletionState`, and wakes waiting
     /// tasks as needed.
     ///
@@ -641,7 +824,15 @@ impl Reactor {
             crate::runtime::task::TaskHeader,
         >,
     ) -> io::Result<usize> {
-        let mut cq = self.ring.completion();
+        let ring = self
+            .ring
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?
+            as *mut IoUring;
+        // SAFETY: the completion view borrows only the ring field. This method
+        // mutates disjoint reactor bookkeeping fields and never replaces or
+        // otherwise accesses the ring until `cq` is dropped.
+        let mut cq = unsafe { (&mut *ring).completion() };
 
         let mut seen = 0usize;
         while seen < max_completions {
@@ -663,17 +854,19 @@ impl Reactor {
 
                 retire_tracked_completion(&mut *runtime_state)?;
 
-                if (*state).is_orphaned() || (*state).is_detached() {
+                if (*state).is_runtime_shutdown() {
+                    close_unclaimed_result_fd_if_needed(&*state);
+                    (*state).result = -libc::ECANCELED;
+                    self.pending_cancels.unlink(state);
+                } else if (*state).is_orphaned() || (*state).is_detached() {
                     // Cancelled/abandoned or detached op — free the pool slot,
                     // no task wake.
-                    close_orphan_result_fd_if_needed(&*state);
+                    close_unclaimed_result_fd_if_needed(&*state);
                     free_op_fields(
-                        &mut self.pending_cancel_head,
-                        &mut self.pending_cancel_tail,
-                        &mut self.pending_cancel_len,
+                        &mut self.pending_cancels,
                         &mut self.retained_pool,
                         &mut self.op_pool,
-                        &mut self.live_ops,
+                        &mut self.live_registry,
                         state,
                     )?;
                 } else {
@@ -688,6 +881,11 @@ impl Reactor {
                             ready_queue,
                             runtime_state,
                         );
+                        // `take_waiter` transfers one owning reference. Keep it
+                        // alive through scheduling, then release it after the
+                        // executor has either queued the live task or observed
+                        // that it already completed.
+                        release_task(waiter);
                     }
                 }
             }
@@ -700,7 +898,238 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
+        debug_assert!(
+            self.live_registry.is_empty(),
+            "reactor dropped with live completion states"
+        );
         unsafe { ManuallyDrop::drop(&mut self.op_pool) };
+    }
+}
+
+/// Measures retirement of targets queued after cancel-submit pressure.
+///
+/// This repository-only benchmark seam excludes queue construction from the
+/// timed interval. Each measured operation retires one completion state in
+/// reverse queue order, exercising the pending-cancel unlink path directly.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn benchmark_cancel_submit_pressure(
+    total_rounds: usize,
+    ops_per_round: usize,
+    queue_depth: usize,
+) -> io::Result<Vec<Duration>> {
+    if total_rounds == 0 || ops_per_round == 0 || queue_depth == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+
+    let ring_entries =
+        u32::try_from(queue_depth).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut reactor = Reactor::new_with_config(ReactorConfig { ring_entries })?;
+    reactor.init();
+
+    let mut queued = Vec::new();
+    queued
+        .try_reserve_exact(queue_depth)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let mut durations = Vec::new();
+    durations
+        .try_reserve_exact(total_rounds)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+
+    for _ in 0..total_rounds {
+        let mut remaining = ops_per_round;
+        let mut elapsed = Duration::ZERO;
+
+        while remaining > 0 {
+            let batch = remaining.min(queue_depth);
+            for _ in 0..batch {
+                let state = reactor.alloc_op();
+                if state.is_null() {
+                    return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+
+                // Model the state immediately after an ASYNC_CANCEL submit
+                // failure. Release builds intentionally compile fault hooks
+                // out of the submission fast path, so this repository-only
+                // seam constructs the equivalent queued state directly.
+                unsafe {
+                    (*state).set_orphaned();
+                    (*state).clear_waiter();
+                }
+                reactor.queue_pending_cancel(state);
+                queued.push(state);
+            }
+
+            if reactor.pending_cancels.len() != batch {
+                return Err(io::Error::other(
+                    "cancel-pressure benchmark did not populate the full queue",
+                ));
+            }
+
+            let started = Instant::now();
+            while let Some(state) = queued.pop() {
+                reactor.free_op(state);
+            }
+            elapsed += started.elapsed();
+
+            if !reactor.pending_cancels.is_empty() || !reactor.live_registry.is_empty() {
+                return Err(io::Error::other(
+                    "cancel-pressure benchmark left reactor state queued",
+                ));
+            }
+            remaining -= batch;
+        }
+
+        durations.push(elapsed);
+    }
+
+    Ok(durations)
+}
+
+#[cfg(test)]
+mod pending_cancel_tests {
+    use super::*;
+    use crate::runtime::task::TaskHeader;
+
+    fn queue_states(
+        count: usize,
+        runtime_shutdown: bool,
+    ) -> (Vec<CompletionState>, Vec<*mut CompletionState>) {
+        let mut states: Vec<_> = (0..count).map(|_| CompletionState::empty()).collect();
+        for state in &mut states {
+            if runtime_shutdown {
+                state.set_runtime_shutdown();
+            } else {
+                state.set_orphaned();
+            }
+        }
+        let pointers = states
+            .iter_mut()
+            .map(|state| state as *mut CompletionState)
+            .collect();
+        (states, pointers)
+    }
+
+    unsafe fn assert_queue_links(queue: &PendingCancelQueue, expected: &[*mut CompletionState]) {
+        assert_eq!(queue.len(), expected.len());
+        assert_eq!(queue.head, expected.first().copied().unwrap_or_default());
+        assert_eq!(queue.tail, expected.last().copied().unwrap_or_default());
+
+        let mut previous = std::ptr::null_mut();
+        let mut current = queue.head;
+        for &expected_ptr in expected {
+            assert_eq!(current, expected_ptr);
+            assert_eq!(unsafe { (*current).cancel_prev() }, previous);
+            previous = current;
+            current = unsafe { (*current).cancel_next };
+        }
+        assert!(current.is_null());
+    }
+
+    #[test]
+    fn pending_cancel_queue_unlinks_head_middle_and_tail_in_constant_link_updates() {
+        let (_states, pointers) = queue_states(4, false);
+        let mut queue = PendingCancelQueue::new();
+        for &ptr in &pointers {
+            unsafe { queue.push_back(ptr) };
+        }
+        unsafe { assert_queue_links(&queue, &pointers) };
+
+        assert!(unsafe { queue.unlink(pointers[1]) });
+        unsafe { assert_queue_links(&queue, &[pointers[0], pointers[2], pointers[3]]) };
+
+        assert!(unsafe { queue.unlink(pointers[0]) });
+        unsafe { assert_queue_links(&queue, &[pointers[2], pointers[3]]) };
+
+        assert!(unsafe { queue.unlink(pointers[3]) });
+        unsafe { assert_queue_links(&queue, &[pointers[2]]) };
+
+        assert!(unsafe { queue.unlink(pointers[2]) });
+        unsafe { assert_queue_links(&queue, &[]) };
+
+        for &ptr in &pointers {
+            unsafe {
+                assert!(!(*ptr).is_cancel_pending());
+                assert!((*ptr).waiter.is_null());
+                assert!((*ptr).cancel_next.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn pending_cancel_retry_snapshot_attempts_each_entry_once_in_fifo_order() {
+        let (_states, pointers) = queue_states(3, false);
+        let mut queue = PendingCancelQueue::new();
+        for &ptr in &pointers {
+            unsafe { queue.push_back(ptr) };
+        }
+
+        let retry_budget = queue.len();
+        let mut attempted = Vec::new();
+        for _ in 0..retry_budget {
+            let ptr = unsafe { queue.pop_front() }.expect("retry queue ended early");
+            attempted.push(ptr);
+            unsafe { queue.push_back(ptr) };
+        }
+
+        assert_eq!(attempted, pointers);
+        unsafe { assert_queue_links(&queue, &pointers) };
+        while unsafe { queue.pop_front() }.is_some() {}
+    }
+
+    #[test]
+    fn pending_cancel_prev_reuses_waiter_only_after_reference_release() {
+        let task = TaskHeader::new();
+        let task_ptr = &task as *const TaskHeader as *mut TaskHeader;
+        let (states, pointers) = queue_states(2, false);
+        let second = pointers[1];
+
+        unsafe { (*second).register_waiter(task_ptr) };
+        assert_eq!(task.refs.get(), 2);
+        unsafe { (*second).clear_waiter() };
+        assert_eq!(task.refs.get(), 1);
+
+        let mut queue = PendingCancelQueue::new();
+        unsafe {
+            queue.push_back(pointers[0]);
+            queue.push_back(pointers[1]);
+            assert_eq!((*pointers[1]).cancel_prev(), pointers[0]);
+            queue.unlink(pointers[1]);
+            queue.unlink(pointers[0]);
+        }
+
+        assert_eq!(task.refs.get(), 1);
+        assert!(states[1].waiter.is_null());
+    }
+
+    #[test]
+    fn pending_cancel_shutdown_drain_clears_every_link_and_count() {
+        let (_states, pointers) = queue_states(4, true);
+        let mut queue = PendingCancelQueue::new();
+        for &ptr in &pointers {
+            unsafe { queue.push_back(ptr) };
+        }
+
+        let mut drained = Vec::new();
+        while let Some(ptr) = unsafe { queue.pop_front() } {
+            drained.push(ptr);
+        }
+
+        assert_eq!(drained, pointers);
+        unsafe { assert_queue_links(&queue, &[]) };
+        for ptr in drained {
+            unsafe {
+                assert!(!(*ptr).is_cancel_pending());
+                assert!((*ptr).waiter.is_null());
+                assert!((*ptr).cancel_next.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn completion_state_remains_one_cache_line() {
+        assert_eq!(std::mem::size_of::<CompletionState>(), 64);
+        assert_eq!(std::mem::align_of::<CompletionState>(), 64);
     }
 }
 
@@ -777,13 +1206,34 @@ mod tests {
 
         let state = reactor.alloc_op();
         assert!(!state.is_null(), "op allocation failed");
-        assert_eq!(reactor.live_ops, 1);
+        assert_eq!(reactor.live_registry.len(), 1);
 
         reactor
             .try_free_op(state)
             .expect("live op should retire cleanly");
 
-        assert_eq!(reactor.live_ops, 0);
+        assert!(reactor.live_registry.is_empty());
+    }
+
+    #[test]
+    fn free_op_swap_removal_updates_moved_registry_index() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+
+        let first = reactor.alloc_op();
+        let second = reactor.alloc_op();
+        assert!(!first.is_null(), "first op allocation failed");
+        assert!(!second.is_null(), "second op allocation failed");
+        assert_eq!(unsafe { (*first).registry_index }, 0);
+        assert_eq!(unsafe { (*second).registry_index }, 1);
+
+        reactor.free_op(first);
+
+        assert_eq!(reactor.live_registry, vec![second]);
+        assert_eq!(unsafe { (*second).registry_index }, 0);
+        reactor.free_op(second);
+        assert!(reactor.live_registry.is_empty());
     }
 
     #[test]
@@ -794,16 +1244,19 @@ mod tests {
 
         let state = reactor.alloc_op();
         assert!(!state.is_null(), "op allocation failed");
-        reactor.live_ops = 0;
+        reactor.live_registry.clear();
 
         let err = reactor
             .try_free_op(state)
             .expect_err("freeing without a live op should fail");
 
         assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert_eq!(reactor.live_ops, 0);
+        assert!(reactor.live_registry.is_empty());
 
-        reactor.live_ops = 1;
+        unsafe {
+            (*state).registry_index = 0;
+        }
+        reactor.live_registry.push(state);
         reactor.free_op(state);
     }
 
@@ -832,14 +1285,14 @@ mod tests {
     }
 
     #[test]
-    fn orphan_result_fd_helper_closes_positive_accept_result() {
+    fn unclaimed_result_fd_helper_closes_positive_orphaned_accept_result() {
         let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
         let mut state = CompletionState::empty();
         state.result = fd;
         state.set_orphaned();
         state.set_close_result_fd_on_orphan();
 
-        close_orphan_result_fd_if_needed(&state);
+        close_unclaimed_result_fd_if_needed(&state);
 
         assert!(
             raw_fd_is_closed(fd),
@@ -848,14 +1301,14 @@ mod tests {
     }
 
     #[test]
-    fn orphan_result_fd_helper_ignores_negative_result() {
+    fn unclaimed_result_fd_helper_ignores_negative_result() {
         let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
         let mut state = CompletionState::empty();
         state.result = -libc::ECANCELED;
         state.set_orphaned();
         state.set_close_result_fd_on_orphan();
 
-        close_orphan_result_fd_if_needed(&state);
+        close_unclaimed_result_fd_if_needed(&state);
 
         assert!(
             !raw_fd_is_closed(fd),
@@ -865,12 +1318,12 @@ mod tests {
     }
 
     #[test]
-    fn orphan_result_fd_helper_requires_orphan_and_close_flag() {
+    fn unclaimed_result_fd_helper_requires_owner_state_and_close_flag() {
         let fd_without_orphan = distinctive_closeable_test_fd().expect("socketpair fd failed");
         let mut without_orphan = CompletionState::empty();
         without_orphan.result = fd_without_orphan;
         without_orphan.set_close_result_fd_on_orphan();
-        close_orphan_result_fd_if_needed(&without_orphan);
+        close_unclaimed_result_fd_if_needed(&without_orphan);
         assert!(!raw_fd_is_closed(fd_without_orphan));
         close_fd_if_open(fd_without_orphan);
 
@@ -878,9 +1331,25 @@ mod tests {
         let mut without_flag = CompletionState::empty();
         without_flag.result = fd_without_flag;
         without_flag.set_orphaned();
-        close_orphan_result_fd_if_needed(&without_flag);
+        close_unclaimed_result_fd_if_needed(&without_flag);
         assert!(!raw_fd_is_closed(fd_without_flag));
         close_fd_if_open(fd_without_flag);
+    }
+
+    #[test]
+    fn unclaimed_result_fd_helper_closes_runtime_shutdown_accept_result() {
+        let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
+        let mut state = CompletionState::empty();
+        state.result = fd;
+        state.set_runtime_shutdown();
+        state.set_close_result_fd_on_orphan();
+
+        close_unclaimed_result_fd_if_needed(&state);
+
+        assert!(
+            raw_fd_is_closed(fd),
+            "shutdown-owned accept result fd stayed open"
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -1035,7 +1504,7 @@ mod tests {
             assert!((*state).is_orphaned());
             assert!((*state).is_cancel_pending());
         }
-        assert_eq!(reactor.pending_cancel_len, 1);
+        assert_eq!(reactor.pending_cancels.len(), 1);
 
         reactor.retry_pending_cancels();
 
@@ -1043,7 +1512,7 @@ mod tests {
             reactor.pending,
             "cancel retry should queue an SQE for the next reactor flush"
         );
-        assert_eq!(reactor.pending_cancel_len, 0);
+        assert_eq!(reactor.pending_cancels.len(), 0);
         unsafe {
             assert!(!(*state).is_cancel_pending());
         }
@@ -1053,22 +1522,110 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn freeing_original_cqe_unlinks_pending_cancel_retry() {
+    fn failed_cancel_retry_uses_one_fifo_snapshot_per_pass() {
         let mut reactor =
             Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
         reactor.init();
-        let state = reactor.alloc_op();
-        assert!(!state.is_null(), "op allocation failed");
+        let states = [reactor.alloc_op(), reactor.alloc_op(), reactor.alloc_op()];
+        assert!(states.iter().all(|state| !state.is_null()));
 
-        crate::runtime::test_hooks::fail_next_raw_sqe_submit();
-        reactor.cancel_op(state);
-        assert_eq!(reactor.pending_cancel_len, 1);
+        for &state in &states {
+            crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+            reactor.cancel_op(state);
+        }
+        for _ in &states {
+            crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+        }
 
-        reactor.free_op(state);
+        reactor.retry_pending_cancels();
 
-        assert_eq!(reactor.pending_cancel_len, 0);
-        assert!(reactor.pending_cancel_head.is_null());
-        assert!(reactor.pending_cancel_tail.is_null());
+        assert_eq!(reactor.pending_cancels.len(), states.len());
+        assert_eq!(reactor.pending_cancels.head, states[0]);
+        assert_eq!(reactor.pending_cancels.tail, states[2]);
+        unsafe {
+            assert_eq!((*states[0]).cancel_next, states[1]);
+            assert_eq!((*states[1]).cancel_prev(), states[0]);
+            assert_eq!((*states[1]).cancel_next, states[2]);
+            assert_eq!((*states[2]).cancel_prev(), states[1]);
+        }
+        assert!(
+            !reactor.pending,
+            "failed retry pass should not have queued an SQE"
+        );
+
+        reactor.retry_pending_cancels();
+        assert!(reactor.pending_cancels.is_empty());
+        assert!(
+            reactor.pending,
+            "successful retries should queue cancel SQEs"
+        );
+
+        for state in states.into_iter().rev() {
+            reactor.free_op(state);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn shutdown_prepare_preserves_links_for_already_queued_orphans() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let states = [reactor.alloc_op(), reactor.alloc_op()];
+        assert!(states.iter().all(|state| !state.is_null()));
+
+        for &state in &states {
+            crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+            reactor.cancel_op(state);
+        }
+
+        reactor.prepare_shutdown();
+
+        assert_eq!(reactor.pending_cancels.len(), states.len());
+        assert_eq!(reactor.pending_cancels.head, states[0]);
+        assert_eq!(reactor.pending_cancels.tail, states[1]);
+        unsafe {
+            assert_eq!((*states[0]).cancel_next, states[1]);
+            assert_eq!((*states[1]).cancel_prev(), states[0]);
+        }
+
+        reactor.free_op(states[1]);
+        reactor.free_op(states[0]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn target_retirement_unlinks_pending_cancel_head_middle_and_tail() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let states = [reactor.alloc_op(), reactor.alloc_op(), reactor.alloc_op()];
+        assert!(states.iter().all(|state| !state.is_null()));
+
+        for &state in &states {
+            crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+            reactor.cancel_op(state);
+        }
+        assert_eq!(reactor.pending_cancels.len(), 3);
+
+        reactor.free_op(states[1]);
+        assert_eq!(reactor.pending_cancels.len(), 2);
+        assert_eq!(reactor.pending_cancels.head, states[0]);
+        assert_eq!(reactor.pending_cancels.tail, states[2]);
+        unsafe {
+            assert_eq!((*states[0]).cancel_next, states[2]);
+            assert_eq!((*states[2]).cancel_prev(), states[0]);
+        }
+
+        reactor.free_op(states[2]);
+        assert_eq!(reactor.pending_cancels.len(), 1);
+        assert_eq!(reactor.pending_cancels.head, states[0]);
+        assert_eq!(reactor.pending_cancels.tail, states[0]);
+
+        reactor.free_op(states[0]);
+        assert!(reactor.pending_cancels.is_empty());
+        assert!(reactor.pending_cancels.head.is_null());
+        assert!(reactor.pending_cancels.tail.is_null());
     }
 
     #[cfg(debug_assertions)]
@@ -1082,13 +1639,13 @@ mod tests {
 
         crate::runtime::test_hooks::fail_next_raw_sqe_submit();
         reactor.cancel_op(state);
-        assert_eq!(reactor.pending_cancel_len, 1);
+        assert_eq!(reactor.pending_cancels.len(), 1);
 
         crate::runtime::test_hooks::fail_next_raw_sqe_submit();
         let status = reactor.flush_sqes().expect("cancel retry flush failed");
 
         assert_eq!(status, ReactorSubmitStatus::Busy);
-        assert_eq!(reactor.pending_cancel_len, 1);
+        assert_eq!(reactor.pending_cancels.len(), 1);
         unsafe {
             assert!((*state).is_cancel_pending());
         }

@@ -1,16 +1,18 @@
 mod common;
 
 use common::{
-    HugeReadOnly, TestIoBuffMut as IoBuffMut, TestProjected, TryMismatchedProjected,
-    TryOversizedProjected, assert_poll_after_ready_parks, fill_try_send_buffer, make_payload_chain,
-    make_read_chain, make_read_only_chain, run_test,
+    HugeReadOnly, InitializationTrackedReadWrite, TestIoBuffMut as IoBuffMut, TestProjected,
+    TryMismatchedProjected, TryOversizedProjected, assert_poll_after_ready_parks,
+    fill_try_send_buffer, make_payload_chain, make_read_chain, make_read_only_chain, run_test,
 };
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
+use std::rc::Rc;
 
 /// Returns a FlowIO UnixStream wrapping one nonblocking socketpair endpoint
 /// plus its connected std peer for one-shot tests that do not need a reactor.
@@ -47,6 +49,25 @@ fn runtime_unix_try_read_immediate_partial_and_would_block() {
 }
 
 #[test]
+fn runtime_unix_kernel_read_skips_userspace_initialization() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_unix_stream();
+        peer.write_all(b"ping").expect("std write failed");
+
+        let initialization_calls = Rc::new(Cell::new(0));
+        let initialized_bytes = Rc::new(Cell::new(0));
+        let buffer =
+            InitializationTrackedReadWrite::new(8, &initialization_calls, &initialized_bytes);
+        let (result, buffer) = stream.read(buffer, 8).await;
+
+        assert_eq!(result.expect("kernel read failed"), 4);
+        assert_eq!(buffer.bytes(), b"ping");
+        assert_eq!(initialization_calls.get(), 0);
+        assert_eq!(initialized_bytes.get(), 0);
+    });
+}
+
+#[test]
 fn runtime_unix_try_read_rejects_invalid_len() {
     let (mut stream, _peer) = connected_try_unix_stream();
     let mut recv = IoBuffMut::new(0, 4, 0);
@@ -56,6 +77,30 @@ fn runtime_unix_try_read_rejects_invalid_len() {
     let err = res.expect_err("oversize try_read should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(recv.payload_bytes(), b"ab");
+}
+
+#[test]
+fn runtime_unix_try_read_prefilled_and_sealed_zero_preserve_payload() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+    peer.write_all(b"ok").expect("std write failed");
+
+    let mut recv = IoBuffMut::new(0, 8, 0);
+    recv.payload_append(b"HEAD").unwrap();
+    let (res, recv) = stream.try_read(recv, 2);
+    assert_eq!(res.expect("prefilled try_read failed"), 2);
+    assert_eq!(recv.payload_bytes(), b"HEADok");
+
+    let mut sealed = IoBuffMut::new(0, 8, 2);
+    sealed.payload_append(b"HEAD").unwrap();
+    sealed.tailroom_append(b":T").unwrap();
+    let (res, sealed) = stream.try_read(sealed, 0);
+    assert_eq!(res.expect("sealed zero read failed"), 0);
+    assert_eq!(sealed.bytes(), b"HEAD:T");
+
+    let (res, sealed) = stream.try_read(sealed, 1);
+    let err = res.expect_err("sealed positive read should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(sealed.bytes(), b"HEAD:T");
 }
 
 #[test]
@@ -191,10 +236,11 @@ fn runtime_unix_stream_ping_pong() {
         let (res, _buf) = client.write(b"ping".to_vec()).await;
         assert_eq!(res.expect("write failed"), 4);
 
-        let recv = vec![0u8; 4];
+        let mut recv = IoBuffMut::new(0, 8, 0);
+        recv.payload_append(b"HEAD").unwrap();
         let (res, buf) = client.read(recv, 4).await;
         assert_eq!(res.expect("read failed"), 4);
-        assert_eq!(&buf[..4], b"pong");
+        assert_eq!(buf.payload_bytes(), b"HEADpong");
     });
 }
 
@@ -219,10 +265,11 @@ fn runtime_unix_write_all_read_exact() {
         let (res, _buf) = client.write_all(send).await;
         assert_eq!(res.expect("write_all failed"), 4);
 
-        let recv = vec![0u8; 4];
+        let mut recv = IoBuffMut::new(0, 8, 0);
+        recv.payload_append(b"HEAD").unwrap();
         let (res, buf) = client.read_exact(recv, 4).await;
         assert_eq!(res.expect("read_exact failed"), 4);
-        assert_eq!(&buf[..], b"pong");
+        assert_eq!(buf.payload_bytes(), b"HEADpong");
     });
 }
 
@@ -269,11 +316,25 @@ fn runtime_unix_read_exact_eof() {
         })
         .expect("spawn server failed");
 
-        let recv = vec![0u8; 4];
+        let mut recv = IoBuffMut::new(0, 8, 0);
+        recv.payload_append(b"HEAD").unwrap();
         let (res, buf) = client.read_exact(recv, 4).await;
         let err = res.expect_err("should fail with UnexpectedEof");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-        assert_eq!(&buf[..2], b"hi");
+        assert_eq!(buf.payload_bytes(), b"HEADhi");
+
+        let (mut client, mut server) = UnixStream::pair().expect("second socketpair failed");
+        Executor::spawn(async move {
+            let (res, _buf) = server.write_all(b"hi".to_vec()).await;
+            res.expect("second server write_all failed");
+            drop(server);
+        })
+        .expect("second server spawn failed");
+
+        let (res, buf) = client.read_exact(b"HEAD".to_vec(), 4).await;
+        let err = res.expect_err("base-zero exact read should report partial EOF");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(buf, b"hi", "positive base-zero progress should overwrite");
     });
 }
 
@@ -361,9 +422,10 @@ fn runtime_unix_shutdown_write() {
             assert_eq!(&buf[..], b"hello");
 
             // Next read should see EOF
-            let buf2 = vec![0u8; 1];
-            let (res, _buf) = reader.read(buf2, 1).await;
+            let buf2 = b"X".to_vec();
+            let (res, buf2) = reader.read(buf2, 1).await;
             assert_eq!(res.expect("read after shutdown failed"), 0);
+            assert_eq!(buf2, b"X", "EOF must preserve existing contents");
         })
         .expect("executor run failed");
 }

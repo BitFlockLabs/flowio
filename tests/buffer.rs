@@ -7,6 +7,7 @@ use flowio::runtime::buffer::{
     IoBuffReadWrite, IoBuffView,
 };
 use static_assertions::assert_not_impl_any;
+use std::mem::MaybeUninit;
 
 fn expect_view(view: Result<IoBuffView, IoBuffError>) -> IoBuffView {
     view.expect("valid IoBuff slice in test")
@@ -26,6 +27,16 @@ fn assert_active_window_within_allocation(buf: &RealIoBuffMut, base: *const u8, 
         "active window end {end} exceeds allocation capacity {total}"
     );
     let _ = buf.bytes();
+}
+
+fn initialize_spare_prefix(spare: &mut [MaybeUninit<u8>], bytes: &[u8]) {
+    assert!(
+        bytes.len() <= spare.len(),
+        "test payload exceeds spare capacity"
+    );
+    for (slot, byte) in spare.iter_mut().zip(bytes) {
+        slot.write(*byte);
+    }
 }
 
 // ============================================================================
@@ -135,12 +146,13 @@ fn buffer_mut_payload_set_len() {
 
     // Write directly into the unwritten region
     let spare = buf.payload_unwritten_mut();
-    spare[..6].copy_from_slice(b"direct");
+    initialize_spare_prefix(spare, b"direct");
     println!("  Wrote 'direct' into payload_unwritten_mut");
 
-    buf.payload_set_len(6).unwrap();
+    // SAFETY: all six newly published payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(6).unwrap() };
     println!(
-        "  After payload_set_len(6): payload={:?}",
+        "  After payload_set_len_initialized(6): payload={:?}",
         buf.payload_bytes()
     );
     assert_eq!(buf.payload_bytes(), b"direct");
@@ -166,6 +178,232 @@ fn buffer_mut_payload_set_len_overflow_returns_error() {
     let result = buf.payload_set_len(9);
     println!("  payload_set_len(9) on capacity=8: {:?}", result);
     assert_eq!(result, Err(IoBuffError::PayloadFull));
+}
+
+#[test]
+fn buffer_spare_capacity_api_signatures_are_initialization_safe() {
+    let unwritten: for<'a> fn(&'a mut RealIoBuffMut) -> &'a mut [MaybeUninit<u8>] =
+        RealIoBuffMut::payload_unwritten_mut;
+    let publish: for<'a> unsafe fn(&'a mut RealIoBuffMut, usize) -> Result<(), IoBuffError> =
+        RealIoBuffMut::payload_set_len_initialized;
+    let userspace: for<'a> unsafe fn(&'a mut RealIoBuffMut, usize) -> &'a mut [u8] =
+        <RealIoBuffMut as IoBuffReadWrite>::initialized_writable_slice;
+    let write_base: for<'a> fn(&'a RealIoBuffMut) -> usize =
+        <RealIoBuffMut as IoBuffReadWrite>::write_base_len;
+
+    let mut buf = IoBuffMut::new(0, 4, 0);
+    assert_eq!(write_base(&buf), 0);
+    assert_eq!(unwritten(&mut buf).len(), 4);
+    // SAFETY: one byte is within the validated writable capacity.
+    assert_eq!(unsafe { userspace(&mut buf, 1) }, &[0]);
+    // SAFETY: publishing zero bytes exposes no new storage.
+    unsafe { publish(&mut buf, 0).unwrap() };
+}
+
+#[test]
+fn buffer_safe_growth_requires_initialized_payload() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+
+    assert_eq!(
+        buf.payload_set_len(1),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    assert_eq!(buf.payload_len(), 0);
+    assert_eq!(buf.payload_remaining(), 8);
+    assert!(buf.payload_bytes().is_empty());
+}
+
+#[test]
+fn buffer_partial_initialization_publishes_only_initialized_prefix() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+    initialize_spare_prefix(buf.payload_unwritten_mut(), b"abc");
+
+    // SAFETY: the first three payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(3).unwrap() };
+    assert_eq!(buf.payload_bytes(), b"abc");
+    assert_eq!(
+        buf.payload_set_len(4),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    assert_eq!(buf.payload_bytes(), b"abc");
+}
+
+#[test]
+fn buffer_safe_shrink_and_regrow_stay_within_initialized_frontier() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+    initialize_spare_prefix(buf.payload_unwritten_mut(), b"abcdef");
+    // SAFETY: the first six payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(6).unwrap() };
+
+    buf.payload_set_len(3).unwrap();
+    assert_eq!(buf.payload_bytes(), b"abc");
+    buf.payload_set_len(6).unwrap();
+    assert_eq!(buf.payload_bytes(), b"abcdef");
+
+    buf.payload_set_len(4).unwrap();
+    assert_eq!(
+        buf.payload_set_len(7),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    assert_eq!(buf.payload_bytes(), b"abcd");
+}
+
+#[test]
+fn buffer_spare_borrow_discards_hidden_initialization_knowledge() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+    initialize_spare_prefix(buf.payload_unwritten_mut(), b"abcd");
+    // SAFETY: the first four payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(4).unwrap() };
+    buf.payload_set_len(2).unwrap();
+
+    {
+        let spare = buf.payload_unwritten_mut();
+        spare[0] = MaybeUninit::uninit();
+    }
+
+    assert_eq!(
+        buf.payload_set_len(3),
+        Err(IoBuffError::PayloadUninitialized),
+        "a safe spare borrow may de-initialize hidden bytes"
+    );
+    assert_eq!(buf.payload_bytes(), b"ab");
+}
+
+#[test]
+fn buffer_initialized_publication_errors_are_atomic() {
+    let mut capacity_limited = IoBuffMut::new(0, 4, 0);
+    initialize_spare_prefix(capacity_limited.payload_unwritten_mut(), b"ab");
+    // SAFETY: the first two payload bytes were initialized above.
+    unsafe { capacity_limited.payload_set_len_initialized(2).unwrap() };
+
+    // SAFETY: this call cannot publish because the requested length is beyond
+    // capacity; the error must leave both visible length and frontier intact.
+    let result = unsafe { capacity_limited.payload_set_len_initialized(5) };
+    assert_eq!(result, Err(IoBuffError::PayloadFull));
+    assert_eq!(capacity_limited.payload_bytes(), b"ab");
+    assert_eq!(
+        capacity_limited.payload_set_len(3),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+
+    let mut sealed = IoBuffMut::new(0, 4, 2);
+    sealed.payload_append(b"ab").unwrap();
+    sealed.tailroom_append(b"T").unwrap();
+    // SAFETY: this call cannot publish while tailroom is active; the error
+    // must leave the existing payload and trailer unchanged.
+    let result = unsafe { sealed.payload_set_len_initialized(3) };
+    assert_eq!(result, Err(IoBuffError::PayloadSealed));
+    assert_eq!(sealed.payload_len(), 2);
+    assert_eq!(sealed.bytes(), b"abT");
+}
+
+#[test]
+fn buffer_initialized_frontier_tracks_advance_and_reset() {
+    let mut buf = IoBuffMut::new(0, 8, 0);
+    initialize_spare_prefix(buf.payload_unwritten_mut(), b"abcdef");
+    // SAFETY: the first six payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(6).unwrap() };
+
+    buf.advance(2).unwrap();
+    assert_eq!(buf.payload_bytes(), b"cdef");
+    assert_eq!(
+        buf.payload_set_len(5),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    initialize_spare_prefix(buf.payload_unwritten_mut(), b"g");
+    // SAFETY: four bytes remain initialized after advance and the next byte
+    // was initialized above.
+    unsafe { buf.payload_set_len_initialized(5).unwrap() };
+    assert_eq!(buf.payload_bytes(), b"cdefg");
+
+    buf.reset();
+    assert!(buf.payload_bytes().is_empty());
+    assert_eq!(
+        buf.payload_set_len(1),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+}
+
+#[test]
+fn buffer_advance_into_tailroom_does_not_publish_stale_trailer_bytes() {
+    let mut buf = IoBuffMut::new(0, 2, 2);
+    buf.payload_append(b"ab").unwrap();
+    buf.tailroom_append(b"XY").unwrap();
+
+    buf.advance(3).unwrap();
+    assert_eq!(buf.bytes(), b"Y");
+    assert!(buf.payload_unwritten_mut().is_empty());
+
+    buf.advance(1).unwrap();
+    assert!(buf.bytes().is_empty());
+    assert!(buf.payload_unwritten_mut().is_empty());
+    assert_eq!(buf.payload_set_len(1), Err(IoBuffError::PayloadFull));
+}
+
+#[test]
+fn buffer_tailroom_extension_after_advance_keeps_new_payload_uninitialized() {
+    let mut buf = IoBuffMut::new(0, 2, 4);
+    buf.payload_append(b"ab").unwrap();
+    buf.tailroom_append(b"WXYZ").unwrap();
+
+    buf.advance(3).unwrap();
+    assert_eq!(buf.bytes(), b"XYZ");
+    buf.payload_extend_from_tailroom(4).unwrap();
+
+    assert!(buf.is_empty());
+    assert_eq!(buf.payload_remaining(), 3);
+    assert_eq!(
+        buf.payload_set_len(1),
+        Err(IoBuffError::PayloadUninitialized),
+        "discarded trailer bytes must not become safely publishable payload"
+    );
+
+    initialize_spare_prefix(buf.payload_unwritten_mut(), b"N");
+    // SAFETY: the first byte in the newly available payload region was
+    // initialized above.
+    unsafe { buf.payload_set_len_initialized(1).unwrap() };
+    assert_eq!(buf.payload_bytes(), b"N");
+}
+
+#[test]
+fn buffer_freeze_thaw_and_shared_cow_discard_unpublished_frontier() {
+    let mut sole = IoBuffMut::new(0, 8, 0);
+    initialize_spare_prefix(sole.payload_unwritten_mut(), b"abcdef");
+    // SAFETY: the first six payload bytes were initialized above.
+    unsafe { sole.payload_set_len_initialized(6).unwrap() };
+    sole.payload_set_len(3).unwrap();
+
+    let frozen = sole.freeze();
+    assert_eq!(frozen.bytes(), b"abc");
+    let mut thawed = frozen.try_mut().expect("sole frozen owner must thaw");
+    assert_eq!(
+        thawed.payload_set_len(4),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    initialize_spare_prefix(thawed.payload_unwritten_mut(), b"d");
+    // SAFETY: the next unpublished byte was initialized above.
+    unsafe { thawed.payload_set_len_initialized(4).unwrap() };
+    assert_eq!(thawed.payload_bytes(), b"abcd");
+
+    let mut shared_source = IoBuffMut::new(0, 8, 0);
+    initialize_spare_prefix(shared_source.payload_unwritten_mut(), b"wxyzQR");
+    // SAFETY: the first six payload bytes were initialized above.
+    unsafe { shared_source.payload_set_len_initialized(6).unwrap() };
+    shared_source.payload_set_len(4).unwrap();
+    let frozen = shared_source.freeze();
+    let shared = frozen.clone();
+    let mut copied = frozen.make_mut().unwrap();
+
+    assert_eq!(copied.payload_bytes(), b"wxyz");
+    assert_eq!(
+        copied.payload_set_len(5),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    initialize_spare_prefix(copied.payload_unwritten_mut(), b"!");
+    // SAFETY: the next unpublished byte was initialized above.
+    unsafe { copied.payload_set_len_initialized(5).unwrap() };
+    assert_eq!(copied.payload_bytes(), b"wxyz!");
+    assert_eq!(shared.bytes(), b"wxyz");
 }
 
 // ============================================================================
@@ -428,8 +666,9 @@ fn buffer_mut_advance_payload_accessors_follow_active_payload() {
 
     let spare = buf.payload_unwritten_mut();
     assert_eq!(spare.len(), 4);
-    spare[..2].copy_from_slice(b"gh");
-    buf.payload_set_len(6).unwrap();
+    initialize_spare_prefix(spare, b"gh");
+    // SAFETY: the two newly published payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(6).unwrap() };
     assert_eq!(buf.payload_bytes(), b"Cdefgh");
     assert_eq!(buf.bytes(), b"Cdefgh");
 
@@ -1094,11 +1333,13 @@ fn buffer_trait_read_write_on_iobuff_mut() {
 
     let writable_ptr = IoBuffReadWrite::as_mut_ptr(&mut buf);
     let writable_len = IoBuffReadWrite::writable_len(&buf);
+    let write_base_len = IoBuffReadWrite::write_base_len(&buf);
     println!(
         "  writable_ptr: {:?}, writable_len: {}",
         writable_ptr, writable_len
     );
     assert_eq!(writable_len, 64);
+    assert_eq!(write_base_len, 0);
 
     // Simulate kernel write
     unsafe {
@@ -1111,6 +1352,17 @@ fn buffer_trait_read_write_on_iobuff_mut() {
     );
     assert_eq!(buf.payload_bytes(), b"kernel_data");
     assert_eq!(buf.payload_len(), 11);
+}
+
+#[test]
+fn buffer_trait_iobuff_write_base_tracks_payload_not_active_window() {
+    let mut buf = IoBuffMut::new(4, 8, 0);
+    buf.headroom_prepend(b"H:").unwrap();
+    buf.payload_append(b"HEAD").unwrap();
+
+    assert_eq!(IoBuffReadWrite::write_base_len(&buf), 4);
+    assert_eq!(IoBuffReadWrite::writable_len(&buf), 4);
+    assert_eq!(IoBuffReadOnly::len(&buf), 6);
 }
 
 #[test]
@@ -1224,8 +1476,9 @@ fn buffer_mut_payload_unwritten_mut_partial_fill() {
     // Then fill 4 more bytes directly
     let spare = buf.payload_unwritten_mut();
     println!("  Spare capacity after 3 bytes: {}", spare.len());
-    spare[..4].copy_from_slice(b"defg");
-    buf.payload_set_len(7).unwrap();
+    initialize_spare_prefix(spare, b"defg");
+    // SAFETY: the four newly published payload bytes were initialized above.
+    unsafe { buf.payload_set_len_initialized(7).unwrap() };
 
     println!("  After partial fill: payload={:?}", buf.payload_bytes());
     assert_eq!(buf.payload_bytes(), b"abcdefg");
@@ -1300,6 +1553,7 @@ fn trait_vec_u8_read_write_prefilled_vec_is_fixed_scratch_from_zero() {
 
     let writable = IoBuffReadWrite::writable_len(&v);
     assert_eq!(writable, v.capacity());
+    assert_eq!(IoBuffReadWrite::write_base_len(&v), 0);
 
     let ptr = IoBuffReadWrite::as_mut_ptr(&mut v);
     unsafe {

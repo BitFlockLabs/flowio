@@ -1,5 +1,5 @@
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig, IoBuffPoolConfigError};
-use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly};
+use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly, IoBuffReadWrite};
 
 macro_rules! seg {
     ($chain:expr, $index:expr) => {
@@ -166,6 +166,89 @@ fn pool_reuse_resets_state() {
     assert_eq!(reused.headroom_remaining(), 8);
     assert_eq!(reused.payload_remaining(), 64);
     assert_eq!(reused.tailroom_remaining(), 8);
+}
+
+#[test]
+fn pool_exact_slot_reuse_resets_initialized_frontier() {
+    let mut pool = new_pool(IoBuffPoolConfig {
+        headroom: 0,
+        payload: 16,
+        tailroom: 0,
+        objs_per_slab: 1,
+    });
+    pool.init();
+
+    let mut first = pool.alloc().unwrap();
+    let first_ptr = IoBuffReadOnly::as_ptr(&first);
+    for (slot, byte) in first.payload_unwritten_mut()[..5].iter_mut().zip(b"stale") {
+        slot.write(*byte);
+    }
+    // SAFETY: all five newly exposed payload bytes were initialized above.
+    unsafe { first.payload_set_len_initialized(5).unwrap() };
+    assert_eq!(first.payload_bytes(), b"stale");
+    drop(first);
+
+    let mut reused = pool.alloc().unwrap();
+    assert_eq!(IoBuffReadOnly::as_ptr(&reused), first_ptr);
+    assert!(reused.is_empty());
+    assert_eq!(
+        reused.payload_set_len(1),
+        Err(IoBuffError::PayloadUninitialized),
+        "a reused slot must not treat stale storage as initialized"
+    );
+
+    for (slot, byte) in reused.payload_unwritten_mut()[..5].iter_mut().zip(b"fresh") {
+        slot.write(*byte);
+    }
+    // SAFETY: all five newly exposed payload bytes were reinitialized for the
+    // new slot lifetime above.
+    unsafe { reused.payload_set_len_initialized(5).unwrap() };
+    assert_eq!(reused.payload_bytes(), b"fresh");
+}
+
+#[test]
+fn pool_partial_publication_lifecycle_tracks_exact_frontier() {
+    let mut pool = new_pool(IoBuffPoolConfig {
+        headroom: 0,
+        payload: 12,
+        tailroom: 0,
+        objs_per_slab: 1,
+    });
+    pool.init();
+
+    let mut buf = pool.alloc().unwrap();
+    for (slot, byte) in buf.payload_unwritten_mut()[..3].iter_mut().zip(b"one") {
+        slot.write(*byte);
+    }
+    // SAFETY: bytes 0..3 were initialized above.
+    unsafe { buf.payload_set_len_initialized(3).unwrap() };
+    assert_eq!(buf.payload_bytes(), b"one");
+    assert_eq!(
+        buf.payload_set_len(4),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    assert_eq!(buf.payload_bytes(), b"one");
+
+    for (slot, byte) in buf.payload_unwritten_mut()[..3].iter_mut().zip(b"two") {
+        slot.write(*byte);
+    }
+    // SAFETY: bytes 3..6 were initialized above and bytes 0..3 remain inside
+    // the initialized frontier.
+    unsafe { buf.payload_set_len_initialized(6).unwrap() };
+    assert_eq!(buf.payload_bytes(), b"onetwo");
+
+    buf.payload_set_len(2).unwrap();
+    assert_eq!(buf.payload_bytes(), b"on");
+    buf.payload_set_len(6).unwrap();
+    assert_eq!(buf.payload_bytes(), b"onetwo");
+
+    buf.reset();
+    assert!(buf.is_empty());
+    assert_eq!(
+        buf.payload_set_len(1),
+        Err(IoBuffError::PayloadUninitialized),
+        "reset must discard the initialized frontier"
+    );
 }
 
 // ============================================================================
@@ -541,9 +624,36 @@ fn pool_simulated_readv() {
     println!("  writable_len: {}", chain.writable_len());
     assert_eq!(chain.writable_len(), 384);
 
-    // SAFETY: a real readv would have initialized the first 200 bytes across
-    // the iovec chain; distribute_written advances payload_len per segment in
-    // order, filling 128 bytes, then 72 bytes, then leaving the third empty.
+    // Materialize the same pointer/length metadata a real readv would receive,
+    // then initialize its first 200 bytes in kernel fill order.
+    let mut iovecs = Vec::with_capacity(chain.segments());
+    for index in 0..chain.segments() {
+        let buffer = chain.get_mut(index).expect("active pool chain segment");
+        iovecs.push(libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.writable_len(),
+        });
+    }
+    let mut remaining = 200;
+    let mut initialized = Vec::with_capacity(200);
+    for iovec in iovecs {
+        let written = remaining.min(iovec.iov_len);
+        for offset in 0..written {
+            let byte = (initialized.len() as u8).wrapping_add(0x40);
+            // SAFETY: this write stays within the materialized writable iovec.
+            unsafe { iovec.iov_base.cast::<u8>().add(offset).write(byte) };
+            initialized.push(byte);
+        }
+        remaining -= written;
+        if remaining == 0 {
+            break;
+        }
+    }
+    assert_eq!(remaining, 0);
+
+    // SAFETY: the first 200 bytes across the materialized iovecs were
+    // initialized above. Publication fills 128 bytes, then 72 bytes, and
+    // leaves the third segment empty.
     unsafe { chain.distribute_written(200) };
 
     println!("  seg0 payload_len: {}", seg!(chain, 0).payload_len());
@@ -553,6 +663,8 @@ fn pool_simulated_readv() {
     assert_eq!(seg!(chain, 0).payload_len(), 128); // full
     assert_eq!(seg!(chain, 1).payload_len(), 72); // partial
     assert_eq!(seg!(chain, 2).payload_len(), 0); // untouched
+    assert_eq!(seg!(chain, 0).payload_bytes(), &initialized[..128]);
+    assert_eq!(seg!(chain, 1).payload_bytes(), &initialized[128..]);
     println!("  Simulated readv: OK");
 }
 

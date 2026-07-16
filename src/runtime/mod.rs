@@ -9,6 +9,17 @@
 //! - [`buffer`] for heap-, pool-, and vectored I/O buffers
 //! - [`timer`] for runtime-native sleeps and timeouts
 //!
+//! Only one [`executor::Executor::run`] may be active on a thread. Runtime I/O
+//! and timer futures must be polled by the FlowIO executor that first submitted
+//! or armed them. Polling without an active FlowIO run or with another
+//! executor's task waker returns [`std::io::ErrorKind::NotConnected`]. A
+//! submitted rental I/O future retains its caller-owned buffer until the
+//! original completion arrives, then returns that buffer with the error.
+//! Standard task wakers must be cloned, woken, and dropped on their owner
+//! thread. Debug builds assert this contract; no cross-thread relay exists.
+//! Timeout wrappers distinguish deadline expiry ([`timer::TimeoutError::Elapsed`])
+//! from timer-runtime failure ([`timer::TimeoutError::Runtime`]).
+//!
 //! # Fast-Path Guidance
 //!
 //! Preferred on the fast path:
@@ -48,6 +59,7 @@ pub(crate) mod fd;
 pub(crate) mod io;
 pub(crate) mod op;
 pub mod reactor;
+pub(crate) mod refcount;
 #[allow(dead_code)]
 pub(crate) mod retained;
 #[cfg(feature = "test-support")]

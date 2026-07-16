@@ -226,7 +226,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
                 .await
                 .expect("timer warmup sleep failed");
             let warm = Executor::spawn(async { 7usize }).expect("spawn warmup failed");
-            assert_eq!(warm.await, 7);
+            assert_eq!(warm.await.expect("warmup task cancelled"), 7);
 
             let before = AllocationSnapshot::current();
 
@@ -248,7 +248,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
                     .await
                     .expect("timer steady-state sleep failed");
                 let handle = Executor::spawn(async { 11usize }).expect("spawn failed");
-                assert_eq!(handle.await, 11);
+                assert_eq!(handle.await.expect("spawned task cancelled"), 11);
             }
 
             let after = AllocationSnapshot::current();

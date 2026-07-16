@@ -9,11 +9,13 @@ use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
 use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_closes_completed_fd;
+use flowio::test_support::runtime::test_hooks;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
 use std::os::fd::IntoRawFd;
-use std::task::Poll;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 /// Spawns a std TCP peer that connects, verifies the payload it receives, and
@@ -103,9 +105,11 @@ fn runtime_tcp_try_read_partial_success() {
     let (mut stream, mut peer) = connected_try_tcp_stream();
     peer.write_all(b"hi").expect("std write failed");
 
-    let (res, buf) = stream.try_read(vec![0u8; 5], 5);
+    let mut recv = IoBuffMut::new(0, 8, 0);
+    recv.payload_append(b"HEAD").unwrap();
+    let (res, buf) = stream.try_read(recv, 4);
     assert_eq!(res.expect("try_read failed"), 2);
-    assert_eq!(&buf[..], b"hi");
+    assert_eq!(buf.payload_bytes(), b"HEADhi");
 }
 
 #[test]
@@ -114,16 +118,14 @@ fn runtime_tcp_try_read_eof() {
     peer.shutdown(Shutdown::Write)
         .expect("std shutdown write failed");
 
-    let mut buf = vec![0u8; 4];
+    let mut buf = b"HEAD".to_vec();
+    buf.reserve(4);
     for _ in 0..100 {
         let (res, returned) = stream.try_read(buf, 4);
         buf = returned;
         match res {
             Ok(0) => {
-                assert!(
-                    buf.is_empty(),
-                    "EOF reports 0 bytes read, so the written length is 0"
-                );
+                assert_eq!(buf, b"HEAD", "EOF must preserve existing contents");
                 return;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
@@ -349,8 +351,11 @@ fn runtime_tcp_split_clone_supports_concurrent_async_read_and_write() {
         })
         .expect("spawn split reader failed");
 
-        assert_eq!(writer.await, b"ping".to_vec());
-        assert_eq!(&reader.await[..], b"pong");
+        assert_eq!(
+            writer.await.expect("writer task cancelled"),
+            b"ping".to_vec()
+        );
+        assert_eq!(&reader.await.expect("reader task cancelled")[..], b"pong");
     });
 
     peer.join().expect("peer panicked");
@@ -427,6 +432,21 @@ fn tcp_accept_forgotten_future_reports_busy_slot_would_block() {
         };
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     });
+}
+
+#[test]
+fn tcp_accept_busy_error_outside_run_prefers_context_error() {
+    let mut listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128)
+        .expect("listener bind failed");
+    let first_accept = listener.accept();
+    std::mem::forget(first_accept);
+
+    let mut second_accept = listener.accept();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        Pin::new(&mut second_accept).poll(&mut cx),
+        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+    ));
 }
 
 #[test]
@@ -537,11 +557,12 @@ fn runtime_tcp_read_exact_eof() {
         .run(async move {
             let (mut stream, _addr) = listener.accept().await.expect("accept failed");
 
-            let recv = vec![0u8; 4];
+            let mut recv = IoBuffMut::new(0, 8, 0);
+            recv.payload_append(b"HEAD").unwrap();
             let (res, buf) = stream.read_exact(recv, 4).await;
             let err = res.expect_err("should fail with UnexpectedEof");
             assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-            assert_eq!(&buf[..2], b"hi");
+            assert_eq!(buf.payload_bytes(), b"HEADhi");
         })
         .expect("executor run failed");
 
@@ -687,6 +708,28 @@ fn runtime_tcp_connector_connect_timeout_propagates_connect_error() {
         .expect("executor run failed");
 }
 
+#[test]
+fn runtime_tcp_connect_timeout_preserves_timer_runtime_error() {
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            test_hooks::fail_next_timer_alloc();
+            let result = TcpStream::connect_timeout(addr, Duration::from_secs(1))
+                .expect("connect_timeout init failed")
+                .await;
+            let err = match result {
+                Ok(_) => panic!("timer allocation failure should abort connect_timeout"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        })
+        .expect("executor run failed");
+}
+
 /// TcpStream address queries and socket options.
 #[test]
 fn runtime_tcp_socket_options() {
@@ -808,10 +851,11 @@ fn runtime_tcp_ping_pong_iobuff() {
             let (res, _buf) = stream.write(send_buf).await;
             assert_eq!(res.expect("write failed"), 4);
 
-            let recv_buf = IoBuffMut::new(0, 4, 0);
+            let mut recv_buf = IoBuffMut::new(0, 8, 0);
+            recv_buf.payload_append(b"HEAD").unwrap();
             let (res, buf) = stream.read(recv_buf, 4).await;
             assert_eq!(res.expect("read failed"), 4);
-            assert_eq!(buf.payload_bytes(), b"pong");
+            assert_eq!(buf.payload_bytes(), b"HEADpong");
         })
         .expect("executor run failed");
 
@@ -847,10 +891,11 @@ fn runtime_tcp_write_all_read_exact_iobuff() {
             let (res, _buf) = stream.write_all(frozen).await;
             assert_eq!(res.expect("write_all failed"), 4);
 
-            let recv_buf = IoBuffMut::new(0, 4, 0);
+            let mut recv_buf = IoBuffMut::new(0, 8, 0);
+            recv_buf.payload_append(b"HEAD").unwrap();
             let (res, buf) = stream.read_exact(recv_buf, 4).await;
             assert_eq!(res.expect("read_exact failed"), 4);
-            assert_eq!(buf.payload_bytes(), b"pong");
+            assert_eq!(buf.payload_bytes(), b"HEADpong");
         })
         .expect("executor run failed");
 

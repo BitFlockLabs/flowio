@@ -7,6 +7,8 @@ use common::{
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::{sleep, timeout};
+#[cfg(debug_assertions)]
+use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
@@ -17,6 +19,24 @@ use std::time::Duration;
 
 fn is_connection_refused(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ECONNREFUSED) || err.kind() == io::ErrorKind::ConnectionRefused
+}
+
+fn prefilled_udp_buffer(writable: usize) -> flowio::runtime::buffer::IoBuffMut {
+    let mut buffer = IoBuffMut::new(0, 4 + writable, 0);
+    buffer.payload_append(b"HEAD").unwrap();
+    buffer
+}
+
+fn connected_udp_pair() -> (UdpSocket, StdUdpSocket, SocketAddr) {
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime udp socket");
+    let local_addr = socket.local_addr();
+    let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind std udp socket");
+    let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    socket.connect(peer_addr).expect("runtime connect failed");
+    peer.connect(local_addr).expect("std peer connect failed");
+    (socket, peer, peer_addr)
 }
 
 #[test]
@@ -612,4 +632,197 @@ fn runtime_udp_send_to_recv_from_iobuff() {
         .expect("executor run failed");
 
     peer_thread.join().expect("peer thread panicked");
+}
+
+#[test]
+fn runtime_udp_prefilled_iobuff_receives_append_for_all_apis() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, peer, peer_addr) = connected_udp_pair();
+
+    assert_eq!(peer.send(b"one").expect("std send one failed"), 3);
+    assert_eq!(peer.send(b"two").expect("std send two failed"), 3);
+    assert_eq!(peer.send(b"tri").expect("std send tri failed"), 3);
+
+    executor
+        .run(async move {
+            let (result, buffer) = socket.recv(prefilled_udp_buffer(3), 3).await;
+            assert_eq!(result.expect("recv failed"), 3);
+            assert_eq!(buffer.payload_bytes(), b"HEADone");
+
+            let (result, buffer) = socket.recv_msg(prefilled_udp_buffer(3), 3).await;
+            assert_eq!(result.expect("recv_msg failed"), 3);
+            assert_eq!(buffer.payload_bytes(), b"HEADtwo");
+
+            let (result, buffer) = socket.recv_from(prefilled_udp_buffer(3), 3).await;
+            let (received, from) = result.expect("recv_from failed");
+            assert_eq!(received, 3);
+            assert_eq!(from, peer_addr);
+            assert_eq!(buffer.payload_bytes(), b"HEADtri");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_udp_zero_datagrams_preserve_prefilled_iobuff_for_all_apis() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, peer, peer_addr) = connected_udp_pair();
+
+    assert_eq!(peer.send(&[]).expect("std send empty recv failed"), 0);
+    assert_eq!(peer.send(&[]).expect("std send empty recv_msg failed"), 0);
+    assert_eq!(peer.send(&[]).expect("std send empty recv_from failed"), 0);
+
+    executor
+        .run(async move {
+            let (result, buffer) = socket.recv(prefilled_udp_buffer(4), 4).await;
+            assert_eq!(result.expect("zero recv failed"), 0);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            let (result, buffer) = socket.recv_msg(prefilled_udp_buffer(4), 4).await;
+            assert_eq!(result.expect("zero recv_msg failed"), 0);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            let (result, buffer) = socket.recv_from(prefilled_udp_buffer(4), 4).await;
+            let (received, from) = result.expect("zero recv_from failed");
+            assert_eq!(received, 0);
+            assert_eq!(from, peer_addr);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_udp_truncation_appends_copied_bytes_to_prefilled_iobuff() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, peer, _peer_addr) = connected_udp_pair();
+
+    assert_eq!(
+        peer.send(b"oversized")
+            .expect("std send recv_msg truncation failed"),
+        9
+    );
+    assert_eq!(
+        peer.send(b"oversized")
+            .expect("std send recv_from truncation failed"),
+        9
+    );
+
+    executor
+        .run(async move {
+            let (result, buffer) = socket.recv_msg(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("truncated recv_msg should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(buffer.payload_bytes(), b"HEADover");
+
+            let (result, buffer) = socket.recv_from(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("truncated recv_from should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(buffer.payload_bytes(), b"HEADover");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_udp_no_progress_boundaries_preserve_prefilled_iobuff() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, peer, _peer_addr) = connected_udp_pair();
+
+    assert_eq!(peer.send(&[]).expect("std send empty boundary failed"), 0);
+
+    executor
+        .run(async move {
+            let (result, buffer) = socket.recv(prefilled_udp_buffer(2), 3).await;
+            let error = result.expect_err("oversize recv should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            let (result, buffer) = socket.recv_msg(prefilled_udp_buffer(2), 3).await;
+            let error = result.expect_err("oversize recv_msg should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            let (result, buffer) = socket.recv_from(prefilled_udp_buffer(2), 3).await;
+            let error = result.expect_err("oversize recv_from should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            let mut sealed = IoBuffMut::new(0, 8, 4);
+            sealed.payload_append(b"HEAD").unwrap();
+            sealed.tailroom_append(b"TAIL").unwrap();
+            let (result, buffer) = socket.recv(sealed, 0).await;
+            assert_eq!(result.expect("zero-length sealed recv failed"), 0);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+            assert_eq!(buffer.bytes(), b"HEADTAIL");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_udp_context_errors_preserve_prefilled_iobuff_for_all_apis() {
+    let (mut socket, _peer, _peer_addr) = connected_udp_pair();
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+    {
+        let mut future = Box::pin(socket.recv(prefilled_udp_buffer(4), 4));
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready((Err(error), buffer)) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+                assert_eq!(buffer.payload_bytes(), b"HEAD");
+            }
+            Poll::Ready((Ok(_), _)) => panic!("recv unexpectedly succeeded outside run"),
+            Poll::Pending => panic!("recv remained pending outside run"),
+        }
+    }
+
+    {
+        let mut future = Box::pin(socket.recv_msg(prefilled_udp_buffer(4), 4));
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready((Err(error), buffer)) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+                assert_eq!(buffer.payload_bytes(), b"HEAD");
+            }
+            Poll::Ready((Ok(_), _)) => panic!("recv_msg unexpectedly succeeded outside run"),
+            Poll::Pending => panic!("recv_msg remained pending outside run"),
+        }
+    }
+
+    {
+        let mut future = Box::pin(socket.recv_from(prefilled_udp_buffer(4), 4));
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready((Err(error), buffer)) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+                assert_eq!(buffer.payload_bytes(), b"HEAD");
+            }
+            Poll::Ready((Ok(_), _)) => panic!("recv_from unexpectedly succeeded outside run"),
+            Poll::Pending => panic!("recv_from remained pending outside run"),
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_udp_submission_errors_preserve_prefilled_iobuff_for_all_apis() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, _peer, _peer_addr) = connected_udp_pair();
+
+    executor
+        .run(async move {
+            test_hooks::fail_next_sqe_submit();
+            let (result, buffer) = socket.recv(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("forced recv submission should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_sqe_submit();
+            let (result, buffer) = socket.recv_msg(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("forced recv_msg submission should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_sqe_submit();
+            let (result, buffer) = socket.recv_from(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("forced recv_from submission should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+        })
+        .expect("executor run failed");
 }

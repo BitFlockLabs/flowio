@@ -21,7 +21,8 @@
 //! ```
 
 use crate::runtime::executor::{
-    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_tracked_sqe,
+    completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_tracked_sqe,
 };
 use crate::runtime::op::CompletionState;
 use io_uring::opcode;
@@ -46,11 +47,13 @@ fn complete_nop_op(
     }
 
     let result = state.result;
-    let pctx = unsafe { poll_ctx_from_waker(cx) };
-    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
 
-    Some(if result < 0 {
+    Some(if op_ctx.context_rejected() {
+        Err(io::Error::from(io::ErrorKind::NotConnected))
+    } else if result < 0 {
         Err(io::Error::from_raw_os_error(-result))
     } else {
         Ok(result)
@@ -63,12 +66,24 @@ fn poll_nop_op(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
 ) -> Poll<io::Result<i32>> {
+    let pctx = match poll_ctx_from_waker(cx) {
+        Ok(pctx) => pctx,
+        Err(err) => {
+            unsafe { drop_op_ptr_unchecked(state_ptr) };
+            return Poll::Ready(Err(err));
+        }
+    };
+
+    if !state_ptr.is_null() && unsafe { (**state_ptr).owner_ptr() } != pctx.owner_ptr() {
+        unsafe { drop_op_ptr_unchecked(state_ptr) };
+        return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+    }
+
     if let Some(result) = complete_nop_op(cx, state_ptr) {
         return Poll::Ready(result);
     }
 
     if state_ptr.is_null() {
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
         let new_state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
         if new_state_ptr.is_null() {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));

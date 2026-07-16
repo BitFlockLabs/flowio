@@ -284,7 +284,11 @@ macro_rules! define_distribute_written {
                 let buf = unsafe { self.buffers[i].assume_init_mut() };
                 let cap = buf.payload_remaining();
                 let written = if remaining >= cap { cap } else { remaining };
-                buf.payload_len += written;
+                let new_len = buf.payload_len() + written;
+                // SAFETY: `written` is bounded by this segment's writable
+                // capacity, and this method's caller guarantees that the
+                // corresponding materialized iovec bytes were initialized.
+                unsafe { buf.publish_initialized_len_unchecked(new_len) };
                 remaining -= written;
                 if remaining == 0 {
                     break;

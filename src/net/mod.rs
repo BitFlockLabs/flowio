@@ -41,6 +41,12 @@
 //! the previous future completes or is dropped, or when the owning
 //! listener/connector is dropped.
 //!
+//! [`io::ErrorKind::NotConnected`] also reports an invalid runtime poll context:
+//! transport futures must be polled inside the FlowIO executor that submitted
+//! them. An unsubmitted rental operation returns the buffer immediately. Once
+//! submitted, it keeps the buffer retained until the original CQE and then
+//! returns the buffer with `NotConnected`.
+//!
 //! # Fast-Path Guidance
 //!
 //! Preferred on the per-message fast path:
@@ -132,6 +138,8 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
+
+use crate::runtime::buffer::IoBuffReadWrite;
 
 pub mod resolver;
 pub mod sctp;
@@ -335,6 +343,8 @@ pub(crate) unsafe fn opt_mut<T>(opt: &mut Option<T>) -> &mut T {
 
 const READ_LEN_EXCEEDS_WRITABLE: &str = "length exceeds writable buffer capacity";
 const LEN_EXCEEDS_U32: &str = "length exceeds io_uring u32 byte-count limit";
+const READ_PROGRESS_EXCEEDS_WRITABLE: &str = "read completion exceeds writable buffer capacity";
+const READ_PUBLICATION_OVERFLOW: &str = "read publication length overflow";
 
 #[inline(always)]
 pub(crate) fn invalid_input(message: &'static str) -> io::Error {
@@ -357,6 +367,52 @@ pub(crate) fn checked_read_len(requested: usize, writable: usize) -> io::Result<
     }
 
     Ok(requested as u32)
+}
+
+/// Completes a contiguous read while publishing positive progress relative to
+/// a snapshotted writable-buffer base.
+///
+/// Zero progress deliberately leaves the logical buffer length unchanged.
+/// This preserves pre-existing payload on EOF, empty datagrams, and internal
+/// no-progress receive transitions.
+///
+/// # Safety
+///
+/// `write_base_len` must have been obtained from `buffer.write_base_len()` for
+/// the same writable window used by the read. The first `written` bytes at
+/// `buffer.as_mut_ptr()` must have been initialized by the producer. `result`
+/// may be an error only when those bytes are still intentional caller-visible
+/// progress, such as a truncated message; pass zero for errors that produced
+/// no caller-visible bytes.
+#[inline(always)]
+pub(crate) unsafe fn complete_read_with_progress<B: IoBuffReadWrite, T>(
+    mut buffer: B,
+    write_base_len: usize,
+    written: usize,
+    result: io::Result<T>,
+) -> (io::Result<T>, B) {
+    if written == 0 {
+        return (result, buffer);
+    }
+
+    let publication = if written > buffer.writable_len() {
+        Err(invalid_input(READ_PROGRESS_EXCEEDS_WRITABLE))
+    } else if let Some(published_len) = write_base_len.checked_add(written) {
+        debug_assert_eq!(
+            write_base_len,
+            buffer.write_base_len(),
+            "writable publication base changed while a read was active"
+        );
+        unsafe { buffer.set_written_len(published_len) };
+        Ok(())
+    } else {
+        Err(invalid_input(READ_PUBLICATION_OVERFLOW))
+    };
+
+    match publication {
+        Ok(()) => (result, buffer),
+        Err(err) => (Err(err), buffer),
+    }
 }
 
 /// Validates a contiguous send length against io_uring opcodes that accept a
@@ -590,6 +646,82 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::buffer::IoBuffMut;
+
+    #[test]
+    fn contiguous_read_progress_appends_to_prefilled_iobuff() {
+        let mut buffer = IoBuffMut::new(0, 8, 0).expect("buffer allocation failed");
+        buffer
+            .payload_append(b"HEAD")
+            .expect("prefix append failed");
+        let write_base_len = buffer.write_base_len();
+        unsafe { std::ptr::copy_nonoverlapping(b"ok".as_ptr(), buffer.as_mut_ptr(), 2) };
+
+        let (result, buffer) = unsafe {
+            complete_read_with_progress(buffer, write_base_len, 2, Ok::<_, io::Error>(2))
+        };
+
+        assert_eq!(result.expect("publication failed"), 2);
+        assert_eq!(buffer.payload_bytes(), b"HEADok");
+    }
+
+    #[test]
+    fn contiguous_read_zero_preserves_flat_and_sealed_buffers() {
+        let flat = b"HEAD".to_vec();
+        let flat_base = flat.write_base_len();
+        let (result, flat) =
+            unsafe { complete_read_with_progress(flat, flat_base, 0, Ok::<_, io::Error>(0)) };
+        assert_eq!(result.expect("zero publication failed"), 0);
+        assert_eq!(flat, b"HEAD");
+
+        let mut sealed = IoBuffMut::new(0, 8, 2).expect("buffer allocation failed");
+        sealed
+            .payload_append(b"HEAD")
+            .expect("payload append failed");
+        sealed.tailroom_append(b":T").expect("tail append failed");
+        assert_eq!(sealed.writable_len(), 0);
+        let sealed_base = sealed.write_base_len();
+        let (result, sealed) =
+            unsafe { complete_read_with_progress(sealed, sealed_base, 0, Ok::<_, io::Error>(0)) };
+        assert_eq!(result.expect("sealed zero publication failed"), 0);
+        assert_eq!(sealed.bytes(), b"HEAD:T");
+        assert_eq!(sealed.payload_bytes(), b"HEAD");
+    }
+
+    #[test]
+    fn contiguous_read_base_counts_payload_not_active_headroom() {
+        let mut buffer = IoBuffMut::new(4, 4, 0).expect("buffer allocation failed");
+        buffer
+            .headroom_prepend(b"H:")
+            .expect("headroom prepend failed");
+        assert_eq!(buffer.write_base_len(), 0);
+        let write_base_len = buffer.write_base_len();
+        unsafe { std::ptr::copy_nonoverlapping(b"ok".as_ptr(), buffer.as_mut_ptr(), 2) };
+
+        let (result, buffer) = unsafe {
+            complete_read_with_progress(buffer, write_base_len, 2, Ok::<_, io::Error>(2))
+        };
+
+        assert_eq!(result.expect("publication failed"), 2);
+        assert_eq!(buffer.bytes(), b"H:ok");
+        assert_eq!(buffer.payload_bytes(), b"ok");
+    }
+
+    #[test]
+    fn contiguous_read_default_base_overwrites_after_positive_progress() {
+        let mut buffer = b"HEAD".to_vec();
+        buffer.reserve(4);
+        assert_eq!(buffer.write_base_len(), 0);
+        let write_base_len = buffer.write_base_len();
+        unsafe { std::ptr::copy_nonoverlapping(b"ok".as_ptr(), buffer.as_mut_ptr(), 2) };
+
+        let (result, buffer) = unsafe {
+            complete_read_with_progress(buffer, write_base_len, 2, Ok::<_, io::Error>(2))
+        };
+
+        assert_eq!(result.expect("publication failed"), 2);
+        assert_eq!(buffer, b"ok");
+    }
 
     #[test]
     fn socket_buffer_size_conversion_accepts_c_int_max() {

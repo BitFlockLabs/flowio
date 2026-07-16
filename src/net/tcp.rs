@@ -188,11 +188,12 @@ use super::{
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_retained_sqe,
+    completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_retained_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
-use crate::runtime::timer::{Elapsed, Timeout, timeout};
+use crate::runtime::timer::{Timeout, TimeoutError, timeout};
 use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
@@ -261,14 +262,20 @@ impl AcceptSlot {
             let state = unsafe { &*self.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
+                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, self.state_ptr) };
                 let payload = unsafe {
-                    (*pctx.reactor()).take_retained_payload::<RetainedAcceptAddr>(self.state_ptr)
+                    (*op_ctx.reactor()).take_retained_payload::<RetainedAcceptAddr>(self.state_ptr)
                 };
-                unsafe { (*pctx.reactor()).free_op(self.state_ptr) };
+                unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
+                if op_ctx.context_rejected() {
+                    if result >= 0 {
+                        close_fd(result as RawFd);
+                    }
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+                }
                 if result < 0 {
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
@@ -284,7 +291,13 @@ impl AcceptSlot {
         }
 
         if self.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    self.in_use = false;
+                    return Poll::Ready(Err(err));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 self.in_use = false;
@@ -393,11 +406,15 @@ impl ConnectSlot {
             let state = unsafe { &*self.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                unsafe { (*pctx.reactor()).free_op(self.state_ptr) };
+                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, self.state_ptr) };
+                unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
+                if op_ctx.context_rejected() {
+                    self.cleanup_fd();
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+                }
                 if result < 0 {
                     let err = io::Error::from_raw_os_error(-result);
                     self.cleanup_fd();
@@ -408,7 +425,14 @@ impl ConnectSlot {
         }
 
         if self.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    self.in_use = false;
+                    self.cleanup_fd();
+                    return Poll::Ready(Err(err));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 self.in_use = false;
@@ -693,9 +717,10 @@ impl TcpStream {
     /// Convenience method that connects to the given address with a deadline.
     ///
     /// Returns `TimedOut` if the connection does not complete before the
-    /// provided duration elapses. For repeated outbound connections, prefer
-    /// [`TcpConnector::connect_timeout`] so the connector can reuse its slot
-    /// metadata across attempts.
+    /// provided duration elapses. Timer-runtime failures, including
+    /// `OutOfMemory`, propagate with their original [`io::ErrorKind`]. For
+    /// repeated outbound connections, prefer [`TcpConnector::connect_timeout`]
+    /// so the connector can reuse its slot metadata across attempts.
     ///
     /// This is appropriate for an isolated timed attempt. For repeated timed
     /// attempts, reuse [`TcpConnector::connect_timeout`].
@@ -771,9 +796,11 @@ impl TcpConnector {
     /// Starts connecting to the provided remote address with a deadline.
     ///
     /// Returns `TimedOut` if the connection does not complete before the
-    /// provided duration elapses. This is the repeated-connect timeout API;
-    /// prefer it over [`TcpStream::connect_timeout`] when the same connector
-    /// is reused across attempts.
+    /// provided duration elapses. Timer-runtime failures, including
+    /// `OutOfMemory`, propagate with their original [`io::ErrorKind`]. This is
+    /// the repeated-connect timeout API; prefer it over
+    /// [`TcpStream::connect_timeout`] when the same connector is reused across
+    /// attempts.
     pub fn connect_timeout(
         &mut self,
         addr: SocketAddr,
@@ -956,7 +983,7 @@ impl Future for AcceptFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         if let Some(err) = this.input_error.take() {
-            return Poll::Ready(Err(err));
+            return Poll::Ready(validate_local_io_result(cx, Err(err)));
         }
         this.slot.poll_accept(this.fd, cx)
     }
@@ -1023,10 +1050,13 @@ impl Drop for ConnectFuture<'_> {
     }
 }
 
-fn map_connect_timeout(result: Result<io::Result<TcpStream>, Elapsed>) -> io::Result<TcpStream> {
+fn map_connect_timeout(
+    result: Result<io::Result<TcpStream>, TimeoutError>,
+) -> io::Result<TcpStream> {
     match result {
         Ok(result) => result,
-        Err(_) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        Err(TimeoutError::Elapsed) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        Err(TimeoutError::Runtime(err)) => Err(err),
     }
 }
 
@@ -1102,10 +1132,14 @@ impl Future for OwnedConnectFuture {
             let state = unsafe { &*this.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
+                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, this.state_ptr) };
+                unsafe { (*op_ctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
+                if op_ctx.context_rejected() {
+                    this.cleanup_fd();
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+                }
                 if result < 0 {
                     let err = io::Error::from_raw_os_error(-result);
                     this.cleanup_fd();
@@ -1117,7 +1151,13 @@ impl Future for OwnedConnectFuture {
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    this.cleanup_fd();
+                    return Poll::Ready(Err(err));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 this.cleanup_fd();

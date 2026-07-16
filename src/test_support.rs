@@ -35,6 +35,10 @@ pub mod utils {
 }
 
 pub mod runtime {
+    pub mod reactor {
+        pub use crate::runtime::reactor::benchmark_cancel_submit_pressure;
+    }
+
     pub mod timer {
         pub use crate::runtime::timer::TimerRuntime;
     }
@@ -48,7 +52,7 @@ pub mod runtime {
     pub mod test_hooks {
         pub use crate::runtime::test_hooks::{
             fail_next_op_alloc, fail_next_ring_submit_errno, fail_next_ring_wait_errno,
-            fail_next_sqe_submit, ring_wait_failures_remaining,
+            fail_next_sqe_submit, fail_next_timer_alloc, ring_wait_failures_remaining,
         };
     }
 

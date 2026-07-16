@@ -89,9 +89,11 @@ use super::{
     new_nonblocking_socket, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
     socket_domain, write_msghdr,
 };
+use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_retained_sqe,
+    completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_retained_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
@@ -274,7 +276,12 @@ impl UdpSocket {
     /// Starts one connected receive into the provided buffer.
     ///
     /// This omits per-datagram peer-address handling on a connected socket.
+    /// Positive progress appends to an `IoBuffMut` payload; buffers that keep
+    /// the provided zero write base publish from their beginning. A zero-byte
+    /// datagram preserves the existing logical contents. The returned byte
+    /// count is relative to this receive.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
@@ -288,6 +295,7 @@ impl UdpSocket {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
+            write_base_len,
             input_error,
             _marker: PhantomData,
         }
@@ -301,7 +309,11 @@ impl UdpSocket {
     /// truncation detection; use [`UdpSocket::recv`] when protocol sizing
     /// guarantees the buffer is large enough and the extra `msghdr`/`iovec`
     /// metadata is unnecessary.
+    /// Positive progress follows the same relative-publication contract as
+    /// [`UdpSocket::recv`]. If truncation is reported, the copied prefix is
+    /// still published before `InvalidData` is returned.
     pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvMsgFuture<'_, B> {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
@@ -315,6 +327,7 @@ impl UdpSocket {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
+            write_base_len,
             input_error,
             _marker: PhantomData,
         }
@@ -346,11 +359,15 @@ impl UdpSocket {
     ///
     /// Use this instead of [`UdpSocket::recv`] when peer addresses vary per
     /// datagram or when the sender address is needed by the caller.
+    /// Positive progress follows the same relative-publication contract as
+    /// [`UdpSocket::recv`]. Truncation or address-decoding errors still publish
+    /// the bytes the kernel copied before the error is returned.
     pub fn recv_from<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
         len: usize,
     ) -> RecvFromFuture<'_, B> {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
@@ -364,6 +381,7 @@ impl UdpSocket {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
+            write_base_len,
             input_error,
             _marker: PhantomData,
         }
@@ -453,6 +471,29 @@ fn zeroed_sockaddr_storage() -> MaybeUninit<libc::sockaddr_storage> {
     MaybeUninit::zeroed()
 }
 
+#[inline(always)]
+/// Takes a completed datagram payload through its origin reactor.
+///
+/// # Safety
+///
+/// A non-null `*state_ptr` must identify a completed operation retaining a
+/// payload of type `T`.
+unsafe fn take_completed_udp_payload<T: 'static>(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+) -> Option<(i32, T, bool)> {
+    if (*state_ptr).is_null() || unsafe { !(**state_ptr).is_completed() } {
+        return None;
+    }
+
+    let result = unsafe { (**state_ptr).result };
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
+    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    *state_ptr = std::ptr::null_mut();
+    Some((result, payload, op_ctx.context_rejected()))
+}
+
 // ---------------------------------------------------------------------------
 // RecvFuture (connected recv via IORING_OP_RECV)
 // ---------------------------------------------------------------------------
@@ -467,6 +508,8 @@ pub struct RecvFuture<'a, B: IoBuffReadWrite> {
     buffer: Option<B>,
     /// Maximum datagram bytes requested from the kernel.
     len: u32,
+    /// Logical payload length captured for relative publication.
+    write_base_len: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
     /// Borrows the parent socket for the future lifetime.
@@ -482,37 +525,38 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedRecvPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let mut buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-                let actual = result as usize;
-                unsafe { buffer.set_written_len(actual) };
-                return Poll::Ready((Ok(actual), buffer));
+        if let Some((result, payload, context_rejected)) =
+            unsafe { take_completed_udp_payload::<RetainedRecvPayload<B>>(cx, &mut this.state_ptr) }
+        {
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
             }
+            if result < 0 {
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+            }
+            let actual = result as usize;
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, actual, Ok(actual))
+            });
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -566,6 +610,8 @@ pub struct RecvMsgFuture<'a, B: IoBuffReadWrite> {
     buffer: Option<B>,
     /// Maximum datagram bytes requested from the kernel.
     len: u32,
+    /// Logical payload length captured for relative publication.
+    write_base_len: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
     /// Borrows the parent socket for the future lifetime.
@@ -581,52 +627,52 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedRecvMsgPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let mut buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-
-                let msg = unsafe { payload.msghdr.assume_init_ref() };
-                // `msg_control` is null, so MSG_CTRUNC is not expected here;
-                // keep the check defensive in case a kernel reports
-                // inconsistent recvmsg flags.
-                let actual = result as usize;
-                unsafe { buffer.set_written_len(actual) };
-                if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
-                    return Poll::Ready((
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "UDP recv_msg message was truncated",
-                        )),
-                        buffer,
-                    ));
-                }
-
-                return Poll::Ready((Ok(actual), buffer));
+        if let Some((result, payload, context_rejected)) = unsafe {
+            take_completed_udp_payload::<RetainedRecvMsgPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
             }
+            if result < 0 {
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+            }
+
+            let msg = unsafe { payload.msghdr.assume_init_ref() };
+            // `msg_control` is null, so MSG_CTRUNC is not expected here;
+            // keep the check defensive in case a kernel reports
+            // inconsistent recvmsg flags.
+            let actual = result as usize;
+            let result = if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "UDP recv_msg message was truncated",
+                ))
+            } else {
+                Ok(actual)
+            };
+
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, actual, result)
+            });
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -716,35 +762,35 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedSendPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-                return Poll::Ready((Ok(result as usize), buffer));
+        if let Some((result, payload, context_rejected)) =
+            unsafe { take_completed_udp_payload::<RetainedSendPayload<B>>(cx, &mut this.state_ptr) }
+        {
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
             }
+            if result < 0 {
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+            }
+            return Poll::Ready((Ok(result as usize), buffer));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -800,6 +846,8 @@ pub struct RecvFromFuture<'a, B: IoBuffReadWrite> {
     buffer: Option<B>,
     /// Maximum datagram bytes requested from the kernel.
     len: u32,
+    /// Logical payload length captured for relative publication.
+    write_base_len: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
     /// Borrows the parent socket for the future lifetime.
@@ -815,58 +863,53 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedRecvFromPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let mut buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-
-                let actual = result as usize;
-
-                let msg = unsafe { payload.msghdr.assume_init_ref() };
-                // `msg_control` is null, so MSG_CTRUNC is not expected here;
-                // keep the check defensive in case a kernel reports
-                // inconsistent recvmsg flags.
-                unsafe { buffer.set_written_len(actual) };
-                if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
-                    return Poll::Ready((
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "UDP recv_from message was truncated",
-                        )),
-                        buffer,
-                    ));
-                }
-                let addr = match unsafe {
-                    socket_addr_from_c(payload.addr.assume_init_ref(), msg.msg_namelen)
-                } {
-                    Ok(addr) => addr,
-                    Err(err) => return Poll::Ready((Err(err), buffer)),
-                };
-                return Poll::Ready((Ok((actual, addr)), buffer));
+        if let Some((result, payload, context_rejected)) = unsafe {
+            take_completed_udp_payload::<RetainedRecvFromPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
             }
+            if result < 0 {
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+            }
+
+            let actual = result as usize;
+
+            let msg = unsafe { payload.msghdr.assume_init_ref() };
+            // `msg_control` is null, so MSG_CTRUNC is not expected here;
+            // keep the check defensive in case a kernel reports
+            // inconsistent recvmsg flags.
+            let result = if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "UDP recv_from message was truncated",
+                ))
+            } else {
+                unsafe { socket_addr_from_c(payload.addr.assume_init_ref(), msg.msg_namelen) }
+                    .map(|addr| (actual, addr))
+            };
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, actual, result)
+            });
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -960,28 +1003,27 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if !this.state_ptr.is_null() {
-            let state = unsafe { &*this.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let pctx = unsafe { poll_ctx_from_waker(cx) };
-                let payload = unsafe {
-                    (*pctx.reactor())
-                        .take_retained_payload::<RetainedSendToPayload<B>>(this.state_ptr)
-                };
-                unsafe { (*pctx.reactor()).free_op(this.state_ptr) };
-                this.state_ptr = std::ptr::null_mut();
-
-                let buffer = payload.buffer;
-                if result < 0 {
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-                }
-                return Poll::Ready((Ok(result as usize), buffer));
+        if let Some((result, payload, context_rejected)) = unsafe {
+            take_completed_udp_payload::<RetainedSendToPayload<B>>(cx, &mut this.state_ptr)
+        } {
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
             }
+            if result < 0 {
+                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
+            }
+            return Poll::Ready((Ok(result as usize), buffer));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };

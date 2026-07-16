@@ -26,6 +26,7 @@ use flowio::test_support::net::sctp::{
     test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
     test_stream_reset_event_type,
 };
+use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::future::Future;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
@@ -91,7 +92,7 @@ async fn accepted_sctp_pair(
         .expect("sctp connect init failed")
         .await
         .expect("sctp connect failed");
-    let server = server.await;
+    let server = server.await.expect("SCTP accept task cancelled");
 
     (client, server)
 }
@@ -1146,16 +1147,18 @@ fn runtime_sctp_recv_msg_rejects_undersized_buffer_without_eor() {
                 .await
                 .expect("connect failed");
 
-            let (recv_res, recv_buf) = stream.recv_msg(vec![0u8; 4], 4).await;
+            let mut recv_buf = IoBuffMut::new(0, 8, 0);
+            recv_buf.payload_append(b"HEAD").unwrap();
+            let (recv_res, recv_buf) = stream.recv_msg(recv_buf, 4).await;
             let err = recv_res.expect_err("undersized SCTP recv_msg should reject partial record");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert!(
                 err.to_string().contains("end-of-record") || err.to_string().contains("truncated"),
                 "undersized SCTP receive should report record truncation: {err}"
             );
-            assert_eq!(&recv_buf[..], b"0123");
+            assert_eq!(recv_buf.payload_bytes(), b"HEAD0123");
 
-            server.await;
+            server.await.expect("server task cancelled");
         })
         .expect("executor run failed");
 }
@@ -1213,13 +1216,15 @@ fn runtime_sctp_recv_msg_resynchronizes_after_oversized_record() {
                 .await;
             assert_eq!(send_res.expect("second send_msg failed"), 6);
 
-            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 64], 64))
+            let mut recv_buf = IoBuffMut::new(0, 68, 0);
+            recv_buf.payload_append(b"HEAD").unwrap();
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(recv_buf, 64))
                 .await
                 .expect("resynchronized SCTP recv timed out");
             let (recv_result, recv_buf) = recv_res;
             let (recv_len, meta) = recv_result.expect("second recv_msg failed");
             assert_eq!(recv_len, 6);
-            assert_eq!(&recv_buf[..recv_len], b"second");
+            assert_eq!(recv_buf.payload_bytes(), b"HEADsecond");
             match meta {
                 SctpRecvMeta::Data(info) => {
                     assert_eq!(info.stream_id, 2);
@@ -1345,13 +1350,15 @@ fn runtime_sctp_recv_msg_shutdown_without_control_is_clean_eof() {
                 .shutdown(Shutdown::Write)
                 .expect("client shutdown write failed");
 
-            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 32], 32))
+            let mut recv_buf = IoBuffMut::new(0, 36, 0);
+            recv_buf.payload_append(b"HEAD").unwrap();
+            let recv_res = timeout(Duration::from_secs(1), server.recv_msg(recv_buf, 32))
                 .await
                 .expect("SCTP clean EOF recv timed out");
             let (recv_result, recv_buf) = recv_res;
             let (recv_len, meta) = recv_result.expect("clean EOF should not error");
             assert_eq!(recv_len, 0);
-            assert!(recv_buf.is_empty());
+            assert_eq!(recv_buf.payload_bytes(), b"HEAD");
             match meta {
                 SctpRecvMeta::Data(info) => assert_eq!(info, Default::default()),
                 SctpRecvMeta::Notification(notification) => {
@@ -1727,11 +1734,25 @@ fn runtime_sctp_fast_send_recv() {
             let (send_res, _buf) = stream.send(send).await;
             assert_eq!(send_res.expect("client send failed"), 4);
 
-            let recv = IoBuffMut::new(0, 64, 0);
+            let mut recv = IoBuffMut::new(0, 64, 0);
+            recv.payload_append(b"HEAD").unwrap();
             let (recv_res, recv_buf) = stream.recv(recv, 4).await;
             let recv_len = recv_res.expect("client recv failed");
             assert_eq!(recv_len, 4);
-            assert_eq!(recv_buf.payload_bytes(), b"ping");
+            assert_eq!(recv_buf.payload_bytes(), b"HEADping");
+
+            let mut zero = IoBuffMut::new(0, 4, 0);
+            zero.payload_append(b"HEAD").unwrap();
+            let (zero_res, zero) = stream.recv(zero, 0).await;
+            assert_eq!(zero_res.expect("zero-length data recv failed"), 0);
+            assert_eq!(zero.payload_bytes(), b"HEAD");
+
+            let mut invalid = IoBuffMut::new(0, 6, 0);
+            invalid.payload_append(b"HEAD").unwrap();
+            let (invalid_res, invalid) = stream.recv(invalid, 3).await;
+            let err = invalid_res.expect_err("oversize data recv should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(invalid.payload_bytes(), b"HEAD");
         })
         .expect("executor run failed");
 }
@@ -2392,7 +2413,10 @@ fn runtime_sctp_accept_drop_then_reaccepts() {
                 .expect("connect init failed")
                 .await
                 .expect("connect failed");
-            let (_server_stream, remote_addr) = server.await.expect("second accept failed");
+            let (_server_stream, remote_addr) = server
+                .await
+                .expect("server accept task cancelled")
+                .expect("second accept failed");
             assert_eq!(
                 remote_addr,
                 stream.local_addr().expect("client local_addr failed")
@@ -2458,6 +2482,7 @@ fn runtime_sctp_cancelled_accept_after_association_reaccepts() {
             let (_server_stream, remote_addr) = timeout(Duration::from_secs(1), server)
                 .await
                 .expect("second accept timed out")
+                .expect("server accept task cancelled")
                 .expect("second accept failed");
             assert_eq!(
                 remote_addr,
@@ -2505,6 +2530,41 @@ fn runtime_sctp_connect_timeout_propagates_connect_error() {
         .expect("executor run failed");
 }
 
+#[test]
+fn runtime_sctp_connect_timeout_preserves_timer_runtime_error() {
+    let init = SctpInitConfig::diameter_default();
+    let listener = match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
+        Ok(listener) => listener,
+        Err(err) => {
+            if sctp_unsupported(&err) {
+                eprintln!(
+                    "skipping runtime_sctp_connect_timeout_preserves_timer_runtime_error: SCTP unsupported ({err})"
+                );
+                return;
+            }
+            panic!("failed to bind sctp listener: {err}");
+        }
+    };
+    let addr = listener.local_addr();
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let mut connector = SctpConnector::new(init);
+
+    executor
+        .run(async move {
+            test_hooks::fail_next_timer_alloc();
+            let result = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("connect_timeout init failed")
+                .await;
+            let err = match result {
+                Ok(_) => panic!("timer allocation failure should abort connect_timeout"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+        })
+        .expect("executor run failed");
+}
+
 // ============================================================================
 // IoBuffMut / IoBuff transport integration tests
 // ============================================================================
@@ -2537,10 +2597,9 @@ fn runtime_sctp_ping_pong_iobuff() {
             Executor::spawn(async move {
                 let (mut stream, _remote) = listener.accept().await.expect("accept failed");
 
-                // Receive with IoBuffMut, skip notifications.
-                // Reset the buffer before reuse: IoBuffMut::as_mut_ptr() advances
-                // past already-written payload, so without reset the next recv
-                // would write at the wrong offset.
+                // Receive with IoBuffMut, skipping notifications. Reset before
+                // reuse so published notification bytes do not become a prefix
+                // of the eventual application data record.
                 let mut current_buf = IoBuffMut::new(0, msg_size, 0);
                 let (recv_len, meta, recv_buf) = loop {
                     let recv_res = stream.recv_msg(current_buf, msg_size).await;
@@ -2607,7 +2666,8 @@ fn runtime_sctp_ping_pong_iobuff() {
             send_res.expect("client send failed");
 
             // Receive with IoBuffMut, skip notifications.
-            let mut current_buf = IoBuffMut::new(0, msg_size, 0);
+            let mut current_buf = IoBuffMut::new(0, msg_size + 4, 0);
+            current_buf.payload_append(b"HEAD").unwrap();
             let (recv_len, meta, recv_buf) = loop {
                 let recv_res = stream.recv_msg(current_buf, msg_size).await;
                 let (recv_len, meta) = recv_res.0.expect("client recv failed");
@@ -2615,6 +2675,7 @@ fn runtime_sctp_ping_pong_iobuff() {
                     SctpRecvMeta::Notification(_) => {
                         let mut buf = recv_res.1;
                         buf.reset();
+                        buf.payload_append(b"HEAD").unwrap();
                         current_buf = buf;
                     }
                     SctpRecvMeta::Data(info) => {
@@ -2623,7 +2684,7 @@ fn runtime_sctp_ping_pong_iobuff() {
                 }
             };
             assert_eq!(recv_len, 4);
-            assert_eq!(recv_buf.payload_bytes()[..recv_len], *b"ping");
+            assert_eq!(recv_buf.payload_bytes(), b"HEADping");
             match meta {
                 SctpRecvMeta::Data(info) => {
                     assert_eq!(info.stream_id, 1);
@@ -2674,11 +2735,12 @@ fn runtime_sctp_recv_msg_rejects_oversize_iobuff() {
                 .await
                 .expect("connect failed");
 
-            let recv = IoBuffMut::new(0, 4, 0);
+            let mut recv = IoBuffMut::new(0, 8, 0);
+            recv.payload_append(b"HEAD").unwrap();
             let (res, buf) = stream.recv_msg(recv, 5).await;
             let err = res.expect_err("oversize recv_msg should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(buf.payload_len(), 0);
+            assert_eq!(buf.payload_bytes(), b"HEAD");
             assert_eq!(buf.payload_remaining(), 4);
         })
         .expect("executor run failed");

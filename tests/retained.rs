@@ -257,12 +257,19 @@ fn retained_iovec_scratch_uses_inline_for_small_counts() {
 #[test]
 fn retained_iovec_scratch_uses_pool_for_512_iovecs() {
     let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
-    {
-        let scratch = pool
-            .alloc_iovec_scratch(512)
-            .expect("512 iovec scratch allocation failed");
-        assert_eq!(scratch.as_uninit_slice().len(), 512);
-    }
+    let mut scratch = pool
+        .alloc_iovec_scratch(512)
+        .expect("512 iovec scratch allocation failed");
+    assert_eq!(scratch.as_uninit_slice().len(), 512);
+    scratch.as_uninit_slice_mut()[0].write(libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 7,
+    });
+    scratch.as_uninit_slice_mut()[511].write(libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 11,
+    });
+    drop(scratch);
 
     let stats = pool.stats();
     println!("512 iovec scratch stats: {stats:?}");

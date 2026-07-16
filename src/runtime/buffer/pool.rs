@@ -295,6 +295,7 @@ impl IoBuffPoolInner {
             header: unsafe { NonNull::new_unchecked(header) },
             offset: unsafe { (*pool_ptr).headroom },
             payload_len: 0,
+            payload_initialized_len: 0,
             tailroom_len: 0,
         })
     }

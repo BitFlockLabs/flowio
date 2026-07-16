@@ -97,7 +97,8 @@
 use super::stream;
 use super::tcp::TcpStream;
 use super::{checked_read_len, opt_mut, opt_ref, opt_take};
-use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
+use crate::net::complete_read_with_progress;
+use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite, readable_slice};
 use rustls::ClientConfig;
 use rustls::client::ClientConnection;
 use rustls::pki_types::ServerName;
@@ -148,6 +149,31 @@ fn tls_protocol_error(err: rustls::Error) -> io::Error {
 /// Builds an internal-invariant error for unexpected wrapper state.
 fn tls_internal_error(message: &'static str) -> io::Error {
     io::Error::other(message)
+}
+
+/// Returns one userspace-safe mutable destination for a TLS plaintext read.
+///
+/// The first call initializes the complete destination through the buffer's
+/// userspace hook. Later polls reacquire the buffer's current raw pointer and
+/// reuse that initialized range without repeating the initialization pass.
+///
+/// # Safety
+///
+/// `len` must be nonzero and validated against `buffer.writable_len()`. When
+/// `initialized` is true, the same buffer and `len` must have completed an
+/// earlier call, with no intervening logical-length or writable-base change.
+#[inline(always)]
+unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
+    buffer: &'a mut B,
+    initialized: &mut bool,
+    len: usize,
+) -> &'a mut [u8] {
+    if !*initialized {
+        let dst = unsafe { buffer.initialized_writable_slice(len) };
+        *initialized = true;
+        return dst;
+    }
+    unsafe { slice::from_raw_parts_mut(buffer.as_mut_ptr(), len) }
 }
 
 /// Explicit TLS wrapper buffer and rustls buffering configuration.
@@ -504,6 +530,11 @@ impl TlsClientStream {
 
     /// Reads up to `len` decrypted plaintext bytes into `buffer`.
     ///
+    /// Positive progress appends to an `IoBuffMut` payload; buffers that keep
+    /// the provided zero write base publish from their beginning. A clean
+    /// zero-byte close or an error before plaintext progress preserves existing
+    /// logical contents. The returned count is relative to this read.
+    ///
     /// # Errors
     /// Returns `NotConnected` if the TLS handshake has not completed yet.
     /// A clean TLS close returns `Ok(0)`.
@@ -520,6 +551,10 @@ impl TlsClientStream {
     }
 
     /// Reads exactly `len` decrypted plaintext bytes into `buffer`.
+    ///
+    /// Positive progress follows the same relative-publication contract as
+    /// [`TlsClientStream::read`]. A terminal error publishes only plaintext
+    /// completed by this operation and preserves the earlier prefix.
     ///
     /// # Errors
     /// Returns `NotConnected` if the TLS handshake has not completed yet.
@@ -920,6 +955,10 @@ pub struct TlsReadFuture<'a, B: IoBuffReadWrite> {
     stream: &'a mut TlsClientStream,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
+    /// Whether the complete destination was initialized on an earlier poll.
+    destination_initialized: bool,
+    /// Logical readable length present before this read started.
+    write_base_len: usize,
     /// Maximum plaintext bytes requested from the TLS reader.
     target: usize,
     /// Deferred validation error returned before any TLS work starts.
@@ -929,6 +968,7 @@ pub struct TlsReadFuture<'a, B: IoBuffReadWrite> {
 impl<'a, B: IoBuffReadWrite> TlsReadFuture<'a, B> {
     fn new(stream: &'a mut TlsClientStream, buffer: B, len: usize) -> Self {
         let mut input_error = None;
+        let write_base_len = buffer.write_base_len();
         let target = match checked_read_len(len, buffer.writable_len()) {
             Ok(target) => target as usize,
             Err(err) => {
@@ -940,6 +980,8 @@ impl<'a, B: IoBuffReadWrite> TlsReadFuture<'a, B> {
         Self {
             stream,
             buffer: Some(buffer),
+            destination_initialized: false,
+            write_base_len,
             target,
             input_error,
         }
@@ -967,24 +1009,32 @@ impl<B: IoBuffReadWrite> Future for TlsReadFuture<'_, B> {
         }
 
         if this.target == 0 {
-            let mut buffer = unsafe { opt_take(&mut this.buffer) };
-            unsafe { buffer.set_written_len(0) };
-            return Poll::Ready((Ok(0), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, 0, Ok(0))
+            });
         }
 
         let buffer = unsafe { opt_mut(&mut this.buffer) };
-        // SAFETY: `target` was validated against `writable_len()` above.
-        let dst = unsafe { slice::from_raw_parts_mut(buffer.as_mut_ptr(), this.target) };
+        // SAFETY: `target` is nonzero and was validated against
+        // `writable_len()` above. This future does not change the buffer's
+        // writable base or logical length before returning it.
+        let dst = unsafe {
+            tls_userspace_destination(buffer, &mut this.destination_initialized, this.target)
+        };
         match this.stream.poll_read_plaintext(cx, dst) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(read)) => {
-                unsafe { buffer.set_written_len(read) };
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                Poll::Ready((Ok(read), buffer))
+                Poll::Ready(unsafe {
+                    complete_read_with_progress(buffer, this.write_base_len, read, Ok(read))
+                })
             }
             Poll::Ready(Err(err)) => {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                Poll::Ready((Err(err), buffer))
+                Poll::Ready(unsafe {
+                    complete_read_with_progress(buffer, this.write_base_len, 0, Err(err))
+                })
             }
         }
     }
@@ -997,8 +1047,10 @@ pub struct TlsReadExactFuture<'a, B: IoBuffReadWrite> {
     stream: &'a mut TlsClientStream,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
-    /// Stable base pointer captured once for incremental exact reads.
-    base_ptr: *mut u8,
+    /// Whether the complete destination was initialized on an earlier poll.
+    destination_initialized: bool,
+    /// Logical readable length present before this read started.
+    write_base_len: usize,
     /// Total plaintext bytes required before completion.
     target: usize,
     /// Plaintext bytes already written into the caller buffer.
@@ -1008,8 +1060,9 @@ pub struct TlsReadExactFuture<'a, B: IoBuffReadWrite> {
 }
 
 impl<'a, B: IoBuffReadWrite> TlsReadExactFuture<'a, B> {
-    fn new(stream: &'a mut TlsClientStream, mut buffer: B, len: usize) -> Self {
+    fn new(stream: &'a mut TlsClientStream, buffer: B, len: usize) -> Self {
         let mut input_error = None;
+        let write_base_len = buffer.write_base_len();
         let target = match checked_read_len(len, buffer.writable_len()) {
             Ok(target) => target as usize,
             Err(err) => {
@@ -1017,12 +1070,11 @@ impl<'a, B: IoBuffReadWrite> TlsReadExactFuture<'a, B> {
                 0
             }
         };
-        let base_ptr = buffer.as_mut_ptr();
-
         Self {
             stream,
             buffer: Some(buffer),
-            base_ptr,
+            destination_initialized: false,
+            write_base_len,
             target,
             filled: 0,
             input_error,
@@ -1051,39 +1103,60 @@ impl<B: IoBuffReadWrite> Future for TlsReadExactFuture<'_, B> {
         }
 
         if this.target == 0 {
-            let mut buffer = unsafe { opt_take(&mut this.buffer) };
-            unsafe { buffer.set_written_len(0) };
-            return Poll::Ready((Ok(0), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, 0, Ok(0))
+            });
         }
 
         loop {
             let remaining = this.target - this.filled;
-            // SAFETY: `base_ptr` is stable for the entire buffer lifetime and
-            // `remaining` stays within the validated writable region.
-            let dst =
-                unsafe { slice::from_raw_parts_mut(this.base_ptr.add(this.filled), remaining) };
+            let buffer = unsafe { opt_mut(&mut this.buffer) };
+            // SAFETY: `target` is nonzero and was validated against
+            // `writable_len()` above. Neither the buffer's writable base nor
+            // logical length changes until completion publishes `filled`
+            // bytes.
+            let dst = unsafe {
+                tls_userspace_destination(buffer, &mut this.destination_initialized, this.target)
+            };
+            let dst = &mut dst[this.filled..this.filled + remaining];
             match this.stream.poll_read_plaintext(cx, dst) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(0)) => {
-                    let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                    unsafe { buffer.set_written_len(this.filled) };
-                    return Poll::Ready((
-                        Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                        buffer,
-                    ));
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            buffer,
+                            this.write_base_len,
+                            this.filled,
+                            Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        )
+                    });
                 }
                 Poll::Ready(Ok(read)) => {
                     this.filled += read;
                     if this.filled == this.target {
-                        let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                        unsafe { buffer.set_written_len(this.target) };
-                        return Poll::Ready((Ok(this.target), buffer));
+                        let buffer = unsafe { opt_take(&mut this.buffer) };
+                        return Poll::Ready(unsafe {
+                            complete_read_with_progress(
+                                buffer,
+                                this.write_base_len,
+                                this.target,
+                                Ok(this.target),
+                            )
+                        });
                     }
                 }
                 Poll::Ready(Err(err)) => {
-                    let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                    unsafe { buffer.set_written_len(this.filled) };
-                    return Poll::Ready((Err(err), buffer));
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            buffer,
+                            this.write_base_len,
+                            this.filled,
+                            Err(err),
+                        )
+                    });
                 }
             }
         }
@@ -1141,9 +1214,7 @@ impl<B: IoBuffReadOnly> Future for TlsWriteFuture<'_, B> {
             }
 
             let buffer = unsafe { opt_ref(&this.buffer) };
-            // SAFETY: IoBuffReadOnly guarantees a stable readable range of
-            // exactly `buffer.len()` bytes for the buffer's lifetime.
-            let src = unsafe { slice::from_raw_parts(buffer.as_ptr(), buffer.len()) };
+            let src = readable_slice(buffer);
             let written = match this.stream.connection.writer().write(src) {
                 Ok(written) => written,
                 Err(err) => {
@@ -1326,16 +1397,163 @@ impl Future for TlsShutdownFuture<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::tls_userspace_destination;
     #[cfg(not(miri))]
     use super::*;
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
+    use crate::runtime::buffer::{IoBuffError, IoBuffMut, IoBuffReadWrite};
     #[cfg(not(miri))]
     use crate::runtime::executor::Executor;
     #[cfg(not(miri))]
     use rustls::RootCertStore;
     #[cfg(not(miri))]
     use std::net::{Ipv4Addr, SocketAddr};
+
+    struct DefaultUninitializedBuffer {
+        storage: Box<[std::mem::MaybeUninit<u8>]>,
+        written: usize,
+    }
+
+    impl DefaultUninitializedBuffer {
+        fn new(capacity: usize) -> Self {
+            Self {
+                storage: Box::new_uninit_slice(capacity),
+                written: 0,
+            }
+        }
+    }
+
+    // SAFETY: the boxed allocation is pointer-stable across moves and contains
+    // `storage.len()` writable bytes. The provided userspace initializer is
+    // intentionally inherited to model a downstream custom implementation.
+    unsafe impl IoBuffReadWrite for DefaultUninitializedBuffer {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.storage.as_mut_ptr().cast()
+        }
+
+        fn writable_len(&self) -> usize {
+            self.storage.len()
+        }
+
+        unsafe fn set_written_len(&mut self, len: usize) {
+            self.written = len.min(self.storage.len());
+        }
+    }
+
+    struct CountingUninitializedBuffer {
+        storage: Box<[std::mem::MaybeUninit<u8>]>,
+        initialization_calls: usize,
+    }
+
+    impl CountingUninitializedBuffer {
+        fn new(capacity: usize) -> Self {
+            Self {
+                storage: Box::new_uninit_slice(capacity),
+                initialization_calls: 0,
+            }
+        }
+    }
+
+    // SAFETY: the boxed allocation is pointer-stable and writable for the
+    // reported capacity. The override initializes exactly the requested
+    // prefix without changing its base or logical length.
+    unsafe impl IoBuffReadWrite for CountingUninitializedBuffer {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.storage.as_mut_ptr().cast()
+        }
+
+        fn writable_len(&self) -> usize {
+            self.storage.len()
+        }
+
+        unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+            self.initialization_calls += 1;
+            let ptr = self.as_mut_ptr();
+            unsafe {
+                std::ptr::write_bytes(ptr, 0, len);
+                std::slice::from_raw_parts_mut(ptr, len)
+            }
+        }
+
+        unsafe fn set_written_len(&mut self, _len: usize) {}
+    }
+
+    #[test]
+    fn tls_userspace_destination_initializes_fresh_vec_prefix() {
+        let mut buffer = vec![0xA5; 8];
+        buffer.clear();
+        let mut initialized = false;
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        assert_eq!(dst, &[0; 5]);
+        dst.copy_from_slice(b"hello");
+        // SAFETY: this test initialized all eight allocated bytes before
+        // clearing the Vec's logical length. The userspace hook must not touch
+        // bytes beyond its requested five-byte prefix.
+        assert_eq!(unsafe { buffer.as_ptr().add(5).read() }, 0xA5);
+        unsafe { buffer.set_written_len(5) };
+        assert_eq!(buffer, b"hello");
+    }
+
+    #[test]
+    fn tls_userspace_destination_initializes_fresh_iobuff() {
+        let mut buffer = IoBuffMut::new(0, 8, 0).unwrap();
+        let mut initialized = false;
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        assert_eq!(dst, &[0; 5]);
+        dst[..3].copy_from_slice(b"abc");
+        unsafe { buffer.set_written_len(3) };
+        assert_eq!(buffer.payload_bytes(), b"abc");
+
+        buffer.payload_set_len(5).unwrap();
+        assert_eq!(buffer.payload_bytes(), b"abc\0\0");
+        assert_eq!(
+            buffer.payload_set_len(6),
+            Err(IoBuffError::PayloadUninitialized)
+        );
+    }
+
+    #[test]
+    fn tls_userspace_destination_preserves_iobuff_frontier() {
+        let mut buffer = IoBuffMut::new(0, 8, 0).unwrap();
+        buffer.payload_append(b"ABCDEFG").unwrap();
+        buffer.payload_set_len(2).unwrap();
+
+        let mut initialized = false;
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        assert_eq!(dst, b"CDEFG");
+        assert_eq!(buffer.payload_bytes(), b"AB");
+    }
+
+    #[test]
+    fn tls_userspace_destination_initializes_default_custom_buffer() {
+        let mut buffer = DefaultUninitializedBuffer::new(8);
+        buffer.storage[5].write(0xA5);
+        let mut initialized = false;
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        assert_eq!(dst, &[0; 5]);
+        assert_eq!(unsafe { buffer.storage[5].assume_init() }, 0xA5);
+    }
+
+    #[test]
+    fn tls_userspace_destination_reuses_prepared_range() {
+        let mut buffer = CountingUninitializedBuffer::new(8);
+        let mut initialized = false;
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        dst[..3].copy_from_slice(b"abc");
+
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        assert_eq!(&dst[..3], b"abc");
+        assert_eq!(buffer.initialization_calls, 1);
+    }
+
+    #[test]
+    fn tls_userspace_destination_preserves_initialized_box_prefix() {
+        let mut buffer = vec![0x5A; 8].into_boxed_slice();
+        let mut initialized = false;
+        let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
+        assert_eq!(dst, &[0x5A; 5]);
+    }
 
     #[cfg(not(miri))]
     fn drain_pending_rustls_writes(connection: &mut ClientConnection) {

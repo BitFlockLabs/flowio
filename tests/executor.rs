@@ -6,13 +6,12 @@ use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly};
-use flowio::runtime::executor::{Executor, ExecutorConfig, TrySpawnError};
+use flowio::runtime::executor::{Executor, ExecutorConfig, JoinError, JoinHandle, TrySpawnError};
 use flowio::runtime::reactor::ReactorConfig;
-use flowio::runtime::timer::{sleep, sleep_until, timeout, timeout_at};
+use flowio::runtime::timer::{Sleep, TimeoutError, sleep, sleep_until, timeout, timeout_at};
 use flowio::test_support::runtime::io::{Nop, NopSlot};
 use flowio::test_support::runtime::op::CompletionState;
 use flowio::test_support::runtime::task::TaskHeader;
-#[cfg(debug_assertions)]
 use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
@@ -23,10 +22,11 @@ use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 fn new_executor() -> Executor {
@@ -42,6 +42,121 @@ fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Execu
     .expect("failed to construct runtime executor")
 }
 
+#[cfg(debug_assertions)]
+fn fd_identity(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` points to writable storage and `fstat` accepts any integer
+    // descriptor, reporting `EBADF` when it is no longer open.
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: successful `fstat` initialized the complete `libc::stat` value.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+struct ExternalWakeFuture {
+    release: Rc<Cell<bool>>,
+    completed: Rc<Cell<bool>>,
+    waker: Rc<RefCell<Option<Waker>>>,
+}
+
+impl Future for ExternalWakeFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.release.get() {
+            self.completed.set(true);
+            return Poll::Ready(());
+        }
+        *self.waker.borrow_mut() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+struct StageCompletedNop {
+    nop: Option<Nop>,
+    staged: Rc<RefCell<Option<Nop>>>,
+    submitted: bool,
+}
+
+struct StageFiredSleep {
+    sleep: Option<Sleep>,
+    staged: Rc<RefCell<Option<Sleep>>>,
+    armed: bool,
+}
+
+impl Future for StageFiredSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.armed {
+            *this.staged.borrow_mut() = this.sleep.take();
+            return Poll::Ready(());
+        }
+
+        let sleep = this.sleep.as_mut().expect("staged sleep missing");
+        assert!(Pin::new(sleep).poll(cx).is_pending());
+        this.armed = true;
+        Poll::Pending
+    }
+}
+
+impl Future for StageCompletedNop {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.submitted {
+            *this.staged.borrow_mut() = this.nop.take();
+            return Poll::Ready(());
+        }
+
+        let nop = this.nop.as_mut().expect("staged NOP missing");
+        assert!(Pin::new(nop).poll(cx).is_pending());
+        this.submitted = true;
+        Poll::Pending
+    }
+}
+
+struct DropCounter(Rc<Cell<usize>>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+fn poll_join_handle<T: 'static>(handle: &mut JoinHandle<T>) -> Poll<Result<T, JoinError>> {
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    Pin::new(handle).poll(&mut cx)
+}
+
+struct NonFlowioWake;
+
+impl Wake for NonFlowioWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn capture_flowio_waker(executor: &mut Executor) -> Waker {
+    let captured = Rc::new(RefCell::new(None));
+    let captured_slot = Rc::clone(&captured);
+    executor
+        .run(poll_fn(move |cx| {
+            *captured_slot.borrow_mut() = Some(cx.waker().clone());
+            Poll::Ready(())
+        }))
+        .expect("capture-waker run failed");
+    captured
+        .borrow_mut()
+        .take()
+        .expect("executor task waker was not captured")
+}
+
 struct CrossTaskRepollShared<F> {
     future: RefCell<F>,
     first_poll_pending: Cell<bool>,
@@ -54,6 +169,17 @@ struct FirstPollSharedFuture<F> {
 
 struct SecondPollSharedFuture<F> {
     shared: Rc<CrossTaskRepollShared<F>>,
+}
+
+struct PendingFutureHandoff<F> {
+    future: RefCell<Option<F>>,
+    receiver_waker: RefCell<Option<Waker>>,
+}
+
+struct PollPendingThenHandoff<F> {
+    future: Option<F>,
+    shared: Rc<PendingFutureHandoff<F>>,
+    hold_after_poll: Duration,
 }
 
 impl<F: Future + Unpin> Future for FirstPollSharedFuture<F> {
@@ -90,6 +216,31 @@ impl<F: Future + Unpin> Future for SecondPollSharedFuture<F> {
                 Poll::Ready(())
             }
         }
+    }
+}
+
+impl<F: Future + Unpin> Future for PollPendingThenHandoff<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let future = this.future.as_mut().expect("handoff future missing");
+        assert!(
+            Pin::new(future).poll(cx).is_pending(),
+            "handoff future completed on its first poll"
+        );
+
+        if !this.hold_after_poll.is_zero() {
+            // Test-only ordering control: make the timer due before this task
+            // completes so process_quota=1 expires it before the receiver runs.
+            std::thread::sleep(this.hold_after_poll);
+        }
+
+        *this.shared.future.borrow_mut() = this.future.take();
+        if let Some(waker) = this.shared.receiver_waker.borrow_mut().take() {
+            waker.wake();
+        }
+        Poll::Ready(())
     }
 }
 
@@ -163,13 +314,116 @@ where
             let second = Executor::spawn(SecondPollSharedFuture { shared })
                 .expect("spawn second shared-poll task");
 
-            first.await;
-            second.await;
+            first.await.expect("first shared task cancelled");
+            second.await.expect("second shared task cancelled");
         })
         .expect("cross-task repoll should complete");
 
     assert!(observed.first_poll_pending.get());
     assert!(observed.completed_by_second.get());
+}
+
+fn run_parent_completion_before_waiter_migration<F>(
+    future: F,
+    hold_after_poll: Duration,
+) -> F::Output
+where
+    F: Future + Unpin + 'static,
+    F::Output: 'static,
+{
+    let shared = Rc::new(PendingFutureHandoff {
+        future: RefCell::new(None),
+        receiver_waker: RefCell::new(None),
+    });
+    let output = Rc::new(RefCell::new(None));
+    let output_slot = Rc::clone(&output);
+    let mut executor = new_executor_with(1, None);
+
+    executor
+        .run({
+            let shared = Rc::clone(&shared);
+            async move {
+                let first_owner = Executor::spawn(PollPendingThenHandoff {
+                    future: Some(future),
+                    shared: Rc::clone(&shared),
+                    hold_after_poll,
+                })
+                .expect("spawn first waiter owner");
+                drop(first_owner);
+
+                let mut migrated = poll_fn(|cx| {
+                    if let Some(future) = shared.future.borrow_mut().take() {
+                        return Poll::Ready(future);
+                    }
+
+                    let mut receiver_waker = shared.receiver_waker.borrow_mut();
+                    if !receiver_waker
+                        .as_ref()
+                        .is_some_and(|stored| stored.will_wake(cx.waker()))
+                    {
+                        *receiver_waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending
+                })
+                .await;
+
+                *output_slot.borrow_mut() = Some(Pin::new(&mut migrated).await);
+            }
+        })
+        .expect("waiter migration run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.task_allocs, 2);
+        assert_eq!(stats.task_frees, 2, "waiter owner task reference leaked");
+    }
+
+    output
+        .borrow_mut()
+        .take()
+        .expect("migrated future did not complete")
+}
+
+fn run_parent_completion_without_pending_future_drop<F>(future: F, hold_after_poll: Duration)
+where
+    F: Future + Unpin + 'static,
+    F::Output: 'static,
+{
+    let shared = Rc::new(PendingFutureHandoff {
+        future: RefCell::new(None),
+        receiver_waker: RefCell::new(None),
+    });
+    let observed = Rc::clone(&shared);
+    let mut executor = new_executor_with(1, None);
+
+    executor
+        .run(async move {
+            let first_owner = Executor::spawn(PollPendingThenHandoff {
+                future: Some(future),
+                shared,
+                hold_after_poll,
+            })
+            .expect("spawn retained pending-future owner");
+            drop(first_owner);
+        })
+        .expect("pending future should remain valid through waiter completion");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.task_allocs, 2);
+        assert_eq!(stats.task_frees, 2, "forgotten waiter owner task leaked");
+    }
+
+    // Keep the future alive without repolling or dropping it until after the
+    // CQE/timer has consumed its waiter, then reclaim its completed state.
+    let pending = observed
+        .future
+        .borrow_mut()
+        .take()
+        .expect("pending future was not retained outside its first owner");
+    drop(pending);
 }
 
 #[cfg(target_os = "linux")]
@@ -541,6 +795,14 @@ fn assert_kernel_write_error(err: &io::Error) {
     );
 }
 
+fn assert_nested_run_error(err: &io::Error) {
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        "nested or reentrant Executor::run is not supported"
+    );
+}
+
 #[test]
 fn runtime_executor_constructs_with_custom_config() {
     let executor = new_executor_with(16, None);
@@ -649,6 +911,129 @@ fn runtime_executor_runs_immediate_task() {
 }
 
 #[test]
+fn runtime_executor_rejects_nested_runs_and_preserves_outer_context() {
+    let mut outer = new_executor();
+    let mut normal_inner = new_executor();
+    let mut panic_inner = new_executor();
+    #[cfg(target_os = "linux")]
+    let mut invalid_affinity_inner = {
+        let max_cpu = 8 * std::mem::size_of::<libc::cpu_set_t>();
+        new_executor_with(16, Some(max_cpu))
+    };
+
+    let nested_polled = Rc::new(Cell::new(false));
+    let nested_drops = Rc::new(Cell::new(0));
+    let panic_polled = Rc::new(Cell::new(false));
+    let spawned_completed = Rc::new(Cell::new(false));
+    let outer_completed = Rc::new(Cell::new(false));
+
+    let nested_polled_probe = Rc::clone(&nested_polled);
+    let nested_drops_probe = Rc::clone(&nested_drops);
+    let panic_polled_probe = Rc::clone(&panic_polled);
+    let spawned_completed_probe = Rc::clone(&spawned_completed);
+    let outer_completed_probe = Rc::clone(&outer_completed);
+
+    outer
+        .run(async move {
+            let nested_drop_guard = DropCounter(nested_drops_probe);
+            let err = normal_inner
+                .run(async move {
+                    let _nested_drop_guard = nested_drop_guard;
+                    nested_polled_probe.set(true);
+                })
+                .expect_err("nested run should be rejected");
+            assert_nested_run_error(&err);
+
+            #[cfg(target_os = "linux")]
+            {
+                let err = invalid_affinity_inner
+                    .run(async {})
+                    .expect_err("nested run should be rejected before affinity setup");
+                assert_nested_run_error(&err);
+            }
+
+            let nested_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                panic_inner.run(async move {
+                    panic_polled_probe.set(true);
+                    panic!("nested future must not be polled");
+                })
+            }));
+            let err = nested_panic
+                .expect("rejecting a nested run must not unwind")
+                .expect_err("panic-capable nested run should be rejected");
+            assert_nested_run_error(&err);
+
+            let handle = Executor::spawn(async move {
+                spawned_completed_probe.set(true);
+            })
+            .expect("outer spawn failed after nested rejection");
+            sleep(Duration::ZERO)
+                .await
+                .expect("outer timer failed after nested rejection");
+            handle
+                .await
+                .expect("outer spawned task was cancelled after nested rejection");
+            outer_completed_probe.set(true);
+        })
+        .expect("outer executor failed after nested rejection");
+
+    assert!(!nested_polled.get(), "rejected nested future was polled");
+    assert_eq!(nested_drops.get(), 1, "rejected nested future leaked");
+    assert!(
+        !panic_polled.get(),
+        "panic-capable nested future was polled"
+    );
+    assert!(
+        spawned_completed.get(),
+        "outer spawned task did not complete after nested rejection"
+    );
+    assert!(
+        outer_completed.get(),
+        "outer task did not complete after nested rejection"
+    );
+}
+
+#[test]
+fn runtime_executor_context_is_cleared_when_run_unwinds() {
+    let mut panicking_executor = new_executor();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panicking_executor.run(async {
+            panic!("executor context unwind probe");
+        })
+    }));
+    assert!(unwind.is_err(), "executor task should have panicked");
+
+    match Executor::try_spawn(async {}) {
+        Err(TrySpawnError::NoExecutor { future }) => drop(future),
+        Ok(_) => panic!("executor context remained installed after unwind"),
+        Err(_) => panic!("unexpected try_spawn error after unwind"),
+    }
+    drop(panicking_executor);
+
+    let mut next_executor = new_executor();
+    let completed = Rc::new(Cell::new(false));
+    let completed_probe = Rc::clone(&completed);
+    next_executor
+        .run(async move {
+            sleep(Duration::ZERO)
+                .await
+                .expect("timer failed after prior executor unwind");
+            let handle = Executor::spawn(async move {
+                completed_probe.set(true);
+            })
+            .expect("spawn failed after prior executor unwind");
+            handle
+                .await
+                .expect("spawned task was cancelled after prior executor unwind");
+        })
+        .expect("executor failed after prior executor unwind");
+    assert!(
+        completed.get(),
+        "executor context was not restored after unwind"
+    );
+}
+
+#[test]
 fn runtime_executor_runs_nop_future() {
     let mut executor = new_executor();
 
@@ -670,6 +1055,81 @@ fn runtime_executor_runs_nop_future() {
     #[cfg(not(debug_assertions))]
     {
         let _ = executor;
+    }
+}
+
+#[test]
+fn runtime_nop_rejects_noop_waker_outside_run() {
+    let mut nop = Nop::new();
+    let mut cx = Context::from_waker(Waker::noop());
+
+    assert!(matches!(
+        Pin::new(&mut nop).poll(&mut cx),
+        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+    ));
+}
+
+#[test]
+fn runtime_nop_rejects_non_flowio_waker_inside_run() {
+    let mut executor = new_executor();
+    executor
+        .run(async {
+            let mut nop = Nop::new();
+            let waker = Waker::from(Arc::new(NonFlowioWake));
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(
+                Pin::new(&mut nop).poll(&mut cx),
+                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+            ));
+        })
+        .expect("executor run failed after non-FlowIO Waker rejection");
+}
+
+#[test]
+fn runtime_read_rejects_initial_poll_outside_run_and_returns_buffer() {
+    let (mut reader, _writer) = UnixStream::pair().expect("socketpair failed");
+    let mut read = Box::pin(reader.read(vec![0u8; 1], 1));
+    let mut cx = Context::from_waker(Waker::noop());
+
+    match read.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), buffer)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(buffer.len(), 1);
+        }
+        Poll::Ready((Ok(_), _)) => panic!("read unexpectedly succeeded outside Executor::run"),
+        Poll::Pending => panic!("read remained pending outside Executor::run"),
+    }
+}
+
+#[test]
+fn runtime_unsubmitted_validation_error_outside_run_returns_context_error_and_buffer() {
+    let (mut reader, _writer) = UnixStream::pair().expect("socketpair failed");
+    let mut read = Box::pin(reader.read(Vec::<u8>::new(), 1));
+    let mut cx = Context::from_waker(Waker::noop());
+
+    match read.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), buffer)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert!(buffer.is_empty());
+        }
+        Poll::Ready((Ok(_), _)) => panic!("invalid read unexpectedly succeeded outside run"),
+        Poll::Pending => panic!("invalid read remained pending outside run"),
+    }
+}
+
+#[test]
+fn runtime_unsubmitted_zero_length_write_outside_run_returns_context_error_and_buffer() {
+    let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+    let mut write = Box::pin(writer.write_all(Vec::<u8>::new()));
+    let mut cx = Context::from_waker(Waker::noop());
+
+    match write.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), buffer)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert!(buffer.is_empty());
+        }
+        Poll::Ready((Ok(_), _)) => panic!("zero write unexpectedly succeeded outside run"),
+        Poll::Pending => panic!("zero write remained pending outside run"),
     }
 }
 
@@ -735,7 +1195,7 @@ fn runtime_executor_drains_multiple_nop_completions() {
             }
 
             for handle in handles {
-                assert_eq!(handle.await, 0);
+                assert_eq!(handle.await.expect("NOP task cancelled"), 0);
             }
         })
         .expect("executor run failed");
@@ -798,6 +1258,68 @@ fn runtime_poll_io_budget_boundary_preserves_nop_completions() {
 #[test]
 fn runtime_nop_repoll_registers_latest_waiter() {
     run_cross_task_repoll(Nop::new());
+}
+
+#[test]
+fn runtime_nop_waiter_owns_completed_parent_until_migration() {
+    let result = run_parent_completion_before_waiter_migration(Nop::new(), Duration::ZERO)
+        .expect("migrated NOP failed");
+    assert_eq!(result, 0);
+}
+
+#[test]
+fn runtime_nop_waiter_owns_parent_while_pending_future_is_not_dropped() {
+    run_parent_completion_without_pending_future_drop(Nop::new(), Duration::ZERO);
+}
+
+#[test]
+fn runtime_submitted_read_delays_foreign_context_error_until_cqe() {
+    let mut foreign_executor = new_executor();
+    let foreign_waker = capture_flowio_waker(&mut foreign_executor);
+    let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            let mut read = Box::pin(reader.read(vec![0u8; 1], 1));
+            let mut injected_foreign_poll = false;
+            let (result, buffer) = poll_fn(|cx| {
+                if !injected_foreign_poll {
+                    assert!(read.as_mut().poll(cx).is_pending());
+
+                    let mut foreign_cx = Context::from_waker(&foreign_waker);
+                    assert!(
+                        read.as_mut().poll(&mut foreign_cx).is_pending(),
+                        "submitted rental operation returned its buffer before the CQE"
+                    );
+
+                    let byte = b"x";
+                    let rc = unsafe {
+                        libc::send(
+                            writer.as_raw_fd(),
+                            byte.as_ptr().cast(),
+                            byte.len(),
+                            libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    assert_eq!(rc, 1, "raw send failed: {}", io::Error::last_os_error());
+                    injected_foreign_poll = true;
+                    return Poll::Pending;
+                }
+
+                read.as_mut().poll(cx)
+            })
+            .await;
+
+            assert_eq!(
+                result
+                    .expect_err("foreign-context read unexpectedly succeeded")
+                    .kind(),
+                io::ErrorKind::NotConnected
+            );
+            assert_eq!(buffer.len(), 1, "rental buffer was not returned");
+        })
+        .expect("origin executor failed after foreign-context read poll");
 }
 
 #[test]
@@ -917,6 +1439,384 @@ fn runtime_run_stalled_task_returns_would_block_and_executor_drops() {
 
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     drop(executor);
+}
+
+#[test]
+fn runtime_stalled_task_resumes_on_next_run_after_external_wake() {
+    let mut executor = new_executor();
+    let release = Rc::new(Cell::new(false));
+    let completed = Rc::new(Cell::new(false));
+    let stored_waker = Rc::new(RefCell::new(None::<Waker>));
+
+    let err = executor
+        .run({
+            let release = Rc::clone(&release);
+            let completed = Rc::clone(&completed);
+            let stored_waker = Rc::clone(&stored_waker);
+            async move {
+                Executor::spawn(ExternalWakeFuture {
+                    release,
+                    completed,
+                    waker: stored_waker,
+                })
+                .expect("external-wake task spawn failed");
+            }
+        })
+        .expect_err("parked task should stall the first run");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+    release.set(true);
+    stored_waker
+        .borrow()
+        .as_ref()
+        .expect("stalled task did not publish its waker")
+        .wake_by_ref();
+
+    let new_root_completed = Rc::new(Cell::new(false));
+    let new_root_flag = Rc::clone(&new_root_completed);
+    executor
+        .run(async move {
+            new_root_flag.set(true);
+        })
+        .expect("second run should drain old and new work");
+
+    assert!(completed.get(), "stalled task did not resume");
+    assert!(new_root_completed.get(), "new root did not run");
+    drop(stored_waker.borrow_mut().take());
+}
+
+#[test]
+fn runtime_executor_drop_cancels_escaped_pending_join_handle_once() {
+    let mut executor = new_executor();
+    let escaped = Rc::new(RefCell::new(None::<JoinHandle<()>>));
+    let future_drops = Rc::new(Cell::new(0usize));
+
+    let err = executor
+        .run({
+            let escaped = Rc::clone(&escaped);
+            let future_drops = Rc::clone(&future_drops);
+            async move {
+                let handle = Executor::spawn(async move {
+                    let _drop_counter = DropCounter(future_drops);
+                    std::future::pending::<()>().await;
+                })
+                .expect("pending task spawn failed");
+                *escaped.borrow_mut() = Some(handle);
+            }
+        })
+        .expect_err("pending task should stall the run");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+    let mut handle = escaped
+        .borrow_mut()
+        .take()
+        .expect("pending join handle did not escape");
+    assert!(!handle.is_finished());
+    drop(executor);
+
+    assert_eq!(future_drops.get(), 1, "pending future dropped incorrectly");
+    assert!(handle.is_finished());
+    assert_eq!(
+        poll_join_handle(&mut handle),
+        Poll::Ready(Err(JoinError::Cancelled))
+    );
+}
+
+#[test]
+fn runtime_completed_join_handle_survives_executor_drop() {
+    let mut executor = new_executor();
+    let escaped = Rc::new(RefCell::new(None::<JoinHandle<usize>>));
+
+    executor
+        .run({
+            let escaped = Rc::clone(&escaped);
+            async move {
+                *escaped.borrow_mut() =
+                    Some(Executor::spawn(async { 73usize }).expect("value task spawn failed"));
+            }
+        })
+        .expect("completed escaped handle should not keep run live");
+
+    let mut handle = escaped
+        .borrow_mut()
+        .take()
+        .expect("completed join handle did not escape");
+    assert!(handle.is_finished());
+    drop(executor);
+    assert_eq!(poll_join_handle(&mut handle), Poll::Ready(Ok(73)));
+}
+
+#[test]
+fn runtime_handle_drop_inside_foreign_executor_reclaims_origin_slot() {
+    let mut first_executor = new_executor();
+    let escaped = Rc::new(RefCell::new(None::<JoinHandle<usize>>));
+    first_executor
+        .run({
+            let escaped = Rc::clone(&escaped);
+            async move {
+                *escaped.borrow_mut() =
+                    Some(Executor::spawn(async { 5usize }).expect("value task spawn failed"));
+            }
+        })
+        .expect("first executor run failed");
+    let handle = escaped
+        .borrow_mut()
+        .take()
+        .expect("join handle did not escape first executor");
+
+    let mut second_executor = new_executor();
+    second_executor
+        .run(async move {
+            drop(handle);
+        })
+        .expect("foreign executor handle drop failed");
+
+    first_executor
+        .run(async {})
+        .expect("origin executor was corrupted by foreign-context drop");
+    second_executor
+        .run(async {})
+        .expect("second executor was corrupted by foreign handle drop");
+}
+
+#[test]
+fn runtime_completed_nop_dropped_after_run_releases_origin_slot() {
+    let mut executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor");
+    let staged = Rc::new(RefCell::new(None::<Nop>));
+
+    executor
+        .run(StageCompletedNop {
+            nop: Some(Nop::new()),
+            staged: Rc::clone(&staged),
+            submitted: false,
+        })
+        .expect("staged NOP run failed");
+
+    drop(
+        staged
+            .borrow_mut()
+            .take()
+            .expect("completed NOP did not escape"),
+    );
+    executor
+        .run(async {
+            assert_eq!(Nop::new().await.expect("reused NOP failed"), 0);
+        })
+        .expect("one-slot reactor was not reusable after outside-run drop");
+}
+
+#[test]
+fn runtime_completed_nop_foreign_repoll_reclaims_origin_slot() {
+    let mut origin = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor");
+    let staged = Rc::new(RefCell::new(None::<Nop>));
+
+    origin
+        .run(StageCompletedNop {
+            nop: Some(Nop::new()),
+            staged: Rc::clone(&staged),
+            submitted: false,
+        })
+        .expect("staged NOP run failed");
+    let mut nop = staged
+        .borrow_mut()
+        .take()
+        .expect("completed NOP did not escape");
+
+    let mut foreign = new_executor();
+    foreign
+        .run(async move {
+            let err = poll_fn(|cx| match Pin::new(&mut nop).poll(cx) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => panic!("completed foreign NOP remained pending"),
+            })
+            .await
+            .expect_err("completed foreign NOP unexpectedly succeeded");
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        })
+        .expect("foreign executor failed while rejecting completed NOP");
+
+    origin
+        .run(async {
+            assert_eq!(Nop::new().await.expect("reused NOP failed"), 0);
+        })
+        .expect("origin reactor slot was not reclaimed by foreign rejection");
+}
+
+#[test]
+fn runtime_fired_sleep_rejects_outside_run_after_executor_drop() {
+    let mut executor = new_executor();
+    let staged = Rc::new(RefCell::new(None::<Sleep>));
+    executor
+        .run(StageFiredSleep {
+            sleep: Some(sleep(Duration::from_millis(1))),
+            staged: Rc::clone(&staged),
+            armed: false,
+        })
+        .expect("staged sleep run failed");
+
+    let mut fired = staged
+        .borrow_mut()
+        .take()
+        .expect("fired sleep did not escape");
+    drop(executor);
+
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(matches!(
+        Pin::new(&mut fired).poll(&mut cx),
+        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+    ));
+}
+
+#[test]
+fn runtime_fired_sleep_rejects_foreign_executor_and_reclaims_origin_entry() {
+    let mut origin = new_executor();
+    let staged = Rc::new(RefCell::new(None::<Sleep>));
+    origin
+        .run(StageFiredSleep {
+            sleep: Some(sleep(Duration::from_millis(1))),
+            staged: Rc::clone(&staged),
+            armed: false,
+        })
+        .expect("staged sleep run failed");
+    let mut fired = staged
+        .borrow_mut()
+        .take()
+        .expect("fired sleep did not escape");
+
+    let mut foreign = new_executor();
+    foreign
+        .run(async move {
+            let err = poll_fn(|cx| match Pin::new(&mut fired).poll(cx) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => panic!("fired foreign timer remained pending"),
+            })
+            .await
+            .expect_err("fired foreign timer unexpectedly succeeded");
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        })
+        .expect("foreign executor failed while rejecting fired timer");
+
+    origin
+        .run(async {})
+        .expect("origin executor was corrupted by foreign timer cleanup");
+}
+
+#[test]
+fn runtime_armed_sleep_rejects_foreign_flowio_waker() {
+    let mut foreign = new_executor();
+    let foreign_waker = capture_flowio_waker(&mut foreign);
+    let mut origin = new_executor();
+
+    origin
+        .run(async move {
+            let mut timer = sleep(Duration::from_secs(60));
+            poll_fn(|cx| {
+                assert!(Pin::new(&mut timer).poll(cx).is_pending());
+
+                let mut foreign_cx = Context::from_waker(&foreign_waker);
+                assert!(matches!(
+                    Pin::new(&mut timer).poll(&mut foreign_cx),
+                    Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+                ));
+                Poll::Ready(())
+            })
+            .await;
+        })
+        .expect("origin executor failed after armed timer rejection");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_cancelled_sleep_rejects_outside_run_after_executor_drop() {
+    let mut executor = new_executor();
+    let staged = Rc::new(RefCell::new(None::<Sleep>));
+    let err = executor
+        .run({
+            let staged = Rc::clone(&staged);
+            async move {
+                let mut timer = sleep(Duration::from_secs(60));
+                poll_fn(|cx| {
+                    assert!(Pin::new(&mut timer).poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                *staged.borrow_mut() = Some(timer);
+                test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            }
+        })
+        .expect_err("injected wait error should leave the timer armed");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+    let mut timer = staged
+        .borrow_mut()
+        .take()
+        .expect("armed sleep did not escape");
+    drop(executor);
+
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(matches!(
+        Pin::new(&mut timer).poll(&mut cx),
+        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+    ));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_executor_drop_fallback_releases_inflight_read_resources_once() {
+    let mut executor = new_executor();
+    let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+    let reader_fd = reader.as_raw_fd();
+    let reader_identity = fd_identity(reader_fd).expect("reader fstat failed");
+    let buffer_drops = Rc::new(Cell::new(0usize));
+    let drops_flag = Rc::clone(&buffer_drops);
+
+    let err = executor
+        .run(async move {
+            test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            let buffer = DropTrackedReadWrite::zeroed(64, &drops_flag);
+            let (_result, _buffer) = reader.read(buffer, 64).await;
+        })
+        .expect_err("injected reactor error should end the run");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    assert_eq!(buffer_drops.get(), 0, "in-flight buffer dropped early");
+
+    test_hooks::fail_next_ring_submit_errno(libc::EIO);
+    drop(executor);
+
+    assert_eq!(buffer_drops.get(), 1, "in-flight buffer drop count");
+    match fd_identity(reader_fd) {
+        Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EBADF)),
+        Ok(current_identity) => assert_ne!(
+            current_identity, reader_identity,
+            "reader descriptor stayed open after executor drop"
+        ),
+    }
+    drop(writer);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_clean_runs_reset_generation_task_counters() {
+    let mut executor = new_executor();
+    executor.run(async {}).expect("first clean run failed");
+    let first = executor.last_stats();
+    assert_eq!(first.task_allocs, 1);
+    assert_eq!(first.task_frees, 1);
+
+    executor.run(async {}).expect("second clean run failed");
+    let second = executor.last_stats();
+    assert_eq!(second.task_allocs, 1);
+    assert_eq!(second.task_frees, 1);
 }
 
 #[cfg(debug_assertions)]
@@ -1114,7 +2014,7 @@ fn runtime_try_spawn_returns_join_handle() {
                 Ok(handle) => handle,
                 Err(_) => panic!("try_spawn failed inside Executor::run"),
             };
-            observed_flag.set(handle.await);
+            observed_flag.set(handle.await.expect("spawned task cancelled"));
         })
         .expect("executor run failed");
 
@@ -1261,8 +2161,37 @@ fn runtime_sleep_completes() {
 }
 
 #[test]
+fn runtime_sleep_rejects_zero_and_nonzero_polls_outside_run() {
+    for duration in [Duration::ZERO, Duration::from_millis(1)] {
+        let mut timer = sleep(duration);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut timer).poll(&mut cx),
+            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+        ));
+    }
+}
+
+#[test]
 fn runtime_sleep_repoll_registers_latest_waiter() {
     run_cross_task_repoll(sleep(Duration::from_millis(5)));
+}
+
+#[test]
+fn runtime_sleep_waiter_owns_completed_parent_until_migration() {
+    run_parent_completion_before_waiter_migration(
+        sleep(Duration::from_millis(1)),
+        Duration::from_millis(5),
+    )
+    .expect("migrated sleep failed");
+}
+
+#[test]
+fn runtime_sleep_waiter_owns_parent_while_pending_future_is_not_dropped() {
+    run_parent_completion_without_pending_future_drop(
+        sleep(Duration::from_millis(1)),
+        Duration::from_millis(5),
+    );
 }
 
 #[test]
@@ -1448,6 +2377,56 @@ fn runtime_sleep_uses_fresh_tick_after_idle_gap() {
 }
 
 #[test]
+fn runtime_relative_sleep_samples_after_same_pass_cpu_delay() {
+    const CPU_DELAY: Duration = Duration::from_millis(40);
+    const SLEEP_TARGET: Duration = Duration::from_millis(20);
+    const MIN_ELAPSED: Duration = Duration::from_millis(15);
+
+    let mut executor = new_executor();
+    let observed = Rc::new(Cell::new(Duration::ZERO));
+    let observed_flag = observed.clone();
+
+    executor
+        .run(async move {
+            let mut anchor = Box::pin(sleep(Duration::from_millis(200)));
+            let mut target = Box::pin(sleep(SLEEP_TARGET));
+            let mut target_start = None;
+
+            let (result, elapsed) = poll_fn(|cx| {
+                if target_start.is_none() {
+                    assert!(
+                        anchor.as_mut().poll(cx).is_pending(),
+                        "anchor sleep should arm before the CPU delay"
+                    );
+                    std::thread::sleep(CPU_DELAY);
+                    target_start = Some(Instant::now());
+                }
+
+                match target.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(result) => {
+                        let elapsed = target_start
+                            .expect("target start should be recorded")
+                            .elapsed();
+                        Poll::Ready((result, elapsed))
+                    }
+                }
+            })
+            .await;
+            result.expect("relative sleep failed");
+            drop(anchor);
+            observed_flag.set(elapsed);
+        })
+        .expect("executor run failed");
+
+    assert!(
+        observed.get() >= MIN_ELAPSED,
+        "relative sleep completed too early after same-pass CPU delay: {:?}",
+        observed.get()
+    );
+}
+
+#[test]
 fn runtime_sleep_until_uses_fresh_tick_after_idle_gap() {
     let mut executor = new_executor();
     let observed = Rc::new(Cell::new(Duration::ZERO));
@@ -1554,6 +2533,27 @@ fn runtime_timeout_completes_before_deadline() {
 }
 
 #[test]
+fn timeout_error_formats_and_exposes_runtime_source() {
+    let elapsed = TimeoutError::Elapsed;
+    assert_eq!(elapsed.to_string(), "runtime timer elapsed");
+    assert!(std::error::Error::source(&elapsed).is_none());
+
+    let runtime = TimeoutError::Runtime(io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        "timer pool exhausted",
+    ));
+    assert_eq!(
+        runtime.to_string(),
+        "runtime timer failed: timer pool exhausted"
+    );
+    let source = std::error::Error::source(&runtime).expect("runtime error source missing");
+    let source = source
+        .downcast_ref::<io::Error>()
+        .expect("runtime error source should remain io::Error");
+    assert_eq!(source.kind(), io::ErrorKind::OutOfMemory);
+}
+
+#[test]
 fn runtime_timeout_expires() {
     let mut executor = new_executor();
     let timed_out = Rc::new(Cell::new(false));
@@ -1566,12 +2566,43 @@ fn runtime_timeout_expires() {
                 11usize
             })
             .await;
-            assert!(result.is_err(), "timeout should have elapsed");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "timeout should report deadline expiry"
+            );
             timed_out_flag.set(true);
         })
         .expect("executor run failed");
 
     assert!(timed_out.get(), "timeout expiry path did not run");
+}
+
+#[test]
+fn runtime_timeout_preserves_timer_allocation_failure() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async {
+            test_hooks::fail_next_timer_alloc();
+            let sleep_err = sleep(Duration::from_secs(1))
+                .await
+                .expect_err("injected sleep allocation failure should surface");
+            assert_eq!(sleep_err.kind(), io::ErrorKind::OutOfMemory);
+
+            test_hooks::fail_next_timer_alloc();
+            let timeout_err = timeout(Duration::from_secs(1), std::future::pending::<()>())
+                .await
+                .expect_err("timeout should preserve timer allocation failure");
+            match timeout_err {
+                TimeoutError::Runtime(err) => {
+                    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+                }
+                TimeoutError::Elapsed => {
+                    panic!("timer allocation failure was misreported as deadline expiry");
+                }
+            }
+        })
+        .expect("executor run failed");
 }
 
 #[test]
@@ -1677,7 +2708,7 @@ fn runtime_join_handle_returns_value() {
     executor
         .run(async move {
             let handle = Executor::spawn(async { 42usize }).expect("spawn failed");
-            let value = handle.await;
+            let value = handle.await.expect("spawned task cancelled");
             assert_eq!(value, 42);
         })
         .expect("executor run failed");
@@ -1692,7 +2723,7 @@ fn runtime_join_handle_returns_string() {
         .run(async move {
             let handle = Executor::spawn(async { String::from("hello from spawned task") })
                 .expect("spawn failed");
-            let value = handle.await;
+            let value = handle.await.expect("spawned task cancelled");
             assert_eq!(value, "hello from spawned task");
         })
         .expect("executor run failed");
@@ -1729,9 +2760,9 @@ fn runtime_join_handle_multiple_concurrent() {
             let h2 = Executor::spawn(async { 20usize }).expect("spawn 2 failed");
             let h3 = Executor::spawn(async { 30usize }).expect("spawn 3 failed");
 
-            let v3 = h3.await;
-            let v1 = h1.await;
-            let v2 = h2.await;
+            let v3 = h3.await.expect("spawn 3 cancelled");
+            let v1 = h1.await.expect("spawn 1 cancelled");
+            let v2 = h2.await.expect("spawn 2 cancelled");
 
             assert_eq!(v1 + v2 + v3, 60);
         })
@@ -1762,8 +2793,8 @@ fn runtime_join_handle_with_io() {
             })
             .expect("spawn reader failed");
 
-            let write_result = writer.await;
-            let read_result = reader.await;
+            let write_result = writer.await.expect("writer task cancelled");
+            let read_result = reader.await.expect("reader task cancelled");
 
             assert_eq!(write_result, 42);
             assert_eq!(&read_result[..], b"join-test");
@@ -1786,7 +2817,7 @@ fn runtime_join_handle_is_finished() {
 
             assert!(!handle.is_finished(), "should not be finished immediately");
 
-            let value = handle.await;
+            let value = handle.await.expect("spawned task cancelled");
             assert_eq!(value, 99);
         })
         .expect("executor run failed");
@@ -2389,7 +3420,7 @@ fn runtime_writev_all_readonly_chain_large_512_advances_across_iovec_boundaries(
                 "large 512 chain dropped early"
             );
 
-            let received = reader_handle.await;
+            let received = reader_handle.await.expect("reader task cancelled");
             assert_eq!(received, expected);
 
             drop(chain);
@@ -2463,7 +3494,7 @@ fn runtime_writev_all_projected_512_writes_in_order_and_fits_task_slot() {
             res.expect("projected 512 readback failed");
             assert_eq!(&recv[..], &expected[..]);
 
-            let (res, source) = writer_handle.await;
+            let (res, source) = writer_handle.await.expect("writer task cancelled");
             assert_eq!(
                 res.expect("projected 512 writev_all failed"),
                 expected.len()
@@ -2620,7 +3651,7 @@ fn runtime_writev_all_projected_large_512_advances_across_iovec_boundaries() {
             assert_eq!(res.expect("large projected writev_all failed"), total);
             assert_eq!(source.expected(), expected);
 
-            let received = reader_handle.await;
+            let received = reader_handle.await.expect("reader task cancelled");
             assert_eq!(received, expected);
         })
         .expect("executor run failed");

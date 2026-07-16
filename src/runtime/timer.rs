@@ -43,11 +43,13 @@
 //! ```
 
 use crate::runtime::executor::{
-    current_poll_owner_task_unchecked, next_timer_wake_epoch_unchecked, note_timer_expired,
-    note_timer_now_tick_call, note_waiter_wake, schedule_ctx_unchecked,
+    ExecutorOwner, PollCtx, next_timer_wake_epoch_unchecked, note_timer_expired,
+    note_timer_now_tick_call, note_waiter_wake, poll_ctx_from_waker, schedule_ctx_unchecked,
     schedule_timer_woken_task_unchecked,
 };
-use crate::runtime::task::TaskHeader;
+use crate::runtime::task::{
+    TaskHeader, clear_task_ref, release_task, replace_task_ref, take_task_ref,
+};
 use crate::utils::list::intrusive::dlist::{DList, Link};
 use crate::utils::memory::pool::{InPlaceInit, Pool};
 use crate::utils::memory::provider::BasicMemoryProvider;
@@ -58,6 +60,7 @@ use std::future::Future;
 use std::io;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -76,13 +79,16 @@ enum TimerState {
     Armed,
     /// Entry has expired and its waiter has already been scheduled.
     Fired,
+    /// Executor shutdown detached the entry before its deadline.
+    Cancelled,
 }
 
 #[repr(C)]
 pub(crate) struct TimerEntry {
     /// Intrusive bucket link while the timer is queued in the wheel.
     link: Link,
-    /// Task to wake when the timer expires.
+    /// Task to wake when the timer expires. A non-null pointer owns one task
+    /// reference.
     waiter: *mut TaskHeader,
     /// Absolute deadline expressed in timer ticks.
     deadline_tick: u64,
@@ -92,6 +98,8 @@ pub(crate) struct TimerEntry {
     bucket_level: u8,
     /// Bucket index within the owning level.
     bucket_index: u16,
+    /// Stable executor owner that allocated this timer entry.
+    owner: Option<Rc<ExecutorOwner>>,
 }
 
 impl TimerEntry {
@@ -105,11 +113,31 @@ impl TimerEntry {
             state: TimerState::Idle,
             bucket_level: INVALID_BUCKET_LEVEL,
             bucket_index: 0,
+            owner: None,
         }
     }
 
+    /// Replaces this timer's owned waiter reference.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `task` must point to a live task on its executor owner thread,
+    /// and this entry must be exclusively accessible.
+    unsafe fn register_waiter(&mut self, task: *mut TaskHeader) {
+        unsafe { replace_task_ref(&mut self.waiter, task) };
+    }
+
+    fn take_waiter(&mut self) -> *mut TaskHeader {
+        unsafe { take_task_ref(&mut self.waiter) }
+    }
+
     fn clear_waiter(&mut self) {
-        self.waiter = std::ptr::null_mut();
+        unsafe { clear_task_ref(&mut self.waiter) };
+    }
+
+    #[inline(always)]
+    fn owner_ptr(&self) -> *const ExecutorOwner {
+        self.owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr)
     }
 }
 
@@ -120,6 +148,9 @@ impl InPlaceInit for TimerEntry {
         slot.write(TimerEntry::new());
     }
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: [(); 48] = [(); std::mem::size_of::<TimerEntry>()];
 
 /// Hierarchical timing wheel plus the cached bookkeeping needed to resume
 /// timer work incrementally across executor passes.
@@ -603,9 +634,10 @@ macro_rules! define_timer_runtime {
             timer_pool: ManuallyDrop<ProviderOwnedPool<TimerEntry, BasicMemoryProvider>>,
             /// Hierarchical timing wheel used to organize deadlines.
             wheel: TimerWheel,
-            /// Per-pass base used to convert relative and absolute deadlines
-            /// consistently without repeated clock reads.
-            arm_base: Option<ArmBase>,
+            /// Per-pass paired clock sample used only for absolute deadlines.
+            absolute_arm_base: Option<ArmBase>,
+            /// Stable owner containing this timer runtime, or null in unit tests.
+            owner: *const ExecutorOwner,
         }
     };
 }
@@ -617,10 +649,9 @@ define_timer_runtime!(pub(crate));
 
 #[derive(Clone, Copy)]
 struct ArmBase {
-    /// Instant sampled at the start of the current arm pass.
+    /// `Instant` half of the paired absolute-deadline clock sample.
     instant: Instant,
-    /// Tick value corresponding to `instant`, reused for all sleeps armed in
-    /// the same executor pass.
+    /// Timer-wheel tick corresponding to `instant`.
     tick: u64,
 }
 
@@ -637,7 +668,8 @@ impl TimerRuntime {
                     .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
             ),
             wheel: TimerWheel::new_uninit(),
-            arm_base: None,
+            absolute_arm_base: None,
+            owner: std::ptr::null(),
         })
     }
 
@@ -645,8 +677,12 @@ impl TimerRuntime {
     pub fn init(&mut self) -> io::Result<()> {
         self.timer_pool.init();
         self.wheel.init()?;
-        self.arm_base = None;
+        self.absolute_arm_base = None;
         Ok(())
+    }
+
+    pub(crate) fn bind_owner(&mut self, owner: *const ExecutorOwner) {
+        self.owner = owner;
     }
 
     /// Samples and returns the current monotonic timer tick.
@@ -655,9 +691,9 @@ impl TimerRuntime {
     }
 
     #[inline(always)]
-    /// Clears the cached arm-time sample at the start of an executor pass.
+    /// Clears the cached absolute-deadline sample for a new executor pass.
     pub(crate) fn begin_executor_pass(&mut self) {
-        self.arm_base = None;
+        self.absolute_arm_base = None;
     }
 
     fn submit_sleep_at_tick(
@@ -665,6 +701,11 @@ impl TimerRuntime {
         task: *mut TaskHeader,
         deadline_tick: u64,
     ) -> io::Result<*mut TimerEntry> {
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        if crate::runtime::test_hooks::take_timer_alloc_failure() {
+            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+        }
+
         let entry = unsafe {
             match self.timer_pool.alloc(()) {
                 Some(entry) => entry,
@@ -677,7 +718,12 @@ impl TimerRuntime {
         unsafe {
             (*entry).link = Link::new_unlinked();
             (*entry).clear_waiter();
-            (*entry).waiter = task;
+            (*entry).owner = if self.owner.is_null() {
+                None
+            } else {
+                Some(ExecutorOwner::clone_rc(self.owner))
+            };
+            (*entry).register_waiter(task);
             (*entry).deadline_tick = deadline_tick;
             (*entry).state = TimerState::Armed;
         }
@@ -685,16 +731,7 @@ impl TimerRuntime {
         Ok(entry)
     }
 
-    fn arm_base(&mut self) -> io::Result<ArmBase> {
-        if let Some(base) = self.arm_base {
-            return Ok(base);
-        }
-
-        // Sample once per executor loop pass. Relative sleeps reuse the same
-        // base tick, and absolute deadlines convert against the matching
-        // Instant sample so both paths stay consistent without a clock read
-        // per armed timer.
-        let instant = Instant::now();
+    fn sample_arm_tick(&mut self) -> io::Result<u64> {
         let tick = now_tick()?;
 
         // When the wheel is empty, its current tick may be arbitrarily stale
@@ -705,19 +742,32 @@ impl TimerRuntime {
             self.wheel.current_tick = tick;
         }
 
+        Ok(tick)
+    }
+
+    fn absolute_arm_base(&mut self) -> io::Result<ArmBase> {
+        if let Some(base) = self.absolute_arm_base {
+            return Ok(base);
+        }
+
+        // Absolute deadlines convert against one paired sample per executor
+        // pass. Relative durations sample their own arm tick instead.
+        let instant = Instant::now();
+        let tick = self.sample_arm_tick()?;
+
         let base = ArmBase { instant, tick };
-        self.arm_base = Some(base);
+        self.absolute_arm_base = Some(base);
         Ok(base)
     }
 
     fn deadline_tick_for_duration(&mut self, duration: Duration) -> io::Result<u64> {
         let ticks = duration_to_ticks(duration);
-        let base = self.arm_base()?;
-        Ok(base.tick.saturating_add(ticks))
+        let arm_tick = self.sample_arm_tick()?;
+        Ok(arm_tick.saturating_add(ticks))
     }
 
     fn deadline_tick_for_instant(&mut self, deadline: Instant) -> io::Result<Option<u64>> {
-        let base = self.arm_base()?;
+        let base = self.absolute_arm_base()?;
         if deadline <= base.instant {
             return Ok(None);
         }
@@ -726,22 +776,20 @@ impl TimerRuntime {
         Ok(Some(base.tick.saturating_add(duration_to_ticks(delta))))
     }
 
-    pub(crate) fn submit_current_sleep_duration(
+    pub(crate) fn submit_sleep_duration(
         &mut self,
+        task: *mut TaskHeader,
         duration: Duration,
     ) -> io::Result<*mut TimerEntry> {
-        // The owning task is taken from the active poll frame and stored once
-        // in the timer entry. Expiry later wakes that task directly.
-        let task = unsafe { current_poll_owner_task_unchecked() };
         let deadline_tick = self.deadline_tick_for_duration(duration)?;
         self.submit_sleep_at_tick(task, deadline_tick)
     }
 
-    pub(crate) fn submit_current_sleep_deadline(
+    pub(crate) fn submit_sleep_deadline(
         &mut self,
+        task: *mut TaskHeader,
         deadline: Instant,
     ) -> io::Result<Option<*mut TimerEntry>> {
-        let task = unsafe { current_poll_owner_task_unchecked() };
         let Some(deadline_tick) = self.deadline_tick_for_instant(deadline)? else {
             return Ok(None);
         };
@@ -770,6 +818,14 @@ impl TimerRuntime {
             self.timer_pool.free(entry);
         }
         Ok(())
+    }
+
+    unsafe fn free_fired_sleep(&mut self, entry: *mut TimerEntry) {
+        unsafe {
+            (*entry).state = TimerState::Idle;
+            (*entry).clear_waiter();
+            self.timer_pool.free(entry);
+        }
     }
 
     /// Expires timers up to `now`, respecting the provided per-pass budget.
@@ -843,7 +899,7 @@ impl TimerRuntime {
                     (*entry_ptr).bucket_level = INVALID_BUCKET_LEVEL;
                     (*entry_ptr).bucket_index = 0;
                     (*entry_ptr).state = TimerState::Fired;
-                    let waiter = (*entry_ptr).waiter;
+                    let waiter = (*entry_ptr).take_waiter();
                     if !waiter.is_null() {
                         note_timer_expired();
                         note_waiter_wake();
@@ -853,7 +909,7 @@ impl TimerRuntime {
                             schedule_ctx.runtime_state,
                             wake_epoch,
                         );
-                        (*entry_ptr).waiter = std::ptr::null_mut();
+                        release_task(waiter);
                     }
                 }
                 remaining_budget -= 1;
@@ -890,6 +946,23 @@ impl TimerRuntime {
             }
         }
     }
+
+    pub(crate) fn cancel_all_for_shutdown(&mut self) {
+        for bucket in &mut self.wheel.lvl0 {
+            cancel_timer_bucket_entries(bucket);
+        }
+        for bucket in &mut self.wheel.lvl1 {
+            cancel_timer_bucket_entries(bucket);
+        }
+        for bucket in &mut self.wheel.lvl2 {
+            cancel_timer_bucket_entries(bucket);
+        }
+        for bucket in &mut self.wheel.lvl3 {
+            cancel_timer_bucket_entries(bucket);
+        }
+        self.wheel.unlink_all_for_drop();
+        self.absolute_arm_base = None;
+    }
 }
 
 impl Drop for TimerRuntime {
@@ -913,6 +986,17 @@ fn free_timer_bucket_entries(
             (*entry).bucket_index = 0;
             (*entry).clear_waiter();
             timer_pool.free(entry);
+        });
+    }
+}
+
+fn cancel_timer_bucket_entries(bucket: &mut DList<TimerEntry>) {
+    unsafe {
+        bucket.drain_all_for_drop(TimerEntry::LINK_OFFSET, |entry| {
+            (*entry).state = TimerState::Cancelled;
+            (*entry).bucket_level = INVALID_BUCKET_LEVEL;
+            (*entry).bucket_index = 0;
+            (*entry).clear_waiter();
         });
     }
 }
@@ -966,7 +1050,7 @@ fn now_tick() -> io::Result<u64> {
 ///
 /// `entry` must point to a live timer entry owned by the active executor, and
 /// this function must run during the poll of the future that owns that entry.
-unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry) {
+unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry, pctx: &PollCtx) {
     debug_assert!(
         !entry.is_null(),
         "cannot refresh waiter for a missing timer entry"
@@ -975,8 +1059,20 @@ unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry) {
         return;
     }
     unsafe {
-        (*entry).waiter = current_poll_owner_task_unchecked();
+        (*entry).register_waiter(pctx.owner_task());
     }
+}
+
+/// Returns the timer runtime recorded by an allocated entry and keeps its owner
+/// alive until the caller finishes reclamation.
+unsafe fn timer_runtime_for_entry(
+    entry: *mut TimerEntry,
+) -> (Option<Rc<ExecutorOwner>>, *mut TimerRuntime) {
+    let owner = unsafe { (*entry).owner.clone() };
+    let timers = owner
+        .as_ref()
+        .map_or(std::ptr::null_mut(), |owner| owner.timers_ptr());
+    (owner, timers)
 }
 
 /// One-shot sleep future scheduled by the runtime timer wheel.
@@ -988,7 +1084,9 @@ unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry) {
 /// data-path read/write step when the same timeout semantics can be preserved.
 ///
 /// The future must be polled inside [`crate::runtime::executor::Executor::run`]
-/// on the thread that owns that executor.
+/// on the thread that owns that executor. Polling outside that run or through
+/// another executor's task waker cancels the timer and returns
+/// [`io::ErrorKind::NotConnected`].
 ///
 /// # Example
 /// ```no_run
@@ -1032,53 +1130,111 @@ impl Sleep {
     }
 }
 
-/// Error returned when a future exceeds its configured deadline.
+/// Error returned when a timeout expires or its runtime timer fails.
 ///
 /// # Example
 /// ```
-/// use flowio::runtime::timer::Elapsed;
+/// use flowio::runtime::timer::TimeoutError;
 ///
-/// let elapsed = Elapsed;
+/// let elapsed = TimeoutError::Elapsed;
 /// assert_eq!(elapsed.to_string(), "runtime timer elapsed");
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Elapsed;
+#[derive(Debug)]
+pub enum TimeoutError {
+    /// The configured deadline elapsed before the wrapped future completed.
+    Elapsed,
+    /// The runtime could not arm or drive the deadline timer.
+    ///
+    /// The contained [`io::Error`] preserves the original runtime failure,
+    /// including resource-pressure errors such as
+    /// [`io::ErrorKind::OutOfMemory`].
+    Runtime(io::Error),
+}
 
-impl fmt::Display for Elapsed {
+impl fmt::Display for TimeoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("runtime timer elapsed")
+        match self {
+            Self::Elapsed => f.write_str("runtime timer elapsed"),
+            Self::Runtime(err) => write!(f, "runtime timer failed: {err}"),
+        }
     }
 }
 
-impl std::error::Error for Elapsed {}
+impl std::error::Error for TimeoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Elapsed => None,
+            Self::Runtime(err) => Some(err),
+        }
+    }
+}
 
 impl Future for Sleep {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let timers = unsafe { crate::runtime::executor::timers_unchecked() };
+
+        let pctx = match poll_ctx_from_waker(cx) {
+            Ok(pctx) => pctx,
+            Err(err) => {
+                if !this.entry.is_null() {
+                    let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
+                    if !timers.is_null() {
+                        let _ = unsafe { &mut *timers }.cancel_sleep(this.entry);
+                    }
+                    this.entry = std::ptr::null_mut();
+                    drop(owner);
+                }
+                return Poll::Ready(Err(err));
+            }
+        };
+
+        if !this.entry.is_null() && unsafe { (*this.entry).owner_ptr() } != pctx.owner_ptr() {
+            let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
+            if !timers.is_null() {
+                let _ = unsafe { &mut *timers }.cancel_sleep(this.entry);
+            }
+            this.entry = std::ptr::null_mut();
+            drop(owner);
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+        }
 
         if !this.entry.is_null() {
             let state = unsafe { (*this.entry).state };
             if state == TimerState::Fired {
+                let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
+                debug_assert!(!timers.is_null());
                 unsafe {
-                    (*this.entry).state = TimerState::Idle;
-                    (*timers).timer_pool.free(this.entry);
+                    (*timers).free_fired_sleep(this.entry);
                 }
                 this.entry = std::ptr::null_mut();
+                drop(owner);
                 return Poll::Ready(Ok(()));
             }
-            unsafe { refresh_sleep_waiter(this.entry) };
+            if state == TimerState::Cancelled {
+                let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
+                debug_assert!(!timers.is_null());
+                unsafe {
+                    (*timers).free_fired_sleep(this.entry);
+                }
+                this.entry = std::ptr::null_mut();
+                drop(owner);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+            }
+            unsafe { refresh_sleep_waiter(this.entry, &pctx) };
             return Poll::Pending;
         }
+
+        let timers = pctx.timers();
 
         if let Some(duration) = this.duration.take() {
             if duration == Duration::ZERO {
                 return Poll::Ready(Ok(()));
             }
 
-            let entry = unsafe { &mut *timers }.submit_current_sleep_duration(duration)?;
+            let entry =
+                unsafe { &mut *timers }.submit_sleep_duration(pctx.owner_task(), duration)?;
             this.entry = entry;
             return Poll::Pending;
         }
@@ -1087,7 +1243,7 @@ impl Future for Sleep {
             return Poll::Ready(Ok(()));
         };
 
-        match unsafe { &mut *timers }.submit_current_sleep_deadline(deadline)? {
+        match unsafe { &mut *timers }.submit_sleep_deadline(pctx.owner_task(), deadline)? {
             Some(entry) => {
                 this.entry = entry;
                 Poll::Pending
@@ -1100,14 +1256,12 @@ impl Future for Sleep {
 impl Drop for Sleep {
     fn drop(&mut self) {
         if !self.entry.is_null() {
-            // Pool teardown intentionally does not drop live task futures.
-            // If that ever changes, this guard keeps an abandoned armed sleep
-            // from dereferencing a cleared executor context during shutdown.
-            let timers = unsafe { crate::runtime::executor::timers_or_null() };
+            let (owner, timers) = unsafe { timer_runtime_for_entry(self.entry) };
             if !timers.is_null() {
                 let _ = unsafe { &mut *timers }.cancel_sleep(self.entry);
             }
             self.entry = std::ptr::null_mut();
+            drop(owner);
         }
     }
 }
@@ -1163,18 +1317,19 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 /// one pooled timer entry if the wrapped future does not complete first.
 ///
 /// The wrapper must be polled inside an active
-/// [`crate::runtime::executor::Executor::run`]. A timer-runtime error is
-/// reported as [`Elapsed`], the same output used for deadline expiry.
+/// [`crate::runtime::executor::Executor::run`]. [`TimeoutError::Elapsed`]
+/// reports deadline expiry, while [`TimeoutError::Runtime`] preserves timer
+/// allocation and runtime failures.
 ///
 /// # Example
 /// ```no_run
 /// use flowio::runtime::executor::Executor;
-/// use flowio::runtime::timer::{sleep, timeout, Elapsed};
+/// use flowio::runtime::timer::{sleep, timeout, TimeoutError};
 /// use std::time::Duration;
 ///
 /// let mut executor = Executor::new()?;
 /// executor.run(async {
-///     let result: Result<std::io::Result<()>, Elapsed> =
+///     let result: Result<std::io::Result<()>, TimeoutError> =
 ///         timeout(Duration::from_millis(10), sleep(Duration::from_millis(1))).await;
 ///     assert!(result.is_ok());
 /// })?;
@@ -1204,7 +1359,7 @@ impl<F> Timeout<F> {
 }
 
 impl<F: Future> Future for Timeout<F> {
-    type Output = Result<F::Output, Elapsed>;
+    type Output = Result<F::Output, TimeoutError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -1215,8 +1370,8 @@ impl<F: Future> Future for Timeout<F> {
         }
 
         match Pin::new(&mut this.sleep).poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Err(Elapsed)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(Elapsed)),
+            Poll::Ready(Ok(())) => Poll::Ready(Err(TimeoutError::Elapsed)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(TimeoutError::Runtime(err))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1227,6 +1382,8 @@ impl<F: Future> Future for Timeout<F> {
 /// Prefer this around a larger operation or protocol phase when one relative
 /// budget applies. Avoid creating one wrapper per tiny I/O step when a shared
 /// phase deadline has the same semantics.
+/// Returns [`TimeoutError::Elapsed`] when the deadline wins and
+/// [`TimeoutError::Runtime`] when the timer cannot be armed or driven.
 /// The returned wrapper must be polled inside an active
 /// [`crate::runtime::executor::Executor::run`].
 ///
@@ -1255,6 +1412,8 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
 /// Prefer this when several operations share one precomputed absolute
 /// deadline. Avoid creating a separate timer per tiny I/O step when that shared
 /// phase deadline has the same semantics.
+/// Returns [`TimeoutError::Elapsed`] when the deadline wins and
+/// [`TimeoutError::Runtime`] when the timer cannot be armed or driven.
 /// The returned wrapper must be polled inside an active
 /// [`crate::runtime::executor::Executor::run`].
 ///
@@ -1282,6 +1441,36 @@ pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn timer_waiter_reference_pairing_is_exact() {
+        let first = TaskHeader::new();
+        let second = TaskHeader::new();
+        let first_ptr = &first as *const TaskHeader as *mut TaskHeader;
+        let second_ptr = &second as *const TaskHeader as *mut TaskHeader;
+        let mut entry = TimerEntry::new();
+
+        unsafe { entry.register_waiter(first_ptr) };
+        assert_eq!(first.refs.get(), 2);
+
+        unsafe { entry.register_waiter(first_ptr) };
+        assert_eq!(first.refs.get(), 2, "same timer waiter retained twice");
+
+        unsafe { entry.register_waiter(second_ptr) };
+        assert_eq!(first.refs.get(), 1, "replaced timer waiter leaked");
+        assert_eq!(second.refs.get(), 2);
+
+        let transferred = entry.take_waiter();
+        assert_eq!(transferred, second_ptr);
+        assert!(entry.waiter.is_null());
+        assert_eq!(second.refs.get(), 2, "taking timer waiter released it");
+        unsafe { release_task(transferred) };
+        assert_eq!(second.refs.get(), 1);
+
+        unsafe { entry.register_waiter(first_ptr) };
+        entry.clear_waiter();
+        assert_eq!(first.refs.get(), 1, "clearing timer waiter leaked it");
+    }
+
     fn init_wheel_at(wheel: &mut TimerWheel, current_tick: u64) {
         wheel.init().expect("timer wheel init failed");
         wheel.current_tick = current_tick;
@@ -1305,6 +1494,41 @@ mod tests {
             2
         );
         assert_eq!(duration_to_ticks(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
+    fn absolute_deadline_conversion_preserves_paired_base_and_rounding() {
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        let instant = Instant::now();
+        runtime.absolute_arm_base = Some(ArmBase { instant, tick: 41 });
+
+        assert_eq!(
+            runtime
+                .deadline_tick_for_instant(instant)
+                .expect("deadline conversion failed"),
+            None
+        );
+        assert_eq!(
+            runtime
+                .deadline_tick_for_instant(instant + Duration::from_nanos(1))
+                .expect("deadline conversion failed"),
+            Some(42)
+        );
+        assert_eq!(
+            runtime
+                .deadline_tick_for_instant(instant + Duration::from_nanos(TIMER_TICK_NS))
+                .expect("deadline conversion failed"),
+            Some(42)
+        );
+        assert_eq!(
+            runtime
+                .deadline_tick_for_instant(
+                    instant + Duration::from_nanos(TIMER_TICK_NS.saturating_add(1)),
+                )
+                .expect("deadline conversion failed"),
+            Some(43)
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
+use flowio::test_support::runtime::test_hooks;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::thread;
@@ -84,6 +85,53 @@ fn resolve_host_rejects_empty_host_name() {
 fn dns_resolver_requires_nameserver() {
     let err = DnsResolver::new(Vec::new()).expect_err("empty nameserver list should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn resolver_stops_nameserver_failover_on_timer_out_of_memory() {
+    let first_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind first dns socket");
+    let first_nameserver = first_server
+        .local_addr()
+        .expect("failed to read first dns socket addr");
+
+    let second_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind second dns socket");
+    let second_nameserver = second_server
+        .local_addr()
+        .expect("failed to read second dns socket addr");
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![first_nameserver, second_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_secs(1));
+            test_hooks::fail_next_timer_alloc();
+
+            let err = resolver
+                .resolve_host("timer-oom.flowio.invalid", 5432)
+                .await
+                .expect_err("timer allocation failure should abort DNS resolution");
+            assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        })
+        .expect("executor run failed");
+
+    first_server
+        .set_nonblocking(true)
+        .expect("failed to make first dns socket nonblocking");
+    let mut buffer = [0u8; 512];
+    first_server
+        .recv_from(&mut buffer)
+        .expect("first nameserver did not receive the query");
+
+    second_server
+        .set_nonblocking(true)
+        .expect("failed to make second dns socket nonblocking");
+    let err = second_server
+        .recv_from(&mut buffer)
+        .expect_err("timer allocation failure should stop nameserver failover");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 }
 
 #[test]

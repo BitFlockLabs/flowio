@@ -201,17 +201,6 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
             self.free_list.push_front_unchecked(link_ptr);
         }
     }
-
-    /// Marks all currently live slots as intentionally abandoned for owner
-    /// teardown.
-    ///
-    /// This is debug-only and reserved for owners that deliberately discard
-    /// pooled object storage without running object destructors during a
-    /// terminal shutdown path.
-    #[cfg(debug_assertions)]
-    pub(crate) fn abandon_live_slots_for_drop(&mut self) {
-        self.live_slots = 0;
-    }
 }
 
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Drop for Pool<'a, T, P> {

@@ -1,10 +1,12 @@
 //! Per-submission completion state shared between io_uring CQE handling and
 //! the runtime's concrete futures.
 
+use crate::runtime::executor::ExecutorOwner;
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool, RetainedPayloadVtable};
-use crate::runtime::task::TaskHeader;
+use crate::runtime::task::{TaskHeader, clear_task_ref, replace_task_ref, take_task_ref};
 use crate::utils::memory::pool::InPlaceInit;
 use std::mem::MaybeUninit;
+use std::rc::Rc;
 
 /// Per-submission state shared between a pinned future and the io_uring CQE
 /// completion path.
@@ -38,9 +40,14 @@ pub struct CompletionState {
     pub cqe_flags: u32,
     /// Internal state bits such as completed/orphaned/detached.
     pub state_flags: u32,
+    /// Index in the owner's bounded live-operation registry.
+    pub(crate) registry_index: u32,
     /// Task waiting on this operation, or null when no waiter is registered.
+    /// A non-null task pointer owns one task reference. After that reference is
+    /// released and `FLAG_CANCEL_PENDING` is set, this word stores the previous
+    /// completion state in the reactor's cancel-retry queue instead.
     pub waiter: *mut TaskHeader,
-    /// Reactor-owned pending-cancel queue link.
+    /// Next completion state in the reactor-owned cancel-retry queue.
     pub(crate) cancel_next: *mut CompletionState,
     /// Erased retained payload whose memory may be referenced by the in-flight
     /// SQE associated with this completion state, or null when no payload is
@@ -48,6 +55,8 @@ pub struct CompletionState {
     retained_payload: *mut (),
     /// Release vtable for `retained_payload`.
     retained_payload_vtable: Option<RetainedPayloadVtable>,
+    /// Stable executor owner that allocated this completion-state slot.
+    owner: Option<Rc<ExecutorOwner>>,
 }
 
 impl CompletionState {
@@ -62,6 +71,11 @@ impl CompletionState {
     pub const FLAG_CLOSE_RESULT_FD_ON_ORPHAN: u32 = 1 << 3;
     /// `ASYNC_CANCEL` submission failed and the reactor must retry it.
     pub const FLAG_CANCEL_PENDING: u32 = 1 << 4;
+    /// Executor shutdown owns cancellation and no task may be woken.
+    pub const FLAG_RUNTIME_SHUTDOWN: u32 = 1 << 5;
+    /// The future was polled without its originating FlowIO executor context.
+    /// Completion still owns any retained payload until the original CQE.
+    pub const FLAG_CONTEXT_REJECTED: u32 = 1 << 6;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -69,10 +83,12 @@ impl CompletionState {
             result: 0,
             cqe_flags: 0,
             state_flags: 0,
+            registry_index: u32::MAX,
             waiter: std::ptr::null_mut(),
             cancel_next: std::ptr::null_mut(),
             retained_payload: std::ptr::null_mut(),
             retained_payload_vtable: None,
+            owner: None,
         }
     }
 
@@ -99,6 +115,11 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn is_cancel_pending(&self) -> bool {
         self.state_flags & Self::FLAG_CANCEL_PENDING != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_runtime_shutdown(&self) -> bool {
+        self.state_flags & Self::FLAG_RUNTIME_SHUTDOWN != 0
     }
 
     #[inline(always)]
@@ -131,21 +152,99 @@ impl CompletionState {
         self.state_flags &= !Self::FLAG_CANCEL_PENDING;
     }
 
+    /// Initializes this orphaned state's intrusive cancel-retry links.
+    ///
+    /// The waiter reference must already have been released. While the state
+    /// remains queued, `waiter` is interpreted only as `cancel_prev`.
     #[inline(always)]
-    pub fn register_waiter(&mut self, task: *mut TaskHeader) {
-        self.waiter = task;
+    pub(crate) fn link_pending_cancel_after(&mut self, previous: *mut CompletionState) {
+        debug_assert!(!self.is_cancel_pending());
+        debug_assert!(self.waiter.is_null());
+        self.set_cancel_pending();
+        self.waiter = previous.cast();
+        self.cancel_next = std::ptr::null_mut();
+    }
+
+    /// Returns the previous cancel-retry queue entry.
+    #[inline(always)]
+    pub(crate) fn cancel_prev(&self) -> *mut CompletionState {
+        debug_assert!(self.is_cancel_pending());
+        self.waiter.cast()
+    }
+
+    /// Updates the previous cancel-retry queue entry.
+    #[inline(always)]
+    pub(crate) fn set_cancel_prev(&mut self, previous: *mut CompletionState) {
+        debug_assert!(self.is_cancel_pending());
+        self.waiter = previous.cast();
+    }
+
+    /// Clears both intrusive cancel links and restores the waiter word to null.
+    #[inline(always)]
+    pub(crate) fn clear_pending_cancel_links(&mut self) {
+        debug_assert!(self.is_cancel_pending());
+        self.waiter = std::ptr::null_mut();
+        self.cancel_next = std::ptr::null_mut();
+        self.clear_cancel_pending();
     }
 
     #[inline(always)]
-    pub fn take_waiter(&mut self) -> *mut TaskHeader {
-        let waiter = self.waiter;
-        self.waiter = std::ptr::null_mut();
-        waiter
+    pub(crate) fn set_runtime_shutdown(&mut self) {
+        self.state_flags |= Self::FLAG_RUNTIME_SHUTDOWN;
     }
 
     #[inline(always)]
-    pub fn clear_waiter(&mut self) {
-        self.waiter = std::ptr::null_mut();
+    pub(crate) fn is_context_rejected(&self) -> bool {
+        self.state_flags & Self::FLAG_CONTEXT_REJECTED != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_context_rejected(&mut self) {
+        self.state_flags |= Self::FLAG_CONTEXT_REJECTED;
+    }
+
+    #[inline(always)]
+    pub(crate) fn bind_owner(&mut self, owner: Option<Rc<ExecutorOwner>>, index: u32) {
+        self.owner = owner;
+        self.registry_index = index;
+    }
+
+    #[inline(always)]
+    pub(crate) fn clone_owner(&self) -> Option<Rc<ExecutorOwner>> {
+        self.owner.clone()
+    }
+
+    #[inline(always)]
+    pub(crate) fn owner_ptr(&self) -> *const ExecutorOwner {
+        self.owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr)
+    }
+
+    /// Replaces this operation's owned waiter reference.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `task` must point to a live task on its executor owner thread.
+    /// This completion state must be live and exclusively accessible.
+    #[inline(always)]
+    pub(crate) unsafe fn register_waiter(&mut self, task: *mut TaskHeader) {
+        debug_assert!(!self.is_cancel_pending());
+        unsafe { replace_task_ref(&mut self.waiter, task) };
+    }
+
+    /// Transfers the waiter reference to the caller without releasing it.
+    ///
+    /// The caller must keep the reference through notification and then call
+    /// `release_task`, or transfer it into another owning slot.
+    #[inline(always)]
+    pub(crate) fn take_waiter(&mut self) -> *mut TaskHeader {
+        debug_assert!(!self.is_cancel_pending());
+        unsafe { take_task_ref(&mut self.waiter) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear_waiter(&mut self) {
+        debug_assert!(!self.is_cancel_pending());
+        unsafe { clear_task_ref(&mut self.waiter) };
     }
 
     /// Attaches a retained payload to this in-flight operation.
@@ -287,10 +386,14 @@ impl CompletionState {
             !self.is_cancel_pending(),
             "cannot resubmit a completion state queued for cancel retry"
         );
+        debug_assert!(
+            self.cancel_next.is_null(),
+            "cannot resubmit a linked completion state"
+        );
         self.result = 0;
         self.cqe_flags = 0;
         self.state_flags = 0;
-        self.waiter = std::ptr::null_mut();
+        self.clear_waiter();
         self.cancel_next = std::ptr::null_mut();
     }
 }
@@ -304,5 +407,47 @@ impl InPlaceInit for CompletionState {
         unsafe {
             slot.as_mut_ptr().write(Self::empty());
         }
+    }
+}
+
+const _: [(); 64] = [(); std::mem::size_of::<CompletionState>()];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::task::release_task;
+
+    #[test]
+    fn completion_waiter_reference_pairing_is_exact() {
+        let first = TaskHeader::new();
+        let second = TaskHeader::new();
+        let first_ptr = &first as *const TaskHeader as *mut TaskHeader;
+        let second_ptr = &second as *const TaskHeader as *mut TaskHeader;
+        let mut state = CompletionState::empty();
+
+        unsafe { state.register_waiter(first_ptr) };
+        assert_eq!(first.refs.get(), 2);
+
+        unsafe { state.register_waiter(first_ptr) };
+        assert_eq!(first.refs.get(), 2, "same waiter retained twice");
+
+        unsafe { state.register_waiter(second_ptr) };
+        assert_eq!(first.refs.get(), 1, "replaced waiter reference leaked");
+        assert_eq!(second.refs.get(), 2);
+
+        let transferred = state.take_waiter();
+        assert_eq!(transferred, second_ptr);
+        assert!(state.waiter.is_null());
+        assert_eq!(second.refs.get(), 2, "taking waiter released ownership");
+        unsafe { release_task(transferred) };
+        assert_eq!(second.refs.get(), 1);
+
+        unsafe { state.register_waiter(first_ptr) };
+        state.clear_waiter();
+        assert_eq!(first.refs.get(), 1, "clearing waiter did not release it");
+
+        unsafe { state.register_waiter(first_ptr) };
+        state.reset_for_resubmit();
+        assert_eq!(first.refs.get(), 1, "resubmit reset leaked waiter");
     }
 }

@@ -28,12 +28,14 @@
 //! If a future is dropped after completion but before polling its result, the
 //! completed state is freed immediately from `Drop`.
 
+use crate::net::complete_read_with_progress;
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    PollCtx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
-    submit_retained_sqe, submit_tracked_sqe,
+    PollCtx, completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_retained_sqe, submit_tracked_sqe,
+    validate_local_io_result,
 };
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
@@ -59,6 +61,9 @@ macro_rules! impl_stream_rw {
         /// or allocate. If no data is immediately available on the
         /// existing nonblocking socket, it returns
         /// [`io::ErrorKind::WouldBlock`] and returns `buffer` unchanged.
+        /// Positive progress appends to an [`IoBuffMut`] payload; buffers that
+        /// retain the provided zero write base publish from their beginning.
+        /// The returned byte count is always relative to this call.
         ///
         /// Prefer [`Self::read`] for normal FlowIO async I/O.
         /// Avoid polling this method as a readiness loop: `WouldBlock` does not
@@ -207,6 +212,12 @@ macro_rules! impl_stream_rw {
         /// completion (rental pattern); the actual byte count is returned
         /// in the `Ok` variant.
         ///
+        /// Positive progress appends to an [`IoBuffMut`] payload. Buffers that
+        /// retain the provided zero write base publish from their beginning.
+        /// A zero-byte completion or an error before progress leaves the
+        /// buffer's existing logical contents unchanged; the returned count is
+        /// relative to this operation rather than the resulting total length.
+        ///
         /// Preferred on the stream fast path when the caller tracks framing:
         /// this performs one contiguous submission and returns short reads
         /// directly.
@@ -253,7 +264,12 @@ macro_rules! impl_stream_rw {
         /// Reads exactly `len` bytes, handling partial reads internally.
         ///
         /// Returns `(Ok(len), buffer)` on success. Returns `UnexpectedEof`
-        /// if the peer closes before `len` bytes arrive.
+        /// if the peer closes before `len` bytes arrive. Positive progress
+        /// appends to an [`IoBuffMut`] payload; buffers that retain the
+        /// provided zero write base publish from their beginning. Any prefix
+        /// read before EOF or another terminal error remains published, while
+        /// an error before progress preserves the existing logical contents.
+        /// The result count remains relative to this operation.
         ///
         /// This complete-buffer API may resubmit after partial reads. Avoid
         /// that retry bookkeeping when exact-length semantics are not
@@ -406,12 +422,12 @@ pub(crate) use impl_stream_rw;
 ///
 /// # Safety
 ///
-/// A non-null `*state_ptr` must identify an operation allocated by the reactor
-/// encoded in `cx`'s FlowIO waker, and its retained payload type must be `T`.
+/// A non-null `*state_ptr` must identify a completed FlowIO operation, and its
+/// retained payload type must be `T`. Cleanup uses the recorded origin reactor.
 unsafe fn take_completed_result_and_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
-) -> Option<(i32, T)> {
+) -> Option<(i32, T, bool)> {
     if state_ptr.is_null() {
         return None;
     }
@@ -422,11 +438,11 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
     }
 
     let result = state.result;
-    let pctx = unsafe { poll_ctx_from_waker(cx) };
-    let payload = unsafe { (*pctx.reactor()).take_retained_payload::<T>(*state_ptr) };
-    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
+    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
-    Some((result, payload))
+    Some((result, payload, op_ctx.context_rejected()))
 }
 
 #[inline(always)]
@@ -435,14 +451,14 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
 ///
 /// # Safety
 ///
-/// A non-null `*state_ptr` must identify an operation allocated by the reactor
-/// encoded in `cx`'s FlowIO waker, with retained payload type `T`. `extract`
-/// must leave no live resource in the payload that still requires destruction.
+/// A non-null `*state_ptr` must identify a completed FlowIO operation with
+/// retained payload type `T`. Cleanup uses its recorded origin reactor, and
+/// `extract` must leave no live resource requiring destruction.
 unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
     extract: impl FnOnce(*mut T) -> R,
-) -> Option<(i32, R)> {
+) -> Option<(i32, R, bool)> {
     if state_ptr.is_null() {
         return None;
     }
@@ -453,12 +469,58 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     }
 
     let result = state.result;
-    let pctx = unsafe { poll_ctx_from_waker(cx) };
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
     let value =
-        unsafe { (*pctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
-    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+        unsafe { (*op_ctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
+    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
-    Some((result, value))
+    Some((result, value, op_ctx.context_rejected()))
+}
+
+#[inline(always)]
+/// Returns the matching current poll context for a completed retry, or takes
+/// its retained payload through the origin reactor after context rejection.
+///
+/// # Safety
+///
+/// `*state_ptr` must identify a completed operation retaining payload type `T`.
+unsafe fn retry_poll_ctx_or_rejected_payload<T: 'static>(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+) -> Result<PollCtx, T> {
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    if let Some(pctx) = op_ctx.matching_poll_ctx() {
+        return Ok(pctx);
+    }
+
+    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
+    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    *state_ptr = std::ptr::null_mut();
+    Err(payload)
+}
+
+#[inline(always)]
+/// Extracting variant of [`retry_poll_ctx_or_rejected_payload`].
+///
+/// # Safety
+///
+/// The state and `extract` requirements match
+/// [`take_retained_payload_with_and_free_state`].
+unsafe fn retry_poll_ctx_or_rejected_payload_with<T: 'static, R>(
+    cx: &mut Context<'_>,
+    state_ptr: &mut *mut CompletionState,
+    extract: impl FnOnce(*mut T) -> R,
+) -> Result<PollCtx, R> {
+    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    if let Some(pctx) = op_ctx.matching_poll_ctx() {
+        return Ok(pctx);
+    }
+
+    let value =
+        unsafe { (*op_ctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
+    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    *state_ptr = std::ptr::null_mut();
+    Err(value)
 }
 
 #[inline(always)]
@@ -497,8 +559,7 @@ fn classify_retry_cqe_result(result: i32) -> RetryCqeResult {
 ///
 /// # Safety
 ///
-/// A non-null `state_ptr` must identify a live operation associated with the
-/// FlowIO reactor and owner task encoded in `cx`'s waker.
+/// A non-null `state_ptr` must identify a live operation owned by this future.
 unsafe fn retry_state_is_in_flight(cx: &mut Context<'_>, state_ptr: *mut CompletionState) -> bool {
     if state_ptr.is_null() {
         return false;
@@ -1095,18 +1156,17 @@ pub(crate) fn try_read_once<B: IoBuffReadWrite>(
         Ok(len) => len as usize,
         Err(err) => return (Err(err), buffer),
     };
+    let write_base_len = buffer.write_base_len();
 
     if len == 0 {
-        unsafe { buffer.set_written_len(0) };
         return (Ok(0), buffer);
     }
 
     let result = unsafe { libc::recv(fd, buffer.as_mut_ptr() as *mut libc::c_void, len, 0) };
     match one_shot_syscall_result(result) {
-        Ok(actual) => {
-            unsafe { buffer.set_written_len(actual) };
-            (Ok(actual), buffer)
-        }
+        Ok(actual) => unsafe {
+            complete_read_with_progress(buffer, write_base_len, actual, Ok(actual))
+        },
         Err(err) => (Err(err), buffer),
     }
 }
@@ -1115,28 +1175,10 @@ pub(crate) fn try_read_once<B: IoBuffReadWrite>(
 #[inline]
 pub(crate) fn try_read_append_once(
     fd: RawFd,
-    mut buffer: IoBuffMut,
+    buffer: IoBuffMut,
     len: usize,
 ) -> (io::Result<usize>, IoBuffMut) {
-    let start_len = buffer.payload_len();
-    let len = match super::checked_read_len(len, buffer.payload_remaining()) {
-        Ok(len) => len as usize,
-        Err(err) => return (Err(err), buffer),
-    };
-
-    if len == 0 {
-        unsafe { buffer.set_written_len(start_len) };
-        return (Ok(0), buffer);
-    }
-
-    let result = unsafe { libc::recv(fd, buffer.as_mut_ptr() as *mut libc::c_void, len, 0) };
-    match one_shot_syscall_result(result) {
-        Ok(actual) => {
-            unsafe { buffer.set_written_len(start_len + actual) };
-            (Ok(actual), buffer)
-        }
-        Err(err) => (Err(err), buffer),
-    }
+    try_read_once(fd, buffer, len)
 }
 
 /// Attempts one nonblocking write syscall from the caller-owned buffer.
@@ -1378,6 +1420,8 @@ pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
     fd: RawFd,
     /// Maximum bytes requested from the kernel.
     len: u32,
+    /// Logical length immediately before the submitted writable region.
+    write_base_len: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
     /// Borrows the parent stream for the future lifetime.
@@ -1386,6 +1430,7 @@ pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
 
 impl<'a, B: IoBuffReadWrite, S> ReadFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B, len: usize) -> Self {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match super::checked_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
@@ -1399,6 +1444,7 @@ impl<'a, B: IoBuffReadWrite, S> ReadFuture<'a, B, S> {
             buffer: Some(buffer),
             fd,
             len,
+            write_base_len,
             input_error,
             _marker: PhantomData,
         }
@@ -1414,27 +1460,38 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_result_and_payload::<RetainedReadPayload<B>>(cx, &mut this.state_ptr)
         } {
-            let mut buffer = payload.buffer;
+            let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
             let actual = result as usize;
-            unsafe { buffer.set_written_len(actual) };
-            return Poll::Ready((Ok(actual), buffer));
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, actual, Ok(actual))
+            });
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -1525,17 +1582,21 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_result_and_payload::<RetainedWritePayload<B>>(cx, &mut this.state_ptr)
         } {
             let buffer = payload.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
@@ -1543,7 +1604,13 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -1588,8 +1655,8 @@ impl<B: IoBuffReadOnly, S> Drop for WriteFuture<'_, B, S> {
 /// Writes the entire buffer, re-submitting on partial writes.
 ///
 /// The base buffer pointer is captured during the initial retained submission
-/// and reused for retries, avoiding repeated `as_ptr()` trait calls. A single
-/// `poll_ctx_from_waker` extraction covers free + alloc + submit per poll.
+/// and reused for retries, avoiding repeated `as_ptr()` trait calls. Context is
+/// validated once for each completion/resubmission pass.
 #[doc(hidden)]
 pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
     /// Completion state reused across sequential retry submissions.
@@ -1643,14 +1710,15 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        // Fast path: still in flight — return without any context extraction.
+        // Fast path: validate/register the current waiter, then remain pending.
         if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
             return Poll::Pending;
         }
@@ -1658,11 +1726,33 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
         // Zero-length write completes immediately.
         if this.state_ptr.is_null() && this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Ok(0), buffer));
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
-        // One context extraction covers free + alloc + submit.
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let pctx = if this.state_ptr.is_null() {
+            match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            }
+        } else {
+            match unsafe {
+                retry_poll_ctx_or_rejected_payload::<RetainedWritePayload<B>>(
+                    cx,
+                    &mut this.state_ptr,
+                )
+            } {
+                Ok(pctx) => pctx,
+                Err(payload) => {
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        payload.buffer,
+                    ));
+                }
+            }
+        };
 
         // Process completed state if any. Sequential retries reuse the same
         // completion slot once the previous CQE has been fully consumed.
@@ -1788,6 +1878,8 @@ pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
     target: u32,
     /// Bytes already read into the destination buffer.
     filled: u32,
+    /// Logical length immediately before the submitted writable region.
+    write_base_len: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
     /// Borrows the parent stream for the future lifetime.
@@ -1796,6 +1888,7 @@ pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
 
 impl<'a, B: IoBuffReadWrite, S> ReadExactFuture<'a, B, S> {
     pub(crate) fn new(fd: RawFd, buffer: B, len: usize) -> Self {
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let target = match super::checked_read_len(len, buffer.writable_len()) {
             Ok(target) => target,
@@ -1811,6 +1904,7 @@ impl<'a, B: IoBuffReadWrite, S> ReadExactFuture<'a, B, S> {
             fd,
             target,
             filled: 0,
+            write_base_len,
             input_error,
             _marker: PhantomData,
         }
@@ -1826,27 +1920,60 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        // Fast path: still in flight — return without any context extraction.
+        // Fast path: validate/register the current waiter, then remain pending.
         if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
             return Poll::Pending;
         }
 
         // Zero-length read completes immediately.
         if this.state_ptr.is_null() && this.target == 0 {
-            let mut buffer = unsafe { opt_take(&mut this.buffer) };
-            unsafe { buffer.set_written_len(0) };
-            return Poll::Ready((Ok(0), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
-        // One context extraction covers free + alloc + submit.
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let pctx = if this.state_ptr.is_null() {
+            match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(err),
+                        )
+                    });
+                }
+            }
+        } else {
+            match unsafe {
+                retry_poll_ctx_or_rejected_payload::<RetainedReadPayload<B>>(
+                    cx,
+                    &mut this.state_ptr,
+                )
+            } {
+                Ok(pctx) => pctx,
+                Err(payload) => {
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            payload.buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        )
+                    });
+                }
+            }
+        };
 
         // Process completed state if any. Sequential retries reuse the same
         // completion slot once the previous CQE has been fully consumed.
@@ -1859,9 +1986,14 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                             &mut this.state_ptr,
                         )
                     };
-                    let mut buffer = payload.buffer;
-                    unsafe { buffer.set_written_len(this.filled as usize) };
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), buffer));
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            payload.buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from_raw_os_error(errno)),
+                        )
+                    });
                 }
                 RetryCqeResult::Zero => {
                     let payload = unsafe {
@@ -1870,12 +2002,14 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                             &mut this.state_ptr,
                         )
                     };
-                    let mut buffer = payload.buffer;
-                    unsafe { buffer.set_written_len(this.filled as usize) };
-                    return Poll::Ready((
-                        Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                        buffer,
-                    ));
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            payload.buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        )
+                    });
                 }
                 RetryCqeResult::Bytes(n) => {
                     let n = n as u32;
@@ -1888,17 +2022,28 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                                 &mut this.state_ptr,
                             )
                         };
-                        let mut buffer = payload.buffer;
-                        unsafe { buffer.set_written_len(this.target as usize) };
-                        return Poll::Ready((Ok(this.target as usize), buffer));
+                        return Poll::Ready(unsafe {
+                            complete_read_with_progress(
+                                payload.buffer,
+                                this.write_base_len,
+                                this.target as usize,
+                                Ok(this.target as usize),
+                            )
+                        });
                     }
                 }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
-            let mut buffer = unsafe { opt_take(&mut this.buffer) };
-            unsafe { buffer.set_written_len(this.filled as usize) };
-            return Poll::Ready((Err(err), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(
+                    buffer,
+                    this.write_base_len,
+                    this.filled as usize,
+                    Err(err),
+                )
+            });
         }
 
         if this.buffer.is_some() {
@@ -1918,9 +2063,12 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                 {
                     (*pctx.reactor()).free_op(this.state_ptr);
                     this.state_ptr = std::ptr::null_mut();
-                    let mut buffer = payload.buffer;
-                    buffer.set_written_len(this.filled as usize);
-                    return Poll::Ready((Err(e), buffer));
+                    return Poll::Ready(complete_read_with_progress(
+                        payload.buffer,
+                        this.write_base_len,
+                        this.filled as usize,
+                        Err(e),
+                    ));
                 }
             }
             unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -1940,9 +2088,12 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                     &pctx,
                     &mut this.state_ptr,
                 );
-                let mut buffer = payload.buffer;
-                buffer.set_written_len(this.filled as usize);
-                return Poll::Ready((Err(e), buffer));
+                return Poll::Ready(complete_read_with_progress(
+                    payload.buffer,
+                    this.write_base_len,
+                    this.filled as usize,
+                    Err(e),
+                ));
             }
         }
 
@@ -1973,8 +2124,8 @@ pub struct ReadExactAppendFuture<'a, S> {
     base_ptr: *mut u8,
     /// Stream descriptor read from by this future.
     fd: RawFd,
-    /// Payload length present before this append operation started.
-    start_len: usize,
+    /// Logical length immediately before the submitted writable region.
+    write_base_len: usize,
     /// Exact append byte count required before the future can succeed.
     target: u32,
     /// Bytes already appended into the destination buffer.
@@ -1987,7 +2138,7 @@ pub struct ReadExactAppendFuture<'a, S> {
 
 impl<'a, S> ReadExactAppendFuture<'a, S> {
     pub(crate) fn new(fd: RawFd, buffer: IoBuffMut, len: usize) -> Self {
-        let start_len = buffer.payload_len();
+        let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let target = match super::checked_read_len(len, buffer.payload_remaining()) {
             Ok(target) => target,
@@ -2001,22 +2152,12 @@ impl<'a, S> ReadExactAppendFuture<'a, S> {
             buffer: Some(buffer),
             base_ptr: std::ptr::null_mut(),
             fd,
-            start_len,
+            write_base_len,
             target,
             filled: 0,
             input_error,
             _marker: PhantomData,
         }
-    }
-
-    #[inline(always)]
-    unsafe fn set_appended_len(
-        mut buffer: IoBuffMut,
-        start_len: usize,
-        appended: u32,
-    ) -> IoBuffMut {
-        unsafe { buffer.set_written_len(start_len + appended as usize) };
-        buffer
     }
 }
 
@@ -2029,27 +2170,60 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        // Fast path: still in flight — return without any context extraction.
+        // Fast path: validate/register the current waiter, then remain pending.
         if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
             return Poll::Pending;
         }
 
         // Zero-length append completes immediately and preserves the payload.
         if this.state_ptr.is_null() && this.target == 0 {
-            let buffer =
-                unsafe { Self::set_appended_len(opt_take(&mut this.buffer), this.start_len, 0) };
-            return Poll::Ready((Ok(0), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
-        // One context extraction covers free + alloc + submit.
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let pctx = if this.state_ptr.is_null() {
+            match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(err),
+                        )
+                    });
+                }
+            }
+        } else {
+            match unsafe {
+                retry_poll_ctx_or_rejected_payload::<RetainedReadPayload<IoBuffMut>>(
+                    cx,
+                    &mut this.state_ptr,
+                )
+            } {
+                Ok(pctx) => pctx,
+                Err(payload) => {
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            payload.buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        )
+                    });
+                }
+            }
+        };
 
         // Process completed state if any. Sequential retries reuse the same
         // completion slot once the previous CQE has been fully consumed.
@@ -2062,10 +2236,14 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
                             &mut this.state_ptr,
                         )
                     };
-                    let buffer = unsafe {
-                        Self::set_appended_len(payload.buffer, this.start_len, this.filled)
-                    };
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), buffer));
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            payload.buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from_raw_os_error(errno)),
+                        )
+                    });
                 }
                 RetryCqeResult::Zero => {
                     let payload = unsafe {
@@ -2074,13 +2252,14 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
                             &mut this.state_ptr,
                         )
                     };
-                    let buffer = unsafe {
-                        Self::set_appended_len(payload.buffer, this.start_len, this.filled)
-                    };
-                    return Poll::Ready((
-                        Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                        buffer,
-                    ));
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            payload.buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        )
+                    });
                 }
                 RetryCqeResult::Bytes(n) => {
                     let n = n as u32;
@@ -2093,19 +2272,28 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
                                 &mut this.state_ptr,
                             )
                         };
-                        let buffer = unsafe {
-                            Self::set_appended_len(payload.buffer, this.start_len, this.target)
-                        };
-                        return Poll::Ready((Ok(this.target as usize), buffer));
+                        return Poll::Ready(unsafe {
+                            complete_read_with_progress(
+                                payload.buffer,
+                                this.write_base_len,
+                                this.target as usize,
+                                Ok(this.target as usize),
+                            )
+                        });
                     }
                 }
             }
         }
         if let Err(err) = unsafe { prepare_retry_state(&pctx, &mut this.state_ptr) } {
-            let buffer = unsafe {
-                Self::set_appended_len(opt_take(&mut this.buffer), this.start_len, this.filled)
-            };
-            return Poll::Ready((Err(err), buffer));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(
+                    buffer,
+                    this.write_base_len,
+                    this.filled as usize,
+                    Err(err),
+                )
+            });
         }
 
         if this.buffer.is_some() {
@@ -2125,9 +2313,12 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
                 {
                     (*pctx.reactor()).free_op(this.state_ptr);
                     this.state_ptr = std::ptr::null_mut();
-                    let buffer =
-                        Self::set_appended_len(payload.buffer, this.start_len, this.filled);
-                    return Poll::Ready((Err(e), buffer));
+                    return Poll::Ready(complete_read_with_progress(
+                        payload.buffer,
+                        this.write_base_len,
+                        this.filled as usize,
+                        Err(e),
+                    ));
                 }
             }
             unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -2147,8 +2338,12 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
                     &pctx,
                     &mut this.state_ptr,
                 );
-                let buffer = Self::set_appended_len(payload.buffer, this.start_len, this.filled);
-                return Poll::Ready((Err(e), buffer));
+                return Poll::Ready(complete_read_with_progress(
+                    payload.buffer,
+                    this.write_base_len,
+                    this.filled as usize,
+                    Err(e),
+                ));
             }
         }
 
@@ -2208,13 +2403,16 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, mut buffer)) = unsafe {
+        if let Some((result, mut buffer, context_rejected)) = unsafe {
             take_completed_result_and_payload_with::<RetainedReadvPayload<N>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload| take_readv_buffer_from_retained(payload),
             )
         } {
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
@@ -2228,14 +2426,21 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
 
         if this.writable == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((
+            let result = validate_local_io_result(
+                cx,
                 Err(super::invalid_input("empty vectored receive chain")),
-                buffer,
-            ));
+            );
+            return Poll::Ready((result, buffer));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
             if state_ptr.is_null() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -2339,7 +2544,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, completion)) = unsafe {
+        if let Some((result, completion, context_rejected)) = unsafe {
             take_completed_result_and_payload_with::<RetainedWritevPayload<C>, _>(
                 cx,
                 &mut this.state_ptr,
@@ -2347,6 +2552,9 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
             )
         } {
             let buffer = completion.buffer;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
+            }
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
             }
@@ -2358,11 +2566,17 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
 
         if this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Ok(0), buffer));
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            };
             let mut scratch = match unsafe { (*pctx.reactor()).alloc_iovec_scratch(this.iov_count) }
             {
                 Ok(scratch) => scratch,
@@ -2501,10 +2715,34 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future
 
         if this.state_ptr.is_null() && this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Ok(0), buffer));
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let pctx = if this.state_ptr.is_null() {
+            match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            }
+        } else {
+            match unsafe {
+                retry_poll_ctx_or_rejected_payload_with::<RetainedWritevPayload<C>, _>(
+                    cx,
+                    &mut this.state_ptr,
+                    |payload| take_writev_completion_from_retained(payload),
+                )
+            } {
+                Ok(pctx) => pctx,
+                Err(completion) => {
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        completion.buffer,
+                    ));
+                }
+            }
+        };
 
         if !this.state_ptr.is_null() {
             match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
@@ -2724,13 +2962,16 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, payload)) = unsafe {
+        if let Some((result, payload, context_rejected)) = unsafe {
             take_completed_result_and_payload::<RetainedProjectedWritevPayload<T>>(
                 cx,
                 &mut this.state_ptr,
             )
         } {
             let source = payload.source;
+            if context_rejected {
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), source));
+            }
             if result < 0 {
                 return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), source));
             }
@@ -2743,17 +2984,24 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let source = unsafe { opt_take(&mut this.source) };
-            return Poll::Ready((Err(err), source));
+            return Poll::Ready((result, source));
         }
 
         if this.total == 0 {
             let source = unsafe { opt_take(&mut this.source) };
-            return Poll::Ready((Ok(0), source));
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), source));
         }
 
         if this.state_ptr.is_null() {
-            let pctx = unsafe { poll_ctx_from_waker(cx) };
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let source = unsafe { opt_take(&mut this.source) };
+                    return Poll::Ready((Err(err), source));
+                }
+            };
             match submit_initial_projected_writev(
                 &pctx,
                 this.fd,
@@ -2830,16 +3078,40 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
 
         if this.source.is_some() {
             if let Err(err) = validate_projected_count_and_len(this.iov_count, this.total) {
+                let result = validate_local_io_result(cx, Err(err));
                 let source = unsafe { opt_take(&mut this.source) };
-                return Poll::Ready((Err(err), source));
+                return Poll::Ready((result, source));
             }
             if this.total == 0 {
                 let source = unsafe { opt_take(&mut this.source) };
-                return Poll::Ready((Ok(0), source));
+                return Poll::Ready((validate_local_io_result(cx, Ok(0)), source));
             }
         }
 
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let pctx = if this.state_ptr.is_null() {
+            match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let source = unsafe { opt_take(&mut this.source) };
+                    return Poll::Ready((Err(err), source));
+                }
+            }
+        } else {
+            match unsafe {
+                retry_poll_ctx_or_rejected_payload::<RetainedProjectedWritevPayload<T>>(
+                    cx,
+                    &mut this.state_ptr,
+                )
+            } {
+                Ok(pctx) => pctx,
+                Err(payload) => {
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        payload.source,
+                    ));
+                }
+            }
+        };
 
         if !this.state_ptr.is_null() {
             match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
@@ -3039,8 +3311,9 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
+            let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((Err(err), buffer));
+            return Poll::Ready((result, buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
@@ -3053,10 +3326,36 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
         if this.state_ptr.is_null() && this.target == 0 {
             let mut buffer = unsafe { opt_take(&mut this.buffer) };
             unsafe { buffer.distribute_written(0) };
-            return Poll::Ready((Ok(0), buffer));
+            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
         }
 
-        let pctx = unsafe { poll_ctx_from_waker(cx) };
+        let pctx = if this.state_ptr.is_null() {
+            match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    let mut buffer = unsafe { opt_take(&mut this.buffer) };
+                    unsafe { buffer.distribute_written(this.filled) };
+                    return Poll::Ready((Err(err), buffer));
+                }
+            }
+        } else {
+            match unsafe {
+                retry_poll_ctx_or_rejected_payload_with::<RetainedReadvPayload<N>, _>(
+                    cx,
+                    &mut this.state_ptr,
+                    |payload| take_readv_buffer_from_retained(payload),
+                )
+            } {
+                Ok(pctx) => pctx,
+                Err(mut buffer) => {
+                    unsafe { buffer.distribute_written(this.filled) };
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        buffer,
+                    ));
+                }
+            }
+        };
 
         if !this.state_ptr.is_null() {
             match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {

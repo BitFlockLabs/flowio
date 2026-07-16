@@ -1,6 +1,7 @@
 //! Doc-hidden retained-payload white-box test support.
 
 use std::io;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
 /// Debug counters for retained-pool white-box tests.
@@ -76,9 +77,67 @@ impl RetainedPayloadPool {
     }
 
     /// Allocates production iovec scratch for `iov_count` active entries.
-    pub fn alloc_iovec_scratch(&mut self, iov_count: usize) -> io::Result<RetainedIovecScratch> {
+    ///
+    /// The safe test-support lease keeps this pool mutably borrowed until the
+    /// scratch is dropped. Production scratch independently retains its
+    /// heap-stable sidecar owner; this additional lifetime prevents white-box
+    /// tests from expressing an invalid parent/lease order.
+    ///
+    /// ```
+    /// use flowio::test_support::runtime::retained_test_support::{
+    ///     RetainedIovecScratch, RetainedPayloadPool,
+    /// };
+    ///
+    /// let mut pool = RetainedPayloadPool::new()?;
+    /// let scratch: RetainedIovecScratch<'_> = pool.alloc_iovec_scratch(512)?;
+    /// assert_eq!(scratch.as_uninit_slice().len(), 512);
+    /// drop(scratch);
+    /// drop(pool);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// A lease cannot escape the pool that created it:
+    ///
+    /// ```compile_fail
+    /// use flowio::test_support::runtime::retained_test_support::{
+    ///     RetainedIovecScratch, RetainedPayloadPool,
+    /// };
+    ///
+    /// fn escaped() -> RetainedIovecScratch<'static> {
+    ///     let mut pool = RetainedPayloadPool::new().unwrap();
+    ///     pool.alloc_iovec_scratch(512).unwrap()
+    /// }
+    /// ```
+    ///
+    /// The parent cannot move while its lease remains live:
+    ///
+    /// ```compile_fail
+    /// use flowio::test_support::runtime::retained_test_support::RetainedPayloadPool;
+    ///
+    /// let mut pool = RetainedPayloadPool::new().unwrap();
+    /// let scratch = pool.alloc_iovec_scratch(512).unwrap();
+    /// let moved_pool = pool;
+    /// drop(scratch);
+    /// drop(moved_pool);
+    /// ```
+    ///
+    /// The parent also cannot be dropped before its lease:
+    ///
+    /// ```compile_fail
+    /// use flowio::test_support::runtime::retained_test_support::RetainedPayloadPool;
+    ///
+    /// let mut pool = RetainedPayloadPool::new().unwrap();
+    /// let scratch = pool.alloc_iovec_scratch(512).unwrap();
+    /// drop(pool);
+    /// drop(scratch);
+    /// ```
+    pub fn alloc_iovec_scratch(
+        &mut self,
+        iov_count: usize,
+    ) -> io::Result<RetainedIovecScratch<'_>> {
         Ok(RetainedIovecScratch {
             inner: self.inner.alloc_iovec_scratch(iov_count)?,
+            _pool: PhantomData,
         })
     }
 
@@ -141,12 +200,14 @@ impl<T: 'static> RetainedPayload<T> {
 }
 
 /// Retained iovec scratch wrapper for integration tests.
-pub struct RetainedIovecScratch {
+pub struct RetainedIovecScratch<'pool> {
     /// Production scratch handle whose allocation path is under test.
     inner: super::retained::RetainedIovecScratch,
+    /// Prevents the safe wrapper from outliving or moving its parent pool.
+    _pool: PhantomData<&'pool mut RetainedPayloadPool>,
 }
 
-impl RetainedIovecScratch {
+impl RetainedIovecScratch<'_> {
     /// Returns the active scratch slots without assuming initialization.
     pub fn as_uninit_slice(&self) -> &[MaybeUninit<libc::iovec>] {
         self.inner.as_uninit_slice()

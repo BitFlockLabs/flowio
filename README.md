@@ -101,6 +101,42 @@ let (result, buffer) = stream.read_exact(buffer, len).await;
 # }
 ```
 
+Direct writes into spare `IoBuffMut` payload capacity use
+`payload_unwritten_mut()`, which returns `MaybeUninit<u8>` slots. Initialize
+the intended prefix and then publish it with the unsafe
+`payload_set_len_initialized()` operation. Safe `payload_set_len()` can only
+move the visible length within bytes the buffer already knows are initialized;
+it never makes fresh pooled or heap capacity readable. Borrowing the spare
+slice conservatively discards knowledge of any initialized-but-hidden bytes,
+because a `MaybeUninit` slot may be safely de-initialized.
+
+Userspace producers that require `&mut [u8]` use the unsafe
+`IoBuffReadWrite::initialized_writable_slice()` hook after validating the
+requested prefix against `writable_len()`. The provided implementation
+initializes exactly that prefix. `IoBuffMut` reuses its initialized frontier,
+`Vec<u8>` initializes only bytes beyond its logical length, and `Box<[u8]>`
+reuses its fully initialized storage. TLS plaintext reads use this hook once
+for each nonempty destination that reaches plaintext polling. Direct kernel
+reads deliberately continue using raw writable capacity, so they do not pay a
+mandatory userspace initialization pass.
+
+Unsafe custom buffer implementations may return a null pointer only when the
+corresponding readable or writable window is empty. Every positive-length
+range must be non-null, suitably aligned, contained in one stable allocation,
+and satisfy the trait's initialization and access contract. TLS partial writes
+handle an empty readable window without consulting its pointer or constructing
+a raw slice from it.
+
+Contiguous read and receive operations report byte counts relative to the
+operation while publishing them relative to the destination's captured write
+base. `IoBuffMut` defines that base as its current payload length, so positive
+progress appends without overwriting an existing payload. Flat buffers and
+custom implementations keep the provided base of zero unless they explicitly
+opt into append-style publication. A zero-byte completion or an error before
+any progress does not publish a new length, so the buffer's existing logical
+contents remain unchanged. Exact reads publish any completed prefix before
+returning EOF or another terminal error.
+
 ## Fast-path guidance
 
 flowio's fast path is the steady-state per-task, per-message, or per-I/O path
@@ -110,7 +146,7 @@ workload is faster without measurement.
 
 | Concern | Preferred on the fast path | Avoid on the fast path | Why / alternative |
 |---|---|---|---|
-| Runtime lifecycle | One long-lived `Executor::run` boundary per runtime thread | Constructing an `Executor` or entering `run` per request | Construction initializes `io_uring`, task storage, queues, and timers. Spawn work inside the existing run. |
+| Runtime lifecycle | One long-lived `Executor::run` boundary per runtime thread | Constructing an `Executor` or entering `run` per request | Construction initializes `io_uring`, stable owner storage, task queues, and timers. A stalled run preserves its tasks for a later `run`, but steady-state work should still spawn inside one active run. |
 | Task admission | `Executor::spawn`; use `try_spawn` when failure must return the future | `spawn` when the future owns a response or cleanup obligation | Tasks use fixed-size slots acquired in slabs. `try_spawn` preserves the unpolled future on allocation pressure; `spawn` maps the error and drops it. |
 | Fixed-shape buffers | Pre-acquired `IoBuffPool` slots | `IoBuffMut::new` per message | Pool reuse avoids per-buffer allocator traffic while warmed capacity is available. Use `new` for setup or genuinely variable shapes. |
 | Frozen buffers | `freeze`, `clone`, `slice`, or `try_mut` when ownership permits | `make_mut` on a shared buffer | Shared `make_mut` allocates and copies. Keep exclusive `IoBuffMut` ownership or use `try_mut` when copying is not acceptable. |
@@ -122,6 +158,31 @@ workload is faster without measurement.
 | SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata construction and parsing, but `recv` does not expose EOR/truncation. Use `send_msg` / `recv_msg` when stream, PPID, flags, EOR, truncation, or notifications matter. |
 | Timers | One `timeout_at` or `timeout` around a protocol phase when a deadline is required | A separate timeout around every tiny I/O step | Each armed deadline consumes timer-wheel state and expiry/cancellation work. Preserve finer timers when protocol semantics require them. |
 | DNS/TLS setup | Reuse `DnsResolver`, resolved addresses, connectors, and established TLS streams | Resolving names or handshaking in a per-message loop | Resolver setup/query construction and TLS handshakes may allocate and perform setup I/O. |
+
+`JoinHandle<T>` resolves to `Result<T, JoinError>`. Normal completion returns
+`Ok(T)`; dropping the owning executor cancels unfinished tasks and makes their
+handles return `Err(JoinError::Cancelled)`. If `Executor::run` returns
+`WouldBlock`, live tasks remain owned by that executor and a later `run` resumes
+them alongside its new root future.
+
+Only one `Executor::run` may be active on a thread. Poll runtime I/O and timer
+futures only through the executor that submitted or armed them. Polling without
+an active FlowIO run or through another executor returns `NotConnected`.
+Unsubmitted rental I/O returns its buffer immediately; submitted I/O retains
+the buffer until the original completion and then returns it with that error.
+
+Standard task `Waker` values must be cloned, woken, and dropped on the thread
+that owns their executor. Debug builds assert this contract; release builds
+keep the direct, allocation-free owner-thread wake path. FlowIO intentionally
+has no cross-thread task-waker relay. Use an application-owned channel or
+reactor-layer signaling for cross-thread work, then create or wake FlowIO tasks
+on the owner thread.
+
+`timeout` and `timeout_at` return `TimeoutError::Elapsed` only when the
+deadline wins. Timer allocation or runtime failures are returned as
+`TimeoutError::Runtime(error)` with the original `io::ErrorKind`. TCP and SCTP
+`connect_timeout` helpers translate only true expiry to `TimedOut` and preserve
+runtime failures such as `OutOfMemory`.
 
 ### Warming a buffer pool
 
@@ -218,11 +279,15 @@ one-to-one SCTP works through `SctpListener`, `SctpConnector`, and
 ## Limitations
 
 - Linux only. The runtime is built on `io_uring`.
-- Single-threaded runtime. flowio buffers are not a cross-thread ownership API.
+- Single-threaded task execution. A runtime instance and its tasks, buffers, and
+  wakers are owner-thread state and are not cross-thread APIs; a runtime is used
+  from the one thread that runs it.
 - Alpha API; compatibility may change between alpha releases.
 - Task and timer pools acquire fixed-size slabs on demand and currently have no
-  user-configurable total slab cap. Allocation failure is surfaced, but callers
-  that require a strict process-memory ceiling must enforce one externally.
+  user-configurable total slab cap. Sleep allocation failure is an
+  `io::Error`; timeout wrappers return it through `TimeoutError::Runtime`.
+  Callers that require a strict process-memory ceiling must enforce one
+  externally.
 - Dropping an in-flight read can discard bytes from a racing completion. Treat
   read cancellation or timeout as a protocol boundary unless your protocol has
   its own recovery path.

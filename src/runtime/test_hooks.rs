@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::io;
 thread_local! {
     static FAIL_OP_ALLOCS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_TIMER_ALLOCS: Cell<usize> = const { Cell::new(0) };
     static FAIL_RAW_SQE_SUBMITS: Cell<usize> = const { Cell::new(0) };
     static FAIL_RING_SUBMITS: Cell<usize> = const { Cell::new(0) };
     static FAIL_RING_SUBMIT_ERRNO: Cell<i32> = const { Cell::new(0) };
@@ -25,6 +26,13 @@ thread_local! {
 #[allow(dead_code)]
 pub fn fail_next_op_alloc() {
     FAIL_OP_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
+}
+
+/// Makes the next timer-entry allocation on this thread fail.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn fail_next_timer_alloc() {
+    FAIL_TIMER_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
 
 /// Makes the next raw reactor SQE submission on this thread fail with
@@ -79,6 +87,19 @@ pub(crate) fn fail_next_reactor_ext_arg_probe() {
 #[inline(always)]
 pub(crate) fn take_op_alloc_failure() -> bool {
     FAIL_OP_ALLOCS.with(|fails| {
+        let remaining = fails.get();
+        if remaining == 0 {
+            false
+        } else {
+            fails.set(remaining - 1);
+            true
+        }
+    })
+}
+
+#[inline(always)]
+pub(crate) fn take_timer_alloc_failure() -> bool {
+    FAIL_TIMER_ALLOCS.with(|fails| {
         let remaining = fails.get();
         if remaining == 0 {
             false
