@@ -20,10 +20,10 @@ fuzzing = []
 test-support = []
 
 [dependencies]
-io-uring = "0.7.11"
-libc = "0.2.182"
-rustls = { version = "0.23.38", default-features = false, features = ["std", "ring", "tls12"] }
-sha2 = "0.10"
+io-uring = "0.7.13"
+libc = "0.2.186"
+rustls = { version = "0.23.42", default-features = false, features = ["std", "ring", "tls12"] }
+sha2 = "0.11"
 
 [dev-dependencies]
 flowio = { path = ".", features = ["test-support"] }
