@@ -43,6 +43,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- DNS resolution now accepts CNAME and address data only from the Answer
+  section. Authority and Additional records remain structurally parsed but
+  cannot seed or extend resolution; an Answer CNAME without an Answer address
+  uses the existing bounded follow-up query.
 - DNS responses with an echoed question now match its name, type, and class
   before applying NXDOMAIN or another nonzero response code. Mismatched
   negative responses fail over instead of terminating the logical lookup;

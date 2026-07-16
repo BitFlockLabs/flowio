@@ -41,6 +41,24 @@ enum TestAnswer {
     QuestionlessNxDomain,
     ServFail,
     QuestionlessServFail,
+    Sectioned(TestSections),
+}
+
+/// Test-only resource record used to build explicit DNS sections.
+#[derive(Clone, Copy)]
+enum TestRecord {
+    A(&'static str, Ipv4Addr),
+    Aaaa(&'static str, Ipv6Addr),
+    Cname(&'static str, &'static str),
+    Truncated(&'static str),
+}
+
+/// Answer, Authority, and Additional records for a section-policy response.
+#[derive(Clone, Copy)]
+struct TestSections {
+    answer: &'static [TestRecord],
+    authority: &'static [TestRecord],
+    additional: &'static [TestRecord],
 }
 
 #[derive(Clone, Copy)]
@@ -1022,14 +1040,174 @@ fn resolve_host_accepts_multi_hop_bundled_cname_address() {
 }
 
 #[test]
+fn resolve_host_follows_answer_cname_instead_of_additional_addresses() {
+    const INITIAL: TestSections = TestSections {
+        answer: &[TestRecord::Cname("db.example.test", "db.internal.test")],
+        authority: &[],
+        additional: &[
+            TestRecord::A("db.internal.test", Ipv4Addr::new(203, 0, 113, 70)),
+            TestRecord::A("unrelated.example.test", Ipv4Addr::new(203, 0, 113, 71)),
+        ],
+    };
+    let expected = Ipv4Addr::new(198, 51, 100, 93);
+
+    let addrs = resolve_with_mock_dns(4, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::Sectioned(INITIAL)),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            ("db.internal.test", 1) => Some(TestAnswer::A(expected)),
+            ("db.internal.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("Answer CNAME should use the bounded follow-up query");
+
+    assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
+}
+
+#[test]
+fn resolve_host_ignores_authority_injection_and_loop() {
+    const AUTHORITY_ONLY: TestSections = TestSections {
+        answer: &[],
+        authority: &[
+            TestRecord::Cname("db.example.test", "db.mid.test"),
+            TestRecord::Cname("db.mid.test", "db.example.test"),
+            TestRecord::A("db.example.test", Ipv4Addr::new(203, 0, 113, 72)),
+            TestRecord::A("db.mid.test", Ipv4Addr::new(203, 0, 113, 73)),
+        ],
+        additional: &[],
+    };
+
+    let err = resolve_with_mock_dns(2, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::Sectioned(AUTHORITY_ONLY)),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect_err("Authority records must not contribute to resolution");
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn resolve_host_ignores_additional_cname_chain() {
+    const ADDITIONAL_ONLY: TestSections = TestSections {
+        answer: &[],
+        authority: &[],
+        additional: &[
+            TestRecord::Cname("db.example.test", "db.internal.test"),
+            TestRecord::A("db.internal.test", Ipv4Addr::new(203, 0, 113, 74)),
+        ],
+    };
+
+    let err = resolve_with_mock_dns(2, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::Sectioned(ADDITIONAL_ONLY)),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect_err("Additional CNAME/address data must not resolve the query");
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn resolve_host_deduplicates_duplicate_answer_names_and_addresses() {
+    const DUPLICATE_ANSWERS: TestSections = TestSections {
+        answer: &[
+            TestRecord::Cname("db.example.test", "db.internal.test"),
+            TestRecord::Cname("db.example.test", "db.internal.test"),
+            TestRecord::A("db.internal.test", Ipv4Addr::new(198, 51, 100, 94)),
+            TestRecord::A("db.internal.test", Ipv4Addr::new(198, 51, 100, 94)),
+        ],
+        authority: &[],
+        additional: &[],
+    };
+
+    let addrs = resolve_with_mock_dns(2, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::Sectioned(DUPLICATE_ANSWERS)),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("duplicate Answer records should remain valid");
+
+    assert_eq!(
+        addrs,
+        vec![SocketAddr::from((Ipv4Addr::new(198, 51, 100, 94), 5432,))]
+    );
+}
+
+#[test]
+fn resolve_host_selects_requested_family_from_mixed_answer_chain() {
+    const MIXED_ANSWERS: TestSections = TestSections {
+        answer: &[
+            TestRecord::Cname("db.example.test", "db.internal.test"),
+            TestRecord::A("db.internal.test", Ipv4Addr::new(198, 51, 100, 95)),
+            TestRecord::Aaaa(
+                "db.internal.test",
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x95),
+            ),
+        ],
+        authority: &[],
+        additional: &[],
+    };
+
+    let addrs = resolve_with_mock_dns(2, Duration::from_millis(200), |name, _| match name {
+        "db.example.test" => Some(TestAnswer::Sectioned(MIXED_ANSWERS)),
+        _ => Some(TestAnswer::NxDomain),
+    })
+    .expect("mixed Answer chain should retain requested-family filtering");
+
+    assert_eq!(
+        addrs,
+        vec![
+            SocketAddr::from((Ipv4Addr::new(198, 51, 100, 95), 5432)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x95), 5432,)),
+        ]
+    );
+}
+
+#[test]
+fn resolve_host_structurally_parses_ignored_sections() {
+    const TRUNCATED_AUTHORITY: TestSections = TestSections {
+        answer: &[],
+        authority: &[TestRecord::Truncated("db.example.test")],
+        additional: &[],
+    };
+    const TRUNCATED_ADDITIONAL: TestSections = TestSections {
+        answer: &[],
+        authority: &[],
+        additional: &[TestRecord::Truncated("db.example.test")],
+    };
+
+    for (label, sections) in [
+        ("Authority", TRUNCATED_AUTHORITY),
+        ("Additional", TRUNCATED_ADDITIONAL),
+    ] {
+        let err = resolve_with_mock_dns(2, Duration::from_millis(200), move |_, _| {
+            Some(TestAnswer::Sectioned(sections))
+        })
+        .expect_err("truncated ignored-section record should fail parsing");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "{label} record should be structurally parsed",
+        );
+    }
+}
+
+#[test]
 fn resolve_host_rejects_cyclic_in_response_cname_chain() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
     let thread = thread::spawn(move || {
-        serve_dns_queries(server, 1, |name, qtype| match (name, qtype) {
-            ("db.example.test", 1) => TestAnswer::CyclicCname("db.mid.test"),
-            ("db.example.test", 28) => TestAnswer::Empty,
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1 | 28) => TestAnswer::CyclicCname("db.mid.test"),
             _ => TestAnswer::NxDomain,
         })
     });
@@ -1612,6 +1790,20 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::QuestionlessNxDomain
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => 0u16,
+        TestAnswer::Sectioned(sections) => {
+            u16::try_from(sections.answer.len()).expect("test Answer record count should fit")
+        }
+    };
+    let authority_count = match answer {
+        TestAnswer::Sectioned(sections) => {
+            u16::try_from(sections.authority.len()).expect("test Authority record count should fit")
+        }
+        _ => 0,
+    };
+    let additional_count = match answer {
+        TestAnswer::Sectioned(sections) => u16::try_from(sections.additional.len())
+            .expect("test Additional record count should fit"),
+        _ => 0,
     };
     let flags = match answer {
         TestAnswer::NegativeQuestionMismatch(_, NegativeRcode::NxDomain)
@@ -1632,8 +1824,8 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
     push_u16_be(&mut response, flags);
     push_u16_be(&mut response, u16::from(include_question));
     push_u16_be(&mut response, answer_count);
-    push_u16_be(&mut response, 0);
-    push_u16_be(&mut response, 0);
+    push_u16_be(&mut response, authority_count);
+    push_u16_be(&mut response, additional_count);
     if include_question {
         response.extend_from_slice(&query[12..question_end]);
     }
@@ -1939,9 +2131,56 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::QuestionlessNxDomain
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => {}
+        TestAnswer::Sectioned(sections) => {
+            for record in sections
+                .answer
+                .iter()
+                .chain(sections.authority)
+                .chain(sections.additional)
+            {
+                push_test_record(&mut response, *record);
+            }
+        }
     }
 
     response
+}
+
+fn push_test_record(response: &mut Vec<u8>, record: TestRecord) {
+    let (owner, rr_type, rdlength) = match record {
+        TestRecord::A(owner, _) => (owner, 1, 4),
+        TestRecord::Aaaa(owner, _) => (owner, 28, 16),
+        TestRecord::Cname(owner, target) => {
+            push_name(response, owner);
+            push_u16_be(response, 5);
+            push_u16_be(response, 1);
+            push_u32_be(response, 60);
+
+            let mut encoded_target = Vec::new();
+            push_name(&mut encoded_target, target);
+            push_u16_be(
+                response,
+                u16::try_from(encoded_target.len()).expect("test CNAME RDATA length should fit"),
+            );
+            response.extend_from_slice(&encoded_target);
+            return;
+        }
+        TestRecord::Truncated(owner) => {
+            push_name(response, owner);
+            return;
+        }
+    };
+
+    push_name(response, owner);
+    push_u16_be(response, rr_type);
+    push_u16_be(response, 1);
+    push_u32_be(response, 60);
+    push_u16_be(response, rdlength);
+    match record {
+        TestRecord::A(_, address) => response.extend_from_slice(&address.octets()),
+        TestRecord::Aaaa(_, address) => response.extend_from_slice(&address.octets()),
+        TestRecord::Cname(_, _) | TestRecord::Truncated(_) => unreachable!(),
+    }
 }
 
 fn question_end(packet: &[u8]) -> io::Result<usize> {

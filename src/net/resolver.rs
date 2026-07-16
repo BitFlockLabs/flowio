@@ -191,6 +191,10 @@ impl DnsResolver {
     /// its response code is applied. Questionless FORMERR, SERVFAIL, NOTIMP,
     /// and REFUSED replies remain prompt nameserver-failover results, while a
     /// questionless NXDOMAIN is drained as an unrelated datagram.
+    /// Only Answer-section CNAME and address records contribute to resolution.
+    /// Authority and Additional records are still parsed for structural
+    /// validity but otherwise ignored; an Answer CNAME without an Answer
+    /// address uses the existing bounded follow-up query.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -414,6 +418,14 @@ enum DnsRecord {
         /// Canonical name reached by following this CNAME record.
         target: String,
     },
+}
+
+/// DNS resource-record section used to keep resolution data Answer-only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DnsRecordSection {
+    Answer,
+    Authority,
+    Additional,
 }
 
 fn next_query_id() -> u16 {
@@ -931,45 +943,53 @@ pub(crate) fn parse_response_packet(
     // Bound the eager allocation by the packet's minimum possible RR density;
     // forged header counts cannot reserve independently of packet size.
     let mut records = Vec::with_capacity(total_rrs.min(max_rrs_by_packet));
-    for _ in 0..total_rrs {
-        let (owner, consumed) = decode_name(packet, offset, 0)?;
-        offset = checked_add(offset, consumed, packet.len())?;
-        let rr = parse_rr_header(packet, offset)?;
-        offset = rr.data_offset + rr.rdlength as usize;
+    for (section, count) in [
+        (DnsRecordSection::Answer, envelope.ancount),
+        (DnsRecordSection::Authority, envelope.nscount),
+        (DnsRecordSection::Additional, envelope.arcount),
+    ] {
+        for _ in 0..count {
+            let (owner, consumed) = decode_name(packet, offset, 0)?;
+            offset = checked_add(offset, consumed, packet.len())?;
+            let rr = parse_rr_header(packet, offset)?;
+            offset = rr.data_offset + rr.rdlength as usize;
 
-        if rr.class != DNS_CLASS_IN {
-            continue;
-        }
+            if rr.class != DNS_CLASS_IN {
+                continue;
+            }
 
-        match rr.rr_type {
-            DNS_TYPE_A if rr.rdlength == 4 => {
-                let data = &packet[rr.data_offset..rr.data_offset + 4];
-                records.push(DnsRecord::Address {
-                    owner,
-                    rr_type: rr.rr_type,
-                    address: IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
-                });
-            }
-            DNS_TYPE_AAAA if rr.rdlength == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
-                records.push(DnsRecord::Address {
-                    owner,
-                    rr_type: rr.rr_type,
-                    address: IpAddr::V6(Ipv6Addr::from(octets)),
-                });
-            }
-            DNS_TYPE_CNAME => {
-                let (target, consumed) = decode_name(packet, rr.data_offset, 0)?;
-                if consumed != rr.rdlength as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "DNS CNAME RDATA did not consume its declared length",
-                    ));
+            match rr.rr_type {
+                DNS_TYPE_A if rr.rdlength == 4 && section == DnsRecordSection::Answer => {
+                    let data = &packet[rr.data_offset..rr.data_offset + 4];
+                    records.push(DnsRecord::Address {
+                        owner,
+                        rr_type: rr.rr_type,
+                        address: IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+                    });
                 }
-                records.push(DnsRecord::Cname { owner, target });
+                DNS_TYPE_AAAA if rr.rdlength == 16 && section == DnsRecordSection::Answer => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
+                    records.push(DnsRecord::Address {
+                        owner,
+                        rr_type: rr.rr_type,
+                        address: IpAddr::V6(Ipv6Addr::from(octets)),
+                    });
+                }
+                DNS_TYPE_CNAME => {
+                    let (target, consumed) = decode_name(packet, rr.data_offset, 0)?;
+                    if consumed != rr.rdlength as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS CNAME RDATA did not consume its declared length",
+                        ));
+                    }
+                    if section == DnsRecordSection::Answer {
+                        records.push(DnsRecord::Cname { owner, target });
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
