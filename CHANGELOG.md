@@ -43,6 +43,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- TLS client scratch sizes are validated before allocation. Zero or
+  unrepresentable capacities return `InvalidInput`, initial reservation
+  failure returns `OutOfMemory`, and the exceptional missing-scratch recovery
+  path is also fallible instead of panicking.
 - Malformed matching-ID DNS datagrams are now rejected by the shared
   candidate/full-parser name walker without constructing and then discarding
   an `io::Error`. Full parsing preserves the same error kinds and messages,

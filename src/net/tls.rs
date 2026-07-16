@@ -151,6 +151,69 @@ fn tls_internal_error(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
 
+#[derive(Clone, Copy)]
+enum TlsScratchKind {
+    Read,
+    Write,
+}
+
+impl TlsScratchKind {
+    const fn zero_size_message(self) -> &'static str {
+        match self {
+            Self::Read => "transport_read_buffer_size must be greater than zero",
+            Self::Write => "transport_write_buffer_size must be greater than zero",
+        }
+    }
+
+    const fn impossible_size_message(self) -> &'static str {
+        match self {
+            Self::Read => "transport_read_buffer_size exceeds the maximum allocation size",
+            Self::Write => "transport_write_buffer_size exceeds the maximum allocation size",
+        }
+    }
+}
+
+fn validate_tls_scratch_size(kind: TlsScratchKind, capacity: usize) -> io::Result<()> {
+    if capacity == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            kind.zero_size_message(),
+        ));
+    }
+    if capacity > isize::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            kind.impossible_size_message(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn reserve_valid_tls_scratch(capacity: usize) -> io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    Ok(buffer)
+}
+
+fn allocate_tls_scratch(kind: TlsScratchKind, capacity: usize) -> io::Result<Vec<u8>> {
+    validate_tls_scratch_size(kind, capacity)?;
+    reserve_valid_tls_scratch(capacity)
+}
+
+fn take_or_reserve_tls_scratch(
+    available: &mut Option<Vec<u8>>,
+    kind: TlsScratchKind,
+    capacity: usize,
+) -> io::Result<Vec<u8>> {
+    match available.take() {
+        Some(buffer) => Ok(buffer),
+        None => allocate_tls_scratch(kind, capacity),
+    }
+}
+
 /// Returns one userspace-safe mutable destination for a TLS plaintext read.
 ///
 /// The first call initializes the complete destination through the buffer's
@@ -181,13 +244,15 @@ unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
 /// This type intentionally does not implement `Default` so callers must make
 /// the buffering decision explicitly.
 ///
-/// `transport_read_buffer_size` is the reusable ciphertext scratch capacity;
+/// `transport_read_buffer_size` is the nonzero reusable ciphertext scratch
+/// capacity;
 /// each submitted raw read is bounded by rustls' maximum wire-record size so
 /// internal rustls ciphertext and plaintext buffers are drained between records.
-/// `transport_write_buffer_size` is the initial capacity used when collecting
-/// TLS records emitted by rustls before writing them to the socket; the buffer
-/// may still grow if rustls emits more than the initial capacity in one flush
-/// cycle.
+/// `transport_write_buffer_size` is the nonzero initial capacity used when
+/// collecting TLS records emitted by rustls before writing them to the socket;
+/// the buffer may still grow if rustls emits more than the initial capacity in
+/// one flush cycle. Both capacities must fit in `isize` and are reserved
+/// fallibly when the wrapper is created.
 ///
 /// For steady-state use, pick values once per connection profile and reuse
 /// them. Recomputing or reallocating these choices per operation is not the
@@ -210,11 +275,11 @@ pub struct TlsClientOptions {
     /// rustls limit for unsent plaintext-before-handshake and pending TLS
     /// records.  `None` means rustls may buffer without bound.
     pub rustls_buffer_limit: Option<usize>,
-    /// Capacity of the reusable ciphertext receive scratch buffer used for
-    /// `read_tls`.
+    /// Nonzero capacity of the reusable ciphertext receive scratch buffer used
+    /// for `read_tls`. The value must not exceed `isize::MAX`.
     pub transport_read_buffer_size: usize,
-    /// Initial capacity of the reusable ciphertext send scratch buffer used
-    /// for `write_tls`.
+    /// Nonzero initial capacity of the reusable ciphertext send scratch buffer
+    /// used for `write_tls`. The value must not exceed `isize::MAX`.
     pub transport_write_buffer_size: usize,
 }
 
@@ -256,6 +321,10 @@ pub struct TlsClientOptions {
 /// drain already-decrypted plaintext and continue reading the transport until
 /// EOF; if a read requires a TLS transport write to make progress after the
 /// write latch is set, that read returns `BrokenPipe`.
+///
+/// Ordinary TLS operations reuse the two reserved ciphertext buffers. If an
+/// earlier exceptional path leaves one unavailable, the operation that needs
+/// it recreates it fallibly and can return `OutOfMemory`.
 pub struct TlsClientStream {
     /// Underlying connected TCP transport owned by this TLS wrapper.
     stream: TcpStream,
@@ -433,7 +502,9 @@ impl TlsClientStream {
     /// the wrapper once per connection and reuse it for the session lifetime.
     ///
     /// # Errors
-    /// Returns `InvalidInput` if either transport scratch buffer size is zero.
+    /// Returns `InvalidInput` if either transport scratch buffer size is zero
+    /// or cannot be represented by a `Vec<u8>` allocation. Returns
+    /// `OutOfMemory` if either scratch reservation fails.
     /// Returns `InvalidData` if rustls rejects the supplied config or server
     /// name while constructing the client connection.
     ///
@@ -477,18 +548,11 @@ impl TlsClientStream {
         server_name: ServerName<'static>,
         options: TlsClientOptions,
     ) -> io::Result<Self> {
-        if options.transport_read_buffer_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transport_read_buffer_size must be greater than zero",
-            ));
-        }
-        if options.transport_write_buffer_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transport_write_buffer_size must be greater than zero",
-            ));
-        }
+        validate_tls_scratch_size(TlsScratchKind::Read, options.transport_read_buffer_size)?;
+        validate_tls_scratch_size(TlsScratchKind::Write, options.transport_write_buffer_size)?;
+
+        let read_tls_buffer = reserve_valid_tls_scratch(options.transport_read_buffer_size)?;
+        let write_tls_buffer = reserve_valid_tls_scratch(options.transport_write_buffer_size)?;
 
         let mut connection =
             ClientConnection::new(config, server_name).map_err(tls_protocol_error)?;
@@ -499,8 +563,8 @@ impl TlsClientStream {
             connection,
             transport_read_buffer_size: options.transport_read_buffer_size,
             transport_write_buffer_size: options.transport_write_buffer_size,
-            read_tls_buffer: Some(Vec::with_capacity(options.transport_read_buffer_size)),
-            write_tls_buffer: Some(Vec::with_capacity(options.transport_write_buffer_size)),
+            read_tls_buffer: Some(read_tls_buffer),
+            write_tls_buffer: Some(write_tls_buffer),
             pending_read_tls: None,
             pending_write_tls: None,
             transport_read_eof: false,
@@ -687,10 +751,12 @@ impl TlsClientStream {
         Ok(())
     }
 
-    fn take_read_tls_buffer(&mut self) -> Vec<u8> {
-        self.read_tls_buffer
-            .take()
-            .unwrap_or_else(|| Vec::with_capacity(self.transport_read_buffer_size))
+    fn take_read_tls_buffer(&mut self) -> io::Result<Vec<u8>> {
+        take_or_reserve_tls_scratch(
+            &mut self.read_tls_buffer,
+            TlsScratchKind::Read,
+            self.transport_read_buffer_size,
+        )
     }
 
     // Returns a read scratch buffer to the stream after clearing any bytes
@@ -702,10 +768,12 @@ impl TlsClientStream {
         }
     }
 
-    fn take_write_tls_buffer(&mut self) -> Vec<u8> {
-        self.write_tls_buffer
-            .take()
-            .unwrap_or_else(|| Vec::with_capacity(self.transport_write_buffer_size))
+    fn take_write_tls_buffer(&mut self) -> io::Result<Vec<u8>> {
+        take_or_reserve_tls_scratch(
+            &mut self.write_tls_buffer,
+            TlsScratchKind::Write,
+            self.transport_write_buffer_size,
+        )
     }
 
     // Returns a write scratch buffer to the stream after clearing any emitted
@@ -780,7 +848,7 @@ impl TlsClientStream {
                 return Poll::Ready(Ok(()));
             }
 
-            let mut buffer = self.take_write_tls_buffer();
+            let mut buffer = self.take_write_tls_buffer()?;
             buffer.clear();
 
             let mut total = 0usize;
@@ -843,7 +911,7 @@ impl TlsClientStream {
                 return Poll::Ready(Err(tls_internal_error("tls transport write/read overlap")));
             }
 
-            let buffer = self.take_read_tls_buffer();
+            let buffer = self.take_read_tls_buffer()?;
             let len = buffer.capacity().min(TLS_MAX_WIRE_READ_SIZE);
             self.pending_read_tls = Some(stream::ReadFuture::new(
                 self.stream.as_raw_fd(),
@@ -1397,9 +1465,12 @@ impl Future for TlsShutdownFuture<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::tls_userspace_destination;
     #[cfg(not(miri))]
     use super::*;
+    use super::{
+        TlsScratchKind, allocate_tls_scratch, take_or_reserve_tls_scratch,
+        tls_userspace_destination,
+    };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
     use crate::runtime::buffer::{IoBuffError, IoBuffMut, IoBuffReadWrite};
@@ -1409,6 +1480,47 @@ mod tests {
     use rustls::RootCertStore;
     #[cfg(not(miri))]
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn tls_scratch_sizes_reject_zero_and_impossible_geometry() {
+        for (kind, field) in [
+            (TlsScratchKind::Read, "transport_read_buffer_size"),
+            (TlsScratchKind::Write, "transport_write_buffer_size"),
+        ] {
+            for capacity in [0, usize::MAX] {
+                let err = allocate_tls_scratch(kind, capacity)
+                    .expect_err("invalid TLS scratch geometry should fail");
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(err.to_string().contains(field));
+            }
+        }
+    }
+
+    #[test]
+    fn tls_scratch_reserves_valid_small_common_and_large_profiles() {
+        for kind in [TlsScratchKind::Read, TlsScratchKind::Write] {
+            for capacity in [1, 16 * 1024, 64 * 1024] {
+                let scratch = allocate_tls_scratch(kind, capacity)
+                    .expect("valid TLS scratch reservation should succeed");
+                assert!(scratch.is_empty());
+                assert!(scratch.capacity() >= capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_tls_scratch_uses_the_same_fallible_reservation_path() {
+        let mut read = None;
+        let scratch = take_or_reserve_tls_scratch(&mut read, TlsScratchKind::Read, 1024)
+            .expect("valid fallback reservation should succeed");
+        assert!(scratch.is_empty());
+        assert!(scratch.capacity() >= 1024);
+
+        let mut write = None;
+        let err = take_or_reserve_tls_scratch(&mut write, TlsScratchKind::Write, usize::MAX)
+            .expect_err("impossible fallback reservation should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     struct DefaultUninitializedBuffer {
         storage: Box<[std::mem::MaybeUninit<u8>]>,
