@@ -10,6 +10,9 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** `JoinHandle<T>` now resolves to `Result<T, JoinError>`.
+  Executor shutdown reports unfinished work as `JoinError::Cancelled` instead
+  of returning an uninitialized task result.
 - **Breaking:** `TcpStream::from_raw_fd`, `UnixStream::from_raw_fd`, and
   `SctpStream::from_raw_fd` now require an unsafe sole-ownership proof. Prefer
   the new safe `from_owned_fd` constructors, which consume `OwnedFd` and make a
@@ -54,6 +57,8 @@ Alpha prereleases carry no compatibility guarantee.
   changing whether the stream list is empty. Generic empty requests and any
   other intent/list mismatch now return `InvalidInput` before a socket-option
   syscall.
+- Runtime dependencies have been refreshed while retaining the existing
+  feature set and minimum supported Rust version.
 
 ### Fixed
 
@@ -98,6 +103,9 @@ Alpha prereleases carry no compatibility guarantee.
   addresses win, same-rank CNAME and recoverable-error conflicts remain
   A-first, and terminal timer/runtime failures retain their documented
   no-address precedence.
+- DNS CNAME traversal now follows one linear Answer-only chain with explicit
+  loop detection, independent 16-hop per-response and total limits, at most one
+  follow-up query round, and a separate compression-pointer depth limit.
 - TCP and Unix immediate, partial-async, and all-async projected writes now,
   after any async runtime-context validation succeeds, validate a
   declared-empty projection once instead of bypassing its stale nonempty
@@ -129,6 +137,9 @@ Alpha prereleases carry no compatibility guarantee.
   contents on zero progress and publish positive progress from the captured
   destination base. Exact-read EOF/errors and datagram metadata/truncation
   errors publish any bytes actually received before returning the error.
+- `Executor::run` now preserves unfinished tasks when it returns `WouldBlock`;
+  a later run resumes the same scheduler state, while executor shutdown
+  cancels each remaining task exactly once.
 - Debug builds assert that standard task wakers are cloned, woken, and dropped
   only on their owner thread; release builds retain the zero-cost
   single-threaded waker path.
