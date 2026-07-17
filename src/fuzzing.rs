@@ -98,14 +98,10 @@ pub fn sctp_parse_notification(data: &[u8]) {
     let _ = crate::net::sctp::parse_notification(data);
 }
 
-/// Fuzz entry: parse SCTP recvmsg metadata with bounded derived lengths.
-pub fn sctp_parse_recv_meta(data: &[u8]) {
+fn observe_sctp_parse_recv_meta(data: &[u8]) -> std::io::Result<crate::net::sctp::SctpRecvMeta> {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
-    let Some((&flag_byte, rest)) = data.split_first() else {
-        let _ = crate::net::sctp::parse_recv_meta(&[], 0, 0, &[]);
-        return;
-    };
+    let flag_byte = data.first().copied().unwrap_or_default();
 
     let mut msg_flags = 0;
     if flag_byte & 0x01 != 0 {
@@ -121,19 +117,21 @@ pub fn sctp_parse_recv_meta(data: &[u8]) {
         msg_flags |= libc::MSG_EOR;
     }
 
-    let split = rest
-        .first()
-        .map(|len| (*len as usize).min(rest.len().saturating_sub(1)))
-        .unwrap_or_default();
-    let control = rest.get(1..1 + split).unwrap_or_default();
-    let data_slice = rest.get(1 + split..).unwrap_or_default();
-    let controllen = if control.is_empty() {
-        0
-    } else {
-        ((flag_byte >> 4) as usize).min(control.len())
-    };
+    // Keep the kernel-reported length independent from the backing-storage
+    // length so all cmsg parser branches remain reachable. Both are full-byte
+    // values and are bounded before any slice is formed:
+    // [flags, control storage length, reported controllen, control..., data...].
+    let body = data.get(3..).unwrap_or_default();
+    let control_len = (data.get(1).copied().unwrap_or_default() as usize).min(body.len());
+    let (control, data_slice) = body.split_at(control_len);
+    let controllen = (data.get(2).copied().unwrap_or_default() as usize).min(control.len());
 
-    let _ = crate::net::sctp::parse_recv_meta(control, controllen, msg_flags, data_slice);
+    crate::net::sctp::parse_recv_meta(control, controllen, msg_flags, data_slice)
+}
+
+/// Fuzz entry: parse SCTP recvmsg metadata with independently bounded lengths.
+pub fn sctp_parse_recv_meta(data: &[u8]) {
+    let _ = std::hint::black_box(observe_sctp_parse_recv_meta(data));
 }
 
 /// Fuzz entry: parse packed SCTP association-address payloads.
@@ -175,9 +173,141 @@ pub fn dns_response_prefilter(data: &[u8]) {
     let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id ^ 0x5555);
 }
 
+fn observe_tls_server_end_point(data: &[u8]) -> Option<Vec<u8>> {
+    let data = maybe_decode_hex_seed(data);
+    crate::net::tls::tls_server_end_point(data.as_ref())
+}
+
+/// Fuzz entry: derive `tls-server-end-point` from arbitrary certificate DER.
+///
+/// The return value lets focused wrapper tests prove that the corpus reaches
+/// both a supported certificate and rejected malformed input. LibFuzzer only
+/// relies on this function never panicking or reading out of bounds.
+pub fn tls_server_end_point(data: &[u8]) -> bool {
+    observe_tls_server_end_point(data).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::sctp::{SctpNotification, SctpRecvInfo, SctpRecvMeta};
+
+    fn cmsg_align(len: usize) -> usize {
+        let align = std::mem::size_of::<usize>();
+        (len + align - 1) & !(align - 1)
+    }
+
+    fn write_ne<const N: usize>(buffer: &mut [u8], offset: usize, bytes: [u8; N]) {
+        buffer[offset..offset + N].copy_from_slice(&bytes);
+    }
+
+    fn rcvinfo_input(info: libc::sctp_rcvinfo, payload: &[u8]) -> Vec<u8> {
+        let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+        let data_offset = cmsg_align(hdr_len);
+        let data_len = std::mem::size_of::<libc::sctp_rcvinfo>();
+        let control_len = data_offset + data_len;
+        let control_len_u8 =
+            u8::try_from(control_len).expect("RCVINFO cmsg should fit in one byte");
+
+        let mut input = Vec::with_capacity(3 + control_len + payload.len());
+        input.extend_from_slice(&[0x08, control_len_u8, control_len_u8]);
+        input.resize(3 + control_len, 0);
+
+        let control = &mut input[3..3 + control_len];
+        // Write fields rather than whole C structs so their zeroed padding is
+        // deterministic in optimized tests and checked corpus comparisons.
+        macro_rules! write_field {
+            ($base:expr, $ty:ty, $field:ident, $value:expr) => {
+                write_ne(
+                    control,
+                    $base + std::mem::offset_of!($ty, $field),
+                    $value.to_ne_bytes(),
+                );
+            };
+        }
+        write_field!(0, libc::cmsghdr, cmsg_len, hdr_len + data_len);
+        write_field!(0, libc::cmsghdr, cmsg_level, libc::IPPROTO_SCTP);
+        write_field!(0, libc::cmsghdr, cmsg_type, libc::SCTP_RCVINFO);
+        write_field!(data_offset, libc::sctp_rcvinfo, rcv_sid, info.rcv_sid);
+        write_field!(data_offset, libc::sctp_rcvinfo, rcv_ssn, info.rcv_ssn);
+        write_field!(data_offset, libc::sctp_rcvinfo, rcv_flags, info.rcv_flags);
+        write_field!(data_offset, libc::sctp_rcvinfo, rcv_ppid, info.rcv_ppid);
+        write_field!(data_offset, libc::sctp_rcvinfo, rcv_tsn, info.rcv_tsn);
+        write_field!(data_offset, libc::sctp_rcvinfo, rcv_cumtsn, info.rcv_cumtsn);
+        write_field!(
+            data_offset,
+            libc::sctp_rcvinfo,
+            rcv_context,
+            info.rcv_context
+        );
+        write_field!(
+            data_offset,
+            libc::sctp_rcvinfo,
+            rcv_assoc_id,
+            info.rcv_assoc_id
+        );
+        input.extend_from_slice(payload);
+        input
+    }
+
+    fn checked_native_seed(seed: &'static [u8], synthesized: Vec<u8>) -> Vec<u8> {
+        // The checked corpus encodes the 64-bit little-endian Linux C ABI used
+        // by the full-hardening host. Other Linux ABIs exercise the same
+        // semantic branch with their synthesized native layout.
+        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+        {
+            let decoded = maybe_decode_hex_seed(seed).into_owned();
+            assert_eq!(decoded, synthesized, "native fuzz seed drifted");
+            decoded
+        }
+        #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+        {
+            let _ = seed;
+            synthesized
+        }
+    }
+
+    fn sample_rcvinfo() -> libc::sctp_rcvinfo {
+        libc::sctp_rcvinfo {
+            rcv_sid: 3,
+            rcv_ssn: 4,
+            rcv_flags: 5,
+            rcv_ppid: 0x0607_0809u32.to_be(),
+            rcv_tsn: 10,
+            rcv_cumtsn: 11,
+            rcv_context: 12,
+            rcv_assoc_id: 13,
+        }
+    }
+
+    fn sample_recv_meta() -> SctpRecvMeta {
+        SctpRecvMeta::Data(SctpRecvInfo {
+            stream_id: 3,
+            ssn: 4,
+            flags: 5,
+            ppid: 0x0607_0809,
+            tsn: 10,
+            cumtsn: 11,
+            context: 12,
+            assoc_id: 13,
+            end_of_record: true,
+        })
+    }
+
+    fn assoc_change_input() -> Vec<u8> {
+        let mut notification = [0u8; 20];
+        let notification_len = notification.len() as u32;
+        notification[0..2].copy_from_slice(&((1u16 << 15) | 1).to_ne_bytes());
+        notification[4..8].copy_from_slice(&notification_len.to_ne_bytes());
+        notification[12..14].copy_from_slice(&1u16.to_ne_bytes());
+        notification[14..16].copy_from_slice(&1u16.to_ne_bytes());
+        notification[16..20].copy_from_slice(&42i32.to_ne_bytes());
+
+        let mut input = Vec::with_capacity(3 + notification.len());
+        input.extend_from_slice(&[0x09, 0, 0]);
+        input.extend_from_slice(&notification);
+        input
+    }
 
     #[test]
     fn hex_seed_decoder_accepts_trailing_ascii_whitespace() {
@@ -190,5 +320,207 @@ mod tests {
         let seed = b"HEX:00 01\n";
         let decoded = maybe_decode_hex_seed(seed);
         assert!(matches!(decoded, Cow::Borrowed(data) if data == seed));
+    }
+
+    #[test]
+    fn sctp_recv_meta_wrapper_reaches_exact_data_and_notification_results() {
+        let data_input = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/valid_rcvinfo_unaligned"),
+            rcvinfo_input(sample_rcvinfo(), b"ping"),
+        );
+        #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+        assert_ne!(
+            data_input[3..]
+                .as_ptr()
+                .align_offset(std::mem::align_of::<libc::cmsghdr>()),
+            0,
+            "the checked corpus must exercise an unaligned control address"
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&data_input).expect("valid RCVINFO should parse"),
+            sample_recv_meta()
+        );
+
+        let notification_input = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/notification_assoc_change"),
+            assoc_change_input(),
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&notification_input)
+                .expect("association-change notification should parse"),
+            SctpRecvMeta::Notification(SctpNotification::AssocChange {
+                state: 0,
+                error: 0,
+                outbound_streams: 1,
+                inbound_streams: 1,
+                assoc_id: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn sctp_recv_meta_wrapper_keeps_reported_length_independent_and_bounded() {
+        let valid = rcvinfo_input(sample_rcvinfo(), b"x");
+        let control_len = valid[1];
+
+        let mut short_report = valid.clone();
+        short_report[2] = control_len - 1;
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&short_report)
+                .expect_err("short reported controllen must reject")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut oversized_report = valid.clone();
+        oversized_report[2] = u8::MAX;
+        assert!(observe_sctp_parse_recv_meta(&oversized_report).is_ok());
+
+        let mut short_backing = valid;
+        short_backing[1] = control_len - 1;
+        short_backing[2] = u8::MAX;
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&short_backing)
+                .expect_err("reported controllen must not exceed backing storage")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn sctp_recv_meta_wrapper_reaches_truncation_and_malformed_cmsg_paths() {
+        let valid = rcvinfo_input(sample_rcvinfo(), b"payload");
+
+        let mut payload_truncated = valid.clone();
+        payload_truncated[0] |= 0x02;
+        let payload_error = observe_sctp_parse_recv_meta(&payload_truncated)
+            .expect_err("MSG_TRUNC must reject the payload");
+        assert!(payload_error.to_string().contains("payload"));
+
+        let mut control_truncated = valid.clone();
+        control_truncated[0] |= 0x04;
+        control_truncated[2] = 0;
+        let control_error = observe_sctp_parse_recv_meta(&control_truncated)
+            .expect_err("MSG_CTRUNC with missing RCVINFO must reject control");
+        assert!(control_error.to_string().contains("control"));
+
+        let mut wrong_type = valid.clone();
+        write_ne(
+            &mut wrong_type[3..],
+            std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+            libc::SCTP_SNDINFO.to_ne_bytes(),
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&wrong_type)
+                .expect_err("wrong cmsg type must reject")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut short_cmsg = valid;
+        write_ne(
+            &mut short_cmsg[3..],
+            std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+            (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<libc::sctp_rcvinfo>() - 1)
+                .to_ne_bytes(),
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&short_cmsg)
+                .expect_err("short cmsg_len must reject")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let short_header = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/truncated_cmsg_header"),
+            {
+                let mut input = rcvinfo_input(sample_rcvinfo(), b"ping");
+                input[0] |= 0x04;
+                input[2] = (std::mem::size_of::<libc::cmsghdr>() - 1) as u8;
+                input
+            },
+        );
+        let header_error = observe_sctp_parse_recv_meta(&short_header)
+            .expect_err("truncated cmsg header must reject");
+        assert!(header_error.to_string().contains("control"));
+
+        let short_rcvinfo = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/truncated_rcvinfo_payload"),
+            {
+                let mut input = rcvinfo_input(sample_rcvinfo(), b"ping");
+                input[2] -= 1;
+                input
+            },
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&short_rcvinfo)
+                .expect_err("truncated RCVINFO must reject")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn sctp_recv_meta_wrapper_handles_empty_and_maximum_bounded_lengths() {
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&[])
+                .expect_err("empty metadata must reject")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let maximum = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/maximum_bounded_control"),
+            {
+                let mut input = rcvinfo_input(sample_rcvinfo(), &[]);
+                input[1] = u8::MAX;
+                input[2] = u8::MAX;
+                input.resize(3 + u8::MAX as usize, 0);
+                input
+            },
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&maximum).expect("maximum bounded control should parse"),
+            sample_recv_meta()
+        );
+    }
+
+    #[test]
+    fn tls_server_end_point_wrapper_reaches_valid_and_malformed_der() {
+        let rsa = include_bytes!("../fuzz/seeds/tls_server_end_point/valid_rsa_sha256_minimal");
+        let ecdsa = include_bytes!("../fuzz/seeds/tls_server_end_point/valid_ecdsa_sha256_minimal");
+        assert_eq!(
+            observe_tls_server_end_point(rsa)
+                .expect("RSA SHA-256 seed should derive a binding")
+                .len(),
+            32
+        );
+        assert_eq!(
+            observe_tls_server_end_point(ecdsa)
+                .expect("ECDSA SHA-256 seed should derive a binding")
+                .len(),
+            32
+        );
+        assert!(!tls_server_end_point(include_bytes!(
+            "../fuzz/seeds/tls_server_end_point/unsupported_ed25519_minimal"
+        )));
+        let malformed_tag =
+            include_bytes!("../fuzz/seeds/tls_server_end_point/malformed_signature_tag");
+        let mut expected_malformed_tag = maybe_decode_hex_seed(rsa).into_owned();
+        assert_eq!(expected_malformed_tag.len(), 22);
+        expected_malformed_tag[19] = 0x04;
+        assert_eq!(
+            maybe_decode_hex_seed(malformed_tag).as_ref(),
+            expected_malformed_tag
+        );
+        assert!(!tls_server_end_point(malformed_tag));
+
+        let truncated_length =
+            include_bytes!("../fuzz/seeds/tls_server_end_point/malformed_truncated_long_length");
+        assert_eq!(
+            maybe_decode_hex_seed(truncated_length).as_ref(),
+            &[0x30, 0x82, 0x01, 0x00]
+        );
+        assert!(!tls_server_end_point(truncated_length));
     }
 }

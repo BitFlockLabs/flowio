@@ -6,7 +6,6 @@ use flowio::net::tcp::TcpStream as FlowTcpStream;
 use flowio::net::tls::{TlsClientOptions, TlsClientStream};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::Executor;
-#[cfg(debug_assertions)]
 use flowio::runtime::timer::sleep;
 use flowio::runtime::timer::timeout;
 #[cfg(debug_assertions)]
@@ -15,7 +14,10 @@ use flowio::test_support::net::tls_test_peer::{drain_available_client_hello, for
 use flowio::test_support::runtime::test_hooks;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{
+    ClientConfig, ProtocolVersion, RootCertStore, ServerConfig, ServerConnection,
+    SupportedProtocolVersion,
+};
 use std::cell::Cell;
 #[cfg(debug_assertions)]
 use std::cell::RefCell;
@@ -29,8 +31,9 @@ use std::sync::mpsc;
 #[cfg(debug_assertions)]
 use std::task::Poll;
 use std::time::Duration;
-#[cfg(debug_assertions)]
 use std::time::Instant;
+
+const TLS_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Small buffers force the 8KiB test payload to span multiple TLS records and
 /// exercise partial read/write pumping.
@@ -46,6 +49,22 @@ fn large_read_tls_options() -> TlsClientOptions {
     TlsClientOptions {
         rustls_buffer_limit: None,
         transport_read_buffer_size: 64 * 1024,
+        transport_write_buffer_size: 2048,
+    }
+}
+
+fn fragmented_read_tls_options() -> TlsClientOptions {
+    TlsClientOptions {
+        rustls_buffer_limit: None,
+        transport_read_buffer_size: 257,
+        transport_write_buffer_size: 2048,
+    }
+}
+
+fn short_write_tls_options() -> TlsClientOptions {
+    TlsClientOptions {
+        rustls_buffer_limit: Some(512),
+        transport_read_buffer_size: 2048,
         transport_write_buffer_size: 2048,
     }
 }
@@ -119,6 +138,17 @@ fn make_client_server_configs() -> (
     ServerName<'static>,
     Vec<u8>,
 ) {
+    make_client_server_configs_for_versions(rustls::DEFAULT_VERSIONS)
+}
+
+fn make_client_server_configs_for_versions(
+    versions: &[&'static SupportedProtocolVersion],
+) -> (
+    Arc<ClientConfig>,
+    Arc<ServerConfig>,
+    ServerName<'static>,
+    Vec<u8>,
+) {
     let certified = generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("failed to generate self-signed test cert");
     let cert_der = certified.cert.der().clone();
@@ -130,12 +160,12 @@ fn make_client_server_configs() -> (
         .expect("failed to add root certificate");
 
     let client = Arc::new(
-        ClientConfig::builder()
+        ClientConfig::builder_with_protocol_versions(versions)
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
     let server = Arc::new(
-        ServerConfig::builder()
+        ServerConfig::builder_with_protocol_versions(versions)
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key_der.into())
             .expect("failed to build rustls server config"),
@@ -164,6 +194,58 @@ fn complete_server_handshake(tcp: &mut std::net::TcpStream, server_config: Arc<S
     let _ = server_connection_after_handshake(tcp, server_config);
 }
 
+fn read_server_plaintext_exact(
+    tls: &mut ServerConnection,
+    tcp: &mut std::net::TcpStream,
+    destination: &mut [u8],
+) {
+    let mut filled = 0usize;
+    while filled < destination.len() {
+        match tls.reader().read(&mut destination[filled..]) {
+            Ok(0) => panic!("server saw clean TLS EOF before the expected plaintext"),
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                tls.complete_io(tcp)
+                    .expect("server plaintext read pump failed");
+            }
+            Err(err) => panic!("server plaintext read failed: {err}"),
+        }
+    }
+}
+
+fn wait_for_server_clean_tls_eof(tls: &mut ServerConnection, tcp: &mut std::net::TcpStream) {
+    let mut probe = [0u8; 1];
+    loop {
+        match tls.reader().read(&mut probe) {
+            Ok(0) => return,
+            Ok(read) => panic!("server received {read} unexpected plaintext bytes before close"),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                tls.complete_io(tcp)
+                    .expect("server close-notify read pump failed");
+            }
+            Err(err) => panic!("server close-notify read failed: {err}"),
+        }
+    }
+}
+
+async fn receive_test_signal<T>(rx: &mpsc::Receiver<T>, description: &'static str) -> T {
+    let deadline = Instant::now() + TLS_TEST_TIMEOUT;
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return value,
+            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                sleep(Duration::from_millis(1))
+                    .await
+                    .expect("test signal wait sleep failed");
+            }
+            Err(mpsc::TryRecvError::Empty) => panic!("{description} timed out"),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("{description} channel disconnected")
+            }
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 fn assert_tls_write_peer_close_error(err: &io::Error) {
     assert!(
@@ -182,21 +264,7 @@ fn assert_tls_write_peer_close_error(err: &io::Error) {
 
 #[cfg(debug_assertions)]
 async fn wait_for_server_reset(rx: &mpsc::Receiver<()>) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match rx.try_recv() {
-            Ok(()) => return,
-            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                sleep(Duration::from_millis(1))
-                    .await
-                    .expect("server reset wait sleep failed");
-            }
-            Err(mpsc::TryRecvError::Empty) => panic!("server did not reset before timeout"),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                panic!("server reset signal channel disconnected")
-            }
-        }
-    }
+    receive_test_signal(rx, "server reset signal").await
 }
 
 #[test]
@@ -281,6 +349,243 @@ fn tls_client_round_trip_and_shutdown() {
             );
 
             tls.shutdown().await.expect("client shutdown failed");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_partial_write_flushes_accepted_prefix_and_returns_source() {
+    let (client_config, server_config, server_name, _) = make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let payload: Vec<u8> = (0..4096).map(|idx| (idx % 251) as u8).collect();
+    let expected = payload.clone();
+    let (server_ready_tx, server_ready_rx) = mpsc::channel();
+    let (accepted_tx, accepted_rx) = mpsc::channel::<usize>();
+    let (prefix_read_tx, prefix_read_rx) = mpsc::channel();
+    let (all_read_tx, all_read_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        server_ready_tx
+            .send(())
+            .expect("failed to report completed server handshake");
+
+        // Do not poll TLS application plaintext until the client's partial
+        // write has returned after flushing its accepted prefix.
+        let accepted = accepted_rx
+            .recv_timeout(TLS_TEST_TIMEOUT)
+            .expect("client did not report the accepted plaintext count");
+        assert!(
+            accepted > 0 && accepted < expected.len(),
+            "client did not report a positive short write: {accepted}"
+        );
+
+        let mut received = vec![0u8; expected.len()];
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut received[..accepted]);
+        assert_eq!(
+            &received[..accepted],
+            &expected[..accepted],
+            "server did not receive the accepted plaintext prefix"
+        );
+        prefix_read_tx
+            .send(())
+            .expect("failed to acknowledge accepted TLS prefix");
+
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut received[accepted..]);
+        assert_eq!(received, expected, "server TLS plaintext order changed");
+        all_read_tx
+            .send(())
+            .expect("failed to acknowledge complete TLS payload");
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = timeout(
+                TLS_TEST_TIMEOUT,
+                FlowTcpStream::connect(addr).expect("connect init failed"),
+            )
+            .await
+            .expect("client connect timed out")
+            .expect("client connect failed");
+            let mut tls =
+                TlsClientStream::new(tcp, client_config, server_name, short_write_tls_options())
+                    .expect("tls stream init failed");
+
+            timeout(TLS_TEST_TIMEOUT, tls.handshake())
+                .await
+                .expect("client handshake timed out")
+                .expect("client handshake failed");
+            receive_test_signal(&server_ready_rx, "server handshake-ready acknowledgement").await;
+
+            let drops = Rc::new(Cell::new(0));
+            let source = DropTrackedReadOnly::new(payload.clone(), &drops);
+            let source_ptr = source.bytes().as_ptr();
+            let (result, returned) = timeout(TLS_TEST_TIMEOUT, tls.write(source))
+                .await
+                .expect("client partial write timed out");
+            let accepted = result.expect("client partial write failed");
+            assert!(
+                accepted > 0 && accepted < payload.len(),
+                "rustls limit did not force a positive short write: {accepted}"
+            );
+            assert_eq!(
+                returned.bytes(),
+                payload.as_slice(),
+                "partial write changed the returned source bytes"
+            );
+            assert_eq!(
+                returned.bytes().as_ptr(),
+                source_ptr,
+                "partial write replaced the caller's source allocation"
+            );
+            assert_eq!(drops.get(), 0, "partial write dropped the returned source");
+
+            accepted_tx
+                .send(accepted)
+                .expect("failed to report accepted plaintext count");
+            receive_test_signal(&prefix_read_rx, "server accepted-prefix acknowledgement").await;
+
+            let remainder = returned.bytes()[accepted..].to_vec();
+            drop(returned);
+            assert_eq!(
+                drops.get(),
+                1,
+                "partial-write source did not drop exactly once"
+            );
+
+            let (result, returned_remainder) =
+                timeout(TLS_TEST_TIMEOUT, tls.write_all(remainder.clone()))
+                    .await
+                    .expect("client remainder write timed out");
+            assert_eq!(
+                result.expect("client remainder write failed"),
+                remainder.len()
+            );
+            assert_eq!(returned_remainder, remainder);
+            receive_test_signal(&all_read_rx, "server complete-payload acknowledgement").await;
+
+            timeout(TLS_TEST_TIMEOUT, tls.shutdown())
+                .await
+                .expect("client shutdown timed out")
+                .expect("client shutdown failed");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls12_only_round_trip_and_bidirectional_close_notify() {
+    const CLIENT_PAYLOAD: &[u8] = b"tls12-client-payload";
+    const SERVER_PAYLOAD: &[u8] = b"tls12-server-payload";
+
+    let (client_config, server_config, server_name, _) =
+        make_client_server_configs_for_versions(&[&rustls::version::TLS12]);
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        assert_eq!(
+            tls.protocol_version(),
+            Some(ProtocolVersion::TLSv1_2),
+            "test peer did not negotiate TLS 1.2"
+        );
+
+        let mut request = [0u8; CLIENT_PAYLOAD.len()];
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut request);
+        assert_eq!(request.as_slice(), CLIENT_PAYLOAD);
+
+        tls.writer()
+            .write_all(SERVER_PAYLOAD)
+            .expect("server TLS 1.2 response write failed");
+        while tls.wants_write() {
+            tls.complete_io(&mut tcp)
+                .expect("server TLS 1.2 response flush failed");
+        }
+
+        // Close the peer direction first so the client must accept a clean
+        // TLS EOF before sending its reciprocal close_notify.
+        tls.send_close_notify();
+        while tls.wants_write() {
+            tls.complete_io(&mut tcp)
+                .expect("server TLS 1.2 close-notify flush failed");
+        }
+        tcp.shutdown(Shutdown::Write)
+            .expect("server TLS 1.2 shutdown write failed");
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = timeout(
+                TLS_TEST_TIMEOUT,
+                FlowTcpStream::connect(addr).expect("connect init failed"),
+            )
+            .await
+            .expect("TLS 1.2 client connect timed out")
+            .expect("TLS 1.2 client connect failed");
+            let mut tls = TlsClientStream::new(tcp, client_config, server_name, tls_options())
+                .expect("TLS 1.2 stream init failed");
+
+            timeout(TLS_TEST_TIMEOUT, tls.handshake())
+                .await
+                .expect("TLS 1.2 client handshake timed out")
+                .expect("TLS 1.2 client handshake failed");
+
+            let request = CLIENT_PAYLOAD.to_vec();
+            let (result, returned) = timeout(TLS_TEST_TIMEOUT, tls.write_all(request.clone()))
+                .await
+                .expect("TLS 1.2 client request write timed out");
+            assert_eq!(
+                result.expect("TLS 1.2 client request write failed"),
+                request.len()
+            );
+            assert_eq!(returned, request);
+
+            let (result, response) = timeout(
+                TLS_TEST_TIMEOUT,
+                tls.read_exact(
+                    Vec::with_capacity(SERVER_PAYLOAD.len()),
+                    SERVER_PAYLOAD.len(),
+                ),
+            )
+            .await
+            .expect("TLS 1.2 client response read timed out");
+            assert_eq!(
+                result.expect("TLS 1.2 client response read failed"),
+                SERVER_PAYLOAD.len()
+            );
+            assert_eq!(response, SERVER_PAYLOAD);
+
+            let (result, response) = timeout(TLS_TEST_TIMEOUT, tls.read(Vec::with_capacity(1), 1))
+                .await
+                .expect("TLS 1.2 client clean-close read timed out");
+            assert_eq!(result.expect("TLS 1.2 clean-close read failed"), 0);
+            assert!(response.is_empty(), "clean-close read published plaintext");
+
+            timeout(TLS_TEST_TIMEOUT, tls.shutdown())
+                .await
+                .expect("TLS 1.2 client shutdown timed out")
+                .expect("TLS 1.2 client shutdown failed");
         })
         .expect("executor run failed");
 
@@ -505,14 +810,12 @@ fn tls_zero_length_prefilled_reads_preserve_prefix_and_park_after_ready() {
     server.join().expect("server thread panicked");
 }
 
-#[test]
-fn tls_large_transport_read_buffer_handles_bulk_ciphertext() {
+fn assert_tls_read_profile_handles_payload(options: TlsClientOptions, payload: Vec<u8>) {
     let (client_config, server_config, server_name, _expected_cert_der) =
         make_client_server_configs();
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
-    let payload = bulk_tls_payload();
     let expected = payload.clone();
     let (server_sent_tx, server_sent_rx) = mpsc::channel();
 
@@ -538,9 +841,7 @@ fn tls_large_transport_read_buffer_handles_bulk_ciphertext() {
                 .expect("connect init failed")
                 .await
                 .expect("connect failed");
-            let mut tls =
-                TlsClientStream::new(tcp, client_config, server_name, large_read_tls_options())
-                    .unwrap();
+            let mut tls = TlsClientStream::new(tcp, client_config, server_name, options).unwrap();
 
             tls.handshake().await.expect("client handshake failed");
             server_sent_rx
@@ -556,6 +857,19 @@ fn tls_large_transport_read_buffer_handles_bulk_ciphertext() {
         .expect("executor run failed");
 
     server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_large_transport_read_buffer_handles_bulk_ciphertext() {
+    assert_tls_read_profile_handles_payload(large_read_tls_options(), bulk_tls_payload());
+}
+
+#[test]
+fn tls_small_transport_read_buffer_handles_fragmented_records() {
+    // The peer emits this 8 KiB write as a record larger than the 257-byte raw
+    // read scratch, forcing the client deframer to consume it in fragments.
+    let payload = (0..8 * 1024).map(|idx| (idx % 239) as u8).collect();
+    assert_tls_read_profile_handles_payload(fragmented_read_tls_options(), payload);
 }
 
 #[test]

@@ -7,22 +7,13 @@ use flowio::net::tcp::TcpStream;
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
+use flowio::test_support::net::sctp::capability_unavailable;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
-
-fn sctp_unsupported(err: &std::io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EPROTONOSUPPORT)
-            | Some(libc::ESOCKTNOSUPPORT)
-            | Some(libc::EAFNOSUPPORT)
-            | Some(libc::EPFNOSUPPORT)
-    )
-}
 
 fn spawn_tcp_echo(rounds: usize) -> (SocketAddr, JoinHandle<()>) {
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -101,7 +92,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
             let addr = listener.local_addr();
             Some((listener, SctpConnector::with_config(sctp_config), addr))
         }
-        Err(err) if sctp_unsupported(&err) => {
+        Err(err) if capability_unavailable(&err) => {
             eprintln!("skipping SCTP allocation-counting segment: SCTP unsupported ({err})");
             None
         }

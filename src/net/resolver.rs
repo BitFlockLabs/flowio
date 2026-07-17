@@ -9,7 +9,8 @@
 //! DNS lookup is intentionally narrow:
 //! - system configuration is read from `/etc/resolv.conf`
 //! - only A and AAAA lookups are issued
-//! - CNAME chains are followed up to a small fixed depth
+//! - one linear CNAME chain is followed with independent per-response,
+//!   cross-response, and name-compression bounds
 //! - search domains and TCP fallback for truncated replies are not yet
 //!   implemented
 //!
@@ -76,7 +77,10 @@ const DNS_RCODE_REFUSED: u8 = 5;
 const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
 const DNS_MAX_NAME_WIRE_LEN: usize = 255;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_CNAME_DEPTH: usize = 4;
+const MAX_CNAME_HOPS_PER_RESPONSE: usize = 16;
+const MAX_CNAME_FOLLOWUP_QUERIES: usize = 1;
+const MAX_CNAME_TOTAL_HOPS: usize = 16;
+const MAX_NAME_COMPRESSION_DEPTH: usize = 8;
 const DNS_UDP_RESPONSE_BUFFER_SIZE: usize = 2048;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const HOSTS_PATH: &str = "/etc/hosts";
@@ -194,7 +198,10 @@ impl DnsResolver {
     /// Only Answer-section CNAME and address records contribute to resolution.
     /// Authority and Additional records are still parsed for structural
     /// validity but otherwise ignored; an Answer CNAME without an Answer
-    /// address uses the existing bounded follow-up query.
+    /// address follows one linear chain for at most 16 hops in one response,
+    /// 16 hops total, and one canonical-name follow-up query round. CNAME loops
+    /// are rejected explicitly. DNS name-compression recursion is bounded
+    /// independently at depth 8.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -208,23 +215,36 @@ impl DnsResolver {
         }
 
         let mut current = host.to_owned();
-        for _ in 0..=MAX_CNAME_DEPTH {
+        let mut cname_followup_queries = 0usize;
+        let mut total_cname_hops = 0usize;
+        loop {
+            let remaining_cname_hops = MAX_CNAME_TOTAL_HOPS - total_cname_hops;
             match self
-                .gather_dns_addresses(&current, port, &mut addrs)
+                .gather_dns_addresses(&current, port, &mut addrs, remaining_cname_hops)
                 .await?
             {
                 ResolveHostStep::Resolved => return Ok(addrs),
-                ResolveHostStep::FollowCname(next) => current = next,
+                ResolveHostStep::FollowCname { next, cname_hops } => {
+                    total_cname_hops += cname_hops;
+                    if cname_followup_queries == MAX_CNAME_FOLLOWUP_QUERIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS resolution exceeded maximum CNAME follow-up query count",
+                        ));
+                    }
+                    cname_followup_queries += 1;
+                    current = next;
+                }
             }
         }
-
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS CNAME chain exceeded maximum depth",
-        ))
     }
 
-    async fn lookup_name(&self, host: &str, qtype: u16) -> io::Result<LookupResult> {
+    async fn lookup_name(
+        &self,
+        host: &str,
+        qtype: u16,
+        remaining_cname_hops: usize,
+    ) -> io::Result<LookupResult> {
         let query_id = next_query_id();
         let packet = encode_query_packet(query_id, host, qtype)?;
         let mut last_err = None;
@@ -232,7 +252,15 @@ impl DnsResolver {
         for nameserver in self.nameservers.iter().copied() {
             match self.query_nameserver(nameserver, &packet, query_id).await {
                 Ok(response) => match parse_response_packet(&response, query_id, host, qtype) {
-                    Ok(result) => return Ok(result),
+                    Ok(result) if result.cname_hops <= remaining_cname_hops => {
+                        return Ok(result);
+                    }
+                    Ok(_) => {
+                        last_err = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS resolution exceeded maximum total CNAME hop count",
+                        ));
+                    }
                     Err(err) => last_err = Some(err),
                 },
                 Err(QueryAttemptError::Timeout(TimeoutError::Runtime(err)))
@@ -300,12 +328,18 @@ impl DnsResolver {
         current: &str,
         port: u16,
         addrs: &mut Vec<SocketAddr>,
+        remaining_cname_hops: usize,
     ) -> io::Result<ResolveHostStep> {
-        let a = match self.lookup_name(current, DNS_TYPE_A).await {
+        let a = match self
+            .lookup_name(current, DNS_TYPE_A, remaining_cname_hops)
+            .await
+        {
             Err(err) if is_terminal_family_lookup_error(&err) => return Err(err),
             outcome => outcome,
         };
-        let aaaa = self.lookup_name(current, DNS_TYPE_AAAA).await;
+        let aaaa = self
+            .lookup_name(current, DNS_TYPE_AAAA, remaining_cname_hops)
+            .await;
         finish_dns_family_lookups(current, port, addrs, a, aaaa)
     }
 }
@@ -338,7 +372,7 @@ fn finish_dns_family_lookups(
                 saw_nx_domain |= result.nx_domain;
                 extend_unique_socket_addrs(addrs, &result.addresses, port);
                 if cname.is_none() {
-                    cname = result.cname;
+                    cname = result.cname.map(|next| (next, result.cname_hops));
                 }
             }
             Err(err) => {
@@ -359,8 +393,8 @@ fn finish_dns_family_lookups(
     if let Some(err) = terminal_error {
         return Err(err);
     }
-    if let Some(next) = cname {
-        return Ok(ResolveHostStep::FollowCname(next));
+    if let Some((next, cname_hops)) = cname {
+        return Ok(ResolveHostStep::FollowCname { next, cname_hops });
     }
     if saw_nx_domain {
         return Err(host_not_found(current));
@@ -391,6 +425,8 @@ pub(crate) struct LookupResult {
     addresses: Vec<IpAddr>,
     /// Last in-chain CNAME target reached while answering the current query.
     cname: Option<String>,
+    /// Number of CNAME edges traversed to reach `cname` or an address.
+    cname_hops: usize,
     /// True when the upstream resolver returned NXDOMAIN for this name.
     nx_domain: bool,
 }
@@ -399,7 +435,13 @@ pub(crate) struct LookupResult {
 enum ResolveHostStep {
     /// At least one address was collected for the logical lookup.
     Resolved,
-    FollowCname(#[doc = "Canonical target queried in the next bounded outer step."] String),
+    /// Continue with one canonical target and its already-consumed hop count.
+    FollowCname {
+        /// Canonical target queried in the next bounded outer step.
+        next: String,
+        /// Hops consumed in the selected A-first family response.
+        cname_hops: usize,
+    },
 }
 
 /// Parsed DNS records retained while matching addresses to a CNAME chain.
@@ -926,6 +968,7 @@ pub(crate) fn parse_response_packet(
         return Ok(LookupResult {
             addresses: Vec::new(),
             cname: None,
+            cname_hops: 0,
             nx_domain: true,
         });
     }
@@ -1002,6 +1045,9 @@ pub(crate) fn parse_response_packet(
     let mut active_owner = query_host;
     let mut cname = None;
     let mut cname_hops = 0usize;
+    let mut seen_owners = [""; MAX_CNAME_HOPS_PER_RESPONSE + 1];
+    seen_owners[0] = query_host;
+    let mut seen_owner_count = 1usize;
     loop {
         for record in &records {
             if let DnsRecord::Address {
@@ -1026,13 +1072,24 @@ pub(crate) fn parse_response_packet(
             break;
         };
 
-        cname_hops += 1;
-        if cname_hops > MAX_CNAME_DEPTH {
+        if seen_owners[..seen_owner_count]
+            .iter()
+            .any(|seen| dns_name_eq(seen, target))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "DNS CNAME chain exceeded maximum depth",
+                "DNS response CNAME chain contained a loop",
             ));
         }
+        if cname_hops == MAX_CNAME_HOPS_PER_RESPONSE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response CNAME chain exceeded maximum per-response hop count",
+            ));
+        }
+        seen_owners[seen_owner_count] = target;
+        seen_owner_count += 1;
+        cname_hops += 1;
         active_owner = target;
         cname = Some(target.clone());
     }
@@ -1040,6 +1097,7 @@ pub(crate) fn parse_response_packet(
     Ok(LookupResult {
         addresses,
         cname,
+        cname_hops,
         nx_domain: false,
     })
 }
@@ -1162,7 +1220,7 @@ fn walk_dns_name(
     depth: usize,
     mut labels: Option<&mut Vec<String>>,
 ) -> Result<(usize, usize), DnsNameWalkError> {
-    if depth > MAX_CNAME_DEPTH + 4 {
+    if depth > MAX_NAME_COMPRESSION_DEPTH {
         return Err(DnsNameWalkError::CompressionDepthExceeded);
     }
     if offset >= packet.len() {
@@ -1399,6 +1457,26 @@ mod tests {
         let (name, consumed) = decode_name(&[0], 0, 0).expect("wire root should decode");
         assert!(name.is_empty());
         assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn compression_depth_bound_accepts_eight_pointers_and_rejects_nine() {
+        let (accepted_packet, accepted_offset) =
+            compression_pointer_chain(MAX_NAME_COMPRESSION_DEPTH);
+        let (name, consumed) = decode_name(&accepted_packet, accepted_offset, 0)
+            .expect("compression chain at the depth limit should decode");
+        assert!(name.is_empty());
+        assert_eq!(consumed, 2);
+
+        let (rejected_packet, rejected_offset) =
+            compression_pointer_chain(MAX_NAME_COMPRESSION_DEPTH + 1);
+        let err = decode_name(&rejected_packet, rejected_offset, 0)
+            .expect_err("compression chain above the depth limit should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "DNS name compression exceeded maximum depth"
+        );
     }
 
     #[test]
@@ -1652,6 +1730,18 @@ mod tests {
         packet.push(0);
     }
 
+    fn compression_pointer_chain(pointer_count: usize) -> (Vec<u8>, usize) {
+        let mut packet = vec![0];
+        let mut target = 0usize;
+        for _ in 0..pointer_count {
+            let pointer_offset = packet.len();
+            assert!(target < 0x4000, "test compression pointer should fit");
+            packet.extend_from_slice(&(0xC000 | target as u16).to_be_bytes());
+            target = pointer_offset;
+        }
+        (packet, target)
+    }
+
     #[test]
     fn socket_addr_dedup_preserves_first_seen_order() {
         let port = 5432;
@@ -1709,11 +1799,13 @@ mod tests {
         let cname_result = LookupResult {
             addresses: Vec::new(),
             cname: Some("db.internal.test".to_owned()),
+            cname_hops: 3,
             nx_domain: false,
         };
         let nx_domain_result = LookupResult {
             addresses: Vec::new(),
             cname: None,
+            cname_hops: 0,
             nx_domain: true,
         };
         let mut addrs = Vec::new();
@@ -1727,7 +1819,10 @@ mod tests {
         .expect("usable CNAME should precede contradictory sibling NXDOMAIN");
 
         match step {
-            ResolveHostStep::FollowCname(next) => assert_eq!(next, "db.internal.test"),
+            ResolveHostStep::FollowCname { next, cname_hops } => {
+                assert_eq!(next, "db.internal.test");
+                assert_eq!(cname_hops, 3);
+            }
             ResolveHostStep::Resolved => panic!("CNAME-only outcome should continue lookup"),
         }
     }
@@ -1742,18 +1837,23 @@ mod tests {
             Ok(LookupResult {
                 addresses: Vec::new(),
                 cname: Some("db-v4.internal.test".to_owned()),
+                cname_hops: 2,
                 nx_domain: false,
             }),
             Ok(LookupResult {
                 addresses: Vec::new(),
                 cname: Some("db-v6.internal.test".to_owned()),
+                cname_hops: 4,
                 nx_domain: false,
             }),
         )
         .expect("A CNAME should win a conflicting sibling CNAME");
 
         match step {
-            ResolveHostStep::FollowCname(next) => assert_eq!(next, "db-v4.internal.test"),
+            ResolveHostStep::FollowCname { next, cname_hops } => {
+                assert_eq!(next, "db-v4.internal.test");
+                assert_eq!(cname_hops, 2);
+            }
             ResolveHostStep::Resolved => panic!("CNAME-only outcome should continue lookup"),
         }
     }
@@ -1763,6 +1863,7 @@ mod tests {
         let nx_domain_result = LookupResult {
             addresses: Vec::new(),
             cname: None,
+            cname_hops: 0,
             nx_domain: true,
         };
         let mut addrs = Vec::new();
@@ -1786,11 +1887,13 @@ mod tests {
         let empty_a = LookupResult {
             addresses: Vec::new(),
             cname: None,
+            cname_hops: 0,
             nx_domain: false,
         };
         let empty_aaaa = LookupResult {
             addresses: Vec::new(),
             cname: None,
+            cname_hops: 0,
             nx_domain: false,
         };
         let mut addrs = Vec::new();
@@ -1814,6 +1917,7 @@ mod tests {
         let cname_result = LookupResult {
             addresses: Vec::new(),
             cname: Some("db.internal.test".to_owned()),
+            cname_hops: 1,
             nx_domain: false,
         };
         let mut addrs = Vec::new();
@@ -1846,6 +1950,7 @@ mod tests {
             Ok(LookupResult {
                 addresses: vec![address],
                 cname: None,
+                cname_hops: 0,
                 nx_domain: false,
             }),
             Err(io::Error::new(

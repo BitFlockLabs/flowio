@@ -198,8 +198,8 @@
 
 use super::{
     MsgHdrInit, checked_read_len, checked_send_len, close_fd, close_if_valid,
-    complete_read_with_progress, current_local_addr, invalid_input, set_reuse_addr, set_sock_opt,
-    socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
+    complete_read_with_progress, current_local_addr, get_sock_opt, invalid_input, set_reuse_addr,
+    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::bytes::{
@@ -215,6 +215,7 @@ use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Timeout, TimeoutError, timeout};
 use io_uring::{opcode, squeue, types};
+use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -228,6 +229,7 @@ use std::time::Duration;
 /// Kernel-facing notification-subscription layout used with SCTP socket
 /// options on Linux.
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct SctpEventSubscribe {
     /// Enables the legacy `SCTP_SNDRCV` (`sctp_sndrcvinfo`) data-I/O
     /// ancillary. Modern `SCTP_RCVINFO` is enabled separately with the
@@ -278,6 +280,25 @@ impl SctpEventSubscribe {
             sctp_assoc_reset_event: mask.assoc_reset as u8,
             sctp_stream_change_event: mask.stream_change as u8,
             sctp_send_failure_event_event: mask.send_failure as u8,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    const fn notification_mask(self) -> SctpNotificationMask {
+        SctpNotificationMask {
+            association: self.sctp_association_event != 0,
+            address: self.sctp_address_event != 0,
+            send_failure: self.sctp_send_failure_event != 0
+                || self.sctp_send_failure_event_event != 0,
+            peer_error: self.sctp_peer_error_event != 0,
+            shutdown: self.sctp_shutdown_event != 0,
+            partial_delivery: self.sctp_partial_delivery_event != 0,
+            adaptation: self.sctp_adaptation_layer_event != 0,
+            authentication: self.sctp_authentication_event != 0,
+            sender_dry: self.sctp_sender_dry_event != 0,
+            stream_reset: self.sctp_stream_reset_event != 0,
+            assoc_reset: self.sctp_assoc_reset_event != 0,
+            stream_change: self.sctp_stream_change_event != 0,
         }
     }
 }
@@ -504,18 +525,39 @@ impl SctpReconfigFlags {
 /// Request parameters for `SCTP_RESET_STREAMS`.
 ///
 /// This is a reconfiguration request type. Use it for explicit stream-reset
-/// control operations, not for steady-state payload exchange.
+/// control operations, not for steady-state payload exchange. The
+/// [`SctpResetStreams::incoming`], [`SctpResetStreams::outgoing`], and
+/// [`SctpResetStreams::bidirectional`] constructors require at least one
+/// stream identifier when the request is submitted. Use the corresponding
+/// `all_*` constructor to request Linux's association-wide zero-count form
+/// deliberately. Mutating `streams` so that it conflicts with the constructor
+/// intent makes the request invalid.
 ///
 /// # Example
 /// ```no_run
 /// use flowio::net::sctp::{SctpResetStreams, SctpReconfigFlags};
 ///
 /// let request = SctpResetStreams::outgoing(&[1, 3]);
+/// let all = SctpResetStreams::all_bidirectional();
+/// assert!(all.streams.is_empty());
 /// let flags = SctpReconfigFlags {
 ///     flags: SctpReconfigFlags::RESET_STREAMS,
 ///     ..SctpReconfigFlags::association_default()
 /// };
-/// # let _ = (request, flags);
+/// # let _ = (request, all, flags);
+/// ```
+///
+/// The private intent tag prevents a downstream struct literal from turning an
+/// accidental empty list into the kernel's all-stream sentinel:
+///
+/// ```compile_fail
+/// use flowio::net::sctp::SctpResetStreams;
+///
+/// let _ = SctpResetStreams {
+///     assoc_id: 0,
+///     flags: 1,
+///     streams: Vec::new(),
+/// };
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SctpResetStreams {
@@ -523,8 +565,11 @@ pub struct SctpResetStreams {
     pub assoc_id: libc::sctp_assoc_t,
     /// Direction flags (incoming, outgoing, or both).
     pub flags: u16,
-    /// Stream numbers to reset.
+    /// Stream numbers to reset. This remains empty for an explicit all-stream
+    /// request.
     pub streams: Vec<u16>,
+    /// Distinguishes an explicit all-stream request from a listed request.
+    intent: SctpResetIntent,
 }
 
 impl SctpResetStreams {
@@ -534,6 +579,19 @@ impl SctpResetStreams {
             assoc_id: 0,
             flags: SCTP_STREAM_RESET_INCOMING,
             streams: streams.to_vec(),
+            intent: SctpResetIntent::Listed,
+        }
+    }
+
+    /// Resets all incoming streams on the association.
+    ///
+    /// This deliberately selects Linux's zero-count all-stream sentinel.
+    pub fn all_incoming() -> Self {
+        Self {
+            assoc_id: 0,
+            flags: SCTP_STREAM_RESET_INCOMING,
+            streams: Vec::new(),
+            intent: SctpResetIntent::All,
         }
     }
 
@@ -543,6 +601,19 @@ impl SctpResetStreams {
             assoc_id: 0,
             flags: SCTP_STREAM_RESET_OUTGOING,
             streams: streams.to_vec(),
+            intent: SctpResetIntent::Listed,
+        }
+    }
+
+    /// Resets all outgoing streams on the association.
+    ///
+    /// This deliberately selects Linux's zero-count all-stream sentinel.
+    pub fn all_outgoing() -> Self {
+        Self {
+            assoc_id: 0,
+            flags: SCTP_STREAM_RESET_OUTGOING,
+            streams: Vec::new(),
+            intent: SctpResetIntent::All,
         }
     }
 
@@ -552,8 +623,30 @@ impl SctpResetStreams {
             assoc_id: 0,
             flags: SCTP_STREAM_RESET_INCOMING | SCTP_STREAM_RESET_OUTGOING,
             streams: streams.to_vec(),
+            intent: SctpResetIntent::Listed,
         }
     }
+
+    /// Resets all incoming and outgoing streams on the association.
+    ///
+    /// This deliberately selects Linux's zero-count all-stream sentinel.
+    pub fn all_bidirectional() -> Self {
+        Self {
+            assoc_id: 0,
+            flags: SCTP_STREAM_RESET_INCOMING | SCTP_STREAM_RESET_OUTGOING,
+            streams: Vec::new(),
+            intent: SctpResetIntent::All,
+        }
+    }
+}
+
+/// Caller intent for the otherwise ambiguous zero-count kernel encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SctpResetIntent {
+    /// Reset only the identifiers carried in `streams`.
+    Listed,
+    /// Deliberately use the kernel's zero-count all-stream sentinel.
+    All,
 }
 
 /// Request parameters for `SCTP_ADD_STREAMS`.
@@ -1040,7 +1133,11 @@ pub struct SctpNotificationMask {
     pub peer_error: bool,
     /// Shutdown notifications.
     pub shutdown: bool,
-    /// Partial-delivery notifications.
+    /// Caller-visible partial-delivery notifications.
+    ///
+    /// FlowIO may keep the kernel event subscribed when receive metadata is
+    /// enabled even if this field is false; aborts identifiable as forced only
+    /// for internal resynchronization are not returned to the caller.
     pub partial_delivery: bool,
     /// Adaptation-layer notifications.
     pub adaptation: bool,
@@ -1110,12 +1207,44 @@ impl SctpNotificationMask {
             stream_change: true,
         }
     }
+
+    /// Returns true when the caller requested any notification for delivery.
+    const fn any(self) -> bool {
+        self.association
+            || self.address
+            || self.send_failure
+            || self.peer_error
+            || self.shutdown
+            || self.partial_delivery
+            || self.adaptation
+            || self.authentication
+            || self.sender_dry
+            || self.stream_reset
+            || self.assoc_reset
+            || self.stream_change
+    }
 }
 
 impl Default for SctpNotificationMask {
     fn default() -> Self {
         Self::signaling_default()
     }
+}
+
+/// Returns the effective kernel notification mask for the receive mode.
+///
+/// Metadata receives can enter record-tail discard after observing a partial
+/// record. Linux reports an abandoned partial delivery through PDAPI, so that
+/// event must remain subscribed whenever modern receive metadata is enabled.
+#[inline(always)]
+const fn effective_sctp_notification_mask(
+    mut notifications: SctpNotificationMask,
+    recv_rcvinfo: bool,
+) -> SctpNotificationMask {
+    if recv_rcvinfo {
+        notifications.partial_delivery = true;
+    }
+    notifications
 }
 
 #[repr(C, packed(4))]
@@ -1330,6 +1459,54 @@ struct SctpResetStreamsHeader {
     flags: u16,
     /// Number of trailing stream identifiers.
     number_streams: u16,
+}
+
+/// Returns the allocation-free error class for an invalid reset shape.
+fn invalid_sctp_reset_request() -> io::Error {
+    io::Error::from(io::ErrorKind::InvalidInput)
+}
+
+/// Validates and encodes one Linux `sctp_reset_streams` request.
+fn encode_sctp_reset_streams(request: &SctpResetStreams) -> io::Result<Vec<u8>> {
+    let number_streams = match (request.intent, request.streams.is_empty()) {
+        (SctpResetIntent::Listed, true) | (SctpResetIntent::All, false) => {
+            return Err(invalid_sctp_reset_request());
+        }
+        (SctpResetIntent::All, true) => 0,
+        (SctpResetIntent::Listed, false) => {
+            u16::try_from(request.streams.len()).map_err(|_| invalid_sctp_reset_request())?
+        }
+    };
+
+    let header_len = std::mem::size_of::<SctpResetStreamsHeader>();
+    let streams_len = std::mem::size_of_val(request.streams.as_slice());
+    let total_len = header_len
+        .checked_add(streams_len)
+        .ok_or_else(invalid_sctp_reset_request)?;
+    libc::socklen_t::try_from(total_len).map_err(|_| invalid_sctp_reset_request())?;
+
+    let mut buffer = vec![0u8; total_len];
+    let header = SctpResetStreamsHeader {
+        assoc_id: request.assoc_id,
+        flags: request.flags,
+        number_streams,
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &header as *const SctpResetStreamsHeader as *const u8,
+            buffer.as_mut_ptr(),
+            header_len,
+        );
+        if streams_len != 0 {
+            std::ptr::copy_nonoverlapping(
+                request.streams.as_ptr() as *const u8,
+                buffer.as_mut_ptr().add(header_len),
+                streams_len,
+            );
+        }
+    }
+
+    Ok(buffer)
 }
 
 #[repr(C)]
@@ -1574,7 +1751,7 @@ fn finish_accepted_stream(
     let remote_addr = socket_addr_from_c(addr, addrlen)?;
     apply_sctp_connected_socket_config(accepted_fd.as_raw_fd(), config)?;
     Ok((
-        SctpStream::from_owned_fd(accepted_fd, remote_addr),
+        SctpStream::from_configured_owned_fd(accepted_fd, remote_addr, config),
         remote_addr,
     ))
 }
@@ -1712,7 +1889,11 @@ impl ConnectSlot {
         // SAFETY: this connect slot owns the successfully created socket, and
         // clearing the sentinel above prevents later slot cleanup from closing
         // the transferred descriptor.
-        SctpStream::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) }, remote_addr)
+        SctpStream::from_configured_owned_fd(
+            unsafe { OwnedFd::from_raw_fd(fd) },
+            remote_addr,
+            self.connected_config,
+        )
     }
 
     fn drop_future(&mut self) {
@@ -2009,7 +2190,10 @@ pub struct SctpSocketConfig {
     /// Association setup parameters used before the socket connects or starts
     /// listening.
     pub init: SctpInitConfig,
-    /// Which SCTP notifications are delivered on the socket.
+    /// Which SCTP notifications are requested for caller-visible delivery.
+    ///
+    /// When `recv_rcvinfo` is true, FlowIO additionally keeps the kernel
+    /// partial-delivery event subscribed for internal receive recovery.
     pub notifications: SctpNotificationMask,
     /// Whether `SCTP_RCVINFO` ancillary metadata is requested from the kernel.
     pub recv_rcvinfo: bool,
@@ -2085,7 +2269,7 @@ impl SctpSocketConfig {
 
     fn socket_options(self) -> SctpSocketOptions {
         SctpSocketOptions {
-            notifications: self.notifications,
+            notifications: effective_sctp_notification_mask(self.notifications, self.recv_rcvinfo),
             recv_rcvinfo: self.recv_rcvinfo,
             nodelay: self.nodelay,
             default_send_info: self.default_send_info,
@@ -2231,17 +2415,71 @@ struct SctpRecvState {
     /// Whether a prior metadata receive consumed the head of an oversized
     /// record and future metadata receives must discard through MSG_EOR.
     discarding_tail: bool,
+    /// Whether PDAPI notifications were explicitly requested by the caller.
+    ///
+    /// A false value means FlowIO subscribed only to preserve metadata-receive
+    /// resynchronization, so a valid abort event is consumed internally.
+    partial_delivery_visible: Cell<bool>,
+    /// Whether any kernel notification is part of the caller-visible mask.
+    ///
+    /// When false, every notification fragment belongs to FlowIO's sole
+    /// forced PDAPI subscription and can be consumed without first assembling
+    /// the complete notification in a short caller buffer.
+    any_notification_visible: Cell<bool>,
     /// Dropped metadata receive completion that must be adopted before the
     /// next metadata receive can preserve record-boundary state.
     stashed: StashedSctpRecv,
 }
 
 impl SctpRecvState {
-    const fn new() -> Self {
+    /// Creates receive state for an externally configured descriptor.
+    ///
+    /// FlowIO cannot infer why an external socket subscribed to PDAPI, so it
+    /// preserves the historical behavior of surfacing valid notifications.
+    const fn external() -> Self {
         Self {
             discarding_tail: false,
+            partial_delivery_visible: Cell::new(true),
+            any_notification_visible: Cell::new(true),
             stashed: StashedSctpRecv::empty(),
         }
+    }
+
+    /// Creates receive state from the caller-requested FlowIO socket policy.
+    const fn configured(config: SctpSocketConfig) -> Self {
+        Self {
+            discarding_tail: false,
+            partial_delivery_visible: Cell::new(config.notifications.partial_delivery),
+            any_notification_visible: Cell::new(config.notifications.any()),
+            stashed: StashedSctpRecv::empty(),
+        }
+    }
+
+    /// Records a successfully applied caller-requested notification policy.
+    fn set_notification_visibility(&self, mask: SctpNotificationMask) {
+        self.partial_delivery_visible.set(mask.partial_delivery);
+        self.any_notification_visible.set(mask.any());
+    }
+
+    /// Updates discard state and returns true when this completion is internal
+    /// recovery work rather than caller-visible metadata.
+    fn should_consume_metadata_completion(
+        &mut self,
+        data_slice: &[u8],
+        msg: &libc::msghdr,
+    ) -> bool {
+        if sctp_msg_notification(msg.msg_flags) && !self.any_notification_visible.get() {
+            self.discarding_tail = !sctp_msg_end_of_record(msg.msg_flags);
+            return true;
+        }
+
+        let partial_delivery_abort = sctp_notification_retires_discard(data_slice, msg.msg_flags);
+        if self.discarding_tail {
+            self.discarding_tail = sctp_discarding_after_completion(msg, data_slice);
+            return !(partial_delivery_abort && self.partial_delivery_visible.get());
+        }
+
+        partial_delivery_abort && !self.partial_delivery_visible.get()
     }
 
     /// Transfers an in-flight metadata receive from a dropped future into the
@@ -2363,9 +2601,11 @@ impl SctpRecvState {
 /// [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until the next
 /// record boundary is reached; the data-only [`SctpStream::recv`] path does
 /// not participate in that resynchronization state. Notifications observed
-/// during internal discard are consumed as control events. An EOR-marked
-/// notification tail or a partial-delivery-aborted notification retires the
-/// discard state; other notification fragments keep discard active.
+/// during internal discard are consumed as control events, except an
+/// explicitly requested partial-delivery abort remains caller-visible while
+/// retiring discard. An EOR-marked notification tail or a
+/// partial-delivery-aborted notification retires discard; other notification
+/// fragments keep discard active.
 ///
 /// # Example
 /// ```no_run
@@ -2405,7 +2645,9 @@ impl SctpStream {
     /// dropped. `OwnedFd` proves unique close ownership, but does not validate
     /// the socket type, supplied peer address, or configuration. The caller is
     /// responsible for nonblocking mode and socket options compatible with the
-    /// data or metadata APIs it uses.
+    /// data or metadata APIs it uses. Existing partial-delivery subscriptions
+    /// on an adopted descriptor remain caller-visible unless a later
+    /// [`SctpStream::set_notification_mask`] call changes that policy.
     ///
     /// # Example
     /// ```no_run
@@ -2430,10 +2672,29 @@ impl SctpStream {
     /// let _second = SctpStream::from_owned_fd(owned, peer);
     /// ```
     pub fn from_owned_fd(fd: OwnedFd, remote_addr: SocketAddr) -> Self {
+        Self::from_owned_fd_with_recv_state(fd, remote_addr, SctpRecvState::external())
+    }
+
+    /// Takes an internally configured descriptor and preserves its requested
+    /// notification-visibility policy separately from the effective kernel
+    /// subscription mask.
+    fn from_configured_owned_fd(
+        fd: OwnedFd,
+        remote_addr: SocketAddr,
+        config: SctpSocketConfig,
+    ) -> Self {
+        Self::from_owned_fd_with_recv_state(fd, remote_addr, SctpRecvState::configured(config))
+    }
+
+    fn from_owned_fd_with_recv_state(
+        fd: OwnedFd,
+        remote_addr: SocketAddr,
+        recv_state: SctpRecvState,
+    ) -> Self {
         Self {
             fd: fd.into(),
             remote_addr,
-            recv_state: SctpRecvState::new(),
+            recv_state,
         }
     }
 
@@ -2441,7 +2702,9 @@ impl SctpStream {
     ///
     /// Callers supplying an external descriptor are responsible for applying
     /// nonblocking mode and socket options compatible with the data or
-    /// metadata APIs they use.
+    /// metadata APIs they use. Existing partial-delivery subscriptions remain
+    /// caller-visible unless a later [`SctpStream::set_notification_mask`]
+    /// call changes that policy.
     ///
     /// # Safety
     ///
@@ -2682,48 +2945,31 @@ impl SctpStream {
         )
     }
 
-    /// Requests a stream reset for one or more SCTP streams.
+    /// Requests a stream reset for listed streams or an explicit all-stream
+    /// selection.
     ///
     /// This requires SCTP stream-reset support and appropriate association
     /// capabilities on the running kernel. It is control-plane work, not the
-    /// per-message data fast path.
+    /// per-message data fast path. Listed requests must contain at least one
+    /// stream identifier; use an `all_*` constructor for all streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when a listed request is empty, an explicit
+    /// all-stream request carries stream identifiers, or the list exceeds the
+    /// kernel request field width.
     ///
     /// # Example
     /// ```no_run
     /// # use flowio::net::sctp::{SctpResetStreams, SctpStream};
     /// # fn demo(stream: &SctpStream) -> std::io::Result<()> {
     /// stream.reset_streams(&SctpResetStreams::outgoing(&[1]))?;
+    /// stream.reset_streams(&SctpResetStreams::all_incoming())?;
     /// # Ok(())
     /// # }
     /// ```
     pub fn reset_streams(&self, request: &SctpResetStreams) -> io::Result<()> {
-        if request.streams.len() > (u16::MAX as usize) {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        }
-
-        let header_len = std::mem::size_of::<SctpResetStreamsHeader>();
-        let streams_len = std::mem::size_of_val(request.streams.as_slice());
-        let total_len = header_len + streams_len;
-        let mut buffer = vec![0u8; total_len];
-        let header = SctpResetStreamsHeader {
-            assoc_id: request.assoc_id,
-            flags: request.flags,
-            number_streams: request.streams.len() as u16,
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &header as *const SctpResetStreamsHeader as *const u8,
-                buffer.as_mut_ptr(),
-                header_len,
-            );
-            if streams_len != 0 {
-                std::ptr::copy_nonoverlapping(
-                    request.streams.as_ptr() as *const u8,
-                    buffer.as_mut_ptr().add(header_len),
-                    streams_len,
-                );
-            }
-        }
+        let buffer = encode_sctp_reset_streams(request)?;
 
         let rc = unsafe {
             libc::setsockopt(
@@ -2731,7 +2977,7 @@ impl SctpStream {
                 libc::IPPROTO_SCTP,
                 SCTP_RESET_STREAMS_OPT,
                 buffer.as_ptr() as *const libc::c_void,
-                total_len as libc::socklen_t,
+                buffer.len() as libc::socklen_t,
             )
         };
         if rc < 0 {
@@ -2872,10 +3118,28 @@ impl SctpStream {
 
     /// Applies a typed SCTP notification subscription mask.
     ///
+    /// If the socket currently has `SCTP_RECVRCVINFO` enabled, the effective
+    /// kernel mask retains the partial-delivery event even when
+    /// `mask.partial_delivery` is false. Abort events identifiable as forced
+    /// by that dependency are consumed as internal metadata-receive recovery;
+    /// setting the field to true keeps complete abort notifications
+    /// caller-visible. If other notification types are also requested, a
+    /// caller buffer too short to identify a fragmented notification retains
+    /// the normal truncated-notification error behavior. The visibility policy
+    /// changes only after the kernel accepts the new mask.
+    ///
     /// This is signaling setup/control-plane work. Data-only fast paths should
     /// use [`SctpSocketConfig::data`] and avoid per-message mask changes.
     pub fn set_notification_mask(&self, mask: SctpNotificationMask) -> io::Result<()> {
-        set_sctp_events(self.fd.as_raw_fd(), mask)
+        let recv_rcvinfo: libc::c_int = get_sock_opt(
+            self.fd.as_raw_fd(),
+            libc::IPPROTO_SCTP,
+            libc::SCTP_RECVRCVINFO,
+        )?;
+        let effective = effective_sctp_notification_mask(mask, recv_rcvinfo != 0);
+        set_sctp_events(self.fd.as_raw_fd(), effective)?;
+        self.recv_state.set_notification_visibility(mask);
+        Ok(())
     }
 
     /// Applies association-wide retransmission and RTO policy.
@@ -2985,11 +3249,12 @@ impl SctpStream {
     /// they cannot masquerade as EOF. Dropping a metadata receive does not
     /// lose record-boundary state: the next metadata receive adopts the
     /// retired completion before submitting its own operation. Notifications
-    /// observed during internal discard are consumed as control events. An
-    /// EOR-marked notification tail or a partial-delivery-aborted notification
-    /// retires the discard state; other notification fragments keep discard
-    /// active. Kernel receive errors are returned as `io::Error` values from
-    /// the completed operation.
+    /// observed during internal discard are consumed as control events, except
+    /// an explicitly requested partial-delivery abort remains caller-visible
+    /// while retiring discard. An EOR-marked notification tail or a
+    /// partial-delivery-aborted notification retires discard; other
+    /// notification fragments keep discard active. Kernel receive errors are
+    /// returned as `io::Error` values from the completed operation.
     ///
     /// Positive delivered bytes append to an `IoBuffMut` payload; buffers that
     /// keep the provided zero write base publish from their beginning. Bytes
@@ -3074,11 +3339,12 @@ impl SctpStream {
     /// masquerade as EOF. Dropping a metadata receive does not lose
     /// record-boundary state: the next metadata receive adopts the retired
     /// completion before submitting its own operation. Notifications observed
-    /// during internal discard are consumed as control events. An EOR-marked
-    /// notification tail or a partial-delivery-aborted notification retires
-    /// the discard state; other notification fragments keep discard active.
-    /// Kernel receive errors are returned as `io::Error` values from the
-    /// completed operation.
+    /// during internal discard are consumed as control events, except an
+    /// explicitly requested partial-delivery abort remains caller-visible
+    /// while retiring discard. An EOR-marked notification tail or a
+    /// partial-delivery-aborted notification retires discard; other
+    /// notification fragments keep discard active. Kernel receive errors are
+    /// returned as `io::Error` values from the completed operation.
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv_msg_vectored<const N: usize>(
@@ -3304,7 +3570,9 @@ fn update_discarding_after_dropped_completion(
     msg: &libc::msghdr,
     data_slice: &[u8],
 ) {
-    if sctp_msg_clean_eof(actual, msg) {
+    if sctp_msg_clean_eof(actual, msg)
+        || sctp_notification_retires_discard(data_slice, msg.msg_flags)
+    {
         *discarding_tail = false;
     } else if *discarding_tail {
         *discarding_tail = sctp_discarding_after_completion(msg, data_slice);
@@ -3724,28 +3992,25 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 return Poll::Ready(completed);
             }
 
-            if this.recv_state.discarding_tail {
-                let discard_next = unsafe {
-                    let ptr = payload.buffer.as_mut_ptr();
-                    let data_slice = std::slice::from_raw_parts(ptr, actual);
-                    sctp_discarding_after_completion(msg, data_slice)
-                };
-                this.recv_state.discarding_tail = discard_next;
+            let data_slice = unsafe {
+                let ptr = payload.buffer.as_mut_ptr();
+                std::slice::from_raw_parts(ptr, actual)
+            };
+            let consume_internal = this
+                .recv_state
+                .should_consume_metadata_completion(data_slice, msg);
+            if consume_internal {
                 let (_, buffer) = unsafe {
                     complete_read_with_progress(payload.buffer, this.write_base_len, 0, Ok(()))
                 };
-                // Non-vectored discard has no reusable iovec scratch to refill:
-                // the next poll builds a fresh single-iovec payload at the same
-                // unchanged caller-visible writable tail.
+                // Non-vectored internal recovery has no reusable iovec scratch
+                // to refill: the next poll builds a fresh single-iovec payload
+                // at the same unchanged caller-visible writable tail.
                 this.buffer = Some(buffer);
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
 
-            let data_slice = unsafe {
-                let ptr = payload.buffer.as_mut_ptr();
-                std::slice::from_raw_parts(ptr, actual)
-            };
             let partial_nonempty = sctp_msg_partial_nonempty(actual, msg.msg_flags);
             let meta = parse_recv_meta(
                 &payload.control[..],
@@ -4016,11 +4281,12 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 return Poll::Ready((Ok((0, sctp_eof_recv_meta())), buffer));
             }
 
-            if this.recv_state.discarding_tail {
-                let data_slice = unsafe {
-                    sctp_vectored_first_iov_slice(&payload.iovecs, this.iov_count, actual)
-                };
-                this.recv_state.discarding_tail = sctp_discarding_after_completion(msg, data_slice);
+            let data_slice =
+                unsafe { sctp_vectored_first_iov_slice(&payload.iovecs, this.iov_count, actual) };
+            let consume_internal = this
+                .recv_state
+                .should_consume_metadata_completion(data_slice, msg);
+            if consume_internal {
                 let mut buffer = payload.buffer;
                 unsafe {
                     buffer.distribute_written(0);
@@ -4029,11 +4295,11 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 let (iov_count, writable_len) = fill_recv_vectored_iovecs(&mut buffer, &mut iovecs);
                 debug_assert_eq!(
                     iov_count, this.iov_count,
-                    "SCTP vectored recv discard changed the receive chain shape"
+                    "SCTP vectored internal recv changed the receive chain shape"
                 );
                 debug_assert!(
                     writable_len > 0,
-                    "SCTP vectored recv discard lost writable capacity"
+                    "SCTP vectored internal recv lost writable capacity"
                 );
                 this.iovecs = iovecs;
                 this.iov_count = iov_count;
@@ -4041,9 +4307,6 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
-
-            let data_slice =
-                unsafe { sctp_vectored_first_iov_slice(&payload.iovecs, this.iov_count, actual) };
 
             let partial_nonempty = sctp_msg_partial_nonempty(actual, msg.msg_flags);
             let meta = parse_recv_meta(
@@ -5418,6 +5681,33 @@ const fn local_sctp_notification_type(index: libc::c_int) -> libc::c_int {
 pub(crate) mod test_support {
     use super::*;
 
+    /// Returns whether a general SCTP capability probe may be treated as
+    /// unavailable rather than as a test or benchmark failure.
+    ///
+    /// This policy is intentionally narrower than option-specific SCTP
+    /// feature probing. Errors such as `EINVAL` and `ENOPROTOOPT` must remain
+    /// visible to catch invalid probe setup and unsupported socket options
+    /// separately.
+    pub fn capability_unavailable(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EPROTONOSUPPORT)
+                | Some(libc::ESOCKTNOSUPPORT)
+                | Some(libc::EAFNOSUPPORT)
+                | Some(libc::EPFNOSUPPORT)
+                | Some(libc::EPERM)
+                | Some(libc::EACCES)
+        )
+    }
+
+    /// Reads the effective Linux SCTP receive-notification options for tests.
+    pub fn test_sctp_socket_receive_options(fd: RawFd) -> io::Result<(SctpNotificationMask, bool)> {
+        let events: SctpEventSubscribe = get_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_EVENTS)?;
+        let recv_rcvinfo: libc::c_int =
+            get_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_RECVRCVINFO)?;
+        Ok((events.notification_mask(), recv_rcvinfo != 0))
+    }
+
     /// Verifies dropping an accept future closes an already-completed accepted
     /// descriptor and releases its reusable slot.
     pub fn test_accept_slot_drop_future_closes_completed_fd() -> io::Result<()> {
@@ -5667,6 +5957,152 @@ mod tests {
         assert_eq!(sqe.user_data, 99);
     }
 
+    fn expected_sctp_reset_encoding(
+        assoc_id: libc::sctp_assoc_t,
+        flags: u16,
+        streams: &[u16],
+    ) -> Vec<u8> {
+        assert_eq!(
+            std::mem::size_of::<SctpResetStreamsHeader>(),
+            std::mem::size_of::<libc::sctp_assoc_t>() + 2 * std::mem::size_of::<u16>()
+        );
+
+        let mut expected = Vec::with_capacity(
+            std::mem::size_of::<SctpResetStreamsHeader>() + std::mem::size_of_val(streams),
+        );
+        expected.extend_from_slice(&assoc_id.to_ne_bytes());
+        expected.extend_from_slice(&flags.to_ne_bytes());
+        expected.extend_from_slice(&(streams.len() as u16).to_ne_bytes());
+        for stream in streams {
+            expected.extend_from_slice(&stream.to_ne_bytes());
+        }
+        expected
+    }
+
+    #[test]
+    fn sctp_reset_listed_constructors_preserve_nonempty_wire_encoding() {
+        let cases = [
+            (
+                SctpResetStreams::incoming(&[11]),
+                SCTP_STREAM_RESET_INCOMING,
+            ),
+            (
+                SctpResetStreams::outgoing(&[12, 13]),
+                SCTP_STREAM_RESET_OUTGOING,
+            ),
+            (
+                SctpResetStreams::bidirectional(&[14]),
+                SCTP_STREAM_RESET_INCOMING | SCTP_STREAM_RESET_OUTGOING,
+            ),
+        ];
+
+        for (request, expected_flags) in cases {
+            assert_eq!(request.intent, SctpResetIntent::Listed);
+            assert_eq!(request.flags, expected_flags);
+            let encoded =
+                encode_sctp_reset_streams(&request).expect("nonempty listed reset should encode");
+            assert_eq!(
+                encoded,
+                expected_sctp_reset_encoding(0, expected_flags, &request.streams)
+            );
+        }
+    }
+
+    #[test]
+    fn sctp_reset_nonempty_encoding_preserves_assoc_duplicates_and_boundary_ids() {
+        let stream_ids = [0, u16::MAX, 7, 7];
+        let mut request = SctpResetStreams::bidirectional(&stream_ids);
+        request.assoc_id = 0x0102_0304;
+
+        let encoded = encode_sctp_reset_streams(&request)
+            .expect("duplicate and boundary stream IDs should encode");
+        assert_eq!(
+            encoded,
+            expected_sctp_reset_encoding(request.assoc_id, request.flags, &stream_ids)
+        );
+    }
+
+    #[test]
+    fn sctp_reset_all_constructors_encode_explicit_zero_count_sentinel() {
+        let cases = [
+            (SctpResetStreams::all_incoming(), SCTP_STREAM_RESET_INCOMING),
+            (SctpResetStreams::all_outgoing(), SCTP_STREAM_RESET_OUTGOING),
+            (
+                SctpResetStreams::all_bidirectional(),
+                SCTP_STREAM_RESET_INCOMING | SCTP_STREAM_RESET_OUTGOING,
+            ),
+        ];
+
+        for (mut request, expected_flags) in cases {
+            request.assoc_id = 29;
+            assert_eq!(request.intent, SctpResetIntent::All);
+            assert!(request.streams.is_empty());
+            assert_eq!(request.flags, expected_flags);
+            let encoded = encode_sctp_reset_streams(&request)
+                .expect("explicit all-stream reset should encode");
+            assert_eq!(
+                encoded,
+                expected_sctp_reset_encoding(request.assoc_id, expected_flags, &[])
+            );
+        }
+    }
+
+    #[test]
+    fn sctp_reset_generic_empty_requests_are_invalid() {
+        let requests = [
+            SctpResetStreams::incoming(&[]),
+            SctpResetStreams::outgoing(&[]),
+            SctpResetStreams::bidirectional(&[]),
+        ];
+
+        for request in requests {
+            let err = encode_sctp_reset_streams(&request)
+                .expect_err("generic empty stream list should be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn sctp_reset_rejects_intent_and_list_shape_mismatches() {
+        let mut listed = SctpResetStreams::outgoing(&[3]);
+        listed.streams.clear();
+        let err = encode_sctp_reset_streams(&listed)
+            .expect_err("cleared listed request should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut all = SctpResetStreams::all_outgoing();
+        all.streams.push(3);
+        let err = encode_sctp_reset_streams(&all)
+            .expect_err("all-stream request with an ID should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn sctp_reset_rejects_stream_count_above_kernel_field_width() {
+        let request = SctpResetStreams::incoming(&vec![0; u16::MAX as usize + 1]);
+        let err = encode_sctp_reset_streams(&request)
+            .expect_err("stream count above u16::MAX should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn sctp_reset_rejects_invalid_shape_before_socket_access() {
+        let raw = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("distinctive fd creation failed");
+        // SAFETY: the test helper returned one descriptor owned only here.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let stream =
+            SctpStream::from_owned_fd(owned, SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)));
+
+        let err = stream
+            .reset_streams(&SctpResetStreams::incoming(&[]))
+            .expect_err("invalid shape should fail before setsockopt");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        drop(stream);
+        assert!(crate::runtime::fd::raw_fd_is_closed(raw));
+    }
+
     fn write_u16_ne(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
     }
@@ -5721,6 +6157,86 @@ mod tests {
         let mut discarding_tail = true;
         update_discarding_after_dropped_completion(&mut discarding_tail, data.len(), &msg, &data);
         assert!(!discarding_tail);
+
+        let mut synchronized = false;
+        update_discarding_after_dropped_completion(&mut synchronized, data.len(), &msg, &data);
+        assert!(
+            !synchronized,
+            "a dropped PDAPI abort must not start discard when none was active"
+        );
+    }
+
+    #[test]
+    fn forced_partial_delivery_abort_is_internal_only_for_metadata_policy() {
+        let data = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+
+        let mut metadata_only = SctpSocketConfig::data(SctpInitConfig::default());
+        metadata_only.recv_rcvinfo = true;
+        let mut forced = SctpRecvState::configured(metadata_only);
+        assert!(forced.should_consume_metadata_completion(&data, &msg));
+
+        forced.discarding_tail = true;
+        assert!(forced.should_consume_metadata_completion(&data, &msg));
+        assert!(!forced.discarding_tail);
+
+        metadata_only.notifications.partial_delivery = true;
+        let mut explicit = SctpRecvState::configured(metadata_only);
+        assert!(!explicit.should_consume_metadata_completion(&data, &msg));
+        assert!(matches!(
+            parse_recv_meta(&[], 0, msg.msg_flags, &data),
+            Ok(SctpRecvMeta::Notification(
+                SctpNotification::PartialDelivery {
+                    indication: SCTP_PARTIAL_DELIVERY_ABORTED,
+                    ..
+                }
+            ))
+        ));
+
+        explicit.discarding_tail = true;
+        assert!(!explicit.should_consume_metadata_completion(&data, &msg));
+        assert!(!explicit.discarding_tail);
+
+        explicit.set_notification_visibility(SctpNotificationMask::none());
+        assert!(explicit.should_consume_metadata_completion(&data, &msg));
+
+        let mut external = SctpRecvState::external();
+        assert!(!external.should_consume_metadata_completion(&data, &msg));
+        let fragment = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        assert!(!external.should_consume_metadata_completion(&data[..1], &fragment));
+
+        let mut other_visible = SctpRecvState::configured(SctpSocketConfig {
+            recv_rcvinfo: true,
+            notifications: SctpNotificationMask {
+                association: true,
+                ..SctpNotificationMask::none()
+            },
+            ..SctpSocketConfig::data(SctpInitConfig::default())
+        });
+        assert!(!other_visible.should_consume_metadata_completion(&data[..1], &fragment));
+
+        let mut fragmented_forced = SctpRecvState::configured(SctpSocketConfig {
+            recv_rcvinfo: true,
+            ..SctpSocketConfig::data(SctpInitConfig::default())
+        });
+        assert!(fragmented_forced.should_consume_metadata_completion(&data[..1], &fragment));
+        assert!(fragmented_forced.discarding_tail);
+        assert!(fragmented_forced.should_consume_metadata_completion(&data[1..2], &msg));
+        assert!(!fragmented_forced.discarding_tail);
+        let intact = test_msghdr_with_flags(libc::MSG_EOR);
+        assert!(!fragmented_forced.should_consume_metadata_completion(b"next", &intact));
+
+        let mut synchronized = false;
+        update_discarding_after_dropped_completion(&mut synchronized, data.len(), &msg, &data);
+        assert!(!synchronized);
+
+        let eor = test_msghdr_with_flags(libc::MSG_EOR);
+        update_discarding_after_dropped_completion(&mut synchronized, 4, &eor, b"next");
+        assert!(!synchronized);
+
+        let eof = test_msghdr_with_flags(0);
+        update_discarding_after_dropped_completion(&mut synchronized, 0, &eof, &[]);
+        assert!(!synchronized);
     }
 
     #[test]
@@ -5835,6 +6351,35 @@ mod tests {
         assert_eq!(unsubscribed.sctp_data_io_event, 0);
         assert_eq!(unsubscribed.sctp_send_failure_event, 0);
         assert_eq!(unsubscribed.sctp_send_failure_event_event, 0);
+    }
+
+    #[test]
+    fn metadata_receive_forces_only_partial_delivery_subscription() {
+        let data = SctpSocketConfig::data(SctpInitConfig::default());
+        let data_options = data.socket_options();
+        assert!(!data_options.recv_rcvinfo);
+        assert_eq!(data_options.notifications, SctpNotificationMask::none());
+
+        let mut metadata_only = data;
+        metadata_only.recv_rcvinfo = true;
+        let metadata_options = metadata_only.socket_options();
+        assert!(metadata_options.recv_rcvinfo);
+        assert_eq!(
+            metadata_options.notifications,
+            SctpNotificationMask {
+                partial_delivery: true,
+                ..SctpNotificationMask::none()
+            }
+        );
+
+        assert_eq!(
+            effective_sctp_notification_mask(SctpNotificationMask::none(), true),
+            metadata_options.notifications
+        );
+        assert_eq!(
+            effective_sctp_notification_mask(SctpNotificationMask::none(), false),
+            SctpNotificationMask::none()
+        );
     }
 
     #[test]

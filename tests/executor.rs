@@ -26,7 +26,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 fn new_executor() -> Executor {
@@ -134,12 +134,6 @@ fn poll_join_handle<T: 'static>(handle: &mut JoinHandle<T>) -> Poll<Result<T, Jo
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     Pin::new(handle).poll(&mut cx)
-}
-
-struct NonFlowioWake;
-
-impl Wake for NonFlowioWake {
-    fn wake(self: Arc<Self>) {}
 }
 
 fn capture_flowio_waker(executor: &mut Executor) -> Waker {
@@ -1075,8 +1069,7 @@ fn runtime_nop_rejects_non_flowio_waker_inside_run() {
     executor
         .run(async {
             let mut nop = Nop::new();
-            let waker = Waker::from(Arc::new(NonFlowioWake));
-            let mut cx = Context::from_waker(&waker);
+            let mut cx = Context::from_waker(Waker::noop());
             assert!(matches!(
                 Pin::new(&mut nop).poll(&mut cx),
                 Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected

@@ -131,8 +131,12 @@ const ECDSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01
 type PendingTlsRead = stream::ReadFuture<'static, Vec<u8>, TlsTransportMarker>;
 type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMarker>;
 
-/// rustls deframer `MAX_WIRE_SIZE`; keep each raw read to at most one TLS
-/// record so ciphertext and plaintext staging are both drained between feeds.
+const DER_SEQUENCE_TAG: u8 = 0x30;
+const DER_BIT_STRING_TAG: u8 = 0x03;
+
+/// rustls deframer `MAX_WIRE_SIZE`; keep the reusable read scratch and each raw
+/// read to at most one TLS record so ciphertext and plaintext staging are both
+/// drained between feeds.
 const TLS_MAX_WIRE_READ_SIZE: usize = 18_437;
 
 /// Marker type used when the shared stream futures are driving raw TLS record
@@ -158,6 +162,13 @@ enum TlsScratchKind {
 }
 
 impl TlsScratchKind {
+    fn effective_capacity(self, requested: usize) -> usize {
+        match self {
+            Self::Read => requested.min(TLS_MAX_WIRE_READ_SIZE),
+            Self::Write => requested,
+        }
+    }
+
     const fn zero_size_message(self) -> &'static str {
         match self {
             Self::Read => "transport_read_buffer_size must be greater than zero",
@@ -200,7 +211,7 @@ fn reserve_valid_tls_scratch(capacity: usize) -> io::Result<Vec<u8>> {
 
 fn allocate_tls_scratch(kind: TlsScratchKind, capacity: usize) -> io::Result<Vec<u8>> {
     validate_tls_scratch_size(kind, capacity)?;
-    reserve_valid_tls_scratch(capacity)
+    reserve_valid_tls_scratch(kind.effective_capacity(capacity))
 }
 
 fn take_or_reserve_tls_scratch(
@@ -244,10 +255,10 @@ unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
 /// This type intentionally does not implement `Default` so callers must make
 /// the buffering decision explicitly.
 ///
-/// `transport_read_buffer_size` is the nonzero reusable ciphertext scratch
-/// capacity;
-/// each submitted raw read is bounded by rustls' maximum wire-record size so
-/// internal rustls ciphertext and plaintext buffers are drained between records.
+/// `transport_read_buffer_size` is the nonzero requested reusable ciphertext
+/// scratch capacity. The effective capacity is the smaller of the requested
+/// value and 18,437 bytes (one maximum TLS wire record), so internal rustls
+/// ciphertext and plaintext buffers are drained between records.
 /// `transport_write_buffer_size` is the nonzero initial capacity used when
 /// collecting TLS records emitted by rustls before writing them to the socket;
 /// the buffer may still grow if rustls emits more than the initial capacity in
@@ -275,8 +286,10 @@ pub struct TlsClientOptions {
     /// rustls limit for unsent plaintext-before-handshake and pending TLS
     /// records.  `None` means rustls may buffer without bound.
     pub rustls_buffer_limit: Option<usize>,
-    /// Nonzero capacity of the reusable ciphertext receive scratch buffer used
-    /// for `read_tls`. The value must not exceed `isize::MAX`.
+    /// Nonzero requested capacity of the reusable ciphertext receive scratch
+    /// buffer used for `read_tls`. The effective capacity is capped at 18,437
+    /// bytes, one maximum TLS wire record. The requested value must not exceed
+    /// `isize::MAX`.
     pub transport_read_buffer_size: usize,
     /// Nonzero initial capacity of the reusable ciphertext send scratch buffer
     /// used for `write_tls`. The value must not exceed `isize::MAX`.
@@ -331,7 +344,7 @@ pub struct TlsClientStream {
     /// rustls client connection holding TLS protocol state and plaintext
     /// buffers.
     connection: ClientConnection,
-    /// Capacity used when creating new raw TLS receive buffers.
+    /// Effective capacity used when creating new raw TLS receive buffers.
     transport_read_buffer_size: usize,
     /// Initial capacity used when collecting rustls-emitted TLS records.
     transport_write_buffer_size: usize,
@@ -366,9 +379,12 @@ fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]])
 /// Derives RFC 5929 `tls-server-end-point` channel-binding bytes from an
 /// end-entity certificate DER blob.
 ///
-/// Returns `None` when the certificate DER is malformed or its signature
-/// algorithm is unsupported for this derivation. Unsupported cases include
-/// algorithms without a defined binding digest, such as Ed25519 and Ed448.
+/// The outer certificate sequence must consume the complete input and contain
+/// exactly a `TBSCertificate` sequence, a `signatureAlgorithm` sequence, and a
+/// `signatureValue` bit string, in that order. Returns `None` when this
+/// structure is malformed or the signature algorithm is unsupported for this
+/// derivation. Unsupported cases include algorithms without a defined binding
+/// digest, such as Ed25519 and Ed448.
 ///
 /// This allocates the returned channel-binding bytes. Call it after the TLS
 /// handshake when a protocol needs the binding value; it is not steady-state
@@ -427,7 +443,7 @@ pub fn tls_server_end_point(certificate_der: &[u8]) -> Option<Vec<u8>> {
 /// certificate sequence.
 fn extract_certificate_signature_algorithm(certificate_der: &[u8]) -> Option<&[u8]> {
     let (tag, header_len, body_len) = read_tlv(certificate_der, 0)?;
-    if tag != 0x30 {
+    if tag != DER_SEQUENCE_TAG {
         return None;
     }
 
@@ -437,12 +453,15 @@ fn extract_certificate_signature_algorithm(certificate_der: &[u8]) -> Option<&[u
         return None;
     }
 
-    let (_, first_header_len, first_body_len) = read_tlv(certificate_der, body_start)?;
+    let (first_tag, first_header_len, first_body_len) = read_tlv(certificate_der, body_start)?;
+    if first_tag != DER_SEQUENCE_TAG {
+        return None;
+    }
     let first_end = body_start
         .checked_add(first_header_len)?
         .checked_add(first_body_len)?;
     let (second_tag, second_header_len, second_body_len) = read_tlv(certificate_der, first_end)?;
-    if second_tag != 0x30 {
+    if second_tag != DER_SEQUENCE_TAG {
         return None;
     }
 
@@ -450,6 +469,18 @@ fn extract_certificate_signature_algorithm(certificate_der: &[u8]) -> Option<&[u
     let second_end = first_end
         .checked_add(second_header_len)?
         .checked_add(second_body_len)?;
+
+    let (third_tag, third_header_len, third_body_len) = read_tlv(certificate_der, second_end)?;
+    if third_tag != DER_BIT_STRING_TAG {
+        return None;
+    }
+    let third_end = second_end
+        .checked_add(third_header_len)?
+        .checked_add(third_body_len)?;
+    if third_end != body_end {
+        return None;
+    }
+
     certificate_der.get(second_body_start..second_end)
 }
 
@@ -496,7 +527,8 @@ impl TlsClientStream {
     /// Creates a new TLS client wrapper around an already-connected TCP stream.
     ///
     /// This allocates the wrapper's reusable ciphertext scratch buffers up
-    /// front using the capacities provided in [`TlsClientOptions`].
+    /// front. Read scratch is capped at one maximum TLS wire record; write
+    /// scratch uses the capacity provided in [`TlsClientOptions`].
     ///
     /// This is connection-setup work. The intended fast path is to construct
     /// the wrapper once per connection and reuse it for the session lifetime.
@@ -551,7 +583,9 @@ impl TlsClientStream {
         validate_tls_scratch_size(TlsScratchKind::Read, options.transport_read_buffer_size)?;
         validate_tls_scratch_size(TlsScratchKind::Write, options.transport_write_buffer_size)?;
 
-        let read_tls_buffer = reserve_valid_tls_scratch(options.transport_read_buffer_size)?;
+        let transport_read_buffer_size =
+            TlsScratchKind::Read.effective_capacity(options.transport_read_buffer_size);
+        let read_tls_buffer = reserve_valid_tls_scratch(transport_read_buffer_size)?;
         let write_tls_buffer = reserve_valid_tls_scratch(options.transport_write_buffer_size)?;
 
         let mut connection =
@@ -561,7 +595,7 @@ impl TlsClientStream {
         Ok(Self {
             stream,
             connection,
-            transport_read_buffer_size: options.transport_read_buffer_size,
+            transport_read_buffer_size,
             transport_write_buffer_size: options.transport_write_buffer_size,
             read_tls_buffer: Some(read_tls_buffer),
             write_tls_buffer: Some(write_tls_buffer),
@@ -1468,7 +1502,7 @@ mod tests {
     #[cfg(not(miri))]
     use super::*;
     use super::{
-        TlsScratchKind, allocate_tls_scratch, take_or_reserve_tls_scratch,
+        TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, allocate_tls_scratch, take_or_reserve_tls_scratch,
         tls_userspace_destination,
     };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
@@ -1503,18 +1537,35 @@ mod tests {
                 let scratch = allocate_tls_scratch(kind, capacity)
                     .expect("valid TLS scratch reservation should succeed");
                 assert!(scratch.is_empty());
-                assert!(scratch.capacity() >= capacity);
+                assert!(scratch.capacity() >= kind.effective_capacity(capacity));
             }
         }
     }
 
     #[test]
+    fn tls_read_scratch_capacity_clamps_only_above_one_wire_record() {
+        for (requested, expected) in [
+            (TLS_MAX_WIRE_READ_SIZE - 1, TLS_MAX_WIRE_READ_SIZE - 1),
+            (TLS_MAX_WIRE_READ_SIZE, TLS_MAX_WIRE_READ_SIZE),
+            (TLS_MAX_WIRE_READ_SIZE + 1, TLS_MAX_WIRE_READ_SIZE),
+            (64 * 1024, TLS_MAX_WIRE_READ_SIZE),
+        ] {
+            assert_eq!(TlsScratchKind::Read.effective_capacity(requested), expected);
+        }
+        assert_eq!(
+            TlsScratchKind::Write.effective_capacity(64 * 1024),
+            64 * 1024
+        );
+    }
+
+    #[test]
     fn missing_tls_scratch_uses_the_same_fallible_reservation_path() {
         let mut read = None;
-        let scratch = take_or_reserve_tls_scratch(&mut read, TlsScratchKind::Read, 1024)
+        let requested = 64 * 1024;
+        let scratch = take_or_reserve_tls_scratch(&mut read, TlsScratchKind::Read, requested)
             .expect("valid fallback reservation should succeed");
         assert!(scratch.is_empty());
-        assert!(scratch.capacity() >= 1024);
+        assert_eq!(scratch.capacity(), TLS_MAX_WIRE_READ_SIZE);
 
         let mut write = None;
         let err = take_or_reserve_tls_scratch(&mut write, TlsScratchKind::Write, usize::MAX)

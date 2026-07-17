@@ -80,15 +80,16 @@ pub mod net {
 
     pub mod sctp {
         pub use crate::net::sctp::test_support::{
-            test_accept_slot_drop_cached_state_closes_completed_fd,
+            capability_unavailable, test_accept_slot_drop_cached_state_closes_completed_fd,
             test_accept_slot_drop_future_closes_completed_fd, test_adaptation_indication_type,
             test_assoc_change_type, test_assoc_reset_event_type,
             test_connect_slot_drop_future_closes_socket_fd, test_parse_notification,
             test_parse_recv_meta, test_partial_delivery_event_type, test_peer_addr_change_type,
             test_peer_addr_params_rejects_optlen, test_remote_error_type,
-            test_send_failed_error_offset, test_send_failed_event_type,
-            test_send_failed_info_offset, test_send_failed_type, test_sender_dry_event_type,
-            test_shutdown_event_type, test_stream_change_event_type, test_stream_reset_event_type,
+            test_sctp_socket_receive_options, test_send_failed_error_offset,
+            test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
+            test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
+            test_stream_reset_event_type,
         };
     }
 

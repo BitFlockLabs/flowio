@@ -155,7 +155,7 @@ workload is faster without measurement.
 | Payload shape | Contiguous APIs for one byte range; vectored/projected APIs for existing segmentation | Building a chain for one contiguous range or coalescing segmented data just to call `write` | Match the API to existing ownership; vectored paths construct bounded iovec metadata, while coalescing copies bytes. |
 | Immediate deadline edge | `try_read`, `try_write`, and `try_writev_projected` only after a deadline has already reached zero | Polling `try_*` as the normal async path | `try_*` makes one direct nonblocking syscall and returns `WouldBlock`; normal async methods register reactor work and wake the task. |
 | UDP peer selection | Connected `send` / `recv` for a stable peer; `recv_msg` when truncation must be detected | `send_to` / `recv_from` for a fixed peer | Connected calls avoid per-datagram address handling. Use address-bearing methods when the peer actually varies. |
-| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata construction and parsing, but `recv` does not expose EOR/truncation. Use `send_msg` / `recv_msg` when stream, PPID, flags, EOR, truncation, or notifications matter. |
+| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. Use `send_msg` / `recv_msg` when stream, PPID, flags, EOR, truncation, or notifications matter. |
 | Timers | One `timeout_at` or `timeout` around a protocol phase when a deadline is required | A separate timeout around every tiny I/O step | Each armed deadline consumes timer-wheel state and expiry/cancellation work. Preserve finer timers when protocol semantics require them. |
 | DNS/TLS setup | Reuse `DnsResolver`, resolved addresses, connectors, and established TLS streams | Resolving names or handshaking in a per-message loop | Resolver setup/query construction and TLS handshakes may allocate and perform setup I/O. |
 
@@ -246,6 +246,53 @@ For data-only SCTP associations, configure the socket with
 Use `send_msg`, `recv_msg`, and their vectored variants when per-message SCTP
 metadata or notifications matter.
 
+On sockets configured by FlowIO, enabling `recv_rcvinfo` also keeps the SCTP
+partial-delivery event subscribed even when the requested notification mask
+sets `partial_delivery` to false. Linux uses that event when it abandons a
+partial delivery, so metadata receive can retire its internal discard state
+before delivering the next intact record. An abort event identifiable as
+subscribed only for this invariant is consumed internally; callers that
+explicitly request partial-delivery notifications continue to receive them. A
+later `set_notification_mask` call cannot remove the event while metadata
+receive requires it. `SctpSocketConfig::data()` leaves both metadata and
+notifications disabled, so plain `recv` retains the lean path.
+
+When the requested notification mask is empty, PDAPI is the sole kernel event,
+so even its short-buffer fragments remain internal through EOR. If other
+notification types are requested, a caller buffer that truncates an event
+before it can be parsed completely retains the normal `InvalidData` behavior.
+
+`SctpStream::from_owned_fd` and `SctpStream::from_raw_fd` adopt ownership but
+do not inspect or configure the socket. Before using metadata receive on an
+externally configured descriptor, the caller must provide nonblocking mode,
+`SCTP_RECVRCVINFO`, and the `SCTP_PARTIAL_DELIVERY_EVENT` subscription needed
+for discard resynchronization. Calling FlowIO's `set_notification_mask` later
+queries the descriptor's current receive-info setting and preserves that
+dependency, but adoption itself remains syscall-free.
+
+SCTP stream reset is a setup/control-plane operation. The generic
+`SctpResetStreams::incoming`, `outgoing`, and `bidirectional` constructors are
+for one or more listed stream IDs; an empty list is rejected with
+`InvalidInput` before a socket-option syscall. Use the explicit
+`all_incoming`, `all_outgoing`, or `all_bidirectional` constructor when the
+association-wide Linux zero-count sentinel is intended:
+
+```rust
+use flowio::net::sctp::SctpResetStreams;
+
+let mut request = SctpResetStreams::all_outgoing();
+request.assoc_id = 7;
+assert!(request.streams.is_empty());
+```
+
+`SctpResetStreams` now carries private intent state, so downstream struct
+literals no longer compile. Start with the matching constructor and then set
+the still-public `assoc_id` or `flags` field when custom values are needed. A
+listed request's `streams` may be replaced only with another nonempty list; an
+`all_*` request must keep its list empty. An intent/list mismatch is
+`InvalidInput`. This control API does not add work to established per-message
+SCTP send or receive paths.
+
 Keep DNS resolution in setup or control paths when the protocol permits.
 Resolve names once, retain the resulting addresses, and put timer deadlines
 around protocol phases rather than every individual message to reduce timer
@@ -271,6 +318,13 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 ```
+
+`TlsClientOptions::transport_read_buffer_size` is validated as a nonzero
+setup option, then capped at 18,437 bytes for the effective per-connection read
+scratch: one maximum TLS wire record. Smaller values retain their requested
+size, the write scratch remains independently configured, and ordinary TLS I/O
+reuses both setup allocations. Raising the read option above the cap therefore
+does not increase the raw read size or reserve additional wrapper read scratch.
 
 SCTP has separate socket and association configuration types. Basic
 one-to-one SCTP works through `SctpListener`, `SctpConnector`, and

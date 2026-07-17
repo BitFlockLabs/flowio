@@ -26,7 +26,10 @@ enum TestAnswer {
     CnameWithQueryOwnerA(&'static str, Ipv4Addr, Ipv4Addr),
     CnameWithAaaa(&'static str, Ipv6Addr),
     CnameWithOutOfOrderA(&'static str, Ipv4Addr),
-    MultiHopCnameWithA(&'static str, &'static str, Ipv4Addr),
+    CnameChain {
+        names: &'static [&'static str],
+        address: Option<Ipv4Addr>,
+    },
     CyclicCname(&'static str),
     QuestionTypeMismatch,
     QuestionClassMismatch,
@@ -43,6 +46,64 @@ enum TestAnswer {
     QuestionlessServFail,
     Sectioned(TestSections),
 }
+
+static CNAME_RESPONSE_BOUNDARY_CHAIN: [&str; 18] = [
+    "db.example.test",
+    "c01.example.test",
+    "c02.example.test",
+    "c03.example.test",
+    "c04.example.test",
+    "c05.example.test",
+    "c06.example.test",
+    "c07.example.test",
+    "c08.example.test",
+    "c09.example.test",
+    "c10.example.test",
+    "c11.example.test",
+    "c12.example.test",
+    "c13.example.test",
+    "c14.example.test",
+    "c15.example.test",
+    "c16.example.test",
+    "c17.example.test",
+];
+
+static CNAME_TOTAL_INITIAL_15: [&str; 16] = [
+    "db.example.test",
+    "t01.example.test",
+    "t02.example.test",
+    "t03.example.test",
+    "t04.example.test",
+    "t05.example.test",
+    "t06.example.test",
+    "t07.example.test",
+    "t08.example.test",
+    "t09.example.test",
+    "t10.example.test",
+    "t11.example.test",
+    "t12.example.test",
+    "t13.example.test",
+    "t14.example.test",
+    "total-followup.example.test",
+];
+
+static CNAME_TOTAL_FOLLOWUP_1: [&str; 2] =
+    ["total-followup.example.test", "total-final.example.test"];
+
+static CNAME_TOTAL_FOLLOWUP_2: [&str; 3] = [
+    "total-followup.example.test",
+    "total-mid.example.test",
+    "total-final.example.test",
+];
+
+static PORTAL_AZURE_CNAME_CHAIN: [&str; 6] = [
+    "portal.azure.com",
+    "portal.azure.trafficmanager.net",
+    "portal.azure.com.edgekey.net",
+    "e11290.dscb.akamaiedge.net",
+    "e11290.d.akamaiedge.net",
+    "portal.edge.example.net",
+];
 
 /// Test-only resource record used to build explicit DNS sections.
 #[derive(Clone, Copy)]
@@ -811,7 +872,7 @@ fn resolve_host_drains_matching_question_pointer_loop_before_response() {
 }
 
 #[test]
-fn resolve_host_follows_cname_to_address() {
+fn resolve_host_accepts_one_cname_followup_query_round() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
@@ -842,6 +903,98 @@ fn resolve_host_follows_cname_to_address() {
         .expect("executor run failed");
 
     thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_rejects_a_second_cname_followup_query_round() {
+    let err = resolve_with_mock_dns(4, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::Cname("db.mid.test")),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            ("db.mid.test", 1) => Some(TestAnswer::Cname("db.final.test")),
+            ("db.mid.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect_err("a second CNAME follow-up round should be rejected");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "DNS resolution exceeded maximum CNAME follow-up query count",
+    );
+}
+
+#[test]
+fn resolve_host_accepts_sixteen_total_cname_hops() {
+    let expected = Ipv4Addr::new(198, 51, 100, 116);
+    let addrs = resolve_with_mock_dns(4, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_TOTAL_INITIAL_15,
+                address: None,
+            }),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            ("total-followup.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_TOTAL_FOLLOWUP_1,
+                address: Some(expected),
+            }),
+            ("total-followup.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("a CNAME chain at the total hop limit should resolve");
+
+    assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
+}
+
+#[test]
+fn resolve_host_rejects_seventeen_total_cname_hops() {
+    let err = resolve_with_mock_dns(4, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_TOTAL_INITIAL_15,
+                address: None,
+            }),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            ("total-followup.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_TOTAL_FOLLOWUP_2,
+                address: Some(Ipv4Addr::new(198, 51, 100, 117)),
+            }),
+            ("total-followup.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect_err("a CNAME chain above the total hop limit should fail");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "DNS resolution exceeded maximum total CNAME hop count",
+    );
+}
+
+#[test]
+fn resolve_host_keeps_in_budget_sibling_address_when_a_exceeds_total_hops() {
+    let expected = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x118);
+    let addrs = resolve_with_mock_dns(4, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_TOTAL_INITIAL_15,
+                address: None,
+            }),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            ("total-followup.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_TOTAL_FOLLOWUP_2,
+                address: Some(Ipv4Addr::new(198, 51, 100, 118)),
+            }),
+            ("total-followup.example.test", 28) => Some(TestAnswer::Aaaa(expected)),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("an in-budget sibling address should survive an over-budget A response");
+
+    assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
 }
 
 #[test]
@@ -1045,16 +1198,16 @@ fn resolve_host_accepts_bundled_cname_aaaa_address() {
 
 #[test]
 fn resolve_host_accepts_multi_hop_bundled_cname_address() {
+    const CHAIN: &[&str] = &["db.example.test", "db.mid.test", "db.internal.test"];
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
     let thread = thread::spawn(move || {
         serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
-            ("db.example.test", 1) => TestAnswer::MultiHopCnameWithA(
-                "db.mid.test",
-                "db.internal.test",
-                Ipv4Addr::new(198, 51, 100, 89),
-            ),
+            ("db.example.test", 1) => TestAnswer::CnameChain {
+                names: CHAIN,
+                address: Some(Ipv4Addr::new(198, 51, 100, 89)),
+            },
             ("db.example.test", 28) => TestAnswer::Empty,
             _ => TestAnswer::NxDomain,
         })
@@ -1077,6 +1230,66 @@ fn resolve_host_accepts_multi_hop_bundled_cname_address() {
         .expect("executor run failed");
 
     thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_accepts_portal_azure_shaped_five_hop_chain() {
+    let expected = Ipv4Addr::new(198, 51, 100, 105);
+    let addrs = resolve_named_with_mock_dns(
+        "portal.azure.com",
+        2,
+        Duration::from_millis(200),
+        move |name, qtype| match (name, qtype) {
+            ("portal.azure.com", 1) => Some(TestAnswer::CnameChain {
+                names: &PORTAL_AZURE_CNAME_CHAIN,
+                address: Some(expected),
+            }),
+            ("portal.azure.com", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        },
+    )
+    .expect("a five-hop portal.azure-shaped response should resolve");
+
+    assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
+}
+
+#[test]
+fn resolve_host_accepts_sixteen_cname_hops_in_one_response() {
+    let expected = Ipv4Addr::new(198, 51, 100, 106);
+    let addrs = resolve_with_mock_dns(2, Duration::from_millis(200), move |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_RESPONSE_BOUNDARY_CHAIN[..17],
+                address: Some(expected),
+            }),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect("an in-response CNAME chain at the hop limit should resolve");
+
+    assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
+}
+
+#[test]
+fn resolve_host_rejects_seventeen_cname_hops_in_one_response() {
+    let err = resolve_with_mock_dns(2, Duration::from_millis(200), |name, qtype| {
+        match (name, qtype) {
+            ("db.example.test", 1) => Some(TestAnswer::CnameChain {
+                names: &CNAME_RESPONSE_BOUNDARY_CHAIN,
+                address: Some(Ipv4Addr::new(198, 51, 100, 107)),
+            }),
+            ("db.example.test", 28) => Some(TestAnswer::Empty),
+            _ => Some(TestAnswer::NxDomain),
+        }
+    })
+    .expect_err("an in-response CNAME chain above the hop limit should fail");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "DNS response CNAME chain exceeded maximum per-response hop count",
+    );
 }
 
 #[test]
@@ -1262,6 +1475,7 @@ fn resolve_host_rejects_cyclic_in_response_cname_chain() {
                 .await
                 .expect_err("cyclic cname should fail");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "DNS response CNAME chain contained a loop",);
         })
         .expect("executor run failed");
 
@@ -1570,6 +1784,18 @@ fn resolve_with_mock_dns<F>(
 where
     F: Fn(&str, u16) -> Option<TestAnswer> + Send + 'static,
 {
+    resolve_named_with_mock_dns("db.example.test", expected_queries, query_timeout, answer)
+}
+
+fn resolve_named_with_mock_dns<F>(
+    host: &'static str,
+    expected_queries: usize,
+    query_timeout: Duration,
+    answer: F,
+) -> io::Result<Vec<SocketAddr>>
+where
+    F: Fn(&str, u16) -> Option<TestAnswer> + Send + 'static,
+{
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
@@ -1584,7 +1810,7 @@ where
         .run(async move {
             let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
             resolver.set_query_timeout(query_timeout);
-            task_result.set(Some(resolver.resolve_host("db.example.test", 5432).await));
+            task_result.set(Some(resolver.resolve_host(host, 5432).await));
         })
         .expect("executor run failed");
 
@@ -1822,7 +2048,14 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         TestAnswer::CnameWithAAndSpoof(_, _, _, _) | TestAnswer::CnameWithQueryOwnerA(_, _, _) => {
             3u16
         }
-        TestAnswer::MultiHopCnameWithA(_, _, _) => 3u16,
+        TestAnswer::CnameChain { names, address } => {
+            let cname_count = names
+                .len()
+                .checked_sub(1)
+                .expect("test CNAME chain should contain an owner");
+            u16::try_from(cname_count + usize::from(address.is_some()))
+                .expect("test CNAME chain answer count should fit")
+        }
         TestAnswer::CyclicCname(_) => 2u16,
         TestAnswer::A(_)
         | TestAnswer::OversizedA(_)
@@ -2080,32 +2313,23 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             push_u16_be(&mut response, encoded.len() as u16);
             response.extend_from_slice(&encoded);
         }
-        TestAnswer::MultiHopCnameWithA(mid, target, ip) => {
-            let mut encoded_mid = Vec::new();
-            push_name(&mut encoded_mid, mid);
-            let mut encoded_target = Vec::new();
-            push_name(&mut encoded_target, target);
-
-            push_u16_be(&mut response, 0xC00C);
-            push_u16_be(&mut response, 5);
-            push_u16_be(&mut response, 1);
-            push_u32_be(&mut response, 60);
-            push_u16_be(&mut response, encoded_mid.len() as u16);
-            response.extend_from_slice(&encoded_mid);
-
-            push_name(&mut response, mid);
-            push_u16_be(&mut response, 5);
-            push_u16_be(&mut response, 1);
-            push_u32_be(&mut response, 60);
-            push_u16_be(&mut response, encoded_target.len() as u16);
-            response.extend_from_slice(&encoded_target);
-
-            push_name(&mut response, target);
-            push_u16_be(&mut response, 1);
-            push_u16_be(&mut response, 1);
-            push_u32_be(&mut response, 60);
-            push_u16_be(&mut response, 4);
-            response.extend_from_slice(&ip.octets());
+        TestAnswer::CnameChain { names, address } => {
+            let query_name = parse_qname(query).expect("test query qname should parse");
+            assert_eq!(
+                names.first().copied(),
+                Some(query_name.as_str()),
+                "test CNAME chain should start at the queried owner",
+            );
+            for pair in names.windows(2) {
+                push_test_record(&mut response, TestRecord::Cname(pair[0], pair[1]));
+            }
+            if let Some(address) = address {
+                let owner = names
+                    .last()
+                    .copied()
+                    .expect("test CNAME chain should contain an address owner");
+                push_test_record(&mut response, TestRecord::A(owner, address));
+            }
         }
         TestAnswer::CyclicCname(mid) => {
             let qname = parse_qname(query).expect("test query qname should parse");

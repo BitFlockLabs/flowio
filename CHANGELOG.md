@@ -40,9 +40,35 @@ Alpha prereleases carry no compatibility guarantee.
   timer allocation or runtime failure. The former unit `Elapsed` error type is
   removed. TCP/SCTP connect-timeout helpers preserve runtime errors and map
   only actual expiry to `TimedOut`.
+- TLS transport-read scratch is now capped at one 18,437-byte wire record after
+  validating the original option. Values below or equal to the cap are
+  unchanged; exceptional read-scratch recovery uses the same cap, and write
+  scratch remains independently configured. A 64 KiB read option therefore
+  requests 47,099 fewer bytes per connection, while ordinary I/O continues to
+  reuse the setup allocation.
+- **Breaking:** `SctpResetStreams` can no longer be built with a downstream
+  struct literal because it carries private all-stream intent. Construct a
+  listed-stream request with `incoming`, `outgoing`, or `bidirectional`, or use
+  the new `all_incoming`, `all_outgoing`, and `all_bidirectional` constructors
+  for the Linux zero-count sentinel, then customize the public fields without
+  changing whether the stream list is empty. Generic empty requests and any
+  other intent/list mismatch now return `InvalidInput` before a socket-option
+  syscall.
 
 ### Fixed
 
+- FlowIO-configured SCTP sockets now keep the partial-delivery event subscribed
+  whenever receive metadata is enabled. Abort events identifiable as forced
+  only for this invariant are consumed internally to resynchronize metadata
+  receive before the next intact record; explicitly requested partial-delivery
+  notifications remain observable. Notification-mask changes cannot remove
+  the mandatory event, while `SctpSocketConfig::data()` plus plain `recv`
+  remains lean.
+- `tls_server_end_point` now derives a channel-binding digest only after the
+  certificate DER is consumed exactly as the ordered `TBSCertificate`,
+  `signatureAlgorithm`, and `signatureValue` outer fields. Malformed, missing,
+  reordered, extra, or trailing certificate structure returns `None`; the
+  existing supported digest mapping is unchanged.
 - TLS client scratch sizes are validated before allocation. Zero or
   unrepresentable capacities return `InvalidInput`, initial reservation
   failure returns `OutOfMemory`, and the exceptional missing-scratch recovery

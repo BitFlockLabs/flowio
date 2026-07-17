@@ -60,5 +60,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "tls_server_end_point"
+path = "fuzz_targets/tls_server_end_point.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace.
 [workspace]
