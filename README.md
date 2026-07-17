@@ -170,6 +170,11 @@ futures only through the executor that submitted or armed them. Polling without
 an active FlowIO run or through another executor returns `NotConnected`.
 Unsubmitted rental I/O returns its buffer immediately; submitted I/O retains
 the buffer until the original completion and then returns it with that error.
+TLS futures validate this boundary before touching rustls or a stream-owned
+staged raw TCP operation. A rejected TLS poll leaves that raw operation
+attached for the next valid TLS call. If a prior valid write poll already
+accepted plaintext, its returned source is not safe to retry: staged
+ciphertext can still be transmitted when valid TLS work resumes.
 
 Standard task `Waker` values must be cloned, woken, and dropped on the thread
 that owns their executor. Debug builds assert this contract; release builds
@@ -296,7 +301,14 @@ SCTP send or receive paths.
 Keep DNS resolution in setup or control paths when the protocol permits.
 Resolve names once, retain the resulting addresses, and put timer deadlines
 around protocol phases rather than every individual message to reduce timer
-bookkeeping.
+bookkeeping. The resolver validates every declared response record before
+using NXDOMAIN or another response code; malformed records in ignored
+sections/classes or malformed known A/AAAA/CNAME RDATA therefore trigger normal
+nameserver failover rather than being accepted as a negative answer. Response
+name labels must be valid UTF-8, including labels reached through compression;
+invalid labels are rejected before echoed-question matching, response-code
+handling, or CNAME follow-up. Valid non-ASCII text is retained, with DNS name
+comparison folding ASCII case only.
 
 ## Configuration
 
@@ -322,9 +334,14 @@ fn main() -> io::Result<()> {
 `TlsClientOptions::transport_read_buffer_size` is validated as a nonzero
 setup option, then capped at 18,437 bytes for the effective per-connection read
 scratch: one maximum TLS wire record. Smaller values retain their requested
-size, the write scratch remains independently configured, and ordinary TLS I/O
-reuses both setup allocations. Raising the read option above the cap therefore
-does not increase the raw read size or reserve additional wrapper read scratch.
+size. `transport_write_buffer_size` independently sets a hard upper bound for
+each FlowIO ciphertext chunk drained from rustls; output beyond that bound is
+sent in later chunks, so a smaller bound can require more raw TCP writes.
+Ordinary TLS I/O reuses both setup allocations without growing the wrapper
+scratch. `rustls_buffer_limit: None` remains a separate choice that permits
+unbounded rustls-internal buffering and does not relax the FlowIO write-chunk
+bound. Raising the read option above its cap therefore does not increase the
+raw read size or reserve additional wrapper read scratch.
 
 SCTP has separate socket and association configuration types. Basic
 one-to-one SCTP works through `SctpListener`, `SctpConnector`, and

@@ -434,6 +434,51 @@ impl<T> DList<T> {
         }
     }
 
+    /// Returns the last payload link without unlinking it.
+    ///
+    /// The returned pointer remains valid only while its containing node stays
+    /// live and linked in this list.
+    #[inline(always)]
+    pub(crate) fn back_link(&self) -> Option<*mut Link> {
+        debug_assert_list_inited!(self);
+
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.head.prev)
+        }
+    }
+
+    /// Returns the payload link immediately before `node_link`, or `None` when
+    /// `node_link` is the first payload node.
+    ///
+    /// # Safety
+    ///
+    /// `node_link` must be non-null and currently linked in this specific
+    /// initialized list. Its containing allocation must stay live and unmoved
+    /// for the duration of the call.
+    #[inline(always)]
+    pub(crate) unsafe fn previous_link(&self, node_link: *mut Link) -> Option<*mut Link> {
+        debug_assert_list_inited!(self);
+        debug_assert!(!node_link.is_null());
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.contains_link(node_link),
+                "previous_link on node that does not belong to this list"
+            );
+        }
+
+        let head_ptr = &self.head as *const Link as *mut Link;
+        let previous = unsafe { Self::normalize_head_ptr((*node_link).prev, head_ptr) };
+        if previous == head_ptr {
+            None
+        } else {
+            Some(previous)
+        }
+    }
+
     /// Removes and returns the first element.
     #[inline(always)]
     /// # Safety
@@ -761,6 +806,47 @@ mod tests {
             std::mem::align_of::<DList<Node>>(),
             std::mem::align_of::<Link>()
         );
+    }
+
+    #[test]
+    fn back_and_previous_links_stop_at_the_payload_boundary() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut nodes = [
+            Node {
+                id: 1,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 2,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 3,
+                link: Link::new_unlinked(),
+            },
+        ];
+        let links = [
+            node_link_ptr(&mut nodes[0]),
+            node_link_ptr(&mut nodes[1]),
+            node_link_ptr(&mut nodes[2]),
+        ];
+
+        assert_eq!(list.back_link(), None);
+        unsafe {
+            list.push_back(links[0]);
+            assert_eq!(list.back_link(), Some(links[0]));
+            assert_eq!(list.previous_link(links[0]), None);
+
+            list.push_back(links[1]);
+            list.push_back(links[2]);
+            assert_eq!(list.back_link(), Some(links[2]));
+            assert_eq!(list.previous_link(links[2]), Some(links[1]));
+            assert_eq!(list.previous_link(links[1]), Some(links[0]));
+            assert_eq!(list.previous_link(links[0]), None);
+        }
+
+        list.unlink_all_for_drop();
     }
 
     #[test]

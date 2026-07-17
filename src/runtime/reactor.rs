@@ -813,8 +813,10 @@ impl Reactor {
     /// a cancel CQE queued behind the boundary is left for the next pass rather
     /// than risking loss of a target CQE.
     ///
-    /// `runtime_state` and `ready_queue` are executor-owned pointers for the
-    /// active run and must remain valid for the whole call.
+    /// `runtime_state` and `ready_queue` belong to this reactor's executor and
+    /// must remain valid for the whole call. A waiter owned by another executor
+    /// on the same thread is routed through that task's stable owner instead of
+    /// these origin pointers.
     pub fn poll_io(
         &mut self,
         max_completions: usize,
@@ -875,8 +877,9 @@ impl Reactor {
                         {
                             (*runtime_state).stats.waiter_wakes += 1;
                         }
-                        crate::runtime::executor::notify_task_into_list_unchecked(
+                        crate::runtime::executor::notify_reactor_waiter_unchecked(
                             waiter,
+                            self.owner,
                             ready_queue,
                             runtime_state,
                         );

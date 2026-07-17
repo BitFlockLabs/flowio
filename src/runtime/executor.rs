@@ -671,7 +671,8 @@ pub(crate) unsafe fn completed_op_ctx_from_waker(
 /// Replaces an in-flight operation's waiter with a validated FlowIO task.
 /// Invalid or foreign polls are remembered so completion returns
 /// `NotConnected`; a valid foreign FlowIO task may still be registered so the
-/// original reactor can notify it after the CQE.
+/// original reactor can notify it through its stable executor owner after the
+/// CQE.
 ///
 /// # Safety
 ///
@@ -1920,6 +1921,42 @@ unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
     }
 }
 
+/// Routes a reactor waiter notification to the task's stable executor owner.
+///
+/// The common case keeps the reactor's direct ready-queue path. A waiter from
+/// another executor on the same owner thread instead uses that task's recorded
+/// owner, so it cannot be linked into or accounted by the reactor's executor.
+///
+/// # Safety
+///
+/// `task_ptr` must point to a live task and this must run on its owner thread.
+/// `reactor_owner`, `ready_list`, and `runtime_state` must describe the same
+/// executor. A null task owner and null reactor owner are permitted together
+/// only for standalone unit tests using an explicitly supplied ready list.
+#[inline(always)]
+pub(crate) unsafe fn notify_reactor_waiter_unchecked(
+    task_ptr: *mut TaskHeader,
+    reactor_owner: *const ExecutorOwner,
+    ready_list: *mut DList<TaskHeader>,
+    runtime_state: *mut RuntimeState,
+) {
+    let task_owner = unsafe {
+        (*task_ptr)
+            .owner
+            .as_ref()
+            .map_or(std::ptr::null(), Rc::as_ptr)
+    };
+    if task_owner == reactor_owner {
+        unsafe {
+            notify_task_into_list_unchecked(task_ptr, ready_list, runtime_state);
+        }
+    } else {
+        unsafe {
+            schedule_task(task_ptr);
+        }
+    }
+}
+
 const TASK_READY_BLOCKING_FLAGS: u64 =
     TaskHeader::FLAG_COMPLETED | TaskHeader::FLAG_RUNNING | TaskHeader::FLAG_QUEUED;
 
@@ -2340,6 +2377,34 @@ mod tests {
 
         let popped = unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
         assert_eq!(popped, Some(task_ptr));
+        assert!(ready_queue.is_empty());
+    }
+
+    #[test]
+    fn reactor_waiter_notification_keeps_matching_owner_direct_path() {
+        let mut ready_queue = DList::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState::new();
+        let mut header = TaskHeader::new();
+        let task_ptr = &mut header as *mut TaskHeader;
+
+        unsafe {
+            notify_reactor_waiter_unchecked(
+                task_ptr,
+                std::ptr::null(),
+                &mut ready_queue,
+                &mut runtime_state,
+            );
+        }
+
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_NOTIFIED) });
+        assert!(unsafe { (*task_ptr).has_flag(TaskHeader::FLAG_QUEUED) });
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.task_schedules, 1);
+        assert_eq!(
+            unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) },
+            Some(task_ptr)
+        );
         assert!(ready_queue.is_empty());
     }
 

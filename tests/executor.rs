@@ -1315,6 +1315,158 @@ fn runtime_submitted_read_delays_foreign_context_error_until_cqe() {
         .expect("origin executor failed after foreign-context read poll");
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
+    let drops = Rc::new(Cell::new(0));
+    let read_drops = Rc::clone(&drops);
+    let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+    let staged_read = Rc::new(RefCell::new(Some(Box::pin(async move {
+        reader
+            .read(DropTrackedReadWrite::zeroed(1, &read_drops), 1)
+            .await
+    }))));
+
+    let mut origin = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot origin executor");
+
+    let origin_read = Rc::clone(&staged_read);
+    let err = origin
+        .run(poll_fn(move |cx| {
+            let mut slot = origin_read.borrow_mut();
+            let read = slot.as_mut().expect("staged read missing");
+            assert!(
+                read.as_mut().poll(cx).is_pending(),
+                "one-byte read completed before it was staged"
+            );
+            test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            Poll::Ready(())
+        }))
+        .expect_err("injected wait failure should stop the origin executor");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    assert_eq!(test_hooks::ring_wait_failures_remaining(), 0);
+    assert_eq!(drops.get(), 0, "submitted read buffer dropped before CQE");
+
+    let mut foreign_read = staged_read
+        .borrow_mut()
+        .take()
+        .expect("staged read was not retained");
+    let foreign_polls = Rc::new(Cell::new(0));
+    let observed_polls = Rc::clone(&foreign_polls);
+    let output = Rc::new(RefCell::new(None));
+    let output_slot = Rc::clone(&output);
+    let mut foreign = new_executor();
+
+    let err = foreign
+        .run(poll_fn(move |cx| {
+            observed_polls.set(observed_polls.get() + 1);
+            match foreign_read.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(value) => {
+                    *output_slot.borrow_mut() = Some(value);
+                    Poll::Ready(())
+                }
+            }
+        }))
+        .expect_err("foreign waiter should remain live until the origin CQE");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(foreign_polls.get(), 1);
+    assert!(output.borrow().is_none());
+    assert_eq!(
+        drops.get(),
+        0,
+        "foreign pending poll dropped the read buffer"
+    );
+
+    let byte = b"x";
+    let sent = unsafe {
+        libc::send(
+            writer.as_raw_fd(),
+            byte.as_ptr().cast(),
+            byte.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    assert_eq!(sent, 1, "raw send failed: {}", io::Error::last_os_error());
+
+    origin
+        .run(async {})
+        .expect("origin executor failed while retiring the read CQE");
+    assert_eq!(
+        foreign_polls.get(),
+        1,
+        "origin executor polled the foreign waiter"
+    );
+    assert!(
+        output.borrow().is_none(),
+        "origin executor completed the foreign task"
+    );
+    assert_eq!(
+        drops.get(),
+        0,
+        "completed read buffer released before foreign consumption"
+    );
+
+    foreign
+        .run(async {})
+        .expect("foreign executor failed while resuming its waiter");
+    assert_eq!(
+        foreign_polls.get(),
+        2,
+        "foreign waiter was not polled exactly once after notification"
+    );
+    let (result, buffer) = output
+        .borrow_mut()
+        .take()
+        .expect("foreign waiter did not publish the read result");
+    assert_eq!(
+        result
+            .expect_err("foreign-context read unexpectedly succeeded")
+            .kind(),
+        io::ErrorKind::NotConnected
+    );
+    drop(buffer);
+    assert_eq!(drops.get(), 1, "read buffer was not returned exactly once");
+
+    let origin_stats = origin.last_stats();
+    assert_eq!(origin_stats.waiter_wakes, 1);
+    assert_eq!(
+        origin_stats.task_schedules, 0,
+        "origin runtime was charged for the foreign waiter schedule"
+    );
+    assert_eq!(origin_stats.task_allocs, 2);
+    assert_eq!(
+        origin_stats.task_frees, origin_stats.task_allocs,
+        "origin task reference leaked"
+    );
+
+    let foreign_stats = foreign.last_stats();
+    assert_eq!(foreign_stats.waiter_wakes, 0);
+    assert_eq!(
+        foreign_stats.task_schedules, 1,
+        "foreign runtime did not own its waiter schedule"
+    );
+    assert_eq!(foreign_stats.task_allocs, 2);
+    assert_eq!(
+        foreign_stats.task_frees, foreign_stats.task_allocs,
+        "foreign task reference leaked"
+    );
+
+    origin
+        .run(async {
+            assert_eq!(Nop::new().await.expect("origin reuse NOP failed"), 0);
+        })
+        .expect("one-slot origin reactor was not reclaimed");
+    foreign
+        .run(async {
+            assert_eq!(Nop::new().await.expect("foreign reuse NOP failed"), 0);
+        })
+        .expect("foreign executor was not reusable");
+}
+
 #[test]
 fn runtime_nop_slot_op_pool_pressure_releases_slot() {
     let mut executor = Executor::new_with_config(ExecutorConfig {

@@ -19,15 +19,19 @@ const BACKWARD_POINTER_LOOP: &[u8] = &[
 const UNSUPPORTED_LABEL: &[u8] = &[
     0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0x40, 0, 1, 0, 1,
 ];
+const INVALID_UTF8_LABEL: &[u8] = &[
+    0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 1, 0, 1,
+];
 
 #[test]
 fn malformed_dns_candidates_are_allocation_free() {
     const ROUNDS: usize = 16_384;
-    const MALFORMED: [&[u8]; 4] = [
+    const MALFORMED: [&[u8]; 5] = [
         TRUNCATED_POINTER,
         FORWARD_POINTER,
         BACKWARD_POINTER_LOOP,
         UNSUPPORTED_LABEL,
+        INVALID_UTF8_LABEL,
     ];
 
     for packet in MALFORMED {

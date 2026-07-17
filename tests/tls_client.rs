@@ -18,18 +18,14 @@ use rustls::{
     ClientConfig, ProtocolVersion, RootCertStore, ServerConfig, ServerConnection,
     SupportedProtocolVersion,
 };
-use std::cell::Cell;
-#[cfg(debug_assertions)]
-use std::cell::RefCell;
-#[cfg(debug_assertions)]
+use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
-#[cfg(debug_assertions)]
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -66,6 +62,14 @@ fn short_write_tls_options() -> TlsClientOptions {
         rustls_buffer_limit: Some(512),
         transport_read_buffer_size: 2048,
         transport_write_buffer_size: 2048,
+    }
+}
+
+fn bounded_write_tls_options(rustls_buffer_limit: Option<usize>) -> TlsClientOptions {
+    TlsClientOptions {
+        rustls_buffer_limit,
+        transport_read_buffer_size: 2048,
+        transport_write_buffer_size: 257,
     }
 }
 
@@ -243,6 +247,58 @@ async fn receive_test_signal<T>(rx: &mpsc::Receiver<T>, description: &'static st
                 panic!("{description} channel disconnected")
             }
         }
+    }
+}
+
+fn capture_flowio_waker(executor: &mut Executor) -> Waker {
+    let captured = Rc::new(RefCell::new(None::<Waker>));
+    let captured_slot = Rc::clone(&captured);
+    executor
+        .run(poll_fn(move |cx| {
+            *captured_slot.borrow_mut() = Some(cx.waker().clone());
+            Poll::Ready(())
+        }))
+        .expect("capture-waker run failed");
+    captured
+        .borrow_mut()
+        .take()
+        .expect("executor task waker was not captured")
+}
+
+fn poll_tls_result_not_connected<F, T>(future: F, waker: &Waker, operation: &str)
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let mut future = Box::pin(future);
+    let mut cx = Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Err(err)) => assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotConnected,
+            "{operation} returned the wrong context error"
+        ),
+        Poll::Ready(Ok(_)) => panic!("{operation} unexpectedly succeeded"),
+        Poll::Pending => panic!("{operation} remained pending"),
+    }
+}
+
+fn poll_tls_rental_not_connected<F, T, B>(future: F, waker: &Waker, operation: &str) -> B
+where
+    F: Future<Output = (io::Result<T>, B)>,
+{
+    let mut future = Box::pin(future);
+    let mut cx = Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), buffer)) => {
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::NotConnected,
+                "{operation} returned the wrong context error"
+            );
+            buffer
+        }
+        Poll::Ready((Ok(_), _)) => panic!("{operation} unexpectedly succeeded"),
+        Poll::Pending => panic!("{operation} remained pending"),
     }
 }
 
@@ -479,6 +535,146 @@ fn tls_partial_write_flushes_accepted_prefix_and_returns_source() {
                 .await
                 .expect("client shutdown timed out")
                 .expect("client shutdown failed");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+fn assert_tls_bounded_write_profile(rustls_buffer_limit: Option<usize>) {
+    let (client_config, server_config, server_name, _) = make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let payload: Vec<u8> = (0..12 * 1024 + 37).map(|idx| (idx % 241) as u8).collect();
+    let expected = payload.clone();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        let mut received = vec![0u8; expected.len()];
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut received);
+        assert_eq!(received, expected, "bounded TLS write changed byte order");
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = timeout(
+                TLS_TEST_TIMEOUT,
+                FlowTcpStream::connect(addr).expect("connect init failed"),
+            )
+            .await
+            .expect("client connect timed out")
+            .expect("client connect failed");
+            let mut tls = TlsClientStream::new(
+                tcp,
+                client_config,
+                server_name,
+                bounded_write_tls_options(rustls_buffer_limit),
+            )
+            .expect("tls stream init failed");
+
+            timeout(TLS_TEST_TIMEOUT, tls.handshake())
+                .await
+                .expect("client handshake timed out")
+                .expect("client handshake failed");
+            let (result, returned) = timeout(TLS_TEST_TIMEOUT, tls.write_all(payload.clone()))
+                .await
+                .expect("bounded client write timed out");
+            assert_eq!(result.expect("bounded client write failed"), payload.len());
+            assert_eq!(returned, payload);
+            timeout(TLS_TEST_TIMEOUT, tls.shutdown())
+                .await
+                .expect("bounded client shutdown timed out")
+                .expect("bounded client shutdown failed");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_bounded_write_scratch_handles_limited_rustls_buffering() {
+    assert_tls_bounded_write_profile(Some(512));
+}
+
+#[test]
+fn tls_bounded_write_scratch_handles_unbounded_rustls_buffering() {
+    assert_tls_bounded_write_profile(None);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn tls_bounded_write_scratch_resumes_staged_chunk_after_future_drop() {
+    let (client_config, server_config, server_name, _) = make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let payload: Vec<u8> = (0..4096).map(|idx| (idx % 229) as u8).collect();
+    let expected = payload.clone();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        let mut received = vec![0u8; expected.len()];
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut received);
+        assert_eq!(
+            received, expected,
+            "resumed staged TLS write changed or lost plaintext"
+        );
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = timeout(
+                TLS_TEST_TIMEOUT,
+                FlowTcpStream::connect(addr).expect("connect init failed"),
+            )
+            .await
+            .expect("client connect timed out")
+            .expect("client connect failed");
+            let mut tls = TlsClientStream::new(
+                tcp,
+                client_config,
+                server_name,
+                bounded_write_tls_options(None),
+            )
+            .expect("tls stream init failed");
+            timeout(TLS_TEST_TIMEOUT, tls.handshake())
+                .await
+                .expect("client handshake timed out")
+                .expect("client handshake failed");
+
+            let mut write = Box::pin(tls.write_all(payload));
+            poll_fn(|cx| match write.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => {
+                    panic!("bounded TLS write completed before staging a raw chunk")
+                }
+            })
+            .await;
+            drop(write);
+
+            timeout(TLS_TEST_TIMEOUT, tls.flush())
+                .await
+                .expect("resumed TLS flush timed out")
+                .expect("resumed TLS flush failed");
+            timeout(TLS_TEST_TIMEOUT, tls.shutdown())
+                .await
+                .expect("resumed TLS shutdown timed out")
+                .expect("resumed TLS shutdown failed");
         })
         .expect("executor run failed");
 
@@ -1263,6 +1459,360 @@ fn tls_cancelled_read_does_not_poison_shutdown() {
         })
         .expect("executor run failed");
 
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_initial_handshake_poll_outside_run_leaves_connection_reusable() {
+    let (client_config, server_config, server_name, _expected_cert_der) =
+        make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let tcp = std::net::TcpStream::connect(addr).expect("std connect failed");
+    tcp.set_nonblocking(true).expect("set_nonblocking failed");
+    let tcp = FlowTcpStream::from_owned_fd(tcp.into());
+    let mut tls = TlsClientStream::new(tcp, client_config, server_name, tls_options())
+        .expect("tls stream init failed");
+
+    poll_tls_result_not_connected(
+        tls.handshake(),
+        Waker::noop(),
+        "initial handshake outside Executor::run",
+    );
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            tls.handshake()
+                .await
+                .expect("valid handshake failed after inactive rejection");
+            tls.shutdown()
+                .await
+                .expect("shutdown failed after valid handshake");
+        })
+        .expect("executor run failed");
+
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_public_futures_reject_foreign_context_before_local_state_changes() {
+    let (client_config, server_config, server_name, _expected_cert_der) =
+        make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        let mut plaintext = [0u8; 4];
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut plaintext);
+        assert_eq!(&plaintext, b"ping");
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut foreign_executor =
+        Executor::new().expect("failed to construct foreign runtime executor");
+    let foreign_waker = capture_flowio_waker(&mut foreign_executor);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = FlowTcpStream::connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+            let mut tls =
+                TlsClientStream::new(tcp, client_config, server_name, tls_options()).unwrap();
+            tls.handshake().await.expect("client handshake failed");
+
+            poll_tls_result_not_connected(
+                tls.handshake(),
+                &foreign_waker,
+                "completed handshake in a foreign context",
+            );
+
+            let buffer = poll_tls_rental_not_connected(
+                tls.read(Vec::<u8>::new(), 0),
+                &foreign_waker,
+                "zero TLS read in a foreign context",
+            );
+            assert!(buffer.is_empty());
+
+            let buffer = poll_tls_rental_not_connected(
+                tls.read_exact(Vec::<u8>::new(), 0),
+                &foreign_waker,
+                "zero TLS read_exact in a foreign context",
+            );
+            assert!(buffer.is_empty());
+
+            let buffer = poll_tls_rental_not_connected(
+                tls.read(Vec::<u8>::new(), 1),
+                &foreign_waker,
+                "invalid TLS read in a foreign context",
+            );
+            assert!(buffer.is_empty());
+
+            let buffer = poll_tls_rental_not_connected(
+                tls.read_exact(Vec::<u8>::new(), 1),
+                &foreign_waker,
+                "invalid TLS read_exact in a foreign context",
+            );
+            assert!(buffer.is_empty());
+
+            let buffer = poll_tls_rental_not_connected(
+                tls.write(Vec::<u8>::new()),
+                &foreign_waker,
+                "empty TLS write in a foreign context",
+            );
+            assert!(buffer.is_empty());
+
+            let buffer = poll_tls_rental_not_connected(
+                tls.write_all(Vec::<u8>::new()),
+                &foreign_waker,
+                "empty TLS write_all in a foreign context",
+            );
+            assert!(buffer.is_empty());
+
+            poll_tls_result_not_connected(
+                tls.flush(),
+                &foreign_waker,
+                "TLS flush in a foreign context",
+            );
+            poll_tls_result_not_connected(
+                tls.shutdown(),
+                &foreign_waker,
+                "TLS shutdown in a foreign context",
+            );
+
+            let (result, returned) = tls.write_all(b"ping".to_vec()).await;
+            assert_eq!(
+                result.expect("valid write failed after rejected shutdown"),
+                returned.len()
+            );
+            tls.shutdown()
+                .await
+                .expect("valid shutdown failed after foreign rejections");
+        })
+        .expect("executor run failed");
+
+    drop(foreign_executor);
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_foreign_read_rejection_preserves_staged_raw_and_buffered_plaintext() {
+    let (client_config, server_config, server_name, _expected_cert_der) =
+        make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let (send_payload_tx, send_payload_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+
+        send_payload_rx
+            .recv_timeout(TLS_TEST_TIMEOUT)
+            .expect("client did not request plaintext");
+        tls.writer()
+            .write_all(b"abcd")
+            .expect("server plaintext write failed");
+        while tls.wants_write() {
+            tls.complete_io(&mut tcp)
+                .expect("server plaintext flush failed");
+        }
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut foreign_executor =
+        Executor::new().expect("failed to construct foreign runtime executor");
+    let foreign_waker = capture_flowio_waker(&mut foreign_executor);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = FlowTcpStream::connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+            let mut tls =
+                TlsClientStream::new(tcp, client_config, server_name, tls_options()).unwrap();
+            tls.handshake().await.expect("client handshake failed");
+
+            let initialization_calls = Rc::new(Cell::new(0));
+            let initialized_bytes = Rc::new(Cell::new(0));
+            let destination =
+                InitializationTrackedReadWrite::new(1, &initialization_calls, &initialized_bytes);
+            let mut read = Box::pin(tls.read(destination, 1));
+            let (result, destination) = poll_fn(|cx| {
+                assert!(
+                    read.as_mut().poll(cx).is_pending(),
+                    "read completed before staging its raw read"
+                );
+                let mut foreign_cx = Context::from_waker(&foreign_waker);
+                match read.as_mut().poll(&mut foreign_cx) {
+                    Poll::Ready(output) => Poll::Ready(output),
+                    Poll::Pending => {
+                        panic!("foreign read poll did not reject before staged raw I/O")
+                    }
+                }
+            })
+            .await;
+            assert_eq!(
+                result
+                    .expect_err("foreign read poll unexpectedly succeeded")
+                    .kind(),
+                io::ErrorKind::NotConnected
+            );
+            assert!(destination.bytes().is_empty());
+            assert_eq!(initialization_calls.get(), 1);
+            assert_eq!(initialized_bytes.get(), 1);
+            drop(read);
+
+            send_payload_tx
+                .send(())
+                .expect("failed to request plaintext");
+            let (result, resumed) = tls.read(vec![0u8; 1], 1).await;
+            assert_eq!(
+                result.expect("valid read did not resume the staged raw read"),
+                1
+            );
+            assert_eq!(&resumed[..1], b"a");
+
+            let rejected_initialization_calls = Rc::new(Cell::new(0));
+            let rejected_initialized_bytes = Rc::new(Cell::new(0));
+            let rejected_destination = InitializationTrackedReadWrite::new(
+                1,
+                &rejected_initialization_calls,
+                &rejected_initialized_bytes,
+            );
+            {
+                let destination = poll_tls_rental_not_connected(
+                    tls.read(rejected_destination, 1),
+                    &foreign_waker,
+                    "buffered TLS read in a foreign context",
+                );
+                assert!(destination.bytes().is_empty());
+            }
+            assert_eq!(rejected_initialization_calls.get(), 0);
+            assert_eq!(rejected_initialized_bytes.get(), 0);
+
+            let (result, buffered) = tls.read(vec![0u8; 1], 1).await;
+            assert_eq!(
+                result.expect("valid read did not preserve buffered plaintext"),
+                1
+            );
+            assert_eq!(&buffered[..1], b"b");
+            for expected in *b"cd" {
+                let (result, tail) = tls.read(vec![0u8; 1], 1).await;
+                assert_eq!(result.expect("tail plaintext read failed"), 1);
+                assert_eq!(tail[0], expected);
+            }
+
+            tls.shutdown().await.expect("client shutdown failed");
+        })
+        .expect("executor run failed");
+
+    drop(foreign_executor);
+    server.join().expect("server thread panicked");
+}
+
+#[test]
+fn tls_foreign_write_rejection_leaves_staged_raw_write_resumable() {
+    let (client_config, server_config, server_name, _expected_cert_der) =
+        make_client_server_configs();
+    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+    let payload = b"staged TLS plaintext".to_vec();
+    let expected = payload.clone();
+
+    let server = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().expect("std accept failed");
+        tcp.set_read_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_read_timeout failed");
+        tcp.set_write_timeout(Some(TLS_TEST_TIMEOUT))
+            .expect("set_write_timeout failed");
+        let mut tls = server_connection_after_handshake(&mut tcp, server_config);
+        let mut plaintext = vec![0u8; expected.len()];
+        read_server_plaintext_exact(&mut tls, &mut tcp, &mut plaintext);
+        assert_eq!(plaintext, expected);
+        wait_for_server_clean_tls_eof(&mut tls, &mut tcp);
+    });
+
+    let mut foreign_executor =
+        Executor::new().expect("failed to construct foreign runtime executor");
+    let foreign_waker = capture_flowio_waker(&mut foreign_executor);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let tcp = FlowTcpStream::connect(addr)
+                .expect("connect init failed")
+                .await
+                .expect("connect failed");
+            let mut tls =
+                TlsClientStream::new(tcp, client_config, server_name, tls_options()).unwrap();
+            tls.handshake().await.expect("client handshake failed");
+
+            let mut write = Box::pin(tls.write_all(payload));
+            let mut write_staged = false;
+            let (result, returned) = poll_fn(|cx| {
+                if !write_staged {
+                    assert!(
+                        write.as_mut().poll(cx).is_pending(),
+                        "TLS write completed before staging its raw write"
+                    );
+                    write_staged = true;
+                    return Poll::Pending;
+                }
+
+                let mut foreign_cx = Context::from_waker(&foreign_waker);
+                match write.as_mut().poll(&mut foreign_cx) {
+                    Poll::Ready(output) => Poll::Ready(output),
+                    Poll::Pending => {
+                        panic!("foreign write poll did not reject before staged raw I/O")
+                    }
+                }
+            })
+            .await;
+            assert_eq!(
+                result
+                    .expect_err("foreign write poll unexpectedly succeeded")
+                    .kind(),
+                io::ErrorKind::NotConnected
+            );
+            assert_eq!(returned, b"staged TLS plaintext");
+            drop(write);
+
+            tls.flush()
+                .await
+                .expect("valid flush did not resume the staged raw write");
+            tls.shutdown().await.expect("client shutdown failed");
+        })
+        .expect("executor run failed");
+
+    drop(foreign_executor);
     server.join().expect("server thread panicked");
 }
 

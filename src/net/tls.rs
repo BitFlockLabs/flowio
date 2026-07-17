@@ -38,8 +38,8 @@
 //!   construction, or [`TlsClientStream::handshake`] inside a per-message
 //!   loop. Reuse the established stream.
 //! - Do not assume the TLS data path is allocator-free: rustls owns protocol
-//!   buffers, and the wrapper's write scratch may grow beyond its configured
-//!   initial capacity.
+//!   buffers. The wrapper's write scratch is a hard per-chunk bound and does
+//!   not grow during ordinary ciphertext draining.
 //!
 //! The example below uses `write_all` / `read_exact` because it makes the
 //! framing obvious. On the hot path, prefer `write` / `read` when the caller
@@ -99,6 +99,7 @@ use super::tcp::TcpStream;
 use super::{checked_read_len, opt_mut, opt_ref, opt_take};
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite, readable_slice};
+use crate::runtime::executor::validate_local_io_result;
 use rustls::ClientConfig;
 use rustls::client::ClientConnection;
 use rustls::pki_types::ServerName;
@@ -153,6 +154,13 @@ fn tls_protocol_error(err: rustls::Error) -> io::Error {
 /// Builds an internal-invariant error for unexpected wrapper state.
 fn tls_internal_error(message: &'static str) -> io::Error {
     io::Error::other(message)
+}
+
+/// Validates one live public TLS future poll before any local completion,
+/// staged raw-operation poll, or rustls-state mutation.
+#[inline(always)]
+fn validate_tls_poll_context(cx: &Context<'_>) -> io::Result<()> {
+    validate_local_io_result(cx, Ok(()))
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +233,88 @@ fn take_or_reserve_tls_scratch(
     }
 }
 
+/// Fixed-capacity append adapter for one reusable TLS ciphertext chunk.
+///
+/// The configured limit, rather than the allocator-provided `Vec` capacity,
+/// defines the visible write boundary. The capacity term also makes an
+/// invariant violation fail with zero progress instead of reallocating.
+struct TlsWriteScratch<'a> {
+    buffer: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl<'a> TlsWriteScratch<'a> {
+    fn new(buffer: &'a mut Vec<u8>, limit: usize) -> Self {
+        debug_assert!(buffer.len() <= limit);
+        Self { buffer, limit }
+    }
+
+    #[inline(always)]
+    fn remaining(&self) -> usize {
+        self.limit
+            .saturating_sub(self.buffer.len())
+            .min(self.buffer.capacity().saturating_sub(self.buffer.len()))
+    }
+}
+
+impl Write for TlsWriteScratch<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = bytes.len().min(self.remaining());
+        self.buffer.extend_from_slice(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut remaining = self.remaining();
+        let mut written = 0usize;
+
+        for buffer in buffers {
+            if remaining == 0 {
+                break;
+            }
+            let take = buffer.len().min(remaining);
+            self.buffer.extend_from_slice(&buffer[..take]);
+            written += take;
+            remaining -= take;
+        }
+
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Drains at most one configured ciphertext chunk from rustls.
+#[derive(Debug)]
+enum TlsWriteScratchError {
+    Write(io::Error),
+    ZeroProgress,
+}
+
+fn drain_tls_write_scratch(
+    connection: &mut ClientConnection,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> Result<usize, TlsWriteScratchError> {
+    let initial_len = buffer.len();
+
+    while connection.wants_write() && buffer.len() < limit {
+        let written = {
+            let mut scratch = TlsWriteScratch::new(buffer, limit);
+            connection
+                .write_tls(&mut scratch)
+                .map_err(TlsWriteScratchError::Write)?
+        };
+        if written == 0 {
+            return Err(TlsWriteScratchError::ZeroProgress);
+        }
+    }
+
+    Ok(buffer.len() - initial_len)
+}
+
 /// Returns one userspace-safe mutable destination for a TLS plaintext read.
 ///
 /// The first call initializes the complete destination through the buffer's
@@ -259,11 +349,11 @@ unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
 /// scratch capacity. The effective capacity is the smaller of the requested
 /// value and 18,437 bytes (one maximum TLS wire record), so internal rustls
 /// ciphertext and plaintext buffers are drained between records.
-/// `transport_write_buffer_size` is the nonzero initial capacity used when
-/// collecting TLS records emitted by rustls before writing them to the socket;
-/// the buffer may still grow if rustls emits more than the initial capacity in
-/// one flush cycle. Both capacities must fit in `isize` and are reserved
-/// fallibly when the wrapper is created.
+/// `transport_write_buffer_size` is the nonzero hard bound for each reusable
+/// ciphertext chunk collected from rustls before writing it to the socket.
+/// Rustls output beyond that bound is drained only after the current owned
+/// chunk is fully submitted. Both capacities must fit in `isize` and are
+/// reserved fallibly when the wrapper is created.
 ///
 /// For steady-state use, pick values once per connection profile and reuse
 /// them. Recomputing or reallocating these choices per operation is not the
@@ -291,8 +381,8 @@ pub struct TlsClientOptions {
     /// bytes, one maximum TLS wire record. The requested value must not exceed
     /// `isize::MAX`.
     pub transport_read_buffer_size: usize,
-    /// Nonzero initial capacity of the reusable ciphertext send scratch buffer
-    /// used for `write_tls`. The value must not exceed `isize::MAX`.
+    /// Nonzero hard capacity of each reusable ciphertext send chunk used for
+    /// `write_tls`. The value must not exceed `isize::MAX`.
     pub transport_write_buffer_size: usize,
 }
 
@@ -327,6 +417,14 @@ pub struct TlsClientOptions {
 /// the next TLS operation. This keeps TLS record handling correct without
 /// introducing background threads or a broader transport abstraction.
 ///
+/// Every live TLS future poll validates that its waker belongs to the active
+/// FlowIO executor before it completes locally or touches rustls or staged raw
+/// I/O. A rejected poll returns `NotConnected` and leaves any staged raw
+/// read/write attached for the next valid TLS operation. If an earlier valid
+/// write poll already gave plaintext to rustls, the rejected future can return
+/// its source while ciphertext remains staged; source return does not prove
+/// that nothing was or will be transmitted, so callers must not retry it.
+///
 /// If a raw transport write fails after rustls has emitted TLS records, the
 /// stream is marked failed. Retrying the same plaintext on that stream could
 /// duplicate records that the kernel already accepted, so later TLS write,
@@ -346,7 +444,7 @@ pub struct TlsClientStream {
     connection: ClientConnection,
     /// Effective capacity used when creating new raw TLS receive buffers.
     transport_read_buffer_size: usize,
-    /// Initial capacity used when collecting rustls-emitted TLS records.
+    /// Hard per-chunk bound used when collecting rustls-emitted TLS records.
     transport_write_buffer_size: usize,
     /// Available reusable ciphertext receive buffer. This is `None` while a
     /// pending raw read owns the buffer.
@@ -621,6 +719,10 @@ impl TlsClientStream {
     /// The handshake is not performed implicitly by `read`, `write`, or
     /// `flush`. Callers must drive it explicitly before application I/O.
     ///
+    /// # Errors
+    /// Returns `NotConnected` when polled without its active FlowIO executor
+    /// task context.
+    ///
     /// This is a connection-setup API, not a steady-state data-path API.
     pub fn handshake(&mut self) -> TlsHandshakeFuture<'_> {
         TlsHandshakeFuture { stream: self }
@@ -634,7 +736,8 @@ impl TlsClientStream {
     /// logical contents. The returned count is relative to this read.
     ///
     /// # Errors
-    /// Returns `NotConnected` if the TLS handshake has not completed yet.
+    /// Returns `NotConnected` if the TLS handshake has not completed or the
+    /// future is polled without its active FlowIO executor task context.
     /// A clean TLS close returns `Ok(0)`.
     /// After a raw transport write failure, already-decrypted plaintext may
     /// still be returned; if a read needs to emit TLS records to make progress
@@ -655,7 +758,8 @@ impl TlsClientStream {
     /// completed by this operation and preserves the earlier prefix.
     ///
     /// # Errors
-    /// Returns `NotConnected` if the TLS handshake has not completed yet.
+    /// Returns `NotConnected` if the TLS handshake has not completed or the
+    /// future is polled without its active FlowIO executor task context.
     /// Returns `UnexpectedEof` if the TLS session reaches EOF before `len`
     /// plaintext bytes become available; any partial plaintext read into the
     /// caller buffer remains published in that returned buffer.
@@ -682,12 +786,16 @@ impl TlsClientStream {
     /// limit. Use [`Self::write_all`] when the full buffer must be accepted.
     ///
     /// # Errors
-    /// Returns `NotConnected` if called before handshake completion and
-    /// `BrokenPipe` if the TLS write side has already been shut down or a
-    /// prior raw transport write failed.
+    /// Returns `NotConnected` if called before handshake completion or polled
+    /// without its active FlowIO executor task context, and `BrokenPipe` if
+    /// the TLS write side has already been shut down or a prior raw transport
+    /// write failed.
     /// If rustls accepts plaintext but the following TLS-record flush fails,
     /// this future returns an error without a progress count; the stream is
     /// failed and callers must not retry the same plaintext on it.
+    /// An invalid-context repoll after an earlier valid poll can instead return
+    /// the source while its ciphertext remains staged; callers must not retry
+    /// that source because a later valid TLS operation resumes the raw write.
     ///
     /// Preferred when the caller tracks plaintext progress. This offers the
     /// plaintext to rustls once and returns the accepted count after flushing
@@ -699,13 +807,17 @@ impl TlsClientStream {
     /// Writes the entire plaintext buffer, draining TLS records as needed.
     ///
     /// # Errors
-    /// Returns `NotConnected` if called before handshake completion and
-    /// `BrokenPipe` if the TLS write side has already been shut down or a
-    /// prior raw transport write failed.
+    /// Returns `NotConnected` if called before handshake completion or polled
+    /// without its active FlowIO executor task context, and `BrokenPipe` if
+    /// the TLS write side has already been shut down or a prior raw transport
+    /// write failed.
     /// If rustls accepts plaintext but a later TLS-record flush fails, this
     /// future returns an error even though some plaintext may already be queued
     /// as TLS records; the stream is failed and callers must not retry the
     /// same plaintext on it.
+    /// An invalid-context repoll after an earlier valid poll can instead return
+    /// the source while its ciphertext remains staged; callers must not retry
+    /// that source because a later valid TLS operation resumes the raw write.
     ///
     /// This complete-buffer API repeatedly offers plaintext to rustls until
     /// the full input is accepted. Avoid that loop when complete-buffer
@@ -722,7 +834,8 @@ impl TlsClientStream {
     /// already-generated outbound records.
     ///
     /// # Errors
-    /// Returns `BrokenPipe` if a prior raw transport write failed.
+    /// Returns `NotConnected` when polled without its active FlowIO executor
+    /// task context and `BrokenPipe` if a prior raw transport write failed.
     ///
     /// This is primarily a control-path API for callers that need an explicit
     /// flush boundary.
@@ -736,9 +849,10 @@ impl TlsClientStream {
     /// The read side remains available until the peer closes its direction.
     ///
     /// # Errors
-    /// If the transport write side has previously failed, shutdown returns
-    /// `BrokenPipe` while reads can still drain plaintext that does not require
-    /// emitting more TLS records.
+    /// Returns `NotConnected` when polled without its active FlowIO executor
+    /// task context. If the transport write side has previously failed,
+    /// shutdown returns `BrokenPipe` while reads can still drain plaintext
+    /// that does not require emitting more TLS records.
     /// This is a shutdown-path API rather than a steady-state fast-path API.
     pub fn shutdown(&mut self) -> TlsShutdownFuture<'_> {
         TlsShutdownFuture { stream: self }
@@ -885,21 +999,29 @@ impl TlsClientStream {
             let mut buffer = self.take_write_tls_buffer()?;
             buffer.clear();
 
-            let mut total = 0usize;
-            while self.connection.wants_write() {
-                let wrote = self.connection.write_tls(&mut buffer)?;
-                if wrote == 0 {
-                    self.transport_write_failed = true;
-                    self.restore_write_tls_buffer(buffer);
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "rustls produced zero TLS bytes while wants_write() was true",
-                    )));
-                }
-                total += wrote;
-            }
+            // The shared raw write future accepts a u32 byte count. Keep the
+            // configured scratch size as an upper bound while never consuming
+            // more ciphertext from rustls than one submission can represent.
+            let chunk_limit = self.transport_write_buffer_size.min(u32::MAX as usize);
+            let written =
+                match drain_tls_write_scratch(&mut self.connection, &mut buffer, chunk_limit) {
+                    Ok(written) => written,
+                    Err(TlsWriteScratchError::Write(err)) => {
+                        self.restore_write_tls_buffer(buffer);
+                        return Poll::Ready(Err(err));
+                    }
+                    Err(TlsWriteScratchError::ZeroProgress) => {
+                        self.transport_write_failed = true;
+                        self.restore_write_tls_buffer(buffer);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "rustls produced zero TLS bytes while wants_write() was true",
+                        )));
+                    }
+                };
 
-            debug_assert_eq!(total, buffer.len());
+            debug_assert_eq!(written, buffer.len());
+            debug_assert!(buffer.len() <= chunk_limit);
             self.pending_write_tls =
                 Some(stream::WriteAllFuture::new(self.stream.as_raw_fd(), buffer));
         }
@@ -1020,6 +1142,10 @@ impl Future for TlsHandshakeFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if let Err(err) = validate_tls_poll_context(cx) {
+            return Poll::Ready(Err(err));
+        }
+
         loop {
             match this.stream.poll_flush_pending_tls(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -1098,6 +1224,11 @@ impl<B: IoBuffReadWrite> Future for TlsReadFuture<'_, B> {
 
         if this.buffer.is_none() {
             return Poll::Pending;
+        }
+
+        if let Err(err) = validate_tls_poll_context(cx) {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
         }
 
         if let Some(err) = this.input_error.take() {
@@ -1192,6 +1323,13 @@ impl<B: IoBuffReadWrite> Future for TlsReadExactFuture<'_, B> {
 
         if this.buffer.is_none() {
             return Poll::Pending;
+        }
+
+        if let Err(err) = validate_tls_poll_context(cx) {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready(unsafe {
+                complete_read_with_progress(buffer, this.write_base_len, this.filled, Err(err))
+            });
         }
 
         if let Some(err) = this.input_error.take() {
@@ -1296,6 +1434,11 @@ impl<B: IoBuffReadOnly> Future for TlsWriteFuture<'_, B> {
             return Poll::Pending;
         }
 
+        if let Err(err) = validate_tls_poll_context(cx) {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
+        }
+
         if this.written.is_none() {
             if let Err(err) = this.stream.ensure_handshake_complete() {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
@@ -1390,6 +1533,11 @@ impl<B: IoBuffReadOnly> Future for TlsWriteAllFuture<'_, B> {
             return Poll::Pending;
         }
 
+        if let Err(err) = validate_tls_poll_context(cx) {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((Err(err), buffer));
+        }
+
         if let Err(err) = this.stream.ensure_handshake_complete() {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((Err(err), buffer));
@@ -1453,6 +1601,9 @@ impl Future for TlsFlushFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        if let Err(err) = validate_tls_poll_context(cx) {
+            return Poll::Ready(Err(err));
+        }
         this.stream.poll_flush_pending_tls(cx)
     }
 }
@@ -1469,6 +1620,10 @@ impl Future for TlsShutdownFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if let Err(err) = validate_tls_poll_context(cx) {
+            return Poll::Ready(Err(err));
+        }
 
         if this.stream.transport_write_failed {
             return Poll::Ready(Err(io::Error::new(
@@ -1500,10 +1655,12 @@ impl Future for TlsShutdownFuture<'_> {
 #[cfg(test)]
 mod tests {
     #[cfg(not(miri))]
+    use super::drain_tls_write_scratch;
+    #[cfg(not(miri))]
     use super::*;
     use super::{
-        TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, allocate_tls_scratch, take_or_reserve_tls_scratch,
-        tls_userspace_destination,
+        TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, TlsWriteScratch, allocate_tls_scratch,
+        take_or_reserve_tls_scratch, tls_userspace_destination,
     };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
@@ -1512,8 +1669,11 @@ mod tests {
     use crate::runtime::executor::Executor;
     #[cfg(not(miri))]
     use rustls::RootCertStore;
+    use std::io::{self, Write};
     #[cfg(not(miri))]
     use std::net::{Ipv4Addr, SocketAddr};
+    #[cfg(not(miri))]
+    use std::task::Waker;
 
     #[test]
     fn tls_scratch_sizes_reject_zero_and_impossible_geometry() {
@@ -1571,6 +1731,86 @@ mod tests {
         let err = take_or_reserve_tls_scratch(&mut write, TlsScratchKind::Write, usize::MAX)
             .expect_err("impossible fallback reservation should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn tls_write_scratch_scalar_stops_at_configured_bound_without_reallocation() {
+        let mut buffer = Vec::with_capacity(32);
+        let allocation = buffer.as_ptr();
+        let capacity = buffer.capacity();
+
+        let mut scratch = TlsWriteScratch::new(&mut buffer, 7);
+        assert_eq!(scratch.write(b"abcd").unwrap(), 4);
+        assert_eq!(scratch.write(b"efgh").unwrap(), 3);
+        assert_eq!(scratch.write(b"ignored").unwrap(), 0);
+        scratch.flush().unwrap();
+
+        assert_eq!(buffer, b"abcdefg");
+        assert_eq!(buffer.as_ptr(), allocation);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[test]
+    fn tls_write_scratch_vectored_preserves_order_and_partial_tail() {
+        let mut buffer = Vec::with_capacity(32);
+        let allocation = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        let buffers = [
+            io::IoSlice::new(b"ab"),
+            io::IoSlice::new(b""),
+            io::IoSlice::new(b"cdef"),
+            io::IoSlice::new(b"ghij"),
+        ];
+
+        let mut scratch = TlsWriteScratch::new(&mut buffer, 8);
+        assert_eq!(scratch.write_vectored(&buffers).unwrap(), 8);
+        assert_eq!(scratch.write_vectored(&buffers).unwrap(), 0);
+
+        assert_eq!(buffer, b"abcdefgh");
+        assert_eq!(buffer.as_ptr(), allocation);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_write_scratch_drains_rustls_in_multiple_bounded_chunks() {
+        const LIMIT: usize = 13;
+
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut connection = ClientConnection::new(
+            config,
+            ServerName::try_from("localhost").expect("invalid test server name"),
+        )
+        .expect("test TLS connection construction failed");
+        connection.set_buffer_limit(None);
+
+        let mut buffer = allocate_tls_scratch(TlsScratchKind::Write, LIMIT)
+            .expect("bounded write scratch allocation failed");
+        let allocation = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        let mut chunks = 0usize;
+        let mut total = 0usize;
+
+        while connection.wants_write() {
+            assert!(chunks < 1024, "rustls bounded drain did not converge");
+            buffer.clear();
+            let written = drain_tls_write_scratch(&mut connection, &mut buffer, LIMIT)
+                .expect("bounded rustls drain failed");
+            assert_eq!(written, buffer.len());
+            assert!(written > 0);
+            assert!(written <= LIMIT);
+            assert_eq!(buffer.as_ptr(), allocation);
+            assert_eq!(buffer.capacity(), capacity);
+            chunks += 1;
+            total += written;
+        }
+
+        assert!(chunks > 1, "test output fit in one bounded chunk");
+        assert!(total > LIMIT);
     }
 
     struct DefaultUninitializedBuffer {
@@ -1716,6 +1956,55 @@ mod tests {
         let mut initialized = false;
         let dst = unsafe { tls_userspace_destination(&mut buffer, &mut initialized, 5) };
         assert_eq!(dst, &[0x5A; 5]);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_read_exact_context_rejection_publishes_prior_progress_once() {
+        let listener =
+            std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let stream = TcpStream::from_owned_fd(client.into());
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut tls = TlsClientStream::new(
+            stream,
+            config,
+            ServerName::try_from("localhost").unwrap(),
+            TlsClientOptions {
+                rustls_buffer_limit: Some(128),
+                transport_read_buffer_size: 128,
+                transport_write_buffer_size: 128,
+            },
+        )
+        .unwrap();
+        let mut future = Box::pin(TlsReadExactFuture::new(&mut tls, Vec::with_capacity(2), 2));
+
+        let this = unsafe { future.as_mut().get_unchecked_mut() };
+        let buffer = unsafe { opt_mut(&mut this.buffer) };
+        let destination = unsafe {
+            tls_userspace_destination(buffer, &mut this.destination_initialized, this.target)
+        };
+        destination[0] = b'a';
+        this.filled = 1;
+
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready((Err(err), buffer)) => {
+                assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+                assert_eq!(buffer, b"a");
+            }
+            Poll::Ready((Ok(_), _)) => panic!("inactive exact read unexpectedly succeeded"),
+            Poll::Pending => panic!("inactive exact read remained pending"),
+        }
+        assert!(
+            future.as_mut().poll(&mut cx).is_pending(),
+            "completed exact read did not park"
+        );
     }
 
     #[cfg(not(miri))]

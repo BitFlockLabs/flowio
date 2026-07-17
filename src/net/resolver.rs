@@ -195,13 +195,22 @@ impl DnsResolver {
     /// its response code is applied. Questionless FORMERR, SERVFAIL, NOTIMP,
     /// and REFUSED replies remain prompt nameserver-failover results, while a
     /// questionless NXDOMAIN is drained as an unrelated datagram.
-    /// Only Answer-section CNAME and address records contribute to resolution.
-    /// Authority and Additional records are still parsed for structural
-    /// validity but otherwise ignored; an Answer CNAME without an Answer
-    /// address follows one linear chain for at most 16 hops in one response,
-    /// 16 hops total, and one canonical-name follow-up query round. CNAME loops
-    /// are rejected explicitly. DNS name-compression recursion is bounded
-    /// independently at depth 8.
+    /// Every literal label in a response name, including a compressed suffix,
+    /// must be valid UTF-8. The shared name walker rejects an invalid echoed
+    /// question before comparison and rejects an invalid record owner or CNAME
+    /// target with `InvalidData` before response-code or chain processing.
+    /// Valid non-ASCII label text is preserved; name comparison folds ASCII case
+    /// only.
+    /// Every declared Answer, Authority, and Additional record is structurally
+    /// validated before NXDOMAIN or another response code is applied. Known A
+    /// and AAAA records require their exact wire lengths, and CNAME RDATA must
+    /// contain exactly one complete encoded name, regardless of section or
+    /// class. Only Internet-class Answer CNAME and address records contribute
+    /// to resolution; all other valid records are ignored. An Answer CNAME
+    /// without an Answer address follows one linear chain for at most 16 hops
+    /// in one response, 16 hops total, and one canonical-name follow-up query
+    /// round. CNAME loops are rejected explicitly. DNS name-compression
+    /// recursion is bounded independently at depth 8.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -964,6 +973,7 @@ pub(crate) fn parse_response_packet(
     }
 
     let rcode = dns_rcode(flags);
+    let records = parse_response_records(packet, &envelope, rcode == 0)?;
     if rcode == DNS_RCODE_NXDOMAIN {
         return Ok(LookupResult {
             addresses: Vec::new(),
@@ -978,67 +988,11 @@ pub(crate) fn parse_response_packet(
         )));
     }
 
-    let Some(question) = envelope.question else {
+    if envelope.question.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response question count did not match query",
         ));
-    };
-    let mut offset = question.end_offset;
-
-    let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;
-    let max_rrs_by_packet = packet.len().saturating_sub(offset) / 11;
-    // Bound the eager allocation by the packet's minimum possible RR density;
-    // forged header counts cannot reserve independently of packet size.
-    let mut records = Vec::with_capacity(total_rrs.min(max_rrs_by_packet));
-    for (section, count) in [
-        (DnsRecordSection::Answer, envelope.ancount),
-        (DnsRecordSection::Authority, envelope.nscount),
-        (DnsRecordSection::Additional, envelope.arcount),
-    ] {
-        for _ in 0..count {
-            let (owner, consumed) = decode_name(packet, offset, 0)?;
-            offset = checked_add(offset, consumed, packet.len())?;
-            let rr = parse_rr_header(packet, offset)?;
-            offset = rr.data_offset + rr.rdlength as usize;
-
-            if rr.class != DNS_CLASS_IN {
-                continue;
-            }
-
-            match rr.rr_type {
-                DNS_TYPE_A if rr.rdlength == 4 && section == DnsRecordSection::Answer => {
-                    let data = &packet[rr.data_offset..rr.data_offset + 4];
-                    records.push(DnsRecord::Address {
-                        owner,
-                        rr_type: rr.rr_type,
-                        address: IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
-                    });
-                }
-                DNS_TYPE_AAAA if rr.rdlength == 16 && section == DnsRecordSection::Answer => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
-                    records.push(DnsRecord::Address {
-                        owner,
-                        rr_type: rr.rr_type,
-                        address: IpAddr::V6(Ipv6Addr::from(octets)),
-                    });
-                }
-                DNS_TYPE_CNAME => {
-                    let (target, consumed) = decode_name(packet, rr.data_offset, 0)?;
-                    if consumed != rr.rdlength as usize {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "DNS CNAME RDATA did not consume its declared length",
-                        ));
-                    }
-                    if section == DnsRecordSection::Answer {
-                        records.push(DnsRecord::Cname { owner, target });
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     let mut addresses = Vec::new();
@@ -1102,6 +1056,117 @@ pub(crate) fn parse_response_packet(
     })
 }
 
+/// Validates every declared resource record and retains only resolution data
+/// from Internet-class Answer records.
+///
+/// This complete walk must finish before the caller interprets the response
+/// code. Section and class affect whether a known record contributes data, but
+/// never whether its owner, header, or known RDATA shape is validated.
+fn parse_response_records(
+    packet: &[u8],
+    envelope: &DnsResponseEnvelope,
+    retain_resolution_data: bool,
+) -> io::Result<Vec<DnsRecord>> {
+    let mut offset = envelope
+        .question
+        .as_ref()
+        .map_or(12, |question| question.end_offset);
+    let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;
+    let max_rrs_by_packet = packet.len().saturating_sub(offset) / 11;
+    // Bound the eager allocation by the packet's minimum possible RR density;
+    // forged header counts cannot reserve independently of packet size.
+    let mut records = if retain_resolution_data {
+        Vec::with_capacity(total_rrs.min(max_rrs_by_packet))
+    } else {
+        Vec::new()
+    };
+
+    for (section, count) in [
+        (DnsRecordSection::Answer, envelope.ancount),
+        (DnsRecordSection::Authority, envelope.nscount),
+        (DnsRecordSection::Additional, envelope.arcount),
+    ] {
+        for _ in 0..count {
+            let (owner, consumed) =
+                decode_or_validate_name(packet, offset, retain_resolution_data)?;
+            offset = checked_add(offset, consumed, packet.len())?;
+            let rr = parse_rr_header(packet, offset)?;
+            offset = rr.data_offset + rr.rdlength as usize;
+            let contributes = retain_resolution_data
+                && section == DnsRecordSection::Answer
+                && rr.class == DNS_CLASS_IN;
+
+            match rr.rr_type {
+                DNS_TYPE_A => {
+                    if rr.rdlength != 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS A RDATA length was not 4 bytes",
+                        ));
+                    }
+                    if contributes {
+                        let data = &packet[rr.data_offset..rr.data_offset + 4];
+                        records.push(DnsRecord::Address {
+                            owner,
+                            rr_type: rr.rr_type,
+                            address: IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+                        });
+                    }
+                }
+                DNS_TYPE_AAAA => {
+                    if rr.rdlength != 16 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS AAAA RDATA length was not 16 bytes",
+                        ));
+                    }
+                    if contributes {
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
+                        records.push(DnsRecord::Address {
+                            owner,
+                            rr_type: rr.rr_type,
+                            address: IpAddr::V6(Ipv6Addr::from(octets)),
+                        });
+                    }
+                }
+                DNS_TYPE_CNAME => {
+                    let (target, consumed) =
+                        decode_or_validate_name(packet, rr.data_offset, retain_resolution_data)?;
+                    if consumed != rr.rdlength as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS CNAME RDATA did not consume its declared length",
+                        ));
+                    }
+                    if contributes {
+                        records.push(DnsRecord::Cname { owner, target });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(records)
+}
+
+/// Decodes a response name when resolution data is needed, or validates it
+/// without allocating when a negative response will discard all records.
+fn decode_or_validate_name(
+    packet: &[u8],
+    offset: usize,
+    materialize: bool,
+) -> io::Result<(String, usize)> {
+    if materialize {
+        decode_name(packet, offset, 0)
+    } else {
+        let (consumed, _) =
+            walk_dns_name(packet, offset, 0, None).map_err(DnsNameWalkError::into_io_error)?;
+        Ok((String::new(), consumed))
+    }
+}
+
 /// The fixed-size resource-record header fields that follow the already-decoded
 /// owner name, as parsed by `parse_rr_header`.
 struct RrHeader {
@@ -1137,8 +1202,8 @@ fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
 /// at `offset`.
 ///
 /// Compression recursion, packet bounds, backward pointers, and the maximum
-/// presentation length are validated by [`walk_dns_name`]. Label octets are
-/// converted with lossy UTF-8 for the returned presentation string.
+/// presentation length are validated by [`walk_dns_name`]. Every label must be
+/// valid UTF-8 before its exact text is added to the presentation string.
 pub(crate) fn decode_name(
     packet: &[u8],
     offset: usize,
@@ -1164,6 +1229,7 @@ enum DnsNameWalkError {
     CompressionPointerNotBackward,
     NameLengthOverflow,
     UnsupportedLabelEncoding,
+    InvalidUtf8Label,
     NameTooLong,
     PacketArithmeticOverflow,
     PacketEndedUnexpectedly,
@@ -1197,6 +1263,7 @@ impl DnsNameWalkError {
                 io::ErrorKind::InvalidData,
                 "DNS label used an unsupported length encoding",
             ),
+            Self::InvalidUtf8Label => (io::ErrorKind::InvalidData, "DNS label was not valid UTF-8"),
             Self::NameTooLong => (
                 io::ErrorKind::InvalidData,
                 "DNS name exceeded maximum length",
@@ -1280,15 +1347,17 @@ fn walk_dns_name(
         presentation_len = presentation_len
             .checked_add(label_len)
             .ok_or(DnsNameWalkError::NameLengthOverflow)?;
+        let label = std::str::from_utf8(&packet[label_start..label_end])
+            .map_err(|_| DnsNameWalkError::InvalidUtf8Label)?;
         if let Some(labels) = labels.as_mut() {
-            labels.push(String::from_utf8_lossy(&packet[label_start..label_end]).into_owned());
+            labels.push(label.to_owned());
         }
         consumed += 1 + label_len;
         pos = label_end;
     }
 
-    // DNS name limits are defined on raw label octets plus separators. Keep
-    // this check independent of the lossy UTF-8 string used by decode callers.
+    // DNS name limits are defined on raw label octets plus separators, not
+    // Unicode scalar or character counts.
     if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
         return Err(DnsNameWalkError::NameTooLong);
     }
@@ -1517,6 +1586,16 @@ mod tests {
                 true,
             ),
             (
+                "valid UTF-8 question",
+                response_with_question_name(QUERY_ID, b"\x03\xef\xbf\xbd\0"),
+                true,
+            ),
+            (
+                "invalid UTF-8 question",
+                response_with_question_name(QUERY_ID, b"\x01\xff\0"),
+                false,
+            ),
+            (
                 "valid compressed root question",
                 response_with_question_name(QUERY_ID, b"\xc0\x04"),
                 true,
@@ -1600,6 +1679,291 @@ mod tests {
     }
 
     #[test]
+    fn declared_rr_validation_precedes_rcode_section_and_class_filters() {
+        #[derive(Clone, Copy)]
+        struct MalformedShape {
+            label: &'static str,
+            rr_type: u16,
+            rdata: &'static [u8],
+            error_kind: io::ErrorKind,
+            error_message: &'static str,
+        }
+
+        let malformed_shapes = [
+            MalformedShape {
+                label: "short A",
+                rr_type: DNS_TYPE_A,
+                rdata: &[192, 0, 2],
+                error_kind: io::ErrorKind::InvalidData,
+                error_message: "DNS A RDATA length was not 4 bytes",
+            },
+            MalformedShape {
+                label: "long A",
+                rr_type: DNS_TYPE_A,
+                rdata: &[192, 0, 2, 1, 0],
+                error_kind: io::ErrorKind::InvalidData,
+                error_message: "DNS A RDATA length was not 4 bytes",
+            },
+            MalformedShape {
+                label: "short AAAA",
+                rr_type: DNS_TYPE_AAAA,
+                rdata: &[0; 15],
+                error_kind: io::ErrorKind::InvalidData,
+                error_message: "DNS AAAA RDATA length was not 16 bytes",
+            },
+            MalformedShape {
+                label: "long AAAA",
+                rr_type: DNS_TYPE_AAAA,
+                rdata: &[0; 17],
+                error_kind: io::ErrorKind::InvalidData,
+                error_message: "DNS AAAA RDATA length was not 16 bytes",
+            },
+            MalformedShape {
+                label: "CNAME with trailing RDATA",
+                rr_type: DNS_TYPE_CNAME,
+                rdata: &[0, 0xA5],
+                error_kind: io::ErrorKind::InvalidData,
+                error_message: "DNS CNAME RDATA did not consume its declared length",
+            },
+        ];
+
+        for (rcode_label, rcode) in [("NOERROR", 0), ("NXDOMAIN", DNS_RCODE_NXDOMAIN)] {
+            for (section_label, section) in [
+                ("Answer", DnsRecordSection::Answer),
+                ("Authority", DnsRecordSection::Authority),
+                ("Additional", DnsRecordSection::Additional),
+            ] {
+                for (class_label, class) in [("IN", DNS_CLASS_IN), ("non-IN", 3)] {
+                    for shape in malformed_shapes {
+                        let context = format!(
+                            "{rcode_label} {section_label} {class_label} {}",
+                            shape.label
+                        );
+                        let packet = response_with_single_test_rr(
+                            section,
+                            rcode,
+                            true,
+                            DNS_TYPE_A,
+                            shape.rr_type,
+                            class,
+                            shape.rdata,
+                        );
+                        let err = match parse_response_packet(
+                            &packet,
+                            0x1234,
+                            "db.example.test",
+                            DNS_TYPE_A,
+                        ) {
+                            Ok(_) => panic!("{context} unexpectedly passed validation"),
+                            Err(err) => err,
+                        };
+                        assert_eq!(err.kind(), shape.error_kind, "{context}");
+                        assert_eq!(err.to_string(), shape.error_message, "{context}");
+                    }
+                }
+            }
+        }
+
+        let mut truncated = response_with_single_test_rr(
+            DnsRecordSection::Authority,
+            DNS_RCODE_NXDOMAIN,
+            true,
+            DNS_TYPE_A,
+            DNS_TYPE_A,
+            DNS_CLASS_IN,
+            &[192, 0, 2, 1],
+        );
+        truncated.pop();
+        let err = match parse_response_packet(&truncated, 0x1234, "db.example.test", DNS_TYPE_A) {
+            Ok(_) => panic!("truncated Authority RDATA unexpectedly produced NXDOMAIN"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "DNS packet ended unexpectedly");
+
+        let questionless = response_with_single_test_rr(
+            DnsRecordSection::Answer,
+            DNS_RCODE_SERVFAIL,
+            false,
+            DNS_TYPE_A,
+            DNS_TYPE_A,
+            DNS_CLASS_IN,
+            &[192, 0, 2],
+        );
+        let err = match parse_response_packet(&questionless, 0x1234, "db.example.test", DNS_TYPE_A)
+        {
+            Ok(_) => panic!("questionless SERVFAIL skipped malformed Answer validation"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS A RDATA length was not 4 bytes");
+    }
+
+    #[test]
+    fn declared_rr_validation_preserves_valid_rcode_and_filtering() {
+        #[derive(Clone, Copy)]
+        struct ValidShape {
+            label: &'static str,
+            rr_type: u16,
+            query_type: u16,
+            rdata: &'static [u8],
+        }
+
+        let valid_shapes = [
+            ValidShape {
+                label: "A",
+                rr_type: DNS_TYPE_A,
+                query_type: DNS_TYPE_A,
+                rdata: &[192, 0, 2, 1],
+            },
+            ValidShape {
+                label: "AAAA",
+                rr_type: DNS_TYPE_AAAA,
+                query_type: DNS_TYPE_AAAA,
+                rdata: &[0; 16],
+            },
+            ValidShape {
+                label: "CNAME",
+                rr_type: DNS_TYPE_CNAME,
+                query_type: DNS_TYPE_A,
+                rdata: &[0],
+            },
+        ];
+
+        for (rcode_label, rcode) in [("NOERROR", 0), ("NXDOMAIN", DNS_RCODE_NXDOMAIN)] {
+            for (section_label, section) in [
+                ("Answer", DnsRecordSection::Answer),
+                ("Authority", DnsRecordSection::Authority),
+                ("Additional", DnsRecordSection::Additional),
+            ] {
+                for (class_label, class) in [("IN", DNS_CLASS_IN), ("non-IN", 3)] {
+                    for shape in valid_shapes {
+                        let context = format!(
+                            "{rcode_label} {section_label} {class_label} {}",
+                            shape.label
+                        );
+                        let packet = response_with_single_test_rr(
+                            section,
+                            rcode,
+                            true,
+                            shape.query_type,
+                            shape.rr_type,
+                            class,
+                            shape.rdata,
+                        );
+                        let result = parse_response_packet(
+                            &packet,
+                            0x1234,
+                            "db.example.test",
+                            shape.query_type,
+                        )
+                        .unwrap_or_else(|err| panic!("{context} failed validation: {err}"));
+                        assert_eq!(result.nx_domain, rcode == DNS_RCODE_NXDOMAIN, "{context}");
+
+                        let contributes = rcode == 0
+                            && section == DnsRecordSection::Answer
+                            && class == DNS_CLASS_IN;
+                        match shape.rr_type {
+                            DNS_TYPE_A | DNS_TYPE_AAAA => {
+                                assert_eq!(
+                                    result.addresses.len(),
+                                    usize::from(contributes),
+                                    "{context}"
+                                );
+                                assert!(result.cname.is_none(), "{context}");
+                            }
+                            DNS_TYPE_CNAME => {
+                                assert!(result.addresses.is_empty(), "{context}");
+                                assert_eq!(
+                                    result.cname.as_deref(),
+                                    contributes.then_some(""),
+                                    "{context}"
+                                );
+                            }
+                            _ => unreachable!("valid test shape used an unknown type"),
+                        }
+                    }
+                }
+            }
+        }
+
+        let servfail = response_with_single_test_rr(
+            DnsRecordSection::Additional,
+            DNS_RCODE_SERVFAIL,
+            false,
+            DNS_TYPE_A,
+            DNS_TYPE_AAAA,
+            3,
+            &[0; 16],
+        );
+        let err = match parse_response_packet(&servfail, 0x1234, "db.example.test", DNS_TYPE_A) {
+            Ok(_) => panic!("valid questionless SERVFAIL unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "DNS server returned response code 2");
+
+        let non_in_answer = response_with_single_test_rr(
+            DnsRecordSection::Answer,
+            0,
+            true,
+            DNS_TYPE_A,
+            DNS_TYPE_A,
+            3,
+            &[192, 0, 2, 1],
+        );
+        let result = parse_response_packet(&non_in_answer, 0x1234, "db.example.test", DNS_TYPE_A)
+            .expect("valid non-IN Answer should be ignored after validation");
+        assert!(!result.nx_domain);
+        assert!(result.addresses.is_empty());
+
+        let opaque_additional = response_with_single_test_rr(
+            DnsRecordSection::Additional,
+            0,
+            true,
+            DNS_TYPE_A,
+            65_000,
+            DNS_CLASS_IN,
+            &[1, 2, 3],
+        );
+        let result =
+            parse_response_packet(&opaque_additional, 0x1234, "db.example.test", DNS_TYPE_A)
+                .expect("bounded unknown RDATA should remain opaque");
+        assert!(result.addresses.is_empty());
+
+        let mut malformed_after_answer = response_with_single_test_rr(
+            DnsRecordSection::Answer,
+            0,
+            true,
+            DNS_TYPE_A,
+            DNS_TYPE_A,
+            DNS_CLASS_IN,
+            &[192, 0, 2, 1],
+        );
+        write_u16_be_at(&mut malformed_after_answer, 8, 1)
+            .expect("test Authority count should fit");
+        push_single_test_rr(
+            &mut malformed_after_answer,
+            true,
+            DNS_TYPE_A,
+            DNS_CLASS_IN,
+            3,
+            &[192, 0, 2],
+        );
+        let err = match parse_response_packet(
+            &malformed_after_answer,
+            0x1234,
+            "db.example.test",
+            DNS_TYPE_A,
+        ) {
+            Ok(_) => panic!("usable Answer hid a malformed later record"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS A RDATA length was not 4 bytes");
+    }
+
+    #[test]
     fn materializing_and_non_materializing_name_walks_share_acceptance() {
         let mut overlong_name = Vec::new();
         for label_len in [63usize, 63, 63, 62] {
@@ -1611,7 +1975,20 @@ mod tests {
         let cases = [
             ("root", vec![0], 0usize, true),
             ("plain", b"\x03www\x07example\x03com\0".to_vec(), 0, true),
+            (
+                "valid UTF-8",
+                b"\x03\xef\xbf\xbd\x07example\0".to_vec(),
+                0,
+                true,
+            ),
+            ("invalid UTF-8", vec![1, 0xff, 0], 0, false),
             ("compressed root", vec![0, 0xc0, 0], 1, true),
+            (
+                "compressed invalid UTF-8 suffix",
+                vec![1, 0xff, 0, 0xc0, 0],
+                3,
+                false,
+            ),
             ("truncated pointer", vec![0xc0], 0, false),
             ("forward pointer", vec![0xc0, 0], 0, false),
             ("backward pointer loop", vec![1, b'x', 0xc0, 0], 0, false),
@@ -1673,6 +2050,11 @@ mod tests {
                 "DNS label used an unsupported length encoding",
             ),
             (
+                DnsNameWalkError::InvalidUtf8Label,
+                io::ErrorKind::InvalidData,
+                "DNS label was not valid UTF-8",
+            ),
+            (
                 DnsNameWalkError::NameTooLong,
                 io::ErrorKind::InvalidData,
                 "DNS name exceeded maximum length",
@@ -1696,6 +2078,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invalid_utf8_question_cannot_alias_replacement_character() {
+        let valid = response_with_question_name(0x1234, b"\x04X\xef\xbf\xbd\x07EXAMPLE\x04TEST\0");
+        parse_response_packet(&valid, 0x1234, "x\u{fffd}.example.test", DNS_TYPE_A)
+            .expect("valid UTF-8 should retain ASCII-only case-insensitive matching");
+
+        let invalid = response_with_question_name(0x1234, b"\x02X\xff\x07EXAMPLE\x04TEST\0");
+        let err =
+            match parse_response_packet(&invalid, 0x1234, "x\u{fffd}.example.test", DNS_TYPE_A) {
+                Ok(_) => panic!("an invalid octet aliased the replacement character"),
+                Err(err) => err,
+            };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS label was not valid UTF-8");
+    }
+
+    #[test]
+    fn invalid_utf8_cname_target_is_rejected_before_chain_selection_or_rcode() {
+        for rcode in [0, DNS_RCODE_NXDOMAIN] {
+            let packet = response_with_single_test_rr(
+                DnsRecordSection::Answer,
+                rcode,
+                true,
+                DNS_TYPE_A,
+                DNS_TYPE_CNAME,
+                DNS_CLASS_IN,
+                &[1, 0xff, 0],
+            );
+            let err = match parse_response_packet(&packet, 0x1234, "db.example.test", DNS_TYPE_A) {
+                Ok(_) => panic!("an invalid CNAME target entered chain selection or RCODE"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "DNS label was not valid UTF-8");
+        }
+    }
+
     fn response_header(query_id: u16, flags: u16, qdcount: u16) -> Vec<u8> {
         let mut packet = Vec::with_capacity(12);
         for field in [query_id, flags, qdcount, 0, 0, 0] {
@@ -1710,6 +2129,64 @@ mod tests {
         packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
         packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
         packet
+    }
+
+    fn response_with_single_test_rr(
+        section: DnsRecordSection,
+        rcode: u8,
+        include_question: bool,
+        query_type: u16,
+        rr_type: u16,
+        class: u16,
+        rdata: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = response_header(
+            0x1234,
+            DNS_FLAG_QR | u16::from(rcode),
+            u16::from(include_question),
+        );
+        let count_offset = match section {
+            DnsRecordSection::Answer => 6,
+            DnsRecordSection::Authority => 8,
+            DnsRecordSection::Additional => 10,
+        };
+        write_u16_be_at(&mut packet, count_offset, 1)
+            .expect("test section count should fit in the DNS header");
+
+        if include_question {
+            push_test_wire_name(&mut packet, "db.example.test");
+            packet.extend_from_slice(&query_type.to_be_bytes());
+            packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        }
+        push_single_test_rr(
+            &mut packet,
+            include_question,
+            rr_type,
+            class,
+            u16::try_from(rdata.len()).expect("test RDATA length should fit in u16"),
+            rdata,
+        );
+        packet
+    }
+
+    fn push_single_test_rr(
+        packet: &mut Vec<u8>,
+        owner_is_question: bool,
+        rr_type: u16,
+        class: u16,
+        rdlength: u16,
+        rdata: &[u8],
+    ) {
+        if owner_is_question {
+            packet.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        } else {
+            packet.push(0);
+        }
+        packet.extend_from_slice(&rr_type.to_be_bytes());
+        packet.extend_from_slice(&class.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&rdlength.to_be_bytes());
+        packet.extend_from_slice(rdata);
     }
 
     fn query_name_with_final_label(final_label_len: usize) -> String {

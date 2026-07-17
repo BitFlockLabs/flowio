@@ -38,6 +38,7 @@ enum TestAnswer {
     CnamePointerLoop,
     CnameRdataOverrun,
     CnameRdataTrailingBytes,
+    InvalidUtf8CnameTarget,
     Empty,
     NxDomain,
     NegativeQuestionMismatch(QuestionMismatch, NegativeRcode),
@@ -45,6 +46,7 @@ enum TestAnswer {
     ServFail,
     QuestionlessServFail,
     Sectioned(TestSections),
+    NegativeSectioned(TestSections, NegativeRcode),
 }
 
 static CNAME_RESPONSE_BOUNDARY_CHAIN: [&str; 18] = [
@@ -141,6 +143,7 @@ enum FirstDnsDatagram {
     Undersized,
     MalformedMatchingQueryId,
     MalformedQuestionPointerLoop,
+    InvalidUtf8QuestionCollision,
     QuestionlessNxDomain,
 }
 
@@ -596,7 +599,13 @@ fn resolve_host_merges_direct_a_and_aaaa_answers() {
 }
 
 #[test]
-fn resolve_host_falls_back_after_malformed_first_nameserver() {
+fn resolve_host_falls_back_after_nxdomain_with_malformed_authority() {
+    const MALFORMED_NXDOMAIN: TestSections = TestSections {
+        answer: &[],
+        authority: &[TestRecord::Truncated("db.example.test")],
+        additional: &[],
+    };
+
     let bad_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind malformed dns socket");
     let bad_nameserver = bad_server
@@ -604,7 +613,7 @@ fn resolve_host_falls_back_after_malformed_first_nameserver() {
         .expect("failed to read malformed dns socket addr");
     let bad_thread = thread::spawn(move || {
         serve_dns_queries(bad_server, 2, |_name, _qtype| {
-            TestAnswer::MalformedCnamePointer
+            TestAnswer::NegativeSectioned(MALFORMED_NXDOMAIN, NegativeRcode::NxDomain)
         })
     });
 
@@ -630,7 +639,7 @@ fn resolve_host_falls_back_after_malformed_first_nameserver() {
             let addrs = resolver
                 .resolve_host("db.example.test", 5432)
                 .await
-                .expect("resolver should fall back after malformed first response");
+                .expect("resolver should fall back after malformed NXDOMAIN Authority");
             assert_eq!(
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 5432))]
@@ -865,6 +874,43 @@ fn resolve_host_drains_matching_question_pointer_loop_before_response() {
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 50), 5432))]
             );
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_drains_invalid_utf8_question_collision_before_response() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let expected = Ipv4Addr::new(192, 0, 2, 53);
+    let thread = thread::spawn(move || {
+        serve_dns_queries_with_first_datagrams(
+            server,
+            2,
+            &[FirstDnsDatagram::InvalidUtf8QuestionCollision],
+            move |name, qtype| {
+                Some(match (name, qtype) {
+                    ("\u{fffd}.example.test", 1) => TestAnswer::A(expected),
+                    ("\u{fffd}.example.test", 28) => TestAnswer::Empty,
+                    _ => TestAnswer::NxDomain,
+                })
+            },
+        )
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("\u{fffd}.example.test", 5432)
+                .await
+                .expect("resolver should drain the invalid UTF-8 question");
+            assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
         })
         .expect("executor run failed");
 
@@ -1721,6 +1767,87 @@ fn resolve_host_rejects_cname_compression_pointer_loop() {
 }
 
 #[test]
+fn resolve_host_rejects_invalid_utf8_cname_without_followup_query() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let thread = thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("failed to set initial dns timeout");
+
+        let mut queries = Vec::new();
+        for expected_qtype in [1, 28] {
+            let mut buffer = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buffer).expect("dns recv_from failed");
+            let query = &buffer[..len];
+            let qname = parse_qname(query).expect("failed to parse dns qname");
+            assert_eq!(qname, "db.example.test");
+            let qtype = parse_qtype(query).expect("failed to parse dns qtype");
+            assert_eq!(qtype, expected_qtype);
+            queries.push((qname, qtype));
+            let answer = if qtype == 1 {
+                TestAnswer::InvalidUtf8CnameTarget
+            } else {
+                TestAnswer::Empty
+            };
+            let response = build_response(query, answer);
+            server
+                .send_to(&response, peer)
+                .expect("dns send_to response failed");
+        }
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resolver did not finish the CNAME rejection test");
+        server
+            .set_nonblocking(true)
+            .expect("failed to make follow-up probe nonblocking");
+        loop {
+            let mut unexpected = [0u8; 512];
+            match server.recv_from(&mut unexpected) {
+                Ok((len, _)) => {
+                    let query = &unexpected[..len];
+                    queries.push((
+                        parse_qname(query).expect("failed to parse follow-up qname"),
+                        parse_qtype(query).expect("failed to parse follow-up qtype"),
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("follow-up query probe failed: {err}"),
+            }
+        }
+        queries
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let result = resolver.resolve_host("db.example.test", 5432).await;
+            done_tx
+                .send(())
+                .expect("failed to release the DNS query recorder");
+            let err = result.expect_err("invalid CNAME target should fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "DNS label was not valid UTF-8");
+        })
+        .expect("executor run failed");
+
+    let queries = thread.join().expect("dns thread panicked");
+    assert_eq!(
+        queries,
+        [
+            ("db.example.test".to_owned(), 1),
+            ("db.example.test".to_owned(), 28),
+        ],
+        "invalid CNAME target must not produce a follow-up query",
+    );
+}
+
+#[test]
 fn resolve_host_rejects_cname_rdata_overrun() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
@@ -1953,6 +2080,27 @@ fn send_first_dns_datagram(
                 .send_to(&malformed, peer)
                 .expect("dns send_to malformed question response failed");
         }
+        FirstDnsDatagram::InvalidUtf8QuestionCollision => {
+            let mut collision = response.to_vec();
+            assert_eq!(
+                collision.get(12..16),
+                Some(&[3, 0xef, 0xbf, 0xbd][..]),
+                "collision fixture requires a leading U+FFFD label",
+            );
+            if read_u16_be_at(&collision, 6).expect("test Answer count should exist") != 0 {
+                let rdata = collision
+                    .len()
+                    .checked_sub(4)
+                    .expect("test A response should contain RDATA");
+                collision[rdata..].copy_from_slice(&[203, 0, 113, 53]);
+            }
+            collision[12] = 1;
+            collision[13] = 0xff;
+            collision.drain(14..16);
+            socket
+                .send_to(&collision, peer)
+                .expect("dns send_to invalid UTF-8 question failed");
+        }
         FirstDnsDatagram::QuestionlessNxDomain => {
             let questionless_nxdomain = build_response(query, TestAnswer::QuestionlessNxDomain);
             socket
@@ -2066,7 +2214,8 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::ForwardCnamePointer
         | TestAnswer::CnamePointerLoop
         | TestAnswer::CnameRdataOverrun
-        | TestAnswer::CnameRdataTrailingBytes => 1u16,
+        | TestAnswer::CnameRdataTrailingBytes
+        | TestAnswer::InvalidUtf8CnameTarget => 1u16,
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch
         | TestAnswer::Empty
@@ -2075,26 +2224,30 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::QuestionlessNxDomain
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => 0u16,
-        TestAnswer::Sectioned(sections) => {
+        TestAnswer::Sectioned(sections) | TestAnswer::NegativeSectioned(sections, _) => {
             u16::try_from(sections.answer.len()).expect("test Answer record count should fit")
         }
     };
     let authority_count = match answer {
-        TestAnswer::Sectioned(sections) => {
+        TestAnswer::Sectioned(sections) | TestAnswer::NegativeSectioned(sections, _) => {
             u16::try_from(sections.authority.len()).expect("test Authority record count should fit")
         }
         _ => 0,
     };
     let additional_count = match answer {
-        TestAnswer::Sectioned(sections) => u16::try_from(sections.additional.len())
-            .expect("test Additional record count should fit"),
+        TestAnswer::Sectioned(sections) | TestAnswer::NegativeSectioned(sections, _) => {
+            u16::try_from(sections.additional.len())
+                .expect("test Additional record count should fit")
+        }
         _ => 0,
     };
     let flags = match answer {
         TestAnswer::NegativeQuestionMismatch(_, NegativeRcode::NxDomain)
+        | TestAnswer::NegativeSectioned(_, NegativeRcode::NxDomain)
         | TestAnswer::NxDomain
         | TestAnswer::QuestionlessNxDomain => 0x8183u16,
         TestAnswer::NegativeQuestionMismatch(_, NegativeRcode::ServFail)
+        | TestAnswer::NegativeSectioned(_, NegativeRcode::ServFail)
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => 0x8182u16,
         _ => 0x8180u16,
@@ -2399,6 +2552,14 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             push_u16_be(&mut response, 0xC00F);
             response.push(0xA5);
         }
+        TestAnswer::InvalidUtf8CnameTarget => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 3);
+            response.extend_from_slice(&[1, 0xff, 0]);
+        }
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch
         | TestAnswer::NegativeQuestionMismatch(_, _)
@@ -2407,7 +2568,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::QuestionlessNxDomain
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => {}
-        TestAnswer::Sectioned(sections) => {
+        TestAnswer::Sectioned(sections) | TestAnswer::NegativeSectioned(sections, _) => {
             for record in sections
                 .answer
                 .iter()

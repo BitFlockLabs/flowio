@@ -62,6 +62,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- TLS ciphertext draining now treats `transport_write_buffer_size` as a hard
+  per-chunk FlowIO bound. One fixed-capacity scalar/vectored adapter preserves
+  ciphertext order, never grows the wrapper scratch during ordinary writes,
+  and fully submits each owned chunk before collecting the next.
+  `rustls_buffer_limit: None` remains an independent rustls-internal buffering
+  choice.
 - FlowIO-configured SCTP sockets now keep the partial-delivery event subscribed
   whenever receive metadata is enabled. Abort events identifiable as forced
   only for this invariant are consumed internally to resynchronize metadata
@@ -91,6 +97,15 @@ Alpha prereleases carry no compatibility guarantee.
   negative responses fail over instead of terminating the logical lookup;
   questionless failover-class responses and questionless-NXDOMAIN draining
   retain their existing behavior.
+- DNS responses now validate every declared record before applying NXDOMAIN or
+  another response code. All sections and classes require sound record framing,
+  exact A/AAAA data lengths, and fully consumed CNAME names; only Answer+IN
+  records remain eligible to supply resolution data.
+- DNS response names now require valid UTF-8 in every literal label, including
+  compressed suffixes. The shared allocation-free candidate/validation walker
+  rejects invalid labels before echoed-question comparison, response-code
+  handling, or CNAME follow-up; valid non-ASCII text remains supported with
+  ASCII-only case folding.
 - DNS lookup now rejects normalized query names over 253 presentation bytes,
   encoded names over 255 bytes, and labels over 63 bytes with `InvalidInput`
   before allocating or sending a query packet. CNAME RDATA must consume its

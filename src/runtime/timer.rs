@@ -177,6 +177,19 @@ struct TimerWheel {
     cascade_count: u8,
     /// Next cascade-array entry to resume.
     cascade_pos: u8,
+    /// Tick whose upper-level cascades were most recently selected.
+    ///
+    /// Kept after cascade work completes so another executor pass on the same
+    /// tick cannot recapture deferred outer entries.
+    cascade_started_tick: u64,
+    /// True once `cascade_started_tick` contains a selected wheel tick.
+    cascade_started_tick_valid: bool,
+    /// Last original link in the active level-3 bucket cascade.
+    ///
+    /// Entries reinserted or appended after this link remain for a later outer
+    /// rotation. Cancellation adjusts this non-owning pointer before unlinking
+    /// and freeing its node.
+    outer_cascade_tail: *mut Link,
     /// Near-future wheel buckets covering the lowest tick bits directly.
     lvl0: [DList<TimerEntry>; LVL0_SLOTS],
     /// Next coarser bucket level.
@@ -201,6 +214,9 @@ impl TimerWheel {
             cascade_indices: [0; 3],
             cascade_count: 0,
             cascade_pos: 0,
+            cascade_started_tick: 0,
+            cascade_started_tick_valid: false,
+            outer_cascade_tail: std::ptr::null_mut(),
             lvl0: array::from_fn(|_| DList::new_uninit()),
             lvl1: array::from_fn(|_| DList::new_uninit()),
             lvl2: array::from_fn(|_| DList::new_uninit()),
@@ -210,6 +226,7 @@ impl TimerWheel {
 
     fn init(&mut self) -> io::Result<()> {
         self.current_tick = now_tick()?;
+        self.cascade_started_tick_valid = false;
         self.next_deadline_tick = None;
         for bucket in &mut self.lvl0 {
             bucket.init();
@@ -227,6 +244,10 @@ impl TimerWheel {
     }
 
     fn unlink_all_for_drop(&mut self) {
+        // Clear the non-owning cascade boundary before any payload link can
+        // become invalid during teardown.
+        self.outer_cascade_tail = std::ptr::null_mut();
+
         for bucket in &mut self.lvl0 {
             bucket.unlink_all_for_drop();
         }
@@ -248,6 +269,8 @@ impl TimerWheel {
         self.lvl3_bits = 0;
         self.cascade_count = 0;
         self.cascade_pos = 0;
+        self.cascade_started_tick = 0;
+        self.cascade_started_tick_valid = false;
     }
 
     fn insert(&mut self, entry: *mut TimerEntry) {
@@ -304,6 +327,7 @@ impl TimerWheel {
         let index = unsafe { (*entry).bucket_index as usize };
         unsafe {
             let link = std::ptr::addr_of_mut!((*entry).link);
+            self.adjust_outer_cascade_tail_before_remove(level, index, link);
             match level {
                 0 => self.lvl0[index].remove(link),
                 1 => self.lvl1[index].remove(link),
@@ -315,6 +339,39 @@ impl TimerWheel {
             (*entry).bucket_level = INVALID_BUCKET_LEVEL;
             (*entry).bucket_index = 0;
         }
+    }
+
+    /// Moves the active outer-cascade stop before its node is unlinked.
+    ///
+    /// Original nodes remain before the captured tail. Entries already
+    /// processed or appended after cascade start are behind it, so removing a
+    /// front tail means no original work remains for this cascade.
+    fn adjust_outer_cascade_tail_before_remove(
+        &mut self,
+        level: u8,
+        index: usize,
+        link: *mut Link,
+    ) {
+        if level != 3 || self.outer_cascade_tail != link {
+            return;
+        }
+
+        let outer_pending = (self.cascade_pos as usize..self.cascade_count as usize)
+            .any(|pos| self.cascade_levels[pos] == 3 && self.cascade_indices[pos] == index);
+        debug_assert!(
+            outer_pending,
+            "outer cascade tail exists without a matching pending bucket"
+        );
+        if !outer_pending {
+            self.outer_cascade_tail = std::ptr::null_mut();
+            return;
+        }
+
+        self.outer_cascade_tail = unsafe {
+            self.lvl3[index]
+                .previous_link(link)
+                .unwrap_or(std::ptr::null_mut())
+        };
     }
 
     #[inline(always)]
@@ -522,12 +579,17 @@ impl TimerWheel {
     }
 
     fn begin_tick_cascade(&mut self) {
-        if self.has_pending_cascade() {
+        if self.has_pending_cascade()
+            || (self.cascade_started_tick_valid && self.cascade_started_tick == self.current_tick)
+        {
             return;
         }
 
+        self.cascade_started_tick = self.current_tick;
+        self.cascade_started_tick_valid = true;
         self.cascade_count = 0;
         self.cascade_pos = 0;
+        self.outer_cascade_tail = std::ptr::null_mut();
 
         if (self.current_tick & ((LVL0_SLOTS as u64) - 1)) == 0 {
             let idx1 = ((self.current_tick >> 8) & ((LVLN_SLOTS as u64) - 1)) as usize;
@@ -546,6 +608,8 @@ impl TimerWheel {
                     self.cascade_levels[self.cascade_count as usize] = 3;
                     self.cascade_indices[self.cascade_count as usize] = idx3;
                     self.cascade_count += 1;
+                    self.outer_cascade_tail =
+                        self.lvl3[idx3].back_link().unwrap_or(std::ptr::null_mut());
                 }
             }
         }
@@ -558,6 +622,10 @@ impl TimerWheel {
             let pos = self.cascade_pos as usize;
             let level = self.cascade_levels[pos];
             let index = self.cascade_indices[pos];
+            if level == 3 && self.outer_cascade_tail.is_null() {
+                self.cascade_pos += 1;
+                continue;
+            }
             let entry_ptr = unsafe {
                 match level {
                     1 => self.lvl1[index].pop_front(TimerEntry::LINK_OFFSET),
@@ -566,15 +634,24 @@ impl TimerWheel {
                 }
             };
             let Some(entry_ptr) = entry_ptr else {
+                if level == 3 {
+                    self.outer_cascade_tail = std::ptr::null_mut();
+                }
                 self.cascade_pos += 1;
                 continue;
             };
+            let entry_link = unsafe { std::ptr::addr_of_mut!((*entry_ptr).link) };
+            let reached_outer_tail = level == 3 && entry_link == self.outer_cascade_tail;
             self.clear_bucket_if_empty(level, index);
             unsafe {
                 (*entry_ptr).bucket_level = INVALID_BUCKET_LEVEL;
                 (*entry_ptr).bucket_index = 0;
             }
             self.insert(entry_ptr);
+            if reached_outer_tail {
+                self.outer_cascade_tail = std::ptr::null_mut();
+                self.cascade_pos += 1;
+            }
             consumed += 1;
         }
 
@@ -582,11 +659,14 @@ impl TimerWheel {
             let pos = self.cascade_pos as usize;
             let level = self.cascade_levels[pos];
             let index = self.cascade_indices[pos];
-            let has_more = unsafe {
-                match level {
-                    1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET).is_some(),
-                    2 => self.lvl2[index].front(TimerEntry::LINK_OFFSET).is_some(),
-                    _ => self.lvl3[index].front(TimerEntry::LINK_OFFSET).is_some(),
+            let has_more = if level == 3 {
+                !self.outer_cascade_tail.is_null()
+            } else {
+                unsafe {
+                    match level {
+                        1 => self.lvl1[index].front(TimerEntry::LINK_OFFSET).is_some(),
+                        _ => self.lvl2[index].front(TimerEntry::LINK_OFFSET).is_some(),
+                    }
                 }
             };
             if has_more {
@@ -598,6 +678,7 @@ impl TimerWheel {
         if !self.has_pending_cascade() {
             self.cascade_count = 0;
             self.cascade_pos = 0;
+            self.outer_cascade_tail = std::ptr::null_mut();
         }
 
         consumed
@@ -924,6 +1005,10 @@ impl TimerRuntime {
     }
 
     fn free_wheel_entries_for_drop(&mut self) {
+        // The boundary does not own the entry. Clear it before draining and
+        // returning any linked entry to the pool.
+        self.wheel.outer_cascade_tail = std::ptr::null_mut();
+
         let timer_pool = &mut *self.timer_pool;
         for index in 0..LVL0_SLOTS {
             if (self.wheel.lvl0_bits[index / 64] & (1u64 << (index % 64))) != 0 {
@@ -948,6 +1033,10 @@ impl TimerRuntime {
     }
 
     pub(crate) fn cancel_all_for_shutdown(&mut self) {
+        // Shutdown invalidates every bucket link, so retire the non-owning
+        // boundary before the first drain.
+        self.wheel.outer_cascade_tail = std::ptr::null_mut();
+
         for bucket in &mut self.wheel.lvl0 {
             cancel_timer_bucket_entries(bucket);
         }
@@ -1727,6 +1816,289 @@ mod tests {
         assert_eq!(entry.bucket_level, 0);
         assert_eq!(entry.bucket_index, 0);
         assert!(unsafe { wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some() });
+
+        wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_outer_cascade_stops_after_captured_tail() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let mut reinserted = timer_entry_at(u64::MAX);
+        let mut captured_tail = timer_entry_at(u64::MAX);
+        let mut appended = timer_entry_at(u64::MAX);
+        let reinserted_ptr = &mut reinserted as *mut TimerEntry;
+        let captured_tail_ptr = &mut captured_tail as *mut TimerEntry;
+        let appended_ptr = &mut appended as *mut TimerEntry;
+        let boundary_tick = 63u64 << 20;
+
+        wheel.insert(reinserted_ptr);
+        wheel.insert(captured_tail_ptr);
+
+        wheel.current_tick = boundary_tick;
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.cascade_count, 3);
+        assert_eq!(wheel.cascade_levels[2], 3);
+        assert_eq!(wheel.cascade_indices[2], 63);
+
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(wheel.has_pending_cascade());
+        wheel.insert(appended_ptr);
+        assert_eq!(wheel.process_cascade_with_budget(8), 1);
+        assert!(
+            !wheel.has_pending_cascade(),
+            "entries added beyond the captured tail were processed again"
+        );
+        assert_eq!(wheel.process_cascade_with_budget(1), 0);
+        for entry in [&reinserted, &captured_tail, &appended] {
+            assert_eq!(entry.deadline_tick, u64::MAX);
+            assert_eq!(entry.bucket_level, 3);
+            assert_eq!(entry.bucket_index, 63);
+            assert!(entry.state == TimerState::Armed);
+        }
+        assert_eq!(
+            unsafe { wheel.lvl3[63].front(TimerEntry::LINK_OFFSET) },
+            Some(reinserted_ptr)
+        );
+        assert_eq!(
+            wheel.lvl3[63].back_link(),
+            Some(std::ptr::addr_of_mut!(captured_tail.link))
+        );
+        assert_eq!(reinserted.link.next, std::ptr::addr_of_mut!(appended.link));
+        assert_eq!(
+            appended.link.next,
+            std::ptr::addr_of_mut!(captured_tail.link)
+        );
+
+        wheel.remove(reinserted_ptr);
+        wheel.remove(captured_tail_ptr);
+        wheel.remove(appended_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_outer_cascade_is_not_recaptured_before_tick_advances() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let boundary_tick = 63u64 << 20;
+        let mut due = timer_entry_at(boundary_tick);
+        let mut multi_rotation = timer_entry_at(u64::MAX);
+        let due_ptr = &mut due as *mut TimerEntry;
+        let multi_rotation_ptr = &mut multi_rotation as *mut TimerEntry;
+
+        wheel.insert(due_ptr);
+        wheel.insert(multi_rotation_ptr);
+        assert_eq!(due.bucket_level, 3);
+        assert_eq!(due.bucket_index, 63);
+        assert_eq!(multi_rotation.bucket_level, 3);
+        assert_eq!(multi_rotation.bucket_index, 63);
+
+        wheel.current_tick = boundary_tick;
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(2), 2);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(due.bucket_level, 0);
+        assert_eq!(due.bucket_index, 0);
+        assert_eq!(multi_rotation.bucket_level, 3);
+        assert_eq!(multi_rotation.bucket_index, 63);
+
+        // Model the next executor pass after the cascade consumed the entire
+        // phase budget: the due level-0 entry keeps the wheel on this tick.
+        wheel.begin_tick_cascade();
+        assert!(
+            !wheel.has_pending_cascade(),
+            "deferred outer entries were recaptured on the same tick"
+        );
+        assert_eq!(multi_rotation.bucket_level, 3);
+        assert_eq!(multi_rotation.bucket_index, 63);
+
+        wheel.current_tick = 127u64 << 20;
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(multi_rotation.bucket_level, 3);
+        assert_eq!(multi_rotation.bucket_index, 63);
+
+        wheel.remove(due_ptr);
+        wheel.remove(multi_rotation_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_outer_cascade_history_does_not_suppress_future_bucket() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let mut due = timer_entry_at(0);
+        let mut multi_rotation = timer_entry_at(1u64 << 26);
+        let mut future = timer_entry_at(1u64 << 8);
+        let due_ptr = &mut due as *mut TimerEntry;
+        let multi_rotation_ptr = &mut multi_rotation as *mut TimerEntry;
+        let future_ptr = &mut future as *mut TimerEntry;
+
+        wheel.insert(due_ptr);
+        wheel.insert(multi_rotation_ptr);
+        wheel.insert(future_ptr);
+        assert_eq!(due.bucket_level, 0);
+        assert_eq!(multi_rotation.bucket_level, 3);
+        assert_eq!(multi_rotation.bucket_index, 0);
+        assert_eq!(future.bucket_level, 1);
+        assert_eq!(future.bucket_index, 1);
+
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(wheel.cascade_started_tick, 0);
+        assert!(wheel.cascade_started_tick_valid);
+
+        // Model cancellation between budgeted passes: only a future upper
+        // bucket remains, just beyond this pass's target.
+        wheel.remove(due_ptr);
+        wheel.remove(multi_rotation_ptr);
+        assert!(wheel.skip_empty_ticks_until_next_work(255));
+        assert_eq!(wheel.current_tick, 256);
+
+        wheel.begin_tick_cascade();
+        assert!(wheel.has_pending_cascade());
+        assert_eq!(wheel.cascade_levels[0], 1);
+        assert_eq!(wheel.cascade_indices[0], 1);
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert_eq!(future.bucket_level, 0);
+        assert_eq!(future.bucket_index, 0);
+
+        wheel.remove(future_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_outer_cascade_cancelled_tail_moves_boundary_backward() {
+        let task = TaskHeader::new();
+        let task_ptr = &task as *const TaskHeader as *mut TaskHeader;
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        runtime.wheel.current_tick = 0;
+        let reinserted_ptr = runtime
+            .submit_sleep_at_tick(task_ptr, u64::MAX)
+            .expect("first outer timer arm failed");
+        let preceding_ptr = runtime
+            .submit_sleep_at_tick(task_ptr, u64::MAX)
+            .expect("second outer timer arm failed");
+        let captured_tail_ptr = runtime
+            .submit_sleep_at_tick(task_ptr, u64::MAX)
+            .expect("captured-tail timer arm failed");
+        assert_eq!(task.refs.get(), 4);
+
+        runtime.wheel.current_tick = 63u64 << 20;
+        runtime.wheel.begin_tick_cascade();
+        assert_eq!(runtime.wheel.process_cascade_with_budget(1), 1);
+        assert_eq!(task.refs.get(), 4);
+
+        runtime
+            .cancel_sleep(captured_tail_ptr)
+            .expect("captured-tail cancellation failed");
+        assert_eq!(task.refs.get(), 3);
+        let replacement_ptr = runtime
+            .submit_sleep_at_tick(task_ptr, u64::MAX)
+            .expect("replacement outer timer arm failed");
+        assert_eq!(
+            replacement_ptr, captured_tail_ptr,
+            "timer pool did not immediately reuse the cancelled boundary slot"
+        );
+        assert_eq!(task.refs.get(), 4);
+
+        assert_eq!(runtime.wheel.process_cascade_with_budget(8), 1);
+        assert!(
+            !runtime.wheel.has_pending_cascade(),
+            "cancelled tail left the preceding original entry unbounded"
+        );
+        for entry_ptr in [reinserted_ptr, preceding_ptr, replacement_ptr] {
+            assert_eq!(unsafe { (*entry_ptr).bucket_level }, 3);
+            assert_eq!(unsafe { (*entry_ptr).bucket_index }, 63);
+            assert!(unsafe { (*entry_ptr).state } == TimerState::Armed);
+        }
+        assert_eq!(task.refs.get(), 4);
+
+        runtime
+            .cancel_sleep(reinserted_ptr)
+            .expect("reinserted timer cancellation failed");
+        runtime
+            .cancel_sleep(preceding_ptr)
+            .expect("preceding timer cancellation failed");
+        runtime
+            .cancel_sleep(replacement_ptr)
+            .expect("replacement timer cancellation failed");
+        assert_eq!(task.refs.get(), 1);
+        assert!(!runtime.wheel.has_pending_entries());
+    }
+
+    #[test]
+    fn timer_wheel_outer_cascade_cancelled_front_tail_clears_boundary() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let mut reinserted = timer_entry_at(u64::MAX);
+        let mut captured_tail = timer_entry_at(u64::MAX);
+        let reinserted_ptr = &mut reinserted as *mut TimerEntry;
+        let captured_tail_ptr = &mut captured_tail as *mut TimerEntry;
+
+        wheel.insert(reinserted_ptr);
+        wheel.insert(captured_tail_ptr);
+        wheel.current_tick = 63u64 << 20;
+        wheel.begin_tick_cascade();
+
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(wheel.has_pending_cascade());
+        assert_eq!(
+            unsafe { wheel.lvl3[63].front(TimerEntry::LINK_OFFSET) },
+            Some(captured_tail_ptr)
+        );
+
+        wheel.remove(captured_tail_ptr);
+        assert_eq!(
+            wheel.process_cascade_with_budget(1),
+            0,
+            "entry appended beyond the cancelled boundary was reprocessed"
+        );
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(reinserted.bucket_level, 3);
+        assert_eq!(reinserted.bucket_index, 63);
+
+        wheel.remove(reinserted_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_outer_cascade_preserves_saturating_deadline_rotations() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let mut entry = timer_entry_at(u64::MAX);
+        let entry_ptr = &mut entry as *mut TimerEntry;
+
+        wheel.insert(entry_ptr);
+        for boundary_tick in [63u64 << 20, 127u64 << 20] {
+            wheel.current_tick = boundary_tick;
+            wheel.begin_tick_cascade();
+            assert_eq!(wheel.process_cascade_with_budget(1), 1);
+            assert!(!wheel.has_pending_cascade());
+            assert_eq!(entry.deadline_tick, u64::MAX);
+            assert_eq!(entry.bucket_level, 3);
+            assert_eq!(entry.bucket_index, 63);
+            assert!(entry.state == TimerState::Armed);
+        }
+
+        wheel.current_tick = !((1u64 << 20) - 1);
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert_eq!(entry.bucket_level, 2);
+        assert_eq!(entry.bucket_index, 63);
+
+        wheel.current_tick = !((1u64 << 14) - 1);
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert_eq!(entry.bucket_level, 1);
+        assert_eq!(entry.bucket_index, 63);
+
+        wheel.current_tick = !((1u64 << 8) - 1);
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert_eq!(entry.deadline_tick, u64::MAX);
+        assert_eq!(entry.bucket_level, 0);
+        assert_eq!(entry.bucket_index, 255);
+        assert!(entry.state == TimerState::Armed);
 
         wheel.remove(entry_ptr);
     }
