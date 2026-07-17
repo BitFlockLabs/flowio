@@ -198,8 +198,9 @@
 
 use super::{
     MsgHdrInit, checked_read_len, checked_send_len, close_fd, close_if_valid,
-    complete_read_with_progress, current_local_addr, get_sock_opt, invalid_input, set_reuse_addr,
-    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
+    complete_read_with_progress, connect_cqe_result, current_local_addr, get_sock_opt,
+    invalid_input, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
+    socket_domain, write_msghdr,
 };
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::bytes::{
@@ -4650,8 +4651,7 @@ impl Future for ConnectFuture<'_> {
                     this.slot.cleanup_fd();
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
                 }
-                if result < 0 {
-                    let err = io::Error::from_raw_os_error(-result);
+                if let Err(err) = connect_cqe_result(result) {
                     this.slot.cleanup_fd();
                     return Poll::Ready(Err(err));
                 }

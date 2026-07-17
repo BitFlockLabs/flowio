@@ -430,6 +430,18 @@ pub(crate) fn checked_send_len(requested: usize) -> io::Result<u32> {
     Ok(requested as u32)
 }
 
+/// Interpret a connect CQE result code. `io_uring` may re-issue an async
+/// `connect(2)` once the socket is writable; if the connection already
+/// completed, that retry returns `EISCONN`, which means the connection is
+/// established, not an error. A real connect failure returns its own errno
+/// (e.g. `ECONNREFUSED`), never `EISCONN`.
+fn connect_cqe_result(result: i32) -> io::Result<()> {
+    if result >= 0 || result == -libc::EISCONN {
+        return Ok(());
+    }
+    Err(io::Error::from_raw_os_error(-result))
+}
+
 fn socket_domain(addr: SocketAddr) -> libc::c_int {
     match addr {
         SocketAddr::V4(_) => libc::AF_INET,
@@ -741,6 +753,16 @@ mod tests {
         let err = socket_buffer_size_to_c_int(libc::c_int::MAX as usize + 1)
             .expect_err("oversize socket buffer should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn connect_cqe_result_treats_eisconn_as_established() {
+        connect_cqe_result(0).expect("zero connect CQE should succeed");
+        connect_cqe_result(-libc::EISCONN).expect("EISCONN connect CQE should mean established");
+
+        let err = connect_cqe_result(-libc::ECONNREFUSED)
+            .expect_err("real connect failure should retain its errno");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
     }
 
     #[test]

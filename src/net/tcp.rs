@@ -181,9 +181,9 @@
 
 use super::stream;
 use super::{
-    WriteBufferChain, WritevProjection, close_fd, close_if_valid, current_local_addr,
-    current_peer_addr, get_sock_opt, new_nonblocking_socket, set_reuse_addr, set_reuse_port,
-    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    WriteBufferChain, WritevProjection, close_fd, close_if_valid, connect_cqe_result,
+    current_local_addr, current_peer_addr, get_sock_opt, new_nonblocking_socket, set_reuse_addr,
+    set_reuse_port, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
@@ -428,8 +428,7 @@ impl ConnectSlot {
                     self.cleanup_fd();
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
                 }
-                if result < 0 {
-                    let err = io::Error::from_raw_os_error(-result);
+                if let Err(err) = connect_cqe_result(result) {
                     self.cleanup_fd();
                     return Poll::Ready(Err(err));
                 }
@@ -1203,8 +1202,7 @@ impl Future for OwnedConnectFuture {
                     this.cleanup_fd();
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
                 }
-                if result < 0 {
-                    let err = io::Error::from_raw_os_error(-result);
+                if let Err(err) = connect_cqe_result(result) {
                     this.cleanup_fd();
                     return Poll::Ready(Err(err));
                 }
