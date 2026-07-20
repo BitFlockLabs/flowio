@@ -183,11 +183,35 @@ has no cross-thread task-waker relay. Use an application-owned channel or
 reactor-layer signaling for cross-thread work, then create or wake FlowIO tasks
 on the owner thread.
 
+Each executor has one bounded worker for terminal socket closes. Dropping a
+fresh, never publicly exposed TCP, Unix, UDP, or SCTP socket skips terminal
+option lookup. External adoption, public raw-fd exposure, descriptor aliases,
+and accepted sockets from an exposed listener instead query `SO_LINGER` once.
+Known or proven nonpositive sockets normally use a batched plain reactor close;
+FlowIO retains the exact descriptor owner in a bounded sequence ledger until
+the kernel reports that close's submission prefix consumed. A final TCP/SCTP
+listener owner released while reclaiming an accept-readiness CQE instead uses a
+no-ring route so it cannot re-enter the borrowed completion queue: proven
+nonpositive linger closes directly, while positive or unclassifiable linger
+still uses bounded worker admission. The worker channel is capped at the
+configured `ring_entries`, and the worker may hold one additional descriptor.
+Admission never waits. If worker admission is full or disconnected, FlowIO
+disables linger best-effort and closes the same owner directly; a failed waiver
+is counted and leaves a residual risk that the direct close honors the original
+positive linger. Executor shutdown destroys the ring before releasing
+unsubmitted close owners, then drains and joins the worker. An admitted
+positive-linger close can delay shutdown. Drop outside an executor remains
+direct without the query.
+
 `timeout` and `timeout_at` return `TimeoutError::Elapsed` only when the
 deadline wins. Timer allocation or runtime failures are returned as
 `TimeoutError::Runtime(error)` with the original `io::ErrorKind`. TCP and SCTP
 `connect_timeout` helpers translate only true expiry to `TimedOut` and preserve
-runtime failures such as `OutOfMemory`.
+runtime failures such as `OutOfMemory`. Timeout wrappers validate the active
+and origin executor before polling the wrapped future; an inactive or foreign
+poll returns `Runtime(NotConnected)` without reaching it. After successful
+validation, the wrapped future remains first in the race and an immediately
+ready result allocates no timer entry.
 
 ### Warming a buffer pool
 
@@ -301,14 +325,17 @@ SCTP send or receive paths.
 Keep DNS resolution in setup or control paths when the protocol permits.
 Resolve names once, retain the resulting addresses, and put timer deadlines
 around protocol phases rather than every individual message to reduce timer
-bookkeeping. The resolver validates every declared response record before
-using NXDOMAIN or another response code; malformed records in ignored
-sections/classes or malformed known A/AAAA/CNAME RDATA therefore trigger normal
-nameserver failover rather than being accepted as a negative answer. Response
-name labels must be valid UTF-8, including labels reached through compression;
-invalid labels are rejected before echoed-question matching, response-code
-handling, or CNAME follow-up. Valid non-ASCII text is retained, with DNS name
-comparison folding ASCII case only.
+bookkeeping. Matching-ID responses must be marked as responses and retain the
+QUERY opcode; other opcodes are drained before question or record handling.
+The resolver validates every declared response record before using NXDOMAIN or
+another response code; malformed records in ignored sections/classes or
+malformed known A/AAAA/CNAME RDATA therefore trigger normal nameserver failover
+rather than being accepted as a negative answer. Response name labels must be
+valid UTF-8 and contain no literal `.`, including labels reached through
+compression; dots are inserted only between wire labels in the decoded
+presentation. Invalid labels are rejected before echoed-question matching,
+response-code handling, or CNAME follow-up. Valid non-ASCII text is retained,
+with DNS name comparison folding ASCII case only.
 
 ## Configuration
 

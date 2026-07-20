@@ -62,6 +62,24 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- DNS response parsing now rejects non-QUERY opcodes before question,
+  response-code, or resource-record handling. Candidate filtering remains
+  allocation-free, while valid QUERY response behavior is unchanged.
+- DNS response parsing now rejects a literal `.` inside any direct or
+  compressed wire label before question comparison, response-code handling,
+  CNAME selection, or follow-up, so distinct label boundaries cannot collapse
+  to the same dotted presentation.
+- Timeout wrappers now validate their active and origin executor before polling
+  the wrapped future. Inactive or foreign polls return
+  `TimeoutError::Runtime(NotConnected)` without triggering wrapped-future side
+  effects, while valid immediately ready futures remain inner-first and arm no
+  timer.
+- TCP and SCTP accept cancellation now retires only the readiness wait and
+  leaves queued peers in the listener backlog. Listener ownership remains
+  valid through cancellation and shutdown, while terminal sockets with
+  positive or unclassifiable linger attempt bounded off-thread close admission.
+  Full or disconnected admission disables linger best-effort before direct
+  close; a failed waiver retains the original positive-linger blocking risk.
 - TLS ciphertext draining now treats `transport_write_buffer_size` as a hard
   per-chunk FlowIO bound. One fixed-capacity scalar/vectored adapter preserves
   ciphertext order, never grows the wrapper scratch during ordinary writes,

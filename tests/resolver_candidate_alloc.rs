@@ -22,16 +22,30 @@ const UNSUPPORTED_LABEL: &[u8] = &[
 const INVALID_UTF8_LABEL: &[u8] = &[
     0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 1, 0, 1,
 ];
+const LITERAL_DOT_LABEL: &[u8] = &[
+    0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+    b'.', b'c', b'o', b'm', 0, 0, 1, 0, 1,
+];
+const COMPRESSED_LITERAL_DOT_LABEL: &[u8] = &[
+    0x12, 0x34, 0x81, 0x80, 0, 1, 3, b'a', b'.', b'b', 0, 0, 0xc0, 6, 0, 1, 0, 1,
+];
+const NON_QUERY_OPCODE: &[u8] = &[
+    0x12, 0x34, 0x89, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3,
+    b'c', b'o', b'm', 0, 0, 1, 0, 1,
+];
 
 #[test]
 fn malformed_dns_candidates_are_allocation_free() {
     const ROUNDS: usize = 16_384;
-    const MALFORMED: [&[u8]; 5] = [
+    const MALFORMED: [&[u8]; 8] = [
         TRUNCATED_POINTER,
         FORWARD_POINTER,
         BACKWARD_POINTER_LOOP,
         UNSUPPORTED_LABEL,
         INVALID_UTF8_LABEL,
+        LITERAL_DOT_LABEL,
+        COMPRESSED_LITERAL_DOT_LABEL,
+        NON_QUERY_OPCODE,
     ];
 
     for packet in MALFORMED {

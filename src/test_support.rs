@@ -52,7 +52,9 @@ pub mod runtime {
     pub mod test_hooks {
         pub use crate::runtime::test_hooks::{
             fail_next_op_alloc, fail_next_ring_submit_errno, fail_next_ring_wait_errno,
-            fail_next_sqe_submit, fail_next_timer_alloc, ring_wait_failures_remaining,
+            fail_next_sqe_submit, fail_next_timer_alloc, force_next_reactor_shutdown_fallback,
+            reactor_shutdown_fallbacks_remaining, ring_submit_failures_remaining,
+            ring_wait_failures_remaining,
         };
     }
 
@@ -75,13 +77,13 @@ pub mod net {
     }
 
     pub mod tcp {
-        pub use crate::net::tcp::test_support::test_accept_slot_drop_cached_state_closes_completed_fd;
+        pub use crate::net::tcp::test_support::test_accept_slot_drop_cached_state_preserves_unrelated_fd;
     }
 
     pub mod sctp {
         pub use crate::net::sctp::test_support::{
-            capability_unavailable, test_accept_slot_drop_cached_state_closes_completed_fd,
-            test_accept_slot_drop_future_closes_completed_fd, test_adaptation_indication_type,
+            capability_unavailable, test_accept_slot_drop_cached_state_preserves_unrelated_fd,
+            test_accept_slot_drop_future_preserves_unrelated_fd, test_adaptation_indication_type,
             test_assoc_change_type, test_assoc_reset_event_type,
             test_connect_slot_drop_future_closes_socket_fd, test_parse_notification,
             test_parse_recv_meta, test_partial_delivery_event_type, test_peer_addr_change_type,

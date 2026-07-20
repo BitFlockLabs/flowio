@@ -181,17 +181,19 @@
 
 use super::stream;
 use super::{
-    WriteBufferChain, WritevProjection, close_fd, close_if_valid, connect_cqe_result,
-    current_local_addr, current_peer_addr, get_sock_opt, new_nonblocking_socket, set_reuse_addr,
-    set_reuse_port, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    WriteBufferChain, WritevProjection, accept_nonblocking, accept_readiness_sqe, close_fd,
+    close_if_valid, connect_cqe_result, current_local_addr, current_peer_addr, get_sock_opt,
+    new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
+    socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
-    refresh_op_waiter_from_waker, submit_retained_sqe, validate_local_io_result,
+    completed_op_ctx_from_waker, drop_op_ptr_unchecked, note_accept_readiness_rearm,
+    poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_retained_sqe,
+    validate_local_io_result,
 };
-use crate::runtime::fd::RuntimeFd;
+use crate::runtime::fd::{LingerProvenance, RetainedListenerFd, RuntimeFd};
 use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Timeout, TimeoutError, timeout};
 use io_uring::{opcode, types};
@@ -200,6 +202,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -207,17 +210,38 @@ use std::time::Duration;
 // AcceptSlot / ConnectSlot
 // ---------------------------------------------------------------------------
 
+fn finish_accepted_stream_with_provenance(
+    accepted_fd: OwnedFd,
+    provenance: LingerProvenance,
+    addr: &libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let stream = TcpStream {
+        fd: RuntimeFd::from_owned_with_provenance(accepted_fd, provenance),
+    };
+    let remote_addr = socket_addr_from_c(addr, addrlen)?;
+    Ok((stream, remote_addr))
+}
+
+#[cfg(test)]
 fn finish_accepted_stream(
     accepted_fd: OwnedFd,
     addr: &libc::sockaddr_storage,
     addrlen: libc::socklen_t,
 ) -> io::Result<(TcpStream, SocketAddr)> {
-    let remote_addr = socket_addr_from_c(addr, addrlen)?;
-    Ok((TcpStream::from_owned_fd(accepted_fd), remote_addr))
+    finish_accepted_stream_with_provenance(
+        accepted_fd,
+        LingerProvenance::KnownNonPositive,
+        addr,
+        addrlen,
+    )
 }
 
 /// Reusable accept-side submission state kept by [`TcpListener`].
 struct AcceptSlot {
+    /// Shared listener owner retained by every readiness submission until its
+    /// CQE or cancellation retires.
+    listener_fd: Arc<RuntimeFd>,
     /// Completion state for the current or last accept submission.
     state_ptr: *mut CompletionState,
     /// True while an [`AcceptFuture`] is borrowing this slot.
@@ -225,8 +249,9 @@ struct AcceptSlot {
 }
 
 impl AcceptSlot {
-    fn new() -> Self {
+    fn new(listener_fd: Arc<RuntimeFd>) -> Self {
         Self {
+            listener_fd,
             state_ptr: std::ptr::null_mut(),
             in_use: false,
         }
@@ -240,12 +265,14 @@ impl AcceptSlot {
         Ok(())
     }
 
+    #[inline(always)]
+    fn inherited_accept_provenance(&self) -> LingerProvenance {
+        self.listener_fd.linger_provenance()
+    }
+
     fn drop_future(&mut self) {
         if !self.state_ptr.is_null() {
             unsafe {
-                if (*self.state_ptr).is_completed() && (*self.state_ptr).result >= 0 {
-                    close_fd((*self.state_ptr).result as RawFd);
-                }
                 drop_op_ptr_unchecked(&mut self.state_ptr);
             }
         }
@@ -256,47 +283,57 @@ impl AcceptSlot {
     fn drop_cached_state(&mut self) {
         // Normal safe use drops AcceptFuture before TcpListener. This also
         // handles safe `mem::forget(AcceptFuture)` teardown, where the slot can
-        // still hold an in-flight or completed accept state when the listener
-        // is finally dropped. A completed accepted fd is owned by this slot and
-        // must be closed before the cached state is released.
+        // still hold an in-flight or completed readiness state when the
+        // listener is finally dropped. A readiness CQE never owns an accepted
+        // descriptor.
         self.drop_future();
     }
 
-    fn poll_accept(
-        &mut self,
-        fd: RawFd,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
         if !self.state_ptr.is_null() {
             let state = unsafe { &*self.state_ptr };
             if state.is_completed() {
                 let result = state.result;
                 let op_ctx = unsafe { completed_op_ctx_from_waker(cx, self.state_ptr) };
-                let payload = unsafe {
-                    (*op_ctx.reactor()).take_retained_payload::<RetainedAcceptAddr>(self.state_ptr)
+                let poll_fd = unsafe {
+                    (*op_ctx.reactor()).take_retained_payload::<RetainedListenerFd>(self.state_ptr)
                 };
                 unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
-                self.in_use = false;
 
                 if op_ctx.context_rejected() {
-                    if result >= 0 {
-                        close_fd(result as RawFd);
-                    }
+                    self.in_use = false;
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
                 }
                 if result < 0 {
+                    self.in_use = false;
                     return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
                 }
-                // SAFETY: a successful accept CQE transfers one new descriptor
-                // to this slot. No other owner exists, and all later error
-                // paths let `OwnedFd` close it exactly once.
-                let accepted_fd = unsafe { OwnedFd::from_raw_fd(result as RawFd) };
-                return Poll::Ready(finish_accepted_stream(
-                    accepted_fd,
-                    &payload.addr,
-                    payload.addrlen,
-                ));
+
+                let accepted_linger_provenance = self.inherited_accept_provenance();
+                match accept_nonblocking(
+                    poll_fd.raw_fd(),
+                    accepted_linger_provenance == LingerProvenance::Uncertain,
+                ) {
+                    Ok((accepted_fd, addr, addrlen)) => {
+                        self.in_use = false;
+                        return Poll::Ready(finish_accepted_stream_with_provenance(
+                            accepted_fd,
+                            accepted_linger_provenance,
+                            &addr,
+                            addrlen,
+                        ));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        // Readiness is only a hint and can be stale. Rearm the
+                        // one-shot poll without consuming slot ownership.
+                        note_accept_readiness_rearm();
+                    }
+                    Err(err) => {
+                        self.in_use = false;
+                        return Poll::Ready(Err(err));
+                    }
+                }
             }
         }
 
@@ -317,21 +354,11 @@ impl AcceptSlot {
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
-            let payload = RetainedAcceptAddr::new();
-
+            let poll_fd = RetainedListenerFd::new(&self.listener_fd);
             unsafe {
-                (*state_ptr).set_close_result_fd_on_orphan();
-                if let Err((e, _payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let sqe = opcode::Accept::new(
-                            types::Fd(fd),
-                            payload.addr_ptr_mut(),
-                            payload.addrlen_ptr_mut(),
-                        )
-                        .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-                        .build()
-                        .user_data(state_ptr as u64);
-                        Ok(sqe)
+                if let Err((e, _poll_fd)) =
+                    submit_retained_sqe(&pctx, state_ptr, poll_fd, |poll_fd| {
+                        Ok(accept_readiness_sqe(poll_fd.raw_fd(), state_ptr as u64))
                     })
                 {
                     (*pctx.reactor()).free_op(state_ptr);
@@ -396,7 +423,9 @@ impl ConnectSlot {
         // SAFETY: this connect slot owns the successfully created socket, and
         // clearing the sentinel above prevents later slot cleanup from closing
         // the transferred descriptor.
-        TcpStream::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
+        TcpStream {
+            fd: RuntimeFd::from_fresh_owned(unsafe { OwnedFd::from_raw_fd(fd) }),
+        }
     }
 
     fn drop_future(&mut self) {
@@ -493,30 +522,6 @@ impl ConnectSlot {
     }
 }
 
-struct RetainedAcceptAddr {
-    /// Kernel-written peer address storage for the accepted connection.
-    addr: libc::sockaddr_storage,
-    /// Address buffer length passed to and updated by `accept`.
-    addrlen: libc::socklen_t,
-}
-
-impl RetainedAcceptAddr {
-    fn new() -> Self {
-        Self {
-            addr: unsafe { std::mem::zeroed() },
-            addrlen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-        }
-    }
-
-    fn addr_ptr_mut(&mut self) -> *mut libc::sockaddr {
-        &mut self.addr as *mut libc::sockaddr_storage as *mut libc::sockaddr
-    }
-
-    fn addrlen_ptr_mut(&mut self) -> *mut libc::socklen_t {
-        &mut self.addrlen
-    }
-}
-
 #[derive(Clone, Copy)]
 struct RetainedConnectAddr {
     /// Prepared peer address retained until connect completion.
@@ -569,6 +574,12 @@ pub struct TcpStream {
     fd: RuntimeFd,
 }
 
+fn finish_split_clone(source: &RuntimeFd, duplicate: io::Result<OwnedFd>) -> io::Result<RuntimeFd> {
+    let duplicate = duplicate?;
+    source.mark_linger_uncertain();
+    Ok(RuntimeFd::from_external_owned(duplicate))
+}
+
 impl TcpStream {
     /// Safely takes ownership of an already-connected socket.
     ///
@@ -603,7 +614,9 @@ impl TcpStream {
     /// let _second = TcpStream::from_owned_fd(owned);
     /// ```
     pub fn from_owned_fd(fd: OwnedFd) -> Self {
-        Self { fd: fd.into() }
+        Self {
+            fd: RuntimeFd::from_external_owned(fd),
+        }
     }
 
     /// Takes ownership of a bare connected-socket descriptor.
@@ -634,7 +647,7 @@ impl TcpStream {
     /// This is socket status/control-plane lookup, not the per-message data
     /// fast path.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        current_local_addr(self.fd.as_raw_fd())
+        current_local_addr(self.fd.raw_fd())
     }
 
     /// Duplicates this connected stream descriptor for explicit read/write
@@ -647,13 +660,15 @@ impl TcpStream {
     /// closes only that descriptor; the underlying TCP stream remains open
     /// while another duplicated handle is alive.
     pub fn try_clone_for_split(&self) -> io::Result<Self> {
-        let fd = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned only by this
-        // call; no other owning wrapper has been constructed for it.
-        Ok(Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) }))
+        let fd = unsafe { libc::fcntl(self.fd.raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let duplicate = if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned only by
+            // this call; no other owning wrapper has been constructed for it.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        finish_split_clone(&self.fd, duplicate).map(|fd| Self { fd })
     }
 
     /// Returns the peer address of this socket.
@@ -661,7 +676,7 @@ impl TcpStream {
     /// This is socket status/control-plane lookup, not the per-message data
     /// fast path.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        current_peer_addr(self.fd.as_raw_fd())
+        current_peer_addr(self.fd.raw_fd())
     }
 
     /// Enables or disables `TCP_NODELAY` (Nagle's algorithm).
@@ -670,7 +685,7 @@ impl TcpStream {
     /// connection setup instead of toggling it per message.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         set_sock_opt(
-            self.fd.as_raw_fd(),
+            self.fd.raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_NODELAY,
             &(nodelay as libc::c_int),
@@ -683,7 +698,7 @@ impl TcpStream {
     /// fast path.
     pub fn nodelay(&self) -> io::Result<bool> {
         let val: libc::c_int =
-            get_sock_opt(self.fd.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY)?;
+            get_sock_opt(self.fd.raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY)?;
         Ok(val != 0)
     }
 
@@ -694,7 +709,7 @@ impl TcpStream {
     /// Apply it during connection setup instead of toggling it per message.
     pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
         set_sock_opt(
-            self.fd.as_raw_fd(),
+            self.fd.raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_KEEPALIVE,
             &(keepalive as libc::c_int),
@@ -706,7 +721,7 @@ impl TcpStream {
     /// This is socket configuration/control-plane work. Apply it during
     /// connection setup instead of changing it per write.
     pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
-        super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
+        super::set_sock_send_buffer_size(self.fd.raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
@@ -714,7 +729,7 @@ impl TcpStream {
     /// This is socket status/control-plane lookup, not the per-message data
     /// fast path.
     pub fn send_buffer_size(&self) -> io::Result<usize> {
-        super::sock_send_buffer_size(self.fd.as_raw_fd())
+        super::sock_send_buffer_size(self.fd.raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
@@ -722,7 +737,7 @@ impl TcpStream {
     /// This is socket configuration/control-plane work. Apply it during
     /// connection setup instead of changing it per read.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
-        super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
+        super::set_sock_recv_buffer_size(self.fd.raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
@@ -730,7 +745,7 @@ impl TcpStream {
     /// This is socket status/control-plane lookup, not the per-message data
     /// fast path.
     pub fn recv_buffer_size(&self) -> io::Result<usize> {
-        super::sock_recv_buffer_size(self.fd.as_raw_fd())
+        super::sock_recv_buffer_size(self.fd.raw_fd())
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -743,7 +758,7 @@ impl TcpStream {
             std::net::Shutdown::Write => libc::SHUT_WR,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
-        let rc = unsafe { libc::shutdown(self.fd.as_raw_fd(), how) };
+        let rc = unsafe { libc::shutdown(self.fd.raw_fd(), how) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -755,7 +770,7 @@ impl TcpStream {
 
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd.expose_raw_fd()
     }
 }
 
@@ -908,7 +923,7 @@ impl Drop for TcpConnector {
 /// ```
 pub struct TcpListener {
     /// Owned listening socket descriptor.
-    fd: RuntimeFd,
+    fd: Arc<RuntimeFd>,
     /// Cached local address assigned after bind/listen.
     local_addr: SocketAddr,
     /// Reusable accept state kept across accepts.
@@ -970,10 +985,11 @@ impl TcpListener {
             }
         };
 
+        let fd = Arc::new(RuntimeFd::from_fresh_raw_fd(fd));
         Ok(Self {
-            fd: RuntimeFd::new(fd),
+            accept_slot: AcceptSlot::new(Arc::clone(&fd)),
+            fd,
             local_addr,
-            accept_slot: AcceptSlot::new(),
         })
     }
 
@@ -994,11 +1010,15 @@ impl TcpListener {
     /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
     /// listener's reusable accept slot is still occupied by a previous future
     /// or if runtime operation capacity cannot accept the submission.
+    ///
+    /// Dropping a pending accept cancels only its readiness wait; it does not
+    /// consume a connection already queued in the listener backlog. If the
+    /// listener's raw fd is exposed, the caller must not concurrently accept
+    /// from it or race changes to its file-status flags.
     pub fn accept(&mut self) -> AcceptFuture<'_> {
         let input_error = self.accept_slot.prepare().err();
         let prepared = input_error.is_none();
         AcceptFuture {
-            fd: self.fd.as_raw_fd(),
             slot: &mut self.accept_slot,
             input_error,
             prepared,
@@ -1008,7 +1028,7 @@ impl TcpListener {
 
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd.expose_raw_fd()
     }
 }
 
@@ -1027,8 +1047,6 @@ impl Drop for TcpListener {
 
 #[doc(hidden)]
 pub struct AcceptFuture<'a> {
-    /// Listening socket descriptor used for the submitted accept request.
-    fd: RawFd,
     /// Borrowed reusable accept slot owned by the listener.
     slot: &'a mut AcceptSlot,
     /// Deferred slot-state error returned before any SQE submission.
@@ -1045,7 +1063,7 @@ impl Future for AcceptFuture<'_> {
         if let Some(err) = this.input_error.take() {
             return Poll::Ready(validate_local_io_result(cx, Err(err)));
         }
-        this.slot.poll_accept(this.fd, cx)
+        this.slot.poll_accept(cx)
     }
 }
 
@@ -1061,15 +1079,16 @@ impl Drop for AcceptFuture<'_> {
 pub(crate) mod test_support {
     use super::*;
 
-    /// Verifies forgotten-future listener teardown closes a completed accepted
-    /// descriptor before releasing its cached completion state.
-    pub fn test_accept_slot_drop_cached_state_closes_completed_fd() -> io::Result<()> {
+    /// Verifies cached readiness teardown does not interpret a readiness mask
+    /// as an accepted descriptor.
+    pub fn test_accept_slot_drop_cached_state_preserves_unrelated_fd() -> io::Result<()> {
         let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
         let mut state = CompletionState::empty();
         state.result = fd;
         state.set_completed();
 
-        let mut slot = AcceptSlot::new();
+        let listener_fd = Arc::new(RuntimeFd::from_fresh_raw_fd(fd));
+        let mut slot = AcceptSlot::new(Arc::clone(&listener_fd));
         slot.in_use = true;
         slot.state_ptr = &mut state;
 
@@ -1078,6 +1097,11 @@ pub(crate) mod test_support {
         if !slot.state_ptr.is_null() || slot.in_use {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
+        if crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        drop(slot);
+        drop(listener_fd);
         if !crate::runtime::fd::raw_fd_is_closed(fd) {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
@@ -1181,7 +1205,9 @@ impl OwnedConnectFuture {
         self.fd = -1;
         // SAFETY: this future owns the successfully created socket, and the
         // cleared sentinel prevents its drop path from closing it again.
-        TcpStream::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
+        TcpStream {
+            fd: RuntimeFd::from_fresh_owned(unsafe { OwnedFd::from_raw_fd(fd) }),
+        }
     }
 }
 
@@ -1310,6 +1336,22 @@ mod tests {
         assert!(
             crate::runtime::fd::raw_fd_is_closed(raw),
             "accepted TCP fd leaked on address decode failure"
+        );
+    }
+
+    #[test]
+    fn failed_split_clone_does_not_taint_the_source() {
+        let source = RuntimeFd::from_fresh_raw_fd(-1);
+        let result = finish_split_clone(&source, Err(io::Error::from_raw_os_error(libc::EMFILE)));
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("injected duplication failure should surface"),
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(
+            source.linger_provenance(),
+            LingerProvenance::KnownNonPositive
         );
     }
 }

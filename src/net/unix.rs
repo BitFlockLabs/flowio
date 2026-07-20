@@ -177,7 +177,14 @@ impl UnixStream {
         let left = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         // SAFETY: same socketpair ownership proof as `left` above.
         let right = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        Ok((Self::from_owned_fd(left), Self::from_owned_fd(right)))
+        Ok((
+            Self {
+                fd: RuntimeFd::from_fresh_owned(left),
+            },
+            Self {
+                fd: RuntimeFd::from_fresh_owned(right),
+            },
+        ))
     }
 
     /// Safely takes ownership of a Unix stream descriptor.
@@ -209,7 +216,9 @@ impl UnixStream {
     /// let _second = UnixStream::from_owned_fd(owned);
     /// ```
     pub fn from_owned_fd(fd: OwnedFd) -> Self {
-        Self { fd: fd.into() }
+        Self {
+            fd: RuntimeFd::from_external_owned(fd),
+        }
     }
 
     /// Takes ownership of a bare Unix stream descriptor.
@@ -241,7 +250,7 @@ impl UnixStream {
     /// This is socket configuration/control-plane work. Apply it during
     /// stream setup instead of changing it per write.
     pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
-        super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
+        super::set_sock_send_buffer_size(self.fd.raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
@@ -249,7 +258,7 @@ impl UnixStream {
     /// This is socket status/control-plane lookup, not the per-message data
     /// fast path.
     pub fn send_buffer_size(&self) -> io::Result<usize> {
-        super::sock_send_buffer_size(self.fd.as_raw_fd())
+        super::sock_send_buffer_size(self.fd.raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
@@ -257,7 +266,7 @@ impl UnixStream {
     /// This is socket configuration/control-plane work. Apply it during
     /// stream setup instead of changing it per read.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
-        super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
+        super::set_sock_recv_buffer_size(self.fd.raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
@@ -265,7 +274,7 @@ impl UnixStream {
     /// This is socket status/control-plane lookup, not the per-message data
     /// fast path.
     pub fn recv_buffer_size(&self) -> io::Result<usize> {
-        super::sock_recv_buffer_size(self.fd.as_raw_fd())
+        super::sock_recv_buffer_size(self.fd.raw_fd())
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -278,7 +287,7 @@ impl UnixStream {
             std::net::Shutdown::Write => libc::SHUT_WR,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
-        let rc = unsafe { libc::shutdown(self.fd.as_raw_fd(), how) };
+        let rc = unsafe { libc::shutdown(self.fd.raw_fd(), how) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -288,6 +297,6 @@ impl UnixStream {
 
 impl AsRawFd for UnixStream {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd.expose_raw_fd()
     }
 }

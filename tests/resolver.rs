@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy)]
 enum TestAnswer {
     A(Ipv4Addr),
+    NonQueryA(Ipv4Addr),
     OversizedA(Ipv4Addr),
     Aaaa(Ipv6Addr),
     AFor(&'static str, Ipv4Addr),
@@ -39,6 +40,7 @@ enum TestAnswer {
     CnameRdataOverrun,
     CnameRdataTrailingBytes,
     InvalidUtf8CnameTarget,
+    LiteralDotCnameTarget,
     Empty,
     NxDomain,
     NegativeQuestionMismatch(QuestionMismatch, NegativeRcode),
@@ -644,6 +646,53 @@ fn resolve_host_falls_back_after_nxdomain_with_malformed_authority() {
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 5432))]
             );
+        })
+        .expect("executor run failed");
+
+    bad_thread.join().expect("bad dns thread panicked");
+    good_thread.join().expect("good dns thread panicked");
+}
+
+#[test]
+fn resolve_host_falls_back_after_non_query_opcode_response() {
+    let rejected_ip = Ipv4Addr::new(203, 0, 113, 57);
+    let expected_ip = Ipv4Addr::new(192, 0, 2, 57);
+
+    let bad_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind non-QUERY dns socket");
+    let bad_nameserver = bad_server
+        .local_addr()
+        .expect("failed to read non-QUERY dns socket addr");
+    let bad_thread = thread::spawn(move || {
+        serve_dns_queries(bad_server, 2, move |_name, _qtype| {
+            TestAnswer::NonQueryA(rejected_ip)
+        })
+    });
+
+    let good_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind QUERY dns socket");
+    let good_nameserver = good_server
+        .local_addr()
+        .expect("failed to read QUERY dns socket addr");
+    let good_thread = thread::spawn(move || {
+        serve_dns_queries(good_server, 2, move |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::A(expected_ip),
+            ("db.example.test", 28) => TestAnswer::Empty,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![bad_nameserver, good_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(100));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("resolver should fail over after non-QUERY responses");
+            assert_eq!(addrs, vec![SocketAddr::from((expected_ip, 5432))]);
         })
         .expect("executor run failed");
 
@@ -1768,6 +1817,21 @@ fn resolve_host_rejects_cname_compression_pointer_loop() {
 
 #[test]
 fn resolve_host_rejects_invalid_utf8_cname_without_followup_query() {
+    assert_rejected_cname_has_no_followup(
+        TestAnswer::InvalidUtf8CnameTarget,
+        "DNS label was not valid UTF-8",
+    );
+}
+
+#[test]
+fn resolve_host_rejects_literal_dot_cname_without_followup_query() {
+    assert_rejected_cname_has_no_followup(
+        TestAnswer::LiteralDotCnameTarget,
+        "DNS literal label contained a dot",
+    );
+}
+
+fn assert_rejected_cname_has_no_followup(answer: TestAnswer, expected_message: &'static str) {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     let nameserver = server.local_addr().expect("failed to read dns socket addr");
@@ -1787,12 +1851,14 @@ fn resolve_host_rejects_invalid_utf8_cname_without_followup_query() {
             let qtype = parse_qtype(query).expect("failed to parse dns qtype");
             assert_eq!(qtype, expected_qtype);
             queries.push((qname, qtype));
-            let answer = if qtype == 1 {
-                TestAnswer::InvalidUtf8CnameTarget
-            } else {
-                TestAnswer::Empty
-            };
-            let response = build_response(query, answer);
+            let response = build_response(
+                query,
+                if qtype == 1 {
+                    answer
+                } else {
+                    TestAnswer::Empty
+                },
+            );
             server
                 .send_to(&response, peer)
                 .expect("dns send_to response failed");
@@ -1832,7 +1898,7 @@ fn resolve_host_rejects_invalid_utf8_cname_without_followup_query() {
                 .expect("failed to release the DNS query recorder");
             let err = result.expect_err("invalid CNAME target should fail");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(err.to_string(), "DNS label was not valid UTF-8");
+            assert_eq!(err.to_string(), expected_message);
         })
         .expect("executor run failed");
 
@@ -2206,6 +2272,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         }
         TestAnswer::CyclicCname(_) => 2u16,
         TestAnswer::A(_)
+        | TestAnswer::NonQueryA(_)
         | TestAnswer::OversizedA(_)
         | TestAnswer::Aaaa(_)
         | TestAnswer::AFor(_, _)
@@ -2215,7 +2282,8 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::CnamePointerLoop
         | TestAnswer::CnameRdataOverrun
         | TestAnswer::CnameRdataTrailingBytes
-        | TestAnswer::InvalidUtf8CnameTarget => 1u16,
+        | TestAnswer::InvalidUtf8CnameTarget
+        | TestAnswer::LiteralDotCnameTarget => 1u16,
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch
         | TestAnswer::Empty
@@ -2250,6 +2318,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::NegativeSectioned(_, NegativeRcode::ServFail)
         | TestAnswer::ServFail
         | TestAnswer::QuestionlessServFail => 0x8182u16,
+        TestAnswer::NonQueryA(_) => 0x8980u16,
         _ => 0x8180u16,
     };
     let include_question = !matches!(
@@ -2299,7 +2368,7 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
     }
 
     match answer {
-        TestAnswer::A(ip) => {
+        TestAnswer::A(ip) | TestAnswer::NonQueryA(ip) => {
             push_u16_be(&mut response, 0xC00C);
             push_u16_be(&mut response, 1);
             push_u16_be(&mut response, 1);
@@ -2559,6 +2628,14 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             push_u32_be(&mut response, 60);
             push_u16_be(&mut response, 3);
             response.extend_from_slice(&[1, 0xff, 0]);
+        }
+        TestAnswer::LiteralDotCnameTarget => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 13);
+            response.extend_from_slice(b"\x0bexample.com\0");
         }
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch

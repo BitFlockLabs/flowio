@@ -48,17 +48,19 @@ use crate::runtime::timer::TimerRuntime;
 use crate::utils::list::intrusive::dlist::DList;
 use crate::utils::memory::provider::MemoryProvider;
 use crate::utils::memory::provider_owned_pool::{ProviderOwnedPool, ProviderOwnedPoolControl};
-use io_uring::{opcode, squeue, types};
+use io_uring::squeue;
 use std::alloc::{Layout, alloc};
 use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::mem::{align_of, size_of};
-use std::os::fd::RawFd;
+use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle as ThreadJoinHandle;
 
 /// Default per-phase cap for one executor loop pass.
 ///
@@ -129,6 +131,10 @@ macro_rules! define_runtime_stats {
             /// expired timer.
             #[cfg(debug_assertions)]
             pub waiter_wakes: usize,
+            /// Readiness completions whose owner-thread `accept4` found no
+            /// queued connection or association and rearmed the one-shot poll.
+            #[cfg(debug_assertions)]
+            pub accept_readiness_rearms: usize,
             /// Number of `clock_gettime` calls for timer tick computation.
             #[cfg(debug_assertions)]
             pub timer_now_tick_calls: usize,
@@ -188,6 +194,46 @@ macro_rules! define_runtime_stats {
             /// metadata before resubmitting the remaining write window.
             #[cfg(debug_assertions)]
             pub writev_partial_continuations: usize,
+            /// Descriptor owners transferred to the executor's bounded close
+            /// worker.
+            #[cfg(debug_assertions)]
+            pub close_worker_admissions: usize,
+            /// Plain socket closes queued into the reactor with ownership
+            /// retained until kernel submission consumes their exact prefix.
+            #[cfg(debug_assertions)]
+            pub close_ring_submissions: usize,
+            /// Nonpositive-linger closes performed directly because the
+            /// reactor could not accept a close SQE.
+            #[cfg(debug_assertions)]
+            pub close_ring_fallbacks: usize,
+            /// Terminal descriptors whose uncertain provenance required one
+            /// `SO_LINGER` query.
+            #[cfg(debug_assertions)]
+            pub close_linger_queries: usize,
+            /// Descriptor owners closed directly on unsupported/non-socket,
+            /// ring-rejection, or worker-admission fallback paths.
+            #[cfg(debug_assertions)]
+            pub close_direct_closes: usize,
+            /// Descriptor linger states that could not be classified before
+            /// conservative worker admission.
+            #[cfg(debug_assertions)]
+            pub close_linger_classification_failures: usize,
+            /// Descriptor owners rejected because the bounded close-worker
+            /// queue was full.
+            #[cfg(debug_assertions)]
+            pub close_worker_full_fallbacks: usize,
+            /// Descriptor owners rejected because the close worker was
+            /// disconnected during teardown or after worker failure.
+            #[cfg(debug_assertions)]
+            pub close_worker_disconnected_fallbacks: usize,
+            /// Positive `SO_LINGER` waits waived before an overload fallback
+            /// close.
+            #[cfg(debug_assertions)]
+            pub close_linger_waivers: usize,
+            /// Failed attempts to disable positive `SO_LINGER` before an
+            /// overload fallback close.
+            #[cfg(debug_assertions)]
+            pub close_linger_waiver_failures: usize,
         }
     };
 }
@@ -396,6 +442,105 @@ impl RuntimeState {
     }
 }
 
+/// Bounded, executor-owned descriptor-close worker.
+///
+/// The executor owner thread is the sole producer and uses `try_send`, so
+/// admission never waits for queue capacity or for a worker that is honoring
+/// positive `SO_LINGER`. The worker is the sole consumer and owns every
+/// admitted descriptor until `close(2)` completes. The channel holds at most
+/// `ring_entries` queued owners and the worker may hold one additional owner
+/// while closing it. Closing the sender drains that finite set before the
+/// worker exits; joining it makes executor shutdown semantics explicit.
+struct CloseWorker {
+    sender: Option<SyncSender<OwnedFd>>,
+    worker: Option<ThreadJoinHandle<()>>,
+}
+
+impl CloseWorker {
+    fn new(capacity: usize) -> io::Result<Self> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "close worker capacity must be positive",
+            ));
+        }
+        let (sender, receiver) = sync_channel(capacity);
+        let worker = std::thread::Builder::new()
+            .name("flowio-close".to_owned())
+            .spawn(move || close_worker_loop(receiver))?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    /// Uses the channel's non-waiting admission API, or returns the unchanged
+    /// sole owner.
+    #[inline(always)]
+    fn try_admit(&self, fd: OwnedFd) -> Result<(), CloseWorkerRejection> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(CloseWorkerRejection::Disconnected(fd));
+        };
+        match sender.try_send(fd) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(fd)) => Err(CloseWorkerRejection::Full(fd)),
+            Err(TrySendError::Disconnected(fd)) => Err(CloseWorkerRejection::Disconnected(fd)),
+        }
+    }
+
+    /// Stops admission, drains all admitted descriptor owners, and joins the sole
+    /// consumer. An admitted positive-linger close may delay this setup-path
+    /// shutdown, matching the socket's requested close semantics.
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            // Dropping an OwnedFd cannot unwind; a panic would therefore come
+            // from outside the close loop's ownership protocol. Do not panic
+            // from Executor::drop while still ensuring the handle is joined.
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for CloseWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn close_worker_loop(receiver: Receiver<OwnedFd>) {
+    while let Ok(fd) = receiver.recv() {
+        drop(fd);
+    }
+}
+
+/// Ensures a worker cannot remain reachable through unfinished task cycles if
+/// a user future's destructor unwinds during executor shutdown.
+struct CloseWorkerShutdownGuard {
+    worker: *mut CloseWorker,
+}
+
+impl CloseWorkerShutdownGuard {
+    fn new(worker: *mut CloseWorker) -> Self {
+        Self { worker }
+    }
+}
+
+impl Drop for CloseWorkerShutdownGuard {
+    fn drop(&mut self) {
+        // SAFETY: shutdown_owner creates this guard from its heap-stable
+        // ExecutorState and keeps that state alive until after guard drop.
+        unsafe {
+            (*self.worker).shutdown();
+        }
+    }
+}
+
+enum CloseWorkerRejection {
+    Full(OwnedFd),
+    Disconnected(OwnedFd),
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ScheduleCtx {
     /// Ready queue the woken task should be pushed onto.
@@ -409,6 +554,8 @@ pub(crate) struct ScheduleCtx {
 struct ExecutorState {
     /// Reactor driving kernel-visible I/O for this owner.
     reactor: Reactor,
+    /// Bounded descriptor-close worker used by runtime-owned transports.
+    close_worker: CloseWorker,
     /// Pool storing pointer-stable task allocations.
     task_pool: ProviderOwnedPool<Task<TASK_POOL_SIZE>, ExecutorTaskMemProvider>,
     /// Main queue of runnable tasks.
@@ -495,6 +642,7 @@ thread_local! {
 
 struct ExecutorCtxGuard {
     owner: *const ExecutorOwner,
+    previous: *const ExecutorOwner,
 }
 
 impl ExecutorCtxGuard {
@@ -515,8 +663,16 @@ impl ExecutorCtxGuard {
     #[inline(always)]
     fn install(owner: *const ExecutorOwner) -> io::Result<Self> {
         Self::reject_if_active()?;
-        EXECUTOR_CTX.with(|ctx_cell| ctx_cell.set(owner));
-        Ok(Self { owner })
+        Ok(Self::install_for_shutdown(owner))
+    }
+
+    /// Temporarily installs `owner` while executor teardown drops runtime
+    /// futures. Teardown can occur while another executor is active on the
+    /// same thread, so the previous context is restored on scope exit.
+    #[inline(always)]
+    fn install_for_shutdown(owner: *const ExecutorOwner) -> Self {
+        let previous = EXECUTOR_CTX.with(|ctx_cell| ctx_cell.replace(owner));
+        Self { owner, previous }
     }
 }
 
@@ -525,7 +681,7 @@ impl Drop for ExecutorCtxGuard {
     fn drop(&mut self) {
         EXECUTOR_CTX.with(|ctx_cell| {
             if ctx_cell.get() == self.owner {
-                ctx_cell.set(std::ptr::null());
+                ctx_cell.set(self.previous);
             }
         });
     }
@@ -952,6 +1108,8 @@ impl Executor {
     /// # Errors
     /// Returns `Unsupported` when the running Linux kernel does not provide
     /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
+    /// Returns the operating-system error if the bounded close-worker thread
+    /// cannot be created.
     ///
     /// # Example
     /// ```no_run
@@ -973,6 +1131,8 @@ impl Executor {
     /// # Errors
     /// Returns `Unsupported` when the running Linux kernel does not provide
     /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
+    /// Returns `InvalidInput` for a zero close-worker capacity and the
+    /// operating-system error if its thread cannot be created.
     ///
     /// # Example
     /// ```no_run
@@ -989,10 +1149,12 @@ impl Executor {
         let all_tasks = DList::new_uninit();
         let reactor = Reactor::new_with_config(config.reactor)?;
         let timers = TimerRuntime::new()?;
+        let close_worker = CloseWorker::new(config.reactor.ring_entries as usize)?;
 
         let owner = Rc::new(ExecutorOwner {
             state: UnsafeCell::new(ExecutorState {
                 reactor,
+                close_worker,
                 task_pool,
                 ready_queue,
                 all_tasks,
@@ -1504,6 +1666,11 @@ impl Executor {
             return;
         }
 
+        let owner_ptr = Rc::as_ptr(&self.owner);
+        let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
+        let _close_worker_guard = CloseWorkerShutdownGuard::new(unsafe {
+            std::ptr::addr_of_mut!((*state_ptr).close_worker)
+        });
         self.shutdown_tasks();
         unsafe {
             (*state_ptr).timers.cancel_all_for_shutdown();
@@ -1686,44 +1853,175 @@ where
     Ok(())
 }
 
-#[inline(always)]
-pub(crate) fn submit_detached_close(pctx: &PollCtx, fd: RawFd) -> io::Result<()> {
-    let reactor = pctx.reactor();
-    let state_ptr = unsafe { (*reactor).alloc_op() };
-    if state_ptr.is_null() {
-        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-    }
-
-    unsafe { (*state_ptr).set_detached() };
-
-    let sqe = opcode::Close::new(types::Fd(fd))
-        .build()
-        .user_data(state_ptr as u64);
-
-    unsafe {
-        if let Err(err) = submit_tracked_sqe(pctx, sqe) {
-            (*reactor).free_op(state_ptr);
-            return Err(err);
-        }
-    }
-
-    Ok(())
+/// Result of trying to transfer a descriptor to the active executor's bounded
+/// close worker.
+pub(crate) enum CloseAdmission {
+    /// The worker accepted sole ownership.
+    Admitted,
+    /// No executor is active; preserve ordinary caller-thread close behavior.
+    OutsideExecutor(OwnedFd),
+    /// The active worker queue was full; apply overload fallback.
+    Full(OwnedFd),
+    /// The active worker was disconnected; apply lifecycle-failure fallback.
+    Disconnected(OwnedFd),
 }
 
+/// Result of trying to transfer a descriptor into the active reactor's
+/// close-only submission ledger.
+pub(crate) enum CloseSubmission {
+    /// The reactor queued a plain close SQE and retained the owner until kernel
+    /// admission.
+    Submitted,
+    /// No executor is active, so the caller retains ordinary drop semantics.
+    OutsideExecutor(OwnedFd),
+    /// The active reactor could not queue the close; the unchanged owner is
+    /// returned for a nonblocking direct-close fallback.
+    Rejected(OwnedFd),
+}
+
+/// Returns whether descriptor teardown currently runs inside an executor.
+///
+/// The caller performs no user code between this check and close routing, so
+/// the owner-thread TLS context cannot change between the two operations.
 #[inline(always)]
-pub(crate) fn try_submit_detached_close(fd: RawFd) -> bool {
+pub(crate) fn has_active_close_context() -> bool {
     EXECUTOR_CTX.with(|ctx_cell| {
         let owner = ctx_cell.get();
         if owner.is_null() {
             return false;
         }
-
-        let pctx = PollCtx {
-            owner,
-            task: std::ptr::null_mut(),
-        };
-        submit_detached_close(&pctx, fd).is_ok()
+        unsafe {
+            (*owner).debug_assert_owner_thread();
+        }
+        true
     })
+}
+
+#[inline(always)]
+pub(crate) fn try_admit_close(fd: OwnedFd) -> CloseAdmission {
+    EXECUTOR_CTX.with(|ctx_cell| {
+        let owner = ctx_cell.get();
+        if owner.is_null() {
+            return CloseAdmission::OutsideExecutor(fd);
+        }
+
+        unsafe {
+            (*owner).debug_assert_owner_thread();
+            let state_ptr = (*owner).state_ptr();
+            let close_worker = std::ptr::addr_of_mut!((*state_ptr).close_worker);
+            let _runtime_state = std::ptr::addr_of_mut!((*state_ptr).runtime_state);
+            match (*close_worker).try_admit(fd) {
+                Ok(()) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        (*_runtime_state).stats.close_worker_admissions += 1;
+                    }
+                    CloseAdmission::Admitted
+                }
+                Err(CloseWorkerRejection::Full(fd)) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        (*_runtime_state).stats.close_worker_full_fallbacks += 1;
+                    }
+                    CloseAdmission::Full(fd)
+                }
+                Err(CloseWorkerRejection::Disconnected(fd)) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        (*_runtime_state).stats.close_worker_disconnected_fallbacks += 1;
+                    }
+                    CloseAdmission::Disconnected(fd)
+                }
+            }
+        }
+    })
+}
+
+/// Tries to queue one plain socket-close SQE while retaining its sole owner
+/// until `io_uring_enter` reports that the matching SQ prefix was consumed.
+///
+/// This is only used for sockets whose positive-linger state has already been
+/// ruled out. The SQE deliberately has no `ASYNC`, `DRAIN`, `LINK`, or fixed
+/// file flags.
+#[inline(always)]
+pub(crate) fn try_submit_close(fd: OwnedFd) -> CloseSubmission {
+    EXECUTOR_CTX.with(|ctx_cell| {
+        let owner = ctx_cell.get();
+        if owner.is_null() {
+            return CloseSubmission::OutsideExecutor(fd);
+        }
+
+        unsafe {
+            (*owner).debug_assert_owner_thread();
+            let state_ptr = (*owner).state_ptr();
+            let reactor = std::ptr::addr_of_mut!((*state_ptr).reactor);
+            let runtime_state = std::ptr::addr_of_mut!((*state_ptr).runtime_state);
+            let op = (*reactor).alloc_op();
+            if op.is_null() {
+                #[cfg(debug_assertions)]
+                {
+                    (*runtime_state).stats.close_ring_fallbacks += 1;
+                }
+                return CloseSubmission::Rejected(fd);
+            }
+
+            (*op).set_detached();
+            match (*reactor).submit_close_sqe(fd, op as u64) {
+                Ok(()) => {
+                    (*runtime_state).inflight_ops += 1;
+                    #[cfg(debug_assertions)]
+                    {
+                        (*runtime_state).stats.sqe_submits += 1;
+                        (*runtime_state).stats.close_ring_submissions += 1;
+                    }
+                    CloseSubmission::Submitted
+                }
+                Err((_err, fd)) => {
+                    (*reactor).free_op(op);
+                    #[cfg(debug_assertions)]
+                    {
+                        (*runtime_state).stats.close_ring_fallbacks += 1;
+                    }
+                    CloseSubmission::Rejected(fd)
+                }
+            }
+        }
+    })
+}
+
+#[inline(always)]
+pub(crate) fn note_close_direct() {
+    #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| stats.close_direct_closes += 1);
+}
+
+#[inline(always)]
+pub(crate) fn note_accept_readiness_rearm() {
+    #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| stats.accept_readiness_rearms += 1);
+}
+
+#[inline(always)]
+pub(crate) fn note_close_linger_query() {
+    #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| stats.close_linger_queries += 1);
+}
+
+#[inline(always)]
+pub(crate) fn note_close_linger_classification_failure() {
+    #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| stats.close_linger_classification_failures += 1);
+}
+
+#[inline(always)]
+pub(crate) fn note_close_linger_waiver(waived: bool, failed: bool) {
+    #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| {
+        stats.close_linger_waivers += usize::from(waived);
+        stats.close_linger_waiver_failures += usize::from(failed);
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = (waived, failed);
 }
 
 #[inline(always)]
@@ -2100,8 +2398,12 @@ pub(crate) unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(miri))]
+    use crate::runtime::fd::{RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed};
     use std::cell::Cell;
     use std::mem::ManuallyDrop;
+    #[cfg(not(miri))]
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::rc::Rc;
     use std::task::{RawWaker, RawWakerVTable};
 
@@ -2146,6 +2448,516 @@ mod tests {
     fn counted_waker(stats: &Rc<CountedWakerStats>) -> Waker {
         let data = Rc::into_raw(Rc::clone(stats)).cast();
         unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn close_worker_full_returns_the_unchanged_descriptor_owner() {
+        let (sender, receiver) = sync_channel(1);
+        let worker = CloseWorker {
+            sender: Some(sender),
+            worker: None,
+        };
+        let admitted_raw =
+            distinctive_closeable_test_fd().expect("create admitted close-test descriptor");
+        let rejected_raw =
+            distinctive_closeable_test_fd().expect("create rejected close-test descriptor");
+        // SAFETY: each helper result is a distinct, open descriptor whose sole
+        // ownership is transferred into one OwnedFd.
+        let admitted = unsafe { OwnedFd::from_raw_fd(admitted_raw) };
+        let rejected = unsafe { OwnedFd::from_raw_fd(rejected_raw) };
+
+        assert!(
+            worker.try_admit(admitted).is_ok(),
+            "first descriptor should occupy the bounded queue"
+        );
+        let returned = match worker.try_admit(rejected) {
+            Err(CloseWorkerRejection::Full(fd)) => fd,
+            Err(CloseWorkerRejection::Disconnected(_)) => {
+                panic!("live undrained receiver should report Full")
+            }
+            Ok(()) => panic!("second descriptor should exceed capacity"),
+        };
+        assert_eq!(returned.as_raw_fd(), rejected_raw);
+        assert!(
+            !raw_fd_is_closed(rejected_raw),
+            "full admission must return a still-open sole owner"
+        );
+        drop(returned);
+        assert!(raw_fd_is_closed(rejected_raw));
+
+        let admitted = receiver
+            .try_recv()
+            .expect("queued descriptor should remain receiver-owned");
+        assert_eq!(admitted.as_raw_fd(), admitted_raw);
+        drop(admitted);
+        assert!(raw_fd_is_closed(admitted_raw));
+        drop(worker);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn close_worker_disconnect_returns_the_unchanged_descriptor_owner() {
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        let worker = CloseWorker {
+            sender: Some(sender),
+            worker: None,
+        };
+        let raw =
+            distinctive_closeable_test_fd().expect("create disconnected close-test descriptor");
+        // SAFETY: the helper returned one open descriptor with sole ownership.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        let returned = match worker.try_admit(owned) {
+            Err(CloseWorkerRejection::Disconnected(fd)) => fd,
+            Err(CloseWorkerRejection::Full(_)) => {
+                panic!("dropped receiver should report Disconnected")
+            }
+            Ok(()) => panic!("disconnected worker must reject admission"),
+        };
+        assert_eq!(returned.as_raw_fd(), raw);
+        assert!(
+            !raw_fd_is_closed(raw),
+            "disconnect must return a still-open sole owner"
+        );
+        drop(returned);
+        assert!(raw_fd_is_closed(raw));
+        drop(worker);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn close_worker_rejects_zero_capacity() {
+        match CloseWorker::new(0) {
+            Err(err) => assert_eq!(err.kind(), ErrorKind::InvalidInput),
+            Ok(_) => panic!("zero-capacity close worker should be rejected"),
+        }
+    }
+
+    #[cfg(all(debug_assertions, not(miri)))]
+    #[test]
+    fn rejected_ring_close_returns_owner_for_direct_fallback() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
+
+        executor
+            .run(async move {
+                crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+                drop(RuntimeFd::from_fresh_raw_fd(raw));
+            })
+            .expect("ring-close fallback run failed");
+
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 0);
+        assert_eq!(stats.close_ring_fallbacks, 1);
+        assert_eq!(stats.close_direct_closes, 1);
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn executor_shutdown_routes_pending_task_fd_to_its_worker_and_joins() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
+        set_positive_linger(raw, 1);
+
+        let err = executor
+            .run(async move {
+                // SAFETY: the test transfers its sole open descriptor owner.
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                let _fd = RuntimeFd::from_external_owned(owned);
+                std::future::pending::<()>().await;
+            })
+            .expect_err("pending task should leave the executor stalled");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+        assert!(
+            !raw_fd_is_closed(raw),
+            "pending task must retain its descriptor before shutdown"
+        );
+
+        executor.shutdown_owner();
+        let state = unsafe { &*executor.owner.state_ptr() };
+        assert!(state.close_worker.sender.is_none());
+        assert!(state.close_worker.worker.is_none());
+        #[cfg(debug_assertions)]
+        assert_eq!(state.runtime_state.stats.close_worker_admissions, 1);
+        assert!(
+            raw_fd_is_closed(raw),
+            "joined close worker must retire the pending task descriptor"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn close_worker_shutdown_guard_joins_after_a_task_destructor_panics() {
+        struct PanicAfterClose {
+            fd: Option<RuntimeFd>,
+        }
+
+        impl Future for PanicAfterClose {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for PanicAfterClose {
+            fn drop(&mut self) {
+                drop(self.fd.take());
+                panic!("intentional task-destructor panic");
+            }
+        }
+
+        let mut executor = Executor::new().expect("executor construction failed");
+        let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
+        set_positive_linger(raw, 1);
+        let err = executor
+            .run(PanicAfterClose {
+                // SAFETY: the test transfers its sole open descriptor owner.
+                fd: Some(RuntimeFd::from_external_owned(unsafe {
+                    OwnedFd::from_raw_fd(raw)
+                })),
+            })
+            .expect_err("pending task should leave the executor stalled");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.shutdown_owner();
+        }));
+        assert!(unwind.is_err(), "task destructor should unwind shutdown");
+
+        let state = unsafe { &*executor.owner.state_ptr() };
+        assert!(state.close_worker.sender.is_none());
+        assert!(state.close_worker.worker.is_none());
+        assert!(
+            raw_fd_is_closed(raw),
+            "unwind guard must join after the descriptor reaches the worker"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn nested_executor_shutdown_restores_the_active_close_owner() {
+        let mut outer = Executor::new().expect("outer executor construction failed");
+        let mut inner = Executor::new().expect("inner executor construction failed");
+        let inner_raw = distinctive_closeable_test_fd().expect("inner fd failed");
+        let outer_raw = distinctive_closeable_test_fd().expect("outer fd failed");
+        set_positive_linger(inner_raw, 1);
+        set_positive_linger(outer_raw, 1);
+
+        let err = inner
+            .run(async move {
+                // SAFETY: the test transfers its sole open descriptor owner.
+                let owned = unsafe { OwnedFd::from_raw_fd(inner_raw) };
+                let _fd = RuntimeFd::from_external_owned(owned);
+                std::future::pending::<()>().await;
+            })
+            .expect_err("inner pending task should stall");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        outer
+            .run(async move {
+                drop(inner);
+                // SAFETY: the test transfers its sole open descriptor owner.
+                let owned = unsafe { OwnedFd::from_raw_fd(outer_raw) };
+                drop(RuntimeFd::from_external_owned(owned));
+            })
+            .expect("outer executor run failed");
+
+        #[cfg(debug_assertions)]
+        let outer_state = unsafe { &*outer.owner.state_ptr() };
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            outer_state.runtime_state.stats.close_worker_admissions, 1,
+            "post-inner-drop descriptor must route back to the outer worker"
+        );
+        assert!(raw_fd_is_closed(inner_raw));
+        outer.shutdown_owner();
+        assert!(raw_fd_is_closed(outer_raw));
+    }
+
+    #[cfg(not(miri))]
+    const CLOSE_LINGER_CHILD_ENV: &str = "FLOWIO_CLOSE_LINGER_CHILD";
+    #[cfg(not(miri))]
+    const CLOSE_LINGER_CHILD_TEST: &str =
+        "runtime::executor::tests::close_worker_full_fallback_waives_positive_linger_child";
+
+    #[cfg(not(miri))]
+    fn replace_with_inert_close_worker(
+        executor: &mut Executor,
+        capacity: usize,
+    ) -> Receiver<OwnedFd> {
+        let state = unsafe { &mut *executor.owner.state_ptr() };
+        state.close_worker.shutdown();
+        let (sender, receiver) = sync_channel(capacity);
+        state.close_worker = CloseWorker {
+            sender: Some(sender),
+            worker: None,
+        };
+        receiver
+    }
+
+    #[cfg(not(miri))]
+    fn replace_with_disconnected_close_worker(executor: &mut Executor) {
+        let state = unsafe { &mut *executor.owner.state_ptr() };
+        state.close_worker.shutdown();
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        state.close_worker = CloseWorker {
+            sender: Some(sender),
+            worker: None,
+        };
+    }
+
+    #[cfg(not(miri))]
+    fn set_positive_linger(fd: std::os::fd::RawFd, seconds: libc::c_int) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: seconds,
+        };
+        // SAFETY: linger is initialized and borrowed for the exact option
+        // byte count during this call.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "set positive SO_LINGER failed");
+    }
+
+    #[cfg(not(miri))]
+    fn tcp_owner_with_pending_data_and_linger() -> (OwnedFd, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind linger-test listener");
+        let addr = listener.local_addr().expect("linger-test local address");
+        let client = std::net::TcpStream::connect(addr).expect("connect linger-test client");
+        let (peer, _) = listener.accept().expect("accept linger-test peer");
+        client
+            .set_nonblocking(true)
+            .expect("set linger-test client nonblocking");
+
+        for fd in [client.as_raw_fd(), peer.as_raw_fd()] {
+            let small_buffer: libc::c_int = 4096;
+            // SAFETY: small_buffer is initialized and borrowed for the exact
+            // integer socket-option size during each call.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    if fd == client.as_raw_fd() {
+                        libc::SO_SNDBUF
+                    } else {
+                        libc::SO_RCVBUF
+                    },
+                    std::ptr::addr_of!(small_buffer).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "set linger-test socket buffer failed");
+        }
+
+        let bytes = [0x5au8; 64 * 1024];
+        let mut sent_total = 0usize;
+        let mut reached_backpressure = false;
+        for _ in 0..4096 {
+            // SAFETY: bytes remains readable for the duration of this
+            // nonblocking send and client is a live stream descriptor.
+            let sent = unsafe {
+                libc::send(
+                    client.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if sent > 0 {
+                sent_total += sent as usize;
+                continue;
+            }
+            if sent == -1 {
+                let err = io::Error::last_os_error();
+                if err.kind() == ErrorKind::WouldBlock {
+                    reached_backpressure = true;
+                    break;
+                }
+                if err.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("fill linger-test send queue failed: {err}");
+            }
+            panic!("linger-test send unexpectedly returned zero");
+        }
+        assert!(sent_total > 0, "linger-test client sent no data");
+        assert!(
+            reached_backpressure,
+            "linger-test client never reached send backpressure"
+        );
+
+        let mut queued: libc::c_int = 0;
+        // SAFETY: queued is writable for the integer result and client is a
+        // live socket descriptor.
+        let rc = unsafe { libc::ioctl(client.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+        assert_eq!(rc, 0, "TIOCOUTQ failed");
+        assert!(queued > 0, "linger-test socket had no unsent bytes");
+
+        set_positive_linger(client.as_raw_fd(), 3);
+        let mut observed = libc::linger {
+            l_onoff: 0,
+            l_linger: 0,
+        };
+        let mut observed_len = std::mem::size_of::<libc::linger>() as libc::socklen_t;
+        // SAFETY: observed and observed_len provide exact writable option
+        // storage for this query.
+        let rc = unsafe {
+            libc::getsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of_mut!(observed).cast(),
+                std::ptr::addr_of_mut!(observed_len),
+            )
+        };
+        assert_eq!(rc, 0, "read positive SO_LINGER failed");
+        assert_ne!(observed.l_onoff, 0);
+        assert_eq!(observed.l_linger, 3);
+
+        (client.into(), peer)
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn disconnected_close_worker_waives_positive_linger_before_fallback() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        replace_with_disconnected_close_worker(&mut executor);
+
+        let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
+        set_positive_linger(raw, 2);
+        // SAFETY: the helper returned one open descriptor whose sole ownership
+        // moves into this test owner.
+        let owner = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        executor
+            .run(async move {
+                drop(RuntimeFd::from_external_owned(owner));
+            })
+            .expect("disconnected close fallback run failed");
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.close_worker_admissions, 0);
+            assert_eq!(stats.close_worker_full_fallbacks, 0);
+            assert_eq!(stats.close_worker_disconnected_fallbacks, 1);
+            assert_eq!(stats.close_linger_waivers, 1);
+            assert_eq!(stats.close_linger_waiver_failures, 0);
+            assert_eq!(stats.close_direct_closes, 1);
+        }
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn close_worker_full_fallback_waives_positive_linger_child() {
+        if std::env::var_os(CLOSE_LINGER_CHILD_ENV).is_none() {
+            return;
+        }
+
+        let mut executor = Executor::new_with_config(ExecutorConfig {
+            reactor: ReactorConfig { ring_entries: 1 },
+            ..ExecutorConfig::default()
+        })
+        .expect("construct close-linger executor");
+        let receiver = replace_with_inert_close_worker(&mut executor, 1);
+        let filler_raw = distinctive_closeable_test_fd().expect("create close-queue filler");
+        set_positive_linger(filler_raw, 1);
+        let (linger_owner, _peer) = tcp_owner_with_pending_data_and_linger();
+        let linger_raw = linger_owner.as_raw_fd();
+
+        let started = std::time::Instant::now();
+        executor
+            .run(async move {
+                // SAFETY: the test transfers its sole open descriptor owner.
+                let filler = unsafe { OwnedFd::from_raw_fd(filler_raw) };
+                drop(RuntimeFd::from_external_owned(filler));
+                drop(RuntimeFd::from_external_owned(linger_owner));
+            })
+            .expect("close-linger executor run failed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "full fallback honored positive linger on the owner thread: {elapsed:?}"
+        );
+        assert!(raw_fd_is_closed(linger_raw));
+
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.close_worker_admissions, 1);
+            assert_eq!(stats.close_worker_full_fallbacks, 1);
+            assert_eq!(stats.close_worker_disconnected_fallbacks, 0);
+            assert_eq!(stats.close_linger_waivers, 1);
+            assert_eq!(stats.close_linger_waiver_failures, 0);
+            assert_eq!(stats.close_direct_closes, 1);
+        }
+
+        let filler = receiver
+            .try_recv()
+            .expect("admitted filler should remain queued");
+        assert_eq!(filler.as_raw_fd(), filler_raw);
+        drop(filler);
+        assert!(raw_fd_is_closed(filler_raw));
+        drop(receiver);
+        executor.shutdown_owner();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn close_worker_full_fallback_positive_linger_has_process_watchdog() {
+        use std::process::{Command, Stdio};
+
+        let current_exe = std::env::current_exe().expect("current unit-test executable");
+        let mut child = Command::new(current_exe)
+            .args(["--exact", CLOSE_LINGER_CHILD_TEST, "--nocapture"])
+            .env(CLOSE_LINGER_CHILD_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn positive-linger child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+
+        loop {
+            if let Some(_status) = child.try_wait().expect("poll positive-linger child") {
+                let output = child
+                    .wait_with_output()
+                    .expect("collect positive-linger child output");
+                assert!(
+                    output.status.success(),
+                    "positive-linger child failed: status={:?}, stdout={}, stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("reap timed-out positive-linger child");
+                panic!(
+                    "positive-linger child exceeded watchdog; stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[repr(align(16))]

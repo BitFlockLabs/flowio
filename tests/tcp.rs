@@ -1,25 +1,49 @@
 mod common;
 
 use common::{
-    EmptyProjected, TestIoBuffMut as IoBuffMut, TestProjected, TryCountMismatchedProjected,
-    TryMismatchedProjected, TryOversizedProjected, fill_try_send_buffer, make_payload_chain,
-    make_read_chain, make_read_only_chain, run_test,
+    BoundedTcpListener, BoundedTcpPeer, BoundedTcpStream, EmptyProjected,
+    TestIoBuffMut as IoBuffMut, TestProjected, TryCountMismatchedProjected, TryMismatchedProjected,
+    TryOversizedProjected, connect_bounded_tcp_peer, fill_try_send_buffer,
+    ipv6_loopback_capability_unavailable, make_payload_chain, make_read_chain,
+    make_read_only_chain, run_test, run_test_output, set_positive_linger, spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
-use flowio::runtime::executor::Executor;
-use flowio::runtime::timer::sleep;
-use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_closes_completed_fd;
+use flowio::runtime::executor::{Executor, ExecutorConfig};
+use flowio::runtime::reactor::ReactorConfig;
+use flowio::runtime::timer::{sleep, timeout};
+use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_preserves_unrelated_fd;
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::future::Future;
-use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
+
+const TCP_SHUTDOWN_FALLBACK_CHILD_ENV: &str = "FLOWIO_TCP_SHUTDOWN_FALLBACK_CHILD";
+const TCP_SHUTDOWN_FALLBACK_TEST: &str =
+    "runtime_tcp_shutdown_fallback_reclaims_readiness_state_with_watchdog";
+const TCP_UNSUBMITTED_READINESS_CHILD_ENV: &str = "FLOWIO_TCP_UNSUBMITTED_READINESS_CHILD";
+const TCP_UNSUBMITTED_READINESS_TEST: &str =
+    "runtime_tcp_unsubmitted_readiness_retains_listener_fd_until_ring_safe";
+const TCP_BOUNDED_PEER_STALL_CHILD_ENV: &str = "FLOWIO_TCP_BOUNDED_PEER_STALL_CHILD";
+const TCP_BOUNDED_PEER_STALL_TEST: &str = "bounded_tcp_peer_forced_stalls_fail_with_context";
+const TCP_IPV6_FLOWIO_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn bind_std_ipv6_tcp_listener_or_skip(test_name: &str) -> Option<BoundedTcpListener> {
+    match BoundedTcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        Ok(listener) => Some(listener),
+        Err(err) if ipv6_loopback_capability_unavailable(&err) => {
+            eprintln!("skipping {test_name}: IPv6 loopback unavailable ({err})");
+            None
+        }
+        Err(err) => panic!("trusted std IPv6 TCP probe failed for {test_name}: {err}"),
+    }
+}
 
 /// Spawns a std TCP peer that connects, verifies the payload it receives, and
 /// writes a fixed response.
@@ -27,11 +51,9 @@ fn spawn_std_tcp_peer(
     addr: SocketAddr,
     expected_recv: Vec<u8>,
     response: Vec<u8>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+) -> BoundedTcpPeer<()> {
+    spawn_bounded_tcp_peer("standard TCP request-response peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = vec![0u8; expected_recv.len()];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(buf, expected_recv, "std peer received unexpected payload");
@@ -41,33 +63,382 @@ fn spawn_std_tcp_peer(
 
 /// Returns a FlowIO TcpStream wrapping an accepted nonblocking std socket plus
 /// its connected std peer for try_* tests that do not need a reactor.
-fn connected_try_tcp_stream() -> (TcpStream, std::net::TcpStream) {
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+fn connected_try_tcp_stream() -> (TcpStream, BoundedTcpStream) {
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
-    let peer = std::net::TcpStream::connect(addr).expect("std connect failed");
-    let (stream, _) = listener.accept().expect("std accept failed");
+    let deadline = common::TcpPeerDeadline::new("connected try-operation TCP peer");
+    let peer = deadline.connect(addr).expect("std connect failed");
+    let (mut stream, _) = deadline.accept(&listener).expect("std accept failed");
     stream
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
-    (TcpStream::from_owned_fd(stream.into()), peer)
+    (TcpStream::from_owned_fd(stream.into_inner().into()), peer)
+}
+
+#[test]
+fn ipv6_loopback_capability_policy_is_narrow() {
+    for errno in [libc::EAFNOSUPPORT, libc::EPFNOSUPPORT, libc::EADDRNOTAVAIL] {
+        let err = io::Error::from_raw_os_error(errno);
+        assert!(
+            ipv6_loopback_capability_unavailable(&err),
+            "accepted IPv6 loopback errno {errno} was not classified unavailable"
+        );
+    }
+
+    for errno in [
+        libc::EPERM,
+        libc::EACCES,
+        libc::EINVAL,
+        libc::ENETUNREACH,
+        libc::ECONNREFUSED,
+    ] {
+        let err = io::Error::from_raw_os_error(errno);
+        assert!(
+            !ipv6_loopback_capability_unavailable(&err),
+            "IPv6 loopback errno {errno} should remain a failure"
+        );
+    }
+
+    assert!(
+        !ipv6_loopback_capability_unavailable(&io::Error::other("probe failed without an errno")),
+        "an IPv6 loopback failure without an errno should remain visible"
+    );
+}
+
+#[test]
+fn bounded_tcp_peer_forced_stalls_fail_with_context() {
+    if std::env::var_os(TCP_BOUNDED_PEER_STALL_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            TCP_BOUNDED_PEER_STALL_TEST,
+            TCP_BOUNDED_PEER_STALL_CHILD_ENV,
+            Duration::from_secs(5),
+        );
+        return;
+    }
+
+    fn assert_timed_out_with_context(err: io::Error, operation: &str) {
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let message = err.to_string();
+        assert!(
+            message.contains("forced") && message.contains(operation),
+            "missing bounded-peer {operation} context: {message}"
+        );
+    }
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 1)
+        .expect("forced connect-stall listener bind failed");
+    let addr = listener.local_addr();
+    const MAX_QUEUED_CONNECTS: usize = 8;
+    let mut queued = Vec::with_capacity(MAX_QUEUED_CONNECTS);
+    let mut connect_err = None;
+    for _ in 0..MAX_QUEUED_CONNECTS {
+        let deadline = common::TcpPeerDeadline::with_timeout(
+            "forced connect stall",
+            Duration::from_millis(100),
+        );
+        let started = std::time::Instant::now();
+        match deadline.connect(addr) {
+            Ok(stream) => queued.push(stream),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                assert!(
+                    started.elapsed() >= Duration::from_millis(20),
+                    "forced connect stall returned before entering the bounded syscall"
+                );
+                connect_err = Some(err);
+                break;
+            }
+            Err(err) => panic!("forced connect stall returned an unexpected error: {err}"),
+        }
+    }
+    let connect_err = connect_err.expect("loopback listen queue did not force a connect stall");
+    assert_timed_out_with_context(connect_err, "connect");
+    drop(queued);
+    drop(listener);
+
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("forced accept-expiry listener bind failed");
+    let expired =
+        common::TcpPeerDeadline::with_timeout("forced accept expiry", Duration::from_millis(1));
+    std::thread::sleep(Duration::from_millis(5));
+    let accept_err = match expired.accept(&listener) {
+        Ok(_) => panic!("expired accept deadline should fail"),
+        Err(err) => err,
+    };
+    assert_timed_out_with_context(accept_err, "accept");
+    let listener_flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
+    assert!(
+        listener_flags >= 0,
+        "F_GETFL failed after expired bounded accept"
+    );
+    assert_eq!(
+        listener_flags & libc::O_NONBLOCK,
+        0,
+        "expired bounded accept left its reusable listener nonblocking"
+    );
+
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("forced read-stall listener bind failed");
+    let addr = listener.local_addr().expect("forced read-stall address");
+    let read_deadline =
+        common::TcpPeerDeadline::with_timeout("forced read stall", Duration::from_millis(100));
+    let mut reader = read_deadline
+        .connect(addr)
+        .expect("forced read-stall connect failed");
+    let (_silent_writer, _) = read_deadline
+        .accept(&listener)
+        .expect("forced read-stall accept failed");
+    assert_timed_out_with_context(
+        reader
+            .read(&mut [0u8; 1])
+            .expect_err("silent peer read should time out"),
+        "read",
+    );
+
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("forced write-stall listener bind failed");
+    let addr = listener.local_addr().expect("forced write-stall address");
+    let write_deadline =
+        common::TcpPeerDeadline::with_timeout("forced write stall", Duration::from_millis(100));
+    let mut writer = write_deadline
+        .connect(addr)
+        .expect("forced write-stall connect failed");
+    let (_silent_reader, _) = write_deadline
+        .accept(&listener)
+        .expect("forced write-stall accept failed");
+    assert_timed_out_with_context(
+        writer
+            .write_all(&vec![0xA5; 16 * 1024 * 1024])
+            .expect_err("undrained peer write should time out"),
+        "write",
+    );
+
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer_release = std::sync::Arc::clone(&release);
+    let peer_exited = std::sync::Arc::clone(&exited);
+    let peer = common::spawn_bounded_tcp_peer_with_timeout(
+        "forced join stall",
+        Duration::from_millis(50),
+        move |_deadline| {
+            while !peer_release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            peer_exited.store(true, std::sync::atomic::Ordering::Release);
+        },
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| peer.finish()))
+        .expect_err("stalled peer finish should panic");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .expect("bounded peer panic should carry text");
+    assert!(
+        message.contains("forced join stall") && message.contains("deadline"),
+        "missing bounded-peer join context: {message}"
+    );
+    release.store(true, std::sync::atomic::Ordering::Release);
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !exited.load(std::sync::atomic::Ordering::Acquire)
+        && std::time::Instant::now() < release_deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        exited.load(std::sync::atomic::Ordering::Acquire),
+        "released join-stall peer did not exit"
+    );
+}
+
+#[test]
+fn runtime_tcp_fresh_listener_drop_skips_linger_query() {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16)
+        .expect("runtime TCP bind failed");
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(listener);
+        })
+        .expect("fresh TCP listener close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
+fn runtime_tcp_saved_public_fd_positive_linger_routes_to_worker() {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16)
+        .expect("runtime TCP bind failed");
+    let saved_raw = listener.as_raw_fd();
+    set_positive_linger(saved_raw);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(listener);
+        })
+        .expect("positive-linger TCP listener close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_worker_admissions, 1);
+        assert_eq!(stats.close_ring_submissions, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+    }
+    drop(executor);
+}
+
+#[test]
+fn runtime_tcp_accept_inherits_known_listener_provenance() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
+    let addr = listener.local_addr();
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        deadline.connect(addr).expect("std connect failed")
+    });
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (stream, _) = listener.accept().await.expect("accept failed");
+            drop(stream);
+            drop(listener);
+        })
+        .expect("known-provenance accept run failed");
+    drop(peer.finish());
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 2);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
+fn runtime_tcp_accept_inherits_exposed_positive_listener_provenance() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
+    let addr = listener.local_addr();
+    set_positive_linger(listener.as_raw_fd());
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        deadline.connect(addr).expect("std connect failed")
+    });
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (stream, _) = listener.accept().await.expect("accept failed");
+            drop(stream);
+            drop(listener);
+        })
+        .expect("uncertain-provenance accept run failed");
+    drop(peer.finish());
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 2);
+        assert_eq!(stats.close_worker_admissions, 2);
+        assert_eq!(stats.close_ring_submissions, 0);
+    }
+    drop(executor);
+}
+
+#[test]
+fn runtime_tcp_forgotten_accept_observes_late_listener_exposure() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
+    let addr = listener.local_addr();
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (connected_tx, connected_rx) = std::sync::mpsc::sync_channel(1);
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        deadline
+            .recv(&start_rx)
+            .expect("late-exposure start signal");
+        let mut stream = deadline.connect(addr).expect("std connect failed");
+        connected_tx
+            .send(())
+            .expect("late-exposure connected signal");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set peer read timeout");
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+            result => panic!("late-exposure listener backlog stayed open: {result:?}"),
+        }
+    });
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before client start"),
+            })
+            .await;
+            std::mem::forget(accept);
+
+            set_positive_linger(listener.as_raw_fd());
+            start_tx.send(()).expect("start late-exposure peer");
+            loop {
+                match connected_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        sleep(Duration::from_millis(1))
+                            .await
+                            .expect("connected wait sleep failed");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("late-exposure peer disconnected before connect")
+                    }
+                }
+            }
+
+            // Drive one timed wait after connect so the readiness CQE can
+            // enter the forgotten slot before listener teardown.
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("accept completion wait failed");
+            drop(listener);
+        })
+        .expect("late-exposure accept run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_worker_admissions, 1);
+        assert_eq!(stats.close_ring_submissions, 0);
+    }
+    drop(executor);
+    peer.finish();
 }
 
 #[test]
 fn runtime_tcp_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
-    let mut peer = std::net::TcpStream::connect(addr).expect("std connect failed");
-    let (standard, _) = listener.accept().expect("std accept failed");
+    let deadline = common::TcpPeerDeadline::new("owned-fd adoption TCP peer");
+    let mut peer = deadline.connect(addr).expect("std connect failed");
+    let (mut standard, _) = deadline.accept(&listener).expect("std accept failed");
     standard
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
 
     let raw = standard.as_raw_fd();
-    let owned: OwnedFd = standard.into();
+    let owned: OwnedFd = standard.into_inner().into();
     let stream = TcpStream::from_owned_fd(owned);
-    assert_eq!(stream.as_raw_fd(), raw);
     let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     assert!(status >= 0, "F_GETFL failed for adopted TCP fd");
     assert_ne!(
@@ -76,7 +447,22 @@ fn runtime_tcp_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
         "adopted TCP fd became blocking"
     );
 
-    drop(stream);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor
+        .run(async move {
+            drop(stream);
+        })
+        .expect("runtime-owned TCP close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+    drop(executor);
+
     peer.set_read_timeout(Some(Duration::from_secs(1)))
         .expect("set_read_timeout failed");
     let mut byte = [0u8; 1];
@@ -85,32 +471,6 @@ fn runtime_tcp_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
         Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
         result => panic!("adopted TCP descriptor was not closed exactly once: {result:?}"),
     }
-}
-
-/// Asserts that the runtime closed an orphaned accepted fd by observing EOF or
-/// reset on the connected peer, with a bounded poll loop.
-async fn wait_for_tcp_peer_close(mut stream: std::net::TcpStream) {
-    stream
-        .set_nonblocking(true)
-        .expect("set_nonblocking failed");
-    let mut byte = [0u8; 1];
-    for _ in 0..100 {
-        match stream.read(&mut byte) {
-            Ok(0) => return,
-            Ok(n) => panic!("orphaned accept peer unexpectedly read {n} bytes"),
-            Err(err)
-                if err.kind() == io::ErrorKind::WouldBlock
-                    || err.kind() == io::ErrorKind::Interrupted =>
-            {
-                sleep(Duration::from_millis(5))
-                    .await
-                    .expect("close wait sleep failed");
-            }
-            Err(err) if err.kind() == io::ErrorKind::ConnectionReset => return,
-            Err(err) => panic!("orphaned accept peer read failed unexpectedly: {err}"),
-        }
-    }
-    panic!("orphaned accept result fd was not closed");
 }
 
 #[test]
@@ -444,13 +804,47 @@ fn runtime_tcp_try_clone_for_split_duplicates_connected_stream_descriptor() {
 }
 
 #[test]
+fn runtime_tcp_successful_split_clone_taints_both_fresh_handles() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
+    let addr = listener.local_addr();
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        deadline.connect(addr).expect("std connect failed")
+    });
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (stream, _) = listener.accept().await.expect("accept failed");
+            let clone = stream
+                .try_clone_for_split()
+                .expect("fresh split clone failed");
+            drop(clone);
+            drop(stream);
+            drop(listener);
+        })
+        .expect("fresh split-clone run failed");
+    drop(peer.finish());
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.close_linger_queries, 2,
+            "both aliased stream owners must become uncertain"
+        );
+        assert_eq!(stats.close_ring_submissions, 3);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
 fn runtime_tcp_split_clone_supports_concurrent_async_read_and_write() {
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         stream.write_all(b"pong").expect("std write failed");
 
         let mut got = [0u8; 4];
@@ -485,7 +879,7 @@ fn runtime_tcp_split_clone_supports_concurrent_async_read_and_write() {
         assert_eq!(&reader.await.expect("reader task cancelled")[..], b"pong");
     });
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
@@ -507,14 +901,206 @@ fn runtime_tcp_ping_pong() {
         assert_eq!(&buf[..4], b"pong");
     });
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
-/// Cancelling accept after a client connected can still leave a completed
-/// kernel accept result; the reactor must close that orphaned fd and keep the
-/// listener reusable.
 #[test]
-fn runtime_tcp_cancelled_accept_closes_orphan_fd_and_reaccepts() {
+fn runtime_tcp_ipv6_listener_accepts_bounded_std_peer() {
+    const TEST_NAME: &str = "runtime_tcp_ipv6_listener_accepts_bounded_std_peer";
+
+    assert!(
+        TCP_IPV6_FLOWIO_TIMEOUT < common::TCP_PEER_TIMEOUT,
+        "the FlowIO IPv6 TCP timeout must expire before the peer deadline"
+    );
+    let Some(probe) = bind_std_ipv6_tcp_listener_or_skip(TEST_NAME) else {
+        return;
+    };
+    drop(probe);
+
+    let mut listener = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 128)
+        .expect("FlowIO IPv6 TCP bind failed after the trusted std probe succeeded");
+    let listener_addr = listener.local_addr();
+    assert_ne!(listener_addr.port(), 0);
+    assert_eq!(
+        listener_addr,
+        SocketAddr::from((Ipv6Addr::LOCALHOST, listener_addr.port()))
+    );
+
+    let peer = spawn_bounded_tcp_peer("IPv6 TCP connector peer", move |deadline| {
+        let mut stream = deadline
+            .connect(listener_addr)
+            .expect("bounded std IPv6 TCP connect failed");
+        let local_addr = stream
+            .local_addr()
+            .expect("bounded std IPv6 TCP local_addr failed");
+        let peer_addr = stream
+            .peer_addr()
+            .expect("bounded std IPv6 TCP peer_addr failed");
+        assert_eq!(
+            local_addr,
+            SocketAddr::from((Ipv6Addr::LOCALHOST, local_addr.port()))
+        );
+        assert_eq!(peer_addr, listener_addr);
+
+        stream
+            .write_all(b"ping")
+            .expect("bounded std IPv6 TCP write failed");
+        let mut response = [0u8; 4];
+        stream
+            .read_exact(&mut response)
+            .expect("bounded std IPv6 TCP read failed");
+        assert_eq!(&response, b"pong");
+        (local_addr, peer_addr)
+    });
+
+    let mut executor =
+        Executor::new().expect("failed to construct FlowIO IPv6 TCP listener executor");
+    let (flowio_local_addr, flowio_peer_addr, accepted_addr) =
+        run_test_output(&mut executor, async move {
+            timeout(TCP_IPV6_FLOWIO_TIMEOUT, async move {
+                let (mut stream, accepted_addr) = listener
+                    .accept()
+                    .await
+                    .expect("FlowIO IPv6 TCP accept failed");
+                let local_addr = stream
+                    .local_addr()
+                    .expect("FlowIO IPv6 TCP local_addr failed");
+                let peer_addr = stream
+                    .peer_addr()
+                    .expect("FlowIO IPv6 TCP peer_addr failed");
+                assert_eq!(local_addr, listener_addr);
+                assert_eq!(peer_addr, accepted_addr);
+                assert_eq!(
+                    accepted_addr,
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, accepted_addr.port()))
+                );
+
+                let (read_result, received) = stream.read_exact(vec![0u8; 4], 4).await;
+                assert_eq!(
+                    read_result.expect("FlowIO IPv6 TCP read failed"),
+                    b"ping".len()
+                );
+                assert_eq!(received.as_slice(), b"ping");
+
+                let (write_result, sent) = stream.write_all(b"pong".to_vec()).await;
+                assert_eq!(
+                    write_result.expect("FlowIO IPv6 TCP write failed"),
+                    b"pong".len()
+                );
+                assert_eq!(sent.as_slice(), b"pong");
+                (local_addr, peer_addr, accepted_addr)
+            })
+            .await
+            .expect("FlowIO IPv6 TCP listener exchange timed out")
+        });
+
+    let (std_local_addr, std_peer_addr) = peer.finish();
+    assert_eq!(std_peer_addr, flowio_local_addr);
+    assert_eq!(std_local_addr, flowio_peer_addr);
+    assert_eq!(std_local_addr, accepted_addr);
+}
+
+#[test]
+fn runtime_tcp_ipv6_connector_connect_timeout_to_bounded_std_peer() {
+    const TEST_NAME: &str = "runtime_tcp_ipv6_connector_connect_timeout_to_bounded_std_peer";
+
+    assert!(
+        TCP_IPV6_FLOWIO_TIMEOUT < common::TCP_PEER_TIMEOUT,
+        "the FlowIO IPv6 TCP timeout must expire before the peer deadline"
+    );
+    let Some(listener) = bind_std_ipv6_tcp_listener_or_skip(TEST_NAME) else {
+        return;
+    };
+    let listener_addr = listener
+        .local_addr()
+        .expect("trusted std IPv6 TCP listener local_addr failed");
+    assert_ne!(listener_addr.port(), 0);
+    assert_eq!(
+        listener_addr,
+        SocketAddr::from((Ipv6Addr::LOCALHOST, listener_addr.port()))
+    );
+
+    let peer = spawn_bounded_tcp_peer("IPv6 TCP listener peer", move |deadline| {
+        let (mut stream, accepted_addr) = deadline
+            .accept(&listener)
+            .expect("bounded std IPv6 TCP accept failed");
+        let local_addr = stream
+            .local_addr()
+            .expect("bounded std IPv6 TCP local_addr failed");
+        let peer_addr = stream
+            .peer_addr()
+            .expect("bounded std IPv6 TCP peer_addr failed");
+        assert_eq!(local_addr, listener_addr);
+        assert_eq!(peer_addr, accepted_addr);
+        assert_eq!(
+            accepted_addr,
+            SocketAddr::from((Ipv6Addr::LOCALHOST, accepted_addr.port()))
+        );
+
+        let mut request = [0u8; 4];
+        stream
+            .read_exact(&mut request)
+            .expect("bounded std IPv6 TCP read failed");
+        assert_eq!(&request, b"ping");
+        stream
+            .write_all(b"pong")
+            .expect("bounded std IPv6 TCP write failed");
+        (accepted_addr, local_addr, peer_addr)
+    });
+
+    let mut connector = TcpConnector::new();
+    let mut executor =
+        Executor::new().expect("failed to construct FlowIO IPv6 TCP connector executor");
+    let (flowio_local_addr, flowio_peer_addr) = run_test_output(&mut executor, async move {
+        timeout(TCP_IPV6_FLOWIO_TIMEOUT, async move {
+            let mut stream = connector
+                .connect_timeout(listener_addr, Duration::from_secs(1))
+                .expect("FlowIO IPv6 TCP connect_timeout initialization failed")
+                .await
+                .expect(
+                    "FlowIO IPv6 TCP connect_timeout failed after the trusted std probe succeeded",
+                );
+            let local_addr = stream
+                .local_addr()
+                .expect("FlowIO IPv6 TCP local_addr failed");
+            let peer_addr = stream
+                .peer_addr()
+                .expect("FlowIO IPv6 TCP peer_addr failed");
+            assert_eq!(
+                local_addr,
+                SocketAddr::from((Ipv6Addr::LOCALHOST, local_addr.port()))
+            );
+            assert_eq!(peer_addr, listener_addr);
+
+            let (write_result, sent) = stream.write_all(b"ping".to_vec()).await;
+            assert_eq!(
+                write_result.expect("FlowIO IPv6 TCP write failed"),
+                b"ping".len()
+            );
+            assert_eq!(sent.as_slice(), b"ping");
+
+            let (read_result, received) = stream.read_exact(vec![0u8; 4], 4).await;
+            assert_eq!(
+                read_result.expect("FlowIO IPv6 TCP read failed"),
+                b"pong".len()
+            );
+            assert_eq!(received.as_slice(), b"pong");
+            (local_addr, peer_addr)
+        })
+        .await
+        .expect("FlowIO IPv6 TCP connector exchange timed out")
+    });
+
+    let (accepted_addr, std_local_addr, std_peer_addr) = peer.finish();
+    assert_eq!(flowio_peer_addr, std_local_addr);
+    assert_eq!(flowio_local_addr, std_peer_addr);
+    assert_eq!(flowio_local_addr, accepted_addr);
+}
+
+/// Cancelling readiness does not consume a queued connection; the next accept
+/// receives that same peer and the reusable slot remains usable afterward.
+#[test]
+fn runtime_tcp_cancelled_accept_preserves_backlog_and_reaccepts() {
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
@@ -527,22 +1113,260 @@ fn runtime_tcp_cancelled_accept_closes_orphan_fd_and_reaccepts() {
         })
         .await;
 
-        let orphan_client = std::net::TcpStream::connect(addr).expect("orphan client connect");
+        let queued_client = connect_bounded_tcp_peer("queued cancelled-accept client", addr)
+            .expect("queued client connect");
+        let queued_addr = queued_client
+            .local_addr()
+            .expect("queued client local_addr failed");
         drop(accept);
-        wait_for_tcp_peer_close(orphan_client).await;
 
-        let client = std::net::TcpStream::connect(addr).expect("second client connect");
-        let client_addr = client.local_addr().expect("client local_addr failed");
+        let (queued_stream, remote_addr) = listener.accept().await.expect("queued accept failed");
+        assert_eq!(remote_addr, queued_addr);
+        drop(queued_stream);
+        drop(queued_client);
+
+        let second_client = connect_bounded_tcp_peer("second cancelled-accept client", addr)
+            .expect("second client connect");
+        let second_addr = second_client
+            .local_addr()
+            .expect("second client local_addr failed");
         let (_stream, remote_addr) = listener.accept().await.expect("second accept failed");
+        assert_eq!(remote_addr, second_addr);
+    });
+}
+
+#[test]
+fn runtime_tcp_accept_rearms_after_stale_readiness() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+    let listener_fd = listener.as_raw_fd();
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before first client connected"),
+            })
+            .await;
+
+            let first_client = connect_bounded_tcp_peer("first stale-readiness client", addr)
+                .expect("first client connect");
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("readiness wait failed");
+
+            // This raw accept is an intentional test-only violation of the
+            // documented no-concurrent-accept contract. It makes the completed
+            // readiness stale before FlowIO performs its owner-thread accept4.
+            let stolen = unsafe {
+                libc::accept4(
+                    listener_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                )
+            };
+            assert!(
+                stolen >= 0,
+                "external accept should steal first readiness: {}",
+                io::Error::last_os_error()
+            );
+            // SAFETY: the successful test accept4 returned one sole-owned fd.
+            let stolen = unsafe { OwnedFd::from_raw_fd(stolen) };
+
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("stale readiness was not rearmed"),
+            })
+            .await;
+
+            let second_client = connect_bounded_tcp_peer("second stale-readiness client", addr)
+                .expect("second client connect");
+            let second_addr = second_client
+                .local_addr()
+                .expect("second client local_addr failed");
+            let (_stream, remote_addr) = accept.await.expect("rearmed accept failed");
+            assert_eq!(remote_addr, second_addr);
+
+            drop(stolen);
+            drop(first_client);
+            drop(second_client);
+        })
+        .expect("stale-readiness run failed");
+    #[cfg(debug_assertions)]
+    assert_eq!(executor.last_stats().accept_readiness_rearms, 1);
+}
+
+#[test]
+fn runtime_tcp_completed_readiness_context_rejection_preserves_backlog() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
+    let addr = listener.local_addr();
+
+    run_test(async move {
+        let mut accept = Box::pin(listener.accept());
+        std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("accept completed before client connected"),
+        })
+        .await;
+
+        let client = connect_bounded_tcp_peer("context-rejection queued client", addr)
+            .expect("queued client connect");
+        let client_addr = client.local_addr().expect("client local_addr failed");
+        sleep(Duration::from_millis(10))
+            .await
+            .expect("readiness wait failed");
+
+        let mut invalid_cx = Context::from_waker(Waker::noop());
+        let err = match Future::poll(accept.as_mut(), &mut invalid_cx) {
+            Poll::Ready(Err(err)) => err,
+            Poll::Ready(Ok(_)) => panic!("invalid-context accept unexpectedly succeeded"),
+            Poll::Pending => panic!("completed readiness remained pending"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        drop(accept);
+
+        let (_stream, remote_addr) = listener
+            .accept()
+            .await
+            .expect("origin-context reaccept failed");
         assert_eq!(remote_addr, client_addr);
     });
 }
 
-/// Teardown probe: a completed accept CQE held in AcceptSlot must close the
-/// orphaned accepted fd when dropped without being polled.
 #[test]
-fn tcp_accept_slot_drop_cached_state_closes_completed_fd() {
-    test_accept_slot_drop_cached_state_closes_completed_fd().unwrap();
+fn runtime_tcp_unsubmitted_readiness_retains_listener_fd_until_ring_safe() {
+    if std::env::var_os(TCP_UNSUBMITTED_READINESS_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            TCP_UNSUBMITTED_READINESS_TEST,
+            TCP_UNSUBMITTED_READINESS_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
+    let listener_fd = listener.as_raw_fd();
+    let mut executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor");
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("empty listener unexpectedly accepted"),
+            })
+            .await;
+            std::mem::forget(accept);
+
+            // Keep the full one-entry SQ userspace-only when listener teardown
+            // tries to queue cancellation.
+            test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+            test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+            drop(listener);
+            assert_eq!(
+                test_hooks::ring_submit_failures_remaining(),
+                0,
+                "listener teardown did not consume both injected submit failures"
+            );
+
+            let flags = unsafe { libc::fcntl(listener_fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "readiness payload released listener fd before ring safety: {}",
+                io::Error::last_os_error()
+            );
+            let replacement = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .expect("replacement bind failed");
+            assert_ne!(
+                replacement.as_raw_fd(),
+                listener_fd,
+                "open retained listener descriptor was numerically reused"
+            );
+        })
+        .expect("unsubmitted readiness ownership run failed");
+    drop(executor);
+    let flags = unsafe { libc::fcntl(listener_fd, libc::F_GETFD) };
+    assert_eq!(
+        flags, -1,
+        "listener fd remained open after reactor teardown"
+    );
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+}
+
+#[test]
+fn runtime_tcp_shutdown_fallback_reclaims_readiness_state_with_watchdog() {
+    if std::env::var_os(TCP_SHUTDOWN_FALLBACK_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            TCP_SHUTDOWN_FALLBACK_TEST,
+            TCP_SHUTDOWN_FALLBACK_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
+    let addr = listener.local_addr();
+    set_positive_linger(listener.as_raw_fd());
+    let mut executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor");
+
+    let err = executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before shutdown peer"),
+            })
+            .await;
+            std::mem::forget(accept);
+            test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            std::future::pending::<()>().await;
+        })
+        .expect_err("injected wait failure should stop the executor");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+    // The readiness CQE may remain unread. It cannot own an accepted fd; the
+    // retained listener owner keeps its numeric identity valid through
+    // cancellation or ring teardown.
+    let mut peer = connect_bounded_tcp_peer("shutdown-fallback observer", addr)
+        .expect("shutdown peer connect failed");
+    test_hooks::force_next_reactor_shutdown_fallback();
+    drop(executor);
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "forced TCP shutdown fallback was not consumed"
+    );
+
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set shutdown peer read timeout");
+    let mut byte = [0u8; 1];
+    match peer.read(&mut byte) {
+        Ok(0) => {}
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        result => panic!("shutdown fallback left TCP listener backlog open: {result:?}"),
+    }
+}
+
+/// Teardown probe: a completed readiness CQE must never be interpreted as an
+/// accepted descriptor.
+#[test]
+fn tcp_accept_slot_drop_cached_state_preserves_unrelated_fd() {
+    test_accept_slot_drop_cached_state_preserves_unrelated_fd().unwrap();
 }
 
 #[test]
@@ -580,14 +1404,12 @@ fn tcp_accept_busy_error_outside_run_prefers_context_error() {
 fn runtime_tcp_connect_ping_pong() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let (mut stream, _) = listener.accept().expect("std accept failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let (mut stream, _) = deadline.accept(&listener).expect("std accept failed");
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"ping");
@@ -614,7 +1436,7 @@ fn runtime_tcp_connect_ping_pong() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
@@ -637,7 +1459,7 @@ fn runtime_tcp_write_all_read_exact() {
         assert_eq!(&buf[..], b"pong");
     });
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
@@ -661,7 +1483,7 @@ fn runtime_tcp_write_all_read_exact_large_payload() {
         assert!(buf.iter().all(|&b| b == 0xAB), "data mismatch on read");
     });
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
@@ -672,10 +1494,8 @@ fn runtime_tcp_read_exact_eof() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::Write;
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         stream.write_all(b"hi").expect("std write failed");
         drop(stream); // close before sending 4 bytes
     });
@@ -693,7 +1513,7 @@ fn runtime_tcp_read_exact_eof() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// TcpStream::connect() convenience creates a connection without a TcpConnector.
@@ -701,13 +1521,12 @@ fn runtime_tcp_read_exact_eof() {
 fn runtime_tcp_stream_connect() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let (mut stream, _) = listener.accept().expect("std accept failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let (mut stream, _) = deadline.accept(&listener).expect("std accept failed");
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"ping");
@@ -732,19 +1551,19 @@ fn runtime_tcp_stream_connect() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
 fn runtime_tcp_stream_connect_timeout_success() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
 
-    let peer = std::thread::spawn(move || {
-        let (_stream, _) = listener.accept().expect("std accept failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let (_stream, _) = deadline.accept(&listener).expect("std accept failed");
     });
 
     executor
@@ -757,19 +1576,19 @@ fn runtime_tcp_stream_connect_timeout_success() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
 fn runtime_tcp_connector_connect_timeout_success() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
 
-    let peer = std::thread::spawn(move || {
-        let (_stream, _) = listener.accept().expect("std accept failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let (_stream, _) = deadline.accept(&listener).expect("std accept failed");
     });
 
     let mut connector = TcpConnector::new();
@@ -784,14 +1603,14 @@ fn runtime_tcp_connector_connect_timeout_success() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
 fn runtime_tcp_stream_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
     drop(listener);
@@ -814,7 +1633,7 @@ fn runtime_tcp_stream_connect_timeout_propagates_connect_error() {
 fn runtime_tcp_connector_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
     drop(listener);
@@ -837,7 +1656,7 @@ fn runtime_tcp_connector_connect_timeout_propagates_connect_error() {
 
 #[test]
 fn runtime_tcp_connect_timeout_preserves_timer_runtime_error() {
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
     let mut executor = Executor::new().expect("failed to construct runtime executor");
@@ -866,10 +1685,9 @@ fn runtime_tcp_socket_options() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = [0u8; 1];
-        use std::io::Read;
         let _ = stream.read(&mut buf);
     });
 
@@ -905,7 +1723,7 @@ fn runtime_tcp_socket_options() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// TcpListener::bind_reuse_port sets SO_REUSEPORT.
@@ -923,12 +1741,12 @@ fn runtime_tcp_listener_reuse_port() {
 fn runtime_tcp_connector_default_trait() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
 
-    let peer = std::thread::spawn(move || {
-        let (_stream, _) = listener.accept().expect("std accept failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let (_stream, _) = deadline.accept(&listener).expect("std accept failed");
     });
 
     let mut connector = TcpConnector::default();
@@ -943,7 +1761,7 @@ fn runtime_tcp_connector_default_trait() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 // ============================================================================
@@ -959,10 +1777,8 @@ fn runtime_tcp_ping_pong_iobuff() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"ping");
@@ -986,7 +1802,7 @@ fn runtime_tcp_ping_pong_iobuff() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// write_all with frozen IoBuff, read_exact with IoBuffMut.
@@ -998,10 +1814,8 @@ fn runtime_tcp_write_all_read_exact_iobuff() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"ping");
@@ -1026,7 +1840,7 @@ fn runtime_tcp_write_all_read_exact_iobuff() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// Staged IoBuffMut append reads preserve previously-read payload bytes.
@@ -1038,10 +1852,8 @@ fn runtime_tcp_read_exact_append_iobuff_staged() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::Write;
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         stream.write_all(b"HEADbody").expect("std write failed");
     });
 
@@ -1061,7 +1873,7 @@ fn runtime_tcp_read_exact_append_iobuff_staged() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// IoBuffMut with headroom — prepend a protocol header before sending.
@@ -1073,10 +1885,8 @@ fn runtime_tcp_iobuff_headroom() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::Read;
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = [0u8; 9];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"HDR:world");
@@ -1096,7 +1906,7 @@ fn runtime_tcp_iobuff_headroom() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// Pool-allocated buffers through TCP transport.
@@ -1108,10 +1918,8 @@ fn runtime_tcp_pool_buffers() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = [0u8; 5];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"hello");
@@ -1143,7 +1951,7 @@ fn runtime_tcp_pool_buffers() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 /// Large payload with IoBuffMut — forces partial kernel transfers.
@@ -1156,10 +1964,8 @@ fn runtime_tcp_write_all_read_exact_large_iobuff() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = vec![0u8; msg_size];
         stream.read_exact(&mut buf).expect("std read failed");
         assert!(buf.iter().all(|&b| b == 0xAB), "data mismatch");
@@ -1185,7 +1991,7 @@ fn runtime_tcp_write_all_read_exact_large_iobuff() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 // ============================================================================
@@ -1201,10 +2007,8 @@ fn runtime_tcp_writev_readv() {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128).expect("bind failed");
     let addr = listener.local_addr();
 
-    let peer = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-
-        let mut stream = std::net::TcpStream::connect(addr).expect("std connect failed");
+    let peer = spawn_bounded_tcp_peer("bounded standard TCP peer", move |deadline| {
+        let mut stream = deadline.connect(addr).expect("std connect failed");
         let mut buf = [0u8; 11];
         stream.read_exact(&mut buf).expect("std read failed");
         assert_eq!(&buf, b"hello world");
@@ -1229,7 +2033,7 @@ fn runtime_tcp_writev_readv() {
         })
         .expect("executor run failed");
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
@@ -1290,7 +2094,7 @@ fn runtime_tcp_writev_all_readonly_chain_to_std_peer() {
         assert_eq!(&buf[..], b"ack");
     });
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }
 
 #[test]
@@ -1314,5 +2118,5 @@ fn runtime_tcp_writev_all_projected_to_std_peer() {
         assert_eq!(&buf[..], b"ack");
     });
 
-    peer.join().expect("peer panicked");
+    peer.finish();
 }

@@ -7,9 +7,10 @@ use flowio::runtime::timer::sleep;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Runs one integration-test future on a fresh executor.
 #[allow(dead_code)]
@@ -19,6 +20,503 @@ where
 {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
     executor.run(future).expect("executor run failed");
+}
+
+/// Runs one integration-test future and returns its output after the executor
+/// has fully drained.
+#[allow(dead_code)]
+pub fn run_test_output<F, T>(executor: &mut Executor, future: F) -> T
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    let output = Rc::new(Cell::new(None));
+    let output_slot = Rc::clone(&output);
+    executor
+        .run(async move {
+            output_slot.set(Some(future.await));
+        })
+        .expect("executor run failed");
+    output
+        .take()
+        .expect("integration-test future did not return its output")
+}
+
+/// Default absolute deadline for one blocking standard-library TCP peer.
+#[allow(dead_code)]
+pub const TCP_PEER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Returns whether a trusted standard-library probe proved that IPv6 loopback
+/// is unavailable on this host.
+#[allow(dead_code)]
+pub fn ipv6_loopback_capability_unavailable(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EAFNOSUPPORT) | Some(libc::EPFNOSUPPORT) | Some(libc::EADDRNOTAVAIL)
+    )
+}
+
+/// One absolute deadline shared by a standard-library TCP peer's setup and I/O.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct TcpPeerDeadline {
+    label: &'static str,
+    expires_at: Instant,
+}
+
+#[allow(dead_code)]
+impl TcpPeerDeadline {
+    /// Starts the default bounded interval for a named TCP peer.
+    pub fn new(label: &'static str) -> Self {
+        Self::with_timeout(label, TCP_PEER_TIMEOUT)
+    }
+
+    /// Starts a caller-selected bounded interval for deterministic regressions.
+    pub fn with_timeout(label: &'static str, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "TCP peer timeout must be nonzero");
+        Self {
+            label,
+            expires_at: Instant::now() + timeout,
+        }
+    }
+
+    fn timeout_error(&self, operation: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "bounded TCP peer '{}' exceeded its deadline during {operation}",
+                self.label
+            ),
+        )
+    }
+
+    fn remaining(&self, operation: &str) -> io::Result<Duration> {
+        self.expires_at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| self.timeout_error(operation))
+    }
+
+    fn remaining_for_wait(&self) -> Duration {
+        self.expires_at
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Connects a standard TCP peer within the remaining absolute deadline.
+    pub fn connect(&self, addr: std::net::SocketAddr) -> io::Result<BoundedTcpStream> {
+        let remaining = self.remaining("connect")?;
+        std::net::TcpStream::connect_timeout(&addr, remaining)
+            .map(|stream| BoundedTcpStream::new(stream, *self))
+            .map_err(|err| {
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) {
+                    self.timeout_error("connect")
+                } else {
+                    err
+                }
+            })
+    }
+
+    /// Accepts a standard TCP peer through bounded nonblocking polling.
+    pub fn accept(
+        &self,
+        listener: &BoundedTcpListener,
+    ) -> io::Result<(BoundedTcpStream, std::net::SocketAddr)> {
+        listener.inner.set_nonblocking(true)?;
+        let accepted = loop {
+            if let Err(err) = self.remaining("accept") {
+                break Err(err);
+            }
+            match listener.inner.accept() {
+                Ok(pair) => break Ok(pair),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    let remaining = match self.remaining("accept") {
+                        Ok(remaining) => remaining,
+                        Err(err) => break Err(err),
+                    };
+                    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        listener.inner.set_nonblocking(false)?;
+        accepted.map(|(stream, addr)| (BoundedTcpStream::new(stream, *self), addr))
+    }
+
+    /// Receives a peer-coordination value within the remaining deadline.
+    pub fn recv<T>(&self, receiver: &std::sync::mpsc::Receiver<T>) -> io::Result<T> {
+        let remaining = self.remaining("channel receive")?;
+        receiver.recv_timeout(remaining).map_err(|err| match err {
+            std::sync::mpsc::RecvTimeoutError::Timeout => self.timeout_error("channel receive"),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!(
+                    "bounded TCP peer '{}' disconnected during channel receive",
+                    self.label
+                ),
+            ),
+        })
+    }
+}
+
+/// Standard TCP listener whose inner socket is only exposed to bounded helpers.
+#[allow(dead_code)]
+pub struct BoundedTcpListener {
+    inner: std::net::TcpListener,
+}
+
+#[allow(dead_code)]
+impl BoundedTcpListener {
+    /// Binds a standard TCP listener for a bounded test peer.
+    pub fn bind(addr: std::net::SocketAddr) -> io::Result<Self> {
+        std::net::TcpListener::bind(addr).map(|inner| Self { inner })
+    }
+
+    /// Returns the listener's assigned local address.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+impl std::os::fd::AsRawFd for BoundedTcpListener {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.inner)
+    }
+}
+
+/// Standard TCP stream whose blocking operations share one absolute deadline.
+#[allow(dead_code)]
+pub struct BoundedTcpStream {
+    inner: std::net::TcpStream,
+    deadline: TcpPeerDeadline,
+    nonblocking: bool,
+    read_timeout_cap: Option<Duration>,
+    write_timeout_cap: Option<Duration>,
+}
+
+#[allow(dead_code)]
+impl BoundedTcpStream {
+    fn new(inner: std::net::TcpStream, deadline: TcpPeerDeadline) -> Self {
+        Self {
+            inner,
+            deadline,
+            nonblocking: false,
+            read_timeout_cap: None,
+            write_timeout_cap: None,
+        }
+    }
+
+    fn operation_timeout(&self, operation: &str, cap: Option<Duration>) -> io::Result<Duration> {
+        let remaining = self.deadline.remaining(operation)?;
+        Ok(cap.map_or(remaining, |cap| cap.min(remaining)))
+    }
+
+    fn read_once(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.nonblocking {
+            let timeout = self.operation_timeout("read", self.read_timeout_cap)?;
+            self.inner.set_read_timeout(Some(timeout))?;
+        }
+        std::io::Read::read(&mut self.inner, buf).map_err(|err| {
+            if !self.nonblocking
+                && matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                )
+            {
+                self.deadline.timeout_error("read")
+            } else {
+                err
+            }
+        })
+    }
+
+    fn write_once(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.nonblocking {
+            let timeout = self.operation_timeout("write", self.write_timeout_cap)?;
+            self.inner.set_write_timeout(Some(timeout))?;
+        }
+        std::io::Write::write(&mut self.inner, buf).map_err(|err| {
+            if !self.nonblocking
+                && matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                )
+            {
+                self.deadline.timeout_error("write")
+            } else {
+                err
+            }
+        })
+    }
+
+    /// Reads once while preserving nonblocking-probe behavior when requested.
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_once(buf)
+    }
+
+    /// Reads the complete buffer under this stream's one absolute deadline.
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        std::io::Read::read_exact(self, buf)
+    }
+
+    /// Writes once while preserving nonblocking-probe behavior when requested.
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_once(buf)
+    }
+
+    /// Writes the complete buffer under this stream's one absolute deadline.
+    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        std::io::Write::write_all(self, buf)
+    }
+
+    /// Applies a smaller read cap without weakening the absolute deadline.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)?;
+        self.read_timeout_cap = timeout;
+        Ok(())
+    }
+
+    /// Applies a smaller write cap without weakening the absolute deadline.
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)?;
+        self.write_timeout_cap = timeout;
+        Ok(())
+    }
+
+    /// Switches between blocking bounded I/O and immediate nonblocking probes.
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)?;
+        self.nonblocking = nonblocking;
+        Ok(())
+    }
+
+    /// Shuts down part or all of the connected peer.
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.inner.shutdown(how)
+    }
+
+    /// Returns the peer stream's local address.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Returns the peer stream's remote address.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    /// Transfers the standard stream out for an ownership-adoption test.
+    pub fn into_inner(self) -> std::net::TcpStream {
+        self.inner
+    }
+}
+
+impl std::io::Read for BoundedTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_once(buf)
+    }
+}
+
+impl std::io::Write for BoundedTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_once(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.nonblocking {
+            let timeout = self.operation_timeout("flush", self.write_timeout_cap)?;
+            self.inner.set_write_timeout(Some(timeout))?;
+        }
+        std::io::Write::flush(&mut self.inner)
+    }
+}
+
+impl std::os::fd::AsRawFd for BoundedTcpStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.inner)
+    }
+}
+
+/// Connects one bounded standard TCP peer using the default deadline.
+#[allow(dead_code)]
+pub fn connect_bounded_tcp_peer(
+    label: &'static str,
+    addr: std::net::SocketAddr,
+) -> io::Result<BoundedTcpStream> {
+    TcpPeerDeadline::new(label).connect(addr)
+}
+
+/// Join handle for a bounded standard TCP peer thread.
+#[allow(dead_code)]
+pub struct BoundedTcpPeer<T> {
+    label: &'static str,
+    deadline: TcpPeerDeadline,
+    outcome: std::sync::mpsc::Receiver<std::thread::Result<T>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+impl<T> BoundedTcpPeer<T> {
+    /// Waits only until the peer's absolute deadline, then propagates its
+    /// original result or panic.
+    pub fn finish(mut self) -> T {
+        let outcome = match self.outcome.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!(
+                    "bounded TCP peer '{}' disconnected without an outcome",
+                    self.label
+                )
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self
+                .outcome
+                .recv_timeout(self.deadline.remaining_for_wait())
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "bounded TCP peer '{}' did not finish before its deadline: {err}",
+                        self.label
+                    )
+                }),
+        };
+
+        let handle = self
+            .handle
+            .take()
+            .expect("bounded TCP peer handle was already consumed");
+        while !handle.is_finished() {
+            let remaining = self.deadline.remaining_for_wait();
+            assert!(
+                !remaining.is_zero(),
+                "bounded TCP peer '{}' returned an outcome but did not exit before its deadline",
+                self.label
+            );
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+
+        match outcome {
+            Ok(output) => output,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+/// Spawns a named standard TCP peer with one shared absolute deadline.
+#[allow(dead_code)]
+pub fn spawn_bounded_tcp_peer<F, T>(label: &'static str, peer: F) -> BoundedTcpPeer<T>
+where
+    F: FnOnce(TcpPeerDeadline) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_bounded_tcp_peer_with_timeout(label, TCP_PEER_TIMEOUT, peer)
+}
+
+/// Spawns a named peer with a caller-selected timeout for regression tests.
+#[allow(dead_code)]
+pub fn spawn_bounded_tcp_peer_with_timeout<F, T>(
+    label: &'static str,
+    timeout: Duration,
+    peer: F,
+) -> BoundedTcpPeer<T>
+where
+    F: FnOnce(TcpPeerDeadline) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let deadline = TcpPeerDeadline::with_timeout(label, timeout);
+    let (sender, outcome) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| peer(deadline)));
+        let _ = sender.send(result);
+    });
+    BoundedTcpPeer {
+        label,
+        deadline,
+        outcome,
+        handle: Some(handle),
+    }
+}
+
+/// Runs one exact integration test in a subprocess and kills/reaps it if the
+/// bounded deadline expires.
+#[allow(dead_code)]
+pub fn run_exact_test_child_with_watchdog(test_name: &str, child_env: &str, timeout: Duration) {
+    let current_exe = std::env::current_exe().expect("current integration-test executable");
+    let mut child = Command::new(current_exe)
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_env, "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn integration-test watchdog child");
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if child
+            .try_wait()
+            .expect("poll integration-test watchdog child")
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .expect("collect integration-test watchdog child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "watchdog child {test_name} failed: status={:?}, stdout={}, stderr={}",
+                output.status,
+                stdout,
+                stderr
+            );
+            assert!(
+                stdout.contains("1 passed;"),
+                "watchdog child {test_name} did not execute exactly one test: stdout={stdout}, stderr={stderr}"
+            );
+            return;
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("reap timed-out integration-test watchdog child");
+            panic!(
+                "watchdog child {test_name} exceeded {timeout:?}; stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Enables a positive `SO_LINGER` interval on a socket for terminal-close
+/// routing tests.
+#[allow(dead_code)]
+pub fn set_positive_linger(fd: std::os::fd::RawFd) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 1,
+    };
+    // SAFETY: `linger` is initialized and borrowed for the exact socket-option
+    // byte count during this call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::addr_of!(linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
 }
 
 #[allow(dead_code)]
@@ -116,21 +614,117 @@ pub fn fill_try_send_buffer(
     panic!("socket send buffer did not fill within bounded attempts");
 }
 
-/// Fake read-only buffer reporting a length above `u32::MAX` to exercise
-/// oversize-send rejection without allocating that much memory.
-#[allow(dead_code)]
-pub struct HugeReadOnly;
+/// Exact readable length used by the valid sparse oversized-send fixture.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+const SPARSE_OVERSIZED_READ_ONLY_LEN: usize = u32::MAX as usize + 1;
 
-// SAFETY: this fixture is only used on validation paths that must reject the
-// oversized length before submitting kernel I/O or dereferencing the pointer.
-unsafe impl IoBuffReadOnly for HugeReadOnly {
+/// Read-only sparse mapping larger than the io_uring 32-bit byte-count limit.
+///
+/// The mapping reserves virtual address space without reserving swap or
+/// populating physical pages. Oversized-send tests must reject it before
+/// consulting the pointer or submitting an SQE.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+pub struct SparseOversizedReadOnly {
+    base: std::ptr::NonNull<u8>,
+    as_ptr_calls: Cell<usize>,
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+impl SparseOversizedReadOnly {
+    /// Reserves one valid initialized read-only mapping of exactly 2^32 bytes.
+    pub fn new() -> io::Result<Self> {
+        let raw = unsafe {
+            // SAFETY: this requests a new anonymous private mapping. No input
+            // pointer or file descriptor is dereferenced, and success is
+            // checked before the returned address is retained.
+            libc::mmap(
+                std::ptr::null_mut(),
+                SPARSE_OVERSIZED_READ_ONLY_LEN,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        let Some(base) = std::ptr::NonNull::new(raw.cast::<u8>()) else {
+            // SAFETY: `raw` names the successful mapping above and the exact
+            // mapping length is unchanged.
+            let rc = unsafe { libc::munmap(raw, SPARSE_OVERSIZED_READ_ONLY_LEN) };
+            assert_eq!(rc, 0, "failed to unmap an unexpected null mapping");
+            return Err(io::Error::other("mmap returned a null address"));
+        };
+
+        Ok(Self {
+            base,
+            as_ptr_calls: Cell::new(0),
+        })
+    }
+
+    /// Returns how often a transport consulted this mapping's data pointer.
+    pub fn as_ptr_calls(&self) -> usize {
+        self.as_ptr_calls.get()
+    }
+}
+
+// SAFETY: successful anonymous mappings are zero-initialized and page-aligned.
+// This mapping is one non-null, immutable 2^32-byte range, which is below
+// `isize::MAX` on the gated 64-bit target. Its address remains stable across
+// moves and stays readable until the owning value unmaps it in `Drop`.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+unsafe impl IoBuffReadOnly for SparseOversizedReadOnly {
     fn as_ptr(&self) -> *const u8 {
-        b"x".as_ptr()
+        self.as_ptr_calls
+            .set(self.as_ptr_calls.get().saturating_add(1));
+        self.base.as_ptr()
     }
 
     fn len(&self) -> usize {
-        u32::MAX as usize + 1
+        SPARSE_OVERSIZED_READ_ONLY_LEN
     }
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+impl Drop for SparseOversizedReadOnly {
+    fn drop(&mut self) {
+        // SAFETY: this value uniquely owns the successful mapping at `base`,
+        // and Drop supplies the exact original length once.
+        let rc = unsafe {
+            libc::munmap(
+                self.base.as_ptr().cast::<libc::c_void>(),
+                SPARSE_OVERSIZED_READ_ONLY_LEN,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "failed to release sparse oversized test mapping: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// Verifies the common oversize-send result without touching mapped bytes.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+pub fn assert_oversized_send_rejected(result: io::Result<usize>, buffer: &SparseOversizedReadOnly) {
+    let err = result.expect_err("oversized send should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        "length exceeds io_uring u32 byte-count limit"
+    );
+    assert_eq!(IoBuffReadOnly::len(buffer), SPARSE_OVERSIZED_READ_ONLY_LEN);
+    assert_eq!(
+        buffer.as_ptr_calls(),
+        0,
+        "oversized send consulted the buffer pointer before rejecting its length"
+    );
 }
 
 /// Drop-tracking read-only buffer used by retained-payload tests.

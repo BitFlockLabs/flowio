@@ -18,7 +18,10 @@
 //! Standard task wakers must be cloned, woken, and dropped on their owner
 //! thread. Debug builds assert this contract; no cross-thread relay exists.
 //! Timeout wrappers distinguish deadline expiry ([`timer::TimeoutError::Elapsed`])
-//! from timer-runtime failure ([`timer::TimeoutError::Runtime`]).
+//! from timer-runtime failure ([`timer::TimeoutError::Runtime`]). A timeout
+//! validates its active and origin executor context before polling the wrapped
+//! future. After validation, the wrapped future retains priority and an
+//! immediately ready result allocates no timer entry.
 //!
 //! # Fast-Path Guidance
 //!

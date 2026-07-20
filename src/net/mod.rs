@@ -137,7 +137,7 @@
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use crate::runtime::buffer::IoBuffReadWrite;
 
@@ -440,6 +440,60 @@ fn connect_cqe_result(result: i32) -> io::Result<()> {
         return Ok(());
     }
     Err(io::Error::from_raw_os_error(-result))
+}
+
+/// Builds the one-shot readiness notification used by TCP and SCTP accept.
+///
+/// The CQE reports only readiness; it never owns an accepted descriptor.
+#[inline(always)]
+fn accept_readiness_sqe(fd: RawFd, user_data: u64) -> io_uring::squeue::Entry {
+    io_uring::opcode::PollAdd::new(io_uring::types::Fd(fd), libc::POLLIN as u32)
+        .build()
+        .user_data(user_data)
+}
+
+/// Accepts one ready connection without allowing the owner thread to block.
+///
+/// Performing `accept4` after a readiness CQE keeps descriptor creation on the
+/// owner thread. An unread or cancelled readiness CQE therefore owns no file
+/// descriptor during bounded reactor teardown. Exposed listeners reassert
+/// `O_NONBLOCK` before the call; fresh internal listeners keep their creation
+/// invariant and avoid the extra status query.
+fn accept_nonblocking(
+    fd: RawFd,
+    reassert_listener_nonblocking: bool,
+) -> io::Result<(OwnedFd, libc::sockaddr_storage, libc::socklen_t)> {
+    if reassert_listener_nonblocking {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK == 0 {
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let accepted = unsafe {
+        libc::accept4(
+            fd,
+            &mut addr as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut addrlen,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if accepted < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: a successful accept4 returns one newly installed descriptor and
+    // transfers its sole userspace ownership to this caller.
+    let accepted = unsafe { OwnedFd::from_raw_fd(accepted) };
+    Ok((accepted, addr, addrlen))
 }
 
 fn socket_domain(addr: SocketAddr) -> libc::c_int {
@@ -763,6 +817,109 @@ mod tests {
         let err = connect_cqe_result(-libc::ECONNREFUSED)
             .expect_err("real connect failure should retain its errno");
         assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
+    }
+
+    #[test]
+    fn socket_addr_v6_c_layout_and_round_trip_preserve_all_fields() {
+        let ip = std::net::Ipv6Addr::new(
+            0x2001, 0x0db8, 0x1234, 0x5678, 0x90ab, 0xcdef, 0x1020, 0x3040,
+        );
+        let addr = SocketAddr::V6(SocketAddrV6::new(ip, 0x1234, 0x0102_0304, 0x0506_0708));
+
+        let (storage, len) = socket_addr_to_c(addr);
+        assert_eq!(
+            len,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        );
+
+        let raw = unsafe {
+            std::ptr::read_unaligned(
+                (&storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
+            )
+        };
+        assert_eq!(raw.sin6_family, libc::AF_INET6 as libc::sa_family_t);
+        assert_eq!(raw.sin6_port, 0x1234u16.to_be());
+        assert_eq!(raw.sin6_addr.s6_addr, ip.octets());
+        assert_eq!(raw.sin6_flowinfo, 0x0102_0304);
+        assert_eq!(raw.sin6_scope_id, 0x0506_0708);
+        assert_eq!(
+            socket_addr_from_c(&storage, len).expect("IPv6 sockaddr should decode"),
+            addr
+        );
+    }
+
+    #[test]
+    fn socket_addr_from_c_rejects_malformed_ipv6_lengths_and_families() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            0x1234,
+            0x0102_0304,
+            0x0506_0708,
+        ));
+        let (storage, _) = socket_addr_to_c(addr);
+        let family_len = std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t;
+        let sockaddr_in6_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+
+        for (case, len) in [
+            ("zero length", 0),
+            ("short family", family_len - 1),
+            ("short IPv6 address", sockaddr_in6_len - 1),
+        ] {
+            let err = socket_addr_from_c(&storage, len).expect_err(case);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
+        }
+
+        let (mut zero_family, _) = socket_addr_to_c(addr);
+        zero_family.ss_family = 0;
+        let err = socket_addr_from_c(&zero_family, sockaddr_in6_len)
+            .expect_err("zero family should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let (mut unknown_family, _) = socket_addr_to_c(addr);
+        unknown_family.ss_family = libc::sa_family_t::MAX;
+        let err = socket_addr_from_c(&unknown_family, sockaddr_in6_len)
+            .expect_err("unknown family should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn nonblocking_accept_reasserts_listener_mode_then_returns_cloexec_socket() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("std listener bind should succeed");
+
+        let err = accept_nonblocking(listener.as_raw_fd(), true)
+            .expect_err("empty listener should not accept");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        let peer = TcpStream::connect(listener.local_addr().expect("listener address missing"))
+            .expect("std client connect should succeed");
+        let peer_addr = peer.local_addr().expect("client local address missing");
+        let (accepted, addr, addrlen) =
+            accept_nonblocking(listener.as_raw_fd(), true).expect("ready listener should accept");
+
+        let status = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            status >= 0,
+            "F_GETFL failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_ne!(status & libc::O_NONBLOCK, 0);
+
+        let fd_flags = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            fd_flags >= 0,
+            "F_GETFD failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            socket_addr_from_c(&addr, addrlen).expect("accepted address should decode"),
+            peer_addr
+        );
     }
 
     #[test]

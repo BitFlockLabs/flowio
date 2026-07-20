@@ -1,9 +1,11 @@
 mod common;
 
 use common::{
-    DropTrackedReadOnly, DropTrackedReadWrite, HugeReadOnly, TestIoBuffMut as IoBuffMut,
+    DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut, set_positive_linger,
     wait_for_drop_count, wait_for_live_slots,
 };
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
 use flowio::net::sctp::{
     SctpAddStreams, SctpAssocConfig, SctpAssocStatus, SctpConnector, SctpInitConfig, SctpListener,
     SctpNotification, SctpNotificationKind, SctpNotificationMask, SctpPeerAddrInfo,
@@ -13,11 +15,12 @@ use flowio::net::sctp::{
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u32_at};
 use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
-use flowio::runtime::executor::Executor;
-use flowio::runtime::timer::timeout;
+use flowio::runtime::executor::{Executor, ExecutorConfig};
+use flowio::runtime::reactor::ReactorConfig;
+use flowio::runtime::timer::{sleep, timeout};
 use flowio::test_support::net::sctp::{
-    capability_unavailable, test_accept_slot_drop_cached_state_closes_completed_fd,
-    test_accept_slot_drop_future_closes_completed_fd, test_adaptation_indication_type,
+    capability_unavailable, test_accept_slot_drop_cached_state_preserves_unrelated_fd,
+    test_accept_slot_drop_future_preserves_unrelated_fd, test_adaptation_indication_type,
     test_assoc_change_type, test_assoc_reset_event_type,
     test_connect_slot_drop_future_closes_socket_fd, test_parse_notification, test_parse_recv_meta,
     test_partial_delivery_event_type, test_peer_addr_change_type,
@@ -27,13 +30,20 @@ use flowio::test_support::net::sctp::{
     test_stream_change_event_type, test_stream_reset_event_type,
 };
 use flowio::test_support::runtime::test_hooks;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
-use std::net::{Ipv4Addr, Shutdown, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
+
+const SCTP_SHUTDOWN_FALLBACK_CHILD_ENV: &str = "FLOWIO_SCTP_SHUTDOWN_FALLBACK_CHILD";
+const SCTP_SHUTDOWN_FALLBACK_TEST: &str =
+    "runtime_sctp_shutdown_fallback_reclaims_readiness_state_with_watchdog";
+const SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD_ENV: &str = "FLOWIO_SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD";
+const SCTP_EXTERNAL_ADOPTION_CLOSE_TEST: &str =
+    "runtime_sctp_external_adoption_classifies_then_uses_ring_close";
 
 fn bind_sctp_listener_or_skip(test_name: &str, config: SctpSocketConfig) -> Option<SctpListener> {
     match SctpListener::bind_with_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, config) {
@@ -46,22 +56,18 @@ fn bind_sctp_listener_or_skip(test_name: &str, config: SctpSocketConfig) -> Opti
     }
 }
 
-fn raw_sctp_stream_or_skip(test_name: &str) -> Option<SctpStream> {
+fn raw_sctp_socket_or_skip(test_name: &str, domain: libc::c_int) -> Option<OwnedFd> {
     let fd = unsafe {
         libc::socket(
-            libc::AF_INET,
+            domain,
             libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             libc::IPPROTO_SCTP,
         )
     };
     if fd >= 0 {
         // SAFETY: a successful socket call returns one descriptor owned only
-        // by this helper; it is immediately moved into the FlowIO stream.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        return Some(SctpStream::from_owned_fd(
-            fd,
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ));
+        // by this helper.
+        return Some(unsafe { OwnedFd::from_raw_fd(fd) });
     }
 
     let err = std::io::Error::last_os_error();
@@ -70,6 +76,310 @@ fn raw_sctp_stream_or_skip(test_name: &str) -> Option<SctpStream> {
         return None;
     }
     panic!("failed to create sctp socket for {test_name}: {err}");
+}
+
+fn raw_sctp_stream_or_skip(test_name: &str) -> Option<(SctpStream, std::os::fd::RawFd)> {
+    let fd = raw_sctp_socket_or_skip(test_name, libc::AF_INET)?;
+    let raw = fd.as_raw_fd();
+    Some((
+        SctpStream::from_owned_fd(fd, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        raw,
+    ))
+}
+
+fn bound_non_listening_sctp_endpoint_or_skip(test_name: &str) -> Option<(OwnedFd, SocketAddr)> {
+    let fd = raw_sctp_socket_or_skip(test_name, libc::AF_INET)?;
+    let bind_addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&bind_addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if capability_unavailable(&err) {
+            eprintln!("skipping {test_name}: SCTP unsupported ({err})");
+            return None;
+        }
+        panic!("failed to bind non-listening SCTP endpoint for {test_name}: {err}");
+    }
+
+    let mut bound_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut bound_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            (&mut bound_addr as *mut libc::sockaddr_in).cast::<libc::sockaddr>(),
+            &mut bound_len,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "failed to read non-listening SCTP endpoint for {test_name}: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        bound_len as usize,
+        std::mem::size_of::<libc::sockaddr_in>(),
+        "unexpected non-listening SCTP endpoint length for {test_name}",
+    );
+    assert_eq!(
+        bound_addr.sin_family,
+        libc::AF_INET as libc::sa_family_t,
+        "unexpected non-listening SCTP endpoint family for {test_name}",
+    );
+
+    let addr = SocketAddr::from((
+        Ipv4Addr::from(bound_addr.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(bound_addr.sin_port),
+    ));
+    assert_eq!(
+        addr.ip(),
+        Ipv4Addr::LOCALHOST,
+        "unexpected non-listening SCTP endpoint address for {test_name}",
+    );
+    assert_ne!(
+        addr.port(),
+        0,
+        "kernel did not assign a non-listening SCTP endpoint port for {test_name}",
+    );
+    Some((fd, addr))
+}
+
+fn sctp_ipv6_bind_capability_unavailable(err: &std::io::Error) -> bool {
+    capability_unavailable(err) || err.raw_os_error() == Some(libc::EADDRNOTAVAIL)
+}
+
+fn raw_sctp_ipv6_loopback_or_skip(test_name: &str) -> bool {
+    let Some(fd) = raw_sctp_socket_or_skip(test_name, libc::AF_INET6) else {
+        return false;
+    };
+    let addr = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: 0,
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr {
+            s6_addr: Ipv6Addr::LOCALHOST.octets(),
+        },
+        sin6_scope_id: 0,
+    };
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_in6 as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+
+    let err = std::io::Error::last_os_error();
+    if sctp_ipv6_bind_capability_unavailable(&err) {
+        eprintln!("skipping {test_name}: IPv6 SCTP loopback unavailable ({err})");
+        return false;
+    }
+    panic!("failed to bind IPv6 SCTP capability socket for {test_name}: {err}");
+}
+
+fn socket_addr_matches_ip_and_port(actual: SocketAddr, expected: SocketAddr) -> bool {
+    // SCTP enumeration may attach interface scope metadata that differs from
+    // getpeername/getsockname. The deterministic conversion regression covers
+    // exact flowinfo/scope preservation; live association identity is IP+port.
+    actual.ip() == expected.ip() && actual.port() == expected.port()
+}
+
+fn assert_assoc_addr_contains(label: &str, addrs: &[SocketAddr], expected: SocketAddr) {
+    assert!(
+        addrs
+            .iter()
+            .copied()
+            .any(|addr| socket_addr_matches_ip_and_port(addr, expected)),
+        "{label} did not contain {expected}: {addrs:?}"
+    );
+}
+
+fn assert_live_sctp_assoc_addrs(
+    mut listener: SctpListener,
+    client_bind_addr: SocketAddr,
+    config: SctpSocketConfig,
+) {
+    const DEADLINE: Duration = Duration::from_secs(2);
+
+    let listener_addr = listener.local_addr();
+    let mut connector = SctpConnector::with_config(config).with_local_addr(client_bind_addr);
+    let mut executor = Executor::new().expect("failed to construct SCTP address-test executor");
+
+    executor
+        .run(async move {
+            let server = Executor::spawn(async move {
+                timeout(DEADLINE, listener.accept())
+                    .await
+                    .expect("SCTP association-address accept timed out")
+                    .expect("SCTP association-address accept failed")
+            })
+            .expect("SCTP association-address accept spawn failed");
+
+            let client = connector
+                .connect_timeout(listener_addr, DEADLINE)
+                .expect("SCTP association-address connect init failed")
+                .await
+                .expect("SCTP association-address connect failed");
+            let (server, accepted_remote_addr) = timeout(DEADLINE, server)
+                .await
+                .expect("SCTP association-address accept join timed out")
+                .expect("SCTP association-address accept task was cancelled");
+
+            let client_local_addr = client.local_addr().expect("client local_addr failed");
+            let client_peer_addr = client.peer_addr();
+            let server_local_addr = server.local_addr().expect("server local_addr failed");
+            let server_peer_addr = server.peer_addr();
+
+            assert!(socket_addr_matches_ip_and_port(
+                client_peer_addr,
+                listener_addr
+            ));
+            assert!(socket_addr_matches_ip_and_port(
+                server_local_addr,
+                listener_addr
+            ));
+            assert!(socket_addr_matches_ip_and_port(
+                accepted_remote_addr,
+                client_local_addr
+            ));
+            assert!(socket_addr_matches_ip_and_port(
+                server_peer_addr,
+                client_local_addr
+            ));
+
+            assert_assoc_addr_contains(
+                "client local_addrs",
+                &client.local_addrs().expect("client local_addrs failed"),
+                client_local_addr,
+            );
+            assert_assoc_addr_contains(
+                "client peer_addrs",
+                &client.peer_addrs().expect("client peer_addrs failed"),
+                client_peer_addr,
+            );
+            assert_assoc_addr_contains(
+                "server local_addrs",
+                &server.local_addrs().expect("server local_addrs failed"),
+                server_local_addr,
+            );
+            assert_assoc_addr_contains(
+                "server peer_addrs",
+                &server.peer_addrs().expect("server peer_addrs failed"),
+                server_peer_addr,
+            );
+        })
+        .expect("SCTP association-address executor run failed");
+}
+
+#[test]
+fn runtime_sctp_fresh_listener_drop_skips_linger_query() {
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_fresh_listener_drop_skips_linger_query",
+        SctpSocketConfig::data(SctpInitConfig::diameter_default()),
+    ) else {
+        return;
+    };
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(listener);
+        })
+        .expect("fresh SCTP listener close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
+fn runtime_sctp_saved_public_fd_positive_linger_routes_to_worker() {
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_saved_public_fd_positive_linger_routes_to_worker",
+        SctpSocketConfig::data(SctpInitConfig::diameter_default()),
+    ) else {
+        return;
+    };
+    let saved_raw = listener.as_raw_fd();
+    set_positive_linger(saved_raw);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(listener);
+        })
+        .expect("positive-linger SCTP listener close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_worker_admissions, 1);
+        assert_eq!(stats.close_ring_submissions, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+    }
+    drop(executor);
+}
+
+#[test]
+fn runtime_sctp_external_adoption_classifies_then_uses_ring_close() {
+    if std::env::var_os(SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            SCTP_EXTERNAL_ADOPTION_CLOSE_TEST,
+            SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let Some((stream, raw)) =
+        raw_sctp_stream_or_skip("runtime_sctp_external_adoption_classifies_then_uses_ring_close")
+    else {
+        return;
+    };
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(stream);
+        })
+        .expect("runtime-owned SCTP close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+
+    // SAFETY: F_GETFD accepts any integer descriptor; EBADF proves closure.
+    let rc = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    assert_eq!(rc, -1, "externally adopted SCTP fd was not closed");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    drop(executor);
 }
 
 async fn accepted_sctp_pair(
@@ -89,6 +399,196 @@ async fn accepted_sctp_pair(
     let server = server.await.expect("SCTP accept task cancelled");
 
     (client, server)
+}
+
+#[test]
+fn runtime_sctp_accept_inherits_known_listener_provenance() {
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_accept_inherits_known_listener_provenance",
+        config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (client, server) = accepted_sctp_pair(listener, connector, addr).await;
+            drop(client);
+            drop(server);
+        })
+        .expect("known SCTP accept close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 3);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
+fn runtime_sctp_accept_inherits_exposed_positive_listener_provenance() {
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_accept_inherits_exposed_positive_listener_provenance",
+        config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    set_positive_linger(listener.as_raw_fd());
+    let connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (client, server) = accepted_sctp_pair(listener, connector, addr).await;
+            drop(client);
+            drop(server);
+        })
+        .expect("uncertain SCTP accept close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 2);
+        assert_eq!(stats.close_worker_admissions, 2);
+        assert_eq!(stats.close_ring_submissions, 1);
+    }
+    drop(executor);
+}
+
+#[test]
+fn runtime_sctp_shutdown_fallback_reclaims_readiness_state_with_watchdog() {
+    if std::env::var_os(SCTP_SHUTDOWN_FALLBACK_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            SCTP_SHUTDOWN_FALLBACK_TEST,
+            SCTP_SHUTDOWN_FALLBACK_CHILD_ENV,
+            Duration::from_secs(15),
+        );
+        return;
+    }
+
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(mut listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_shutdown_fallback_reclaims_readiness_state_with_watchdog",
+        config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    set_positive_linger(listener.as_raw_fd());
+    let mut server_executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot server executor");
+
+    let err = server_executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("SCTP accept completed before shutdown peer"),
+            })
+            .await;
+            std::mem::forget(accept);
+            test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            std::future::pending::<()>().await;
+        })
+        .expect_err("injected wait failure should stop the SCTP executor");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+    let mut connector = SctpConnector::with_config(config);
+    let mut client_executor = Executor::new().expect("failed to construct client executor");
+    let client_slot = Rc::new(RefCell::new(None));
+    let client_output = Rc::clone(&client_slot);
+    client_executor
+        .run(async move {
+            let client = connector
+                .connect(addr)
+                .expect("SCTP connect init failed")
+                .await
+                .expect("SCTP shutdown peer connect failed");
+            *client_output.borrow_mut() = Some(client);
+        })
+        .expect("SCTP client executor failed");
+    let mut client = client_slot
+        .borrow_mut()
+        .take()
+        .expect("SCTP client output missing");
+    drop(client_executor);
+
+    test_hooks::force_next_reactor_shutdown_fallback();
+    drop(server_executor);
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "forced SCTP shutdown fallback was not consumed"
+    );
+
+    let mut observer = Executor::new().expect("failed to construct SCTP observer");
+    observer
+        .run(async move {
+            wait_for_sctp_peer_teardown(&mut client).await;
+        })
+        .expect("SCTP shutdown peer did not observe teardown");
+}
+
+#[test]
+fn runtime_sctp_forgotten_accept_observes_late_listener_exposure() {
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(mut listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_forgotten_accept_observes_late_listener_exposure",
+        config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let client_slot = Rc::new(RefCell::new(None));
+    let client_output = Rc::clone(&client_slot);
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("SCTP accept completed before connect"),
+            })
+            .await;
+            std::mem::forget(accept);
+
+            set_positive_linger(listener.as_raw_fd());
+            let client = connector
+                .connect(addr)
+                .expect("SCTP connect init failed")
+                .await
+                .expect("SCTP connect failed");
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("SCTP readiness completion wait failed");
+            drop(listener);
+            *client_output.borrow_mut() = Some(client);
+        })
+        .expect("late-exposure SCTP accept run failed");
+    let client = client_slot
+        .borrow_mut()
+        .take()
+        .expect("late-exposure SCTP client output missing");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_worker_admissions, 1);
+        assert_eq!(stats.close_ring_submissions, 0);
+    }
+    drop(executor);
+    drop(client);
 }
 
 fn pooled_sctp_payload_chain(pool: &mut IoBuffPool) -> IoBuffVec<2> {
@@ -145,6 +645,36 @@ fn test_send_info(stream_id: u16, ppid: u32) -> SctpSendInfo {
 }
 
 const LINUX_SCTP_COMM_UP: u16 = 0;
+const LINUX_SCTP_COMM_LOST: u16 = 1;
+const LINUX_SCTP_RESTART: u16 = 2;
+const LINUX_SCTP_SHUTDOWN_COMP: u16 = 3;
+const LINUX_SCTP_CANT_STR_ASSOC: u16 = 4;
+
+/// Returns whether a Linux association-change state proves teardown.
+fn sctp_assoc_change_is_terminal(state: u16) -> bool {
+    matches!(
+        state,
+        LINUX_SCTP_COMM_LOST | LINUX_SCTP_SHUTDOWN_COMP | LINUX_SCTP_CANT_STR_ASSOC
+    )
+}
+
+#[test]
+fn sctp_peer_teardown_assoc_change_classifier_is_exact() {
+    for (state, expected_terminal) in [
+        (LINUX_SCTP_COMM_UP, false),
+        (LINUX_SCTP_COMM_LOST, true),
+        (LINUX_SCTP_RESTART, false),
+        (LINUX_SCTP_SHUTDOWN_COMP, true),
+        (LINUX_SCTP_CANT_STR_ASSOC, true),
+        (u16::MAX, false),
+    ] {
+        assert_eq!(
+            sctp_assoc_change_is_terminal(state),
+            expected_terminal,
+            "unexpected teardown classification for SCTP association state {state}"
+        );
+    }
+}
 
 #[test]
 fn sctp_capability_policy_accepts_only_kernel_absence_and_permission_denial() {
@@ -175,6 +705,73 @@ fn sctp_capability_policy_accepts_only_kernel_absence_and_permission_denial() {
         !capability_unavailable(&std::io::Error::other("probe failed without an errno")),
         "an SCTP capability failure without an errno should remain visible"
     );
+}
+
+#[test]
+fn sctp_ipv6_bind_capability_policy_is_narrow() {
+    for errno in [
+        libc::EPROTONOSUPPORT,
+        libc::ESOCKTNOSUPPORT,
+        libc::EAFNOSUPPORT,
+        libc::EPFNOSUPPORT,
+        libc::EPERM,
+        libc::EACCES,
+        libc::EADDRNOTAVAIL,
+    ] {
+        let err = std::io::Error::from_raw_os_error(errno);
+        assert!(
+            sctp_ipv6_bind_capability_unavailable(&err),
+            "accepted IPv6 SCTP bind errno {errno} was not classified unavailable"
+        );
+    }
+
+    for errno in [libc::EINVAL, libc::ENOPROTOOPT, libc::EOPNOTSUPP, libc::EIO] {
+        let err = std::io::Error::from_raw_os_error(errno);
+        assert!(
+            !sctp_ipv6_bind_capability_unavailable(&err),
+            "IPv6 SCTP bind errno {errno} should remain a failure"
+        );
+    }
+
+    assert!(
+        !sctp_ipv6_bind_capability_unavailable(&std::io::Error::other(
+            "probe failed without an errno"
+        )),
+        "an IPv6 SCTP bind failure without an errno should remain visible"
+    );
+}
+
+#[test]
+fn runtime_sctp_assoc_addrs_preserve_ipv4_addresses_and_ports() {
+    const TEST_NAME: &str = "runtime_sctp_assoc_addrs_preserve_ipv4_addresses_and_ports";
+
+    let Some(capability_socket) = raw_sctp_socket_or_skip(TEST_NAME, libc::AF_INET) else {
+        return;
+    };
+    drop(capability_socket);
+
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let listener =
+        SctpListener::bind_with_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, config)
+            .expect("FlowIO IPv4 SCTP bind failed after the raw capability probe succeeded");
+
+    assert_live_sctp_assoc_addrs(listener, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), config);
+}
+
+#[test]
+fn runtime_sctp_assoc_addrs_preserve_ipv6_addresses_and_ports() {
+    const TEST_NAME: &str = "runtime_sctp_assoc_addrs_preserve_ipv6_addresses_and_ports";
+
+    if !raw_sctp_ipv6_loopback_or_skip(TEST_NAME) {
+        return;
+    }
+
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let listener =
+        SctpListener::bind_with_config(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 128, config)
+            .expect("FlowIO IPv6 SCTP bind failed after the raw capability probe succeeded");
+
+    assert_live_sctp_assoc_addrs(listener, SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), config);
 }
 
 #[test]
@@ -242,16 +839,16 @@ fn sctp_reset_streams_rejects_invalid_shapes_before_the_socket_option() {
     }
 }
 
-/// Polls an orphaned SCTP peer until it observes association teardown.
+/// Polls an SCTP shutdown peer until it observes association teardown.
 ///
-/// EOF, shutdown/association-change notifications, reset, and not-connected
-/// errors all count as teardown. Data is a failure.
+/// EOF, shutdown/terminal association-change notifications, reset, and
+/// not-connected errors all count as teardown. Data is a failure.
 async fn wait_for_sctp_peer_teardown(stream: &mut flowio::net::sctp::SctpStream) {
     let mut current_buf = vec![0u8; 256];
     for _ in 0..8 {
         let recv_res = timeout(Duration::from_secs(1), stream.recv_msg(current_buf, 256))
             .await
-            .expect("orphaned SCTP accept peer close wait timed out");
+            .expect("SCTP shutdown peer close wait timed out");
         let (res, returned_buf) = recv_res;
 
         match res {
@@ -263,13 +860,13 @@ async fn wait_for_sctp_peer_teardown(stream: &mut flowio::net::sctp::SctpStream)
             Ok((
                 _recv_len,
                 SctpRecvMeta::Notification(SctpNotification::AssocChange { state, .. }),
-            )) if state != 0 => return,
+            )) if sctp_assoc_change_is_terminal(state) => return,
             Ok((_recv_len, SctpRecvMeta::Notification(_))) => {
                 current_buf = returned_buf;
                 continue;
             }
             Ok((recv_len, SctpRecvMeta::Data(_))) => {
-                panic!("orphaned SCTP accept peer unexpectedly read {recv_len} data bytes");
+                panic!("SCTP shutdown peer unexpectedly read {recv_len} data bytes");
             }
             Err(err)
                 if matches!(
@@ -285,11 +882,11 @@ async fn wait_for_sctp_peer_teardown(stream: &mut flowio::net::sctp::SctpStream)
             {
                 return;
             }
-            Err(err) => panic!("orphaned SCTP accept peer read failed unexpectedly: {err}"),
+            Err(err) => panic!("SCTP shutdown peer read failed unexpectedly: {err}"),
         }
     }
 
-    panic!("orphaned SCTP accept peer did not observe association teardown");
+    panic!("SCTP shutdown peer did not observe association teardown");
 }
 
 /// Builds a zeroed SCTP notification buffer with sn_type/sn_flags/sn_length
@@ -355,18 +952,18 @@ fn localhost_sockaddr_storage(port: u16) -> libc::sockaddr_storage {
     storage
 }
 
-/// Dropping an accept future whose CQE already completed must close the
-/// orphaned accepted fd and clear the reusable slot.
+/// Dropping a future with completed readiness must release its reusable slot
+/// without treating the readiness mask as a descriptor.
 #[test]
-fn sctp_accept_slot_drop_future_closes_completed_fd() {
-    test_accept_slot_drop_future_closes_completed_fd().unwrap();
+fn sctp_accept_slot_drop_future_preserves_unrelated_fd() {
+    test_accept_slot_drop_future_preserves_unrelated_fd().unwrap();
 }
 
-/// Same orphaned-fd-close guarantee on cached-state teardown as on
-/// drop_future: a completed-but-unconsumed accept fd is closed.
+/// Forgotten-future listener teardown has the same readiness-only ownership
+/// guarantee.
 #[test]
-fn sctp_accept_slot_drop_cached_state_closes_completed_fd() {
-    test_accept_slot_drop_cached_state_closes_completed_fd().unwrap();
+fn sctp_accept_slot_drop_cached_state_preserves_unrelated_fd() {
+    test_accept_slot_drop_cached_state_preserves_unrelated_fd().unwrap();
 }
 
 /// Dropping an in-flight connect future closes the connecting socket fd and
@@ -1782,7 +2379,8 @@ fn runtime_sctp_dropped_recv_msg_vectored_eor_retires_discard_state() {
 
 #[test]
 fn runtime_sctp_vectored_empty_chain_semantics() {
-    let Some(mut stream) = raw_sctp_stream_or_skip("runtime_sctp_vectored_empty_chain_semantics")
+    let Some((mut stream, _)) =
+        raw_sctp_stream_or_skip("runtime_sctp_vectored_empty_chain_semantics")
     else {
         return;
     };
@@ -2611,10 +3209,10 @@ fn runtime_sctp_accept_drop_then_reaccepts() {
         .expect("executor run failed");
 }
 
-/// Cancelling an accept after an association was established must close the
-/// orphaned accepted fd and leave the listener reusable.
+/// Cancelling readiness does not consume an established queued association;
+/// the next accept receives it and the reusable slot remains usable.
 #[test]
-fn runtime_sctp_cancelled_accept_after_association_reaccepts() {
+fn runtime_sctp_cancelled_accept_preserves_backlog_and_reaccepts() {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let init = SctpInitConfig::diameter_default();
@@ -2627,7 +3225,7 @@ fn runtime_sctp_cancelled_accept_after_association_reaccepts() {
         Err(err) => {
             if capability_unavailable(&err) {
                 eprintln!(
-                    "skipping runtime_sctp_cancelled_accept_after_association_reaccepts: SCTP unsupported ({err})"
+                    "skipping runtime_sctp_cancelled_accept_preserves_backlog_and_reaccepts: SCTP unsupported ({err})"
                 );
                 return;
             }
@@ -2648,15 +3246,23 @@ fn runtime_sctp_cancelled_accept_after_association_reaccepts() {
             })
             .await;
 
-            let orphan_stream = connector
+            let queued_stream = connector
                 .connect_timeout(addr, Duration::from_secs(1))
-                .expect("orphan connect_timeout init failed")
+                .expect("queued connect_timeout init failed")
                 .await
-                .expect("orphan connect failed");
-            let mut orphan_stream = orphan_stream;
+                .expect("queued connect failed");
+            let queued_addr = queued_stream
+                .local_addr()
+                .expect("queued client local_addr failed");
             drop(accept);
-            wait_for_sctp_peer_teardown(&mut orphan_stream).await;
-            drop(orphan_stream);
+
+            let (queued_server, remote_addr) = timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("queued accept timed out")
+                .expect("queued accept failed");
+            assert_eq!(remote_addr, queued_addr);
+            drop(queued_server);
+            drop(queued_stream);
 
             let server = Executor::spawn(async move { listener.accept().await })
                 .expect("server accept spawn failed");
@@ -2679,24 +3285,146 @@ fn runtime_sctp_cancelled_accept_after_association_reaccepts() {
 }
 
 #[test]
-fn runtime_sctp_connect_timeout_propagates_connect_error() {
-    use std::net::{Ipv4Addr, SocketAddr};
-
-    let init = SctpInitConfig::diameter_default();
-    let listener = match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
-        Ok(listener) => listener,
-        Err(err) => {
-            if capability_unavailable(&err) {
-                eprintln!(
-                    "skipping runtime_sctp_connect_timeout_propagates_connect_error: SCTP unsupported ({err})"
-                );
-                return;
-            }
-            panic!("failed to bind sctp listener: {err}");
-        }
+fn runtime_sctp_accept_rearms_after_stale_readiness() {
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(mut listener) =
+        bind_sctp_listener_or_skip("runtime_sctp_accept_rearms_after_stale_readiness", config)
+    else {
+        return;
     };
     let addr = listener.local_addr();
-    drop(listener);
+    let listener_fd = listener.as_raw_fd();
+    let mut connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before first association"),
+            })
+            .await;
+
+            let first_client = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("first connect_timeout init failed")
+                .await
+                .expect("first SCTP connect failed");
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("SCTP readiness wait failed");
+
+            // This raw accept is an intentional test-only violation of the
+            // documented no-concurrent-accept contract. It makes the completed
+            // readiness stale before FlowIO performs its owner-thread accept4.
+            let stolen = unsafe {
+                libc::accept4(
+                    listener_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                )
+            };
+            assert!(
+                stolen >= 0,
+                "external SCTP accept should steal first readiness: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: the successful test accept4 returned one sole-owned fd.
+            let stolen = unsafe { OwnedFd::from_raw_fd(stolen) };
+
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("stale SCTP readiness was not rearmed"),
+            })
+            .await;
+
+            let second_client = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("second connect_timeout init failed")
+                .await
+                .expect("second SCTP connect failed");
+            let second_addr = second_client
+                .local_addr()
+                .expect("second SCTP client local_addr failed");
+            let (_server, remote_addr) = timeout(Duration::from_secs(1), accept)
+                .await
+                .expect("rearmed SCTP accept timed out")
+                .expect("rearmed SCTP accept failed");
+            assert_eq!(remote_addr, second_addr);
+
+            drop(stolen);
+            drop(first_client);
+            drop(second_client);
+        })
+        .expect("stale SCTP readiness run failed");
+    #[cfg(debug_assertions)]
+    assert_eq!(executor.last_stats().accept_readiness_rearms, 1);
+}
+
+#[test]
+fn runtime_sctp_completed_readiness_context_rejection_preserves_backlog() {
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(mut listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_completed_readiness_context_rejection_preserves_backlog",
+        config,
+    ) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let mut accept = Box::pin(listener.accept());
+            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("accept completed before queued association"),
+            })
+            .await;
+
+            let client = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("queued connect_timeout init failed")
+                .await
+                .expect("queued SCTP connect failed");
+            let client_addr = client
+                .local_addr()
+                .expect("queued SCTP client local_addr failed");
+            sleep(Duration::from_millis(10))
+                .await
+                .expect("SCTP readiness wait failed");
+
+            let mut invalid_cx = Context::from_waker(Waker::noop());
+            let err = match Future::poll(accept.as_mut(), &mut invalid_cx) {
+                Poll::Ready(Err(err)) => err,
+                Poll::Ready(Ok(_)) => {
+                    panic!("invalid-context SCTP accept unexpectedly succeeded")
+                }
+                Poll::Pending => panic!("completed SCTP readiness remained pending"),
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+            drop(accept);
+
+            let (_server, remote_addr) = timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("origin-context SCTP reaccept timed out")
+                .expect("origin-context SCTP reaccept failed");
+            assert_eq!(remote_addr, client_addr);
+        })
+        .expect("SCTP context-rejection run failed");
+}
+
+#[test]
+fn runtime_sctp_connect_timeout_propagates_connect_error() {
+    const TEST_NAME: &str = "runtime_sctp_connect_timeout_propagates_connect_error";
+
+    let init = SctpInitConfig::diameter_default();
+    let Some((refusal_guard, addr)) = bound_non_listening_sctp_endpoint_or_skip(TEST_NAME) else {
+        return;
+    };
 
     let mut executor = Executor::new().expect("failed to construct executor");
     let mut connector = SctpConnector::new(init);
@@ -2714,6 +3442,7 @@ fn runtime_sctp_connect_timeout_propagates_connect_error() {
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
         })
         .expect("executor run failed");
+    drop(refusal_guard);
 }
 
 #[test]
@@ -2933,15 +3662,14 @@ fn runtime_sctp_recv_msg_rejects_oversize_iobuff() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 fn runtime_sctp_send_rejects_oversize_iobuff() {
     use std::net::{Ipv4Addr, SocketAddr};
 
+    let oversized =
+        SparseOversizedReadOnly::new().expect("failed to reserve sparse oversized mapping");
     let init = SctpInitConfig::diameter_default();
-    let mut listener = match SctpListener::bind(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        128,
-        init,
-    ) {
+    let listener = match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
         Ok(listener) => listener,
         Err(err) => {
             if capability_unavailable(&err) {
@@ -2956,30 +3684,27 @@ fn runtime_sctp_send_rejects_oversize_iobuff() {
 
     let mut executor = Executor::new().expect("failed to construct executor");
     let addr = listener.local_addr();
-    let mut connector = SctpConnector::new(init);
+    let connector = SctpConnector::new(init);
 
-    executor
-        .run(async move {
-            Executor::spawn(async move {
-                let (_stream, _remote) = listener.accept().await.expect("accept failed");
-            })
-            .expect("accept spawn failed");
+    let (mut stream, server) =
+        run_test_output(&mut executor, accepted_sctp_pair(listener, connector, addr));
 
-            let mut stream = connector
-                .connect(addr)
-                .expect("connect init failed")
-                .await
-                .expect("connect failed");
+    let (_oversized, _stream, _server) = run_test_output(&mut executor, async move {
+        let (res, oversized) = stream.send(oversized).await;
+        assert_oversized_send_rejected(res, &oversized);
 
-            let (res, _buf) = stream.send(HugeReadOnly).await;
-            let err = res.expect_err("oversize send should fail");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let (res, oversized) = stream.send_msg(oversized, SctpSendInfo::default()).await;
+        assert_oversized_send_rejected(res, &oversized);
 
-            let (res, _buf) = stream.send_msg(HugeReadOnly, SctpSendInfo::default()).await;
-            let err = res.expect_err("oversize send_msg should fail");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        })
-        .expect("executor run failed");
+        (oversized, stream, server)
+    });
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().sqe_submits,
+        0,
+        "oversized SCTP sends should submit no SQE"
+    );
 }
 
 // ============================================================================

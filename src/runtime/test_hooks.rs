@@ -19,6 +19,7 @@ thread_local! {
     static FAIL_RING_WAIT_ERRNO: Cell<i32> = const { Cell::new(0) };
     static FAIL_IOBUFF_POOL_SLAB_ALLOCS: Cell<usize> = const { Cell::new(0) };
     static FAIL_REACTOR_EXT_ARG_PROBES: Cell<usize> = const { Cell::new(0) };
+    static FORCE_REACTOR_SHUTDOWN_FALLBACKS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Makes the next completion-state allocation on this thread fail.
@@ -82,6 +83,16 @@ pub(crate) fn fail_next_iobuff_pool_slab_alloc() {
 #[allow(dead_code)]
 pub(crate) fn fail_next_reactor_ext_arg_probe() {
     FAIL_REACTOR_EXT_ARG_PROBES.with(|fails| fails.set(fails.get().saturating_add(1)));
+}
+
+/// Makes the next reactor shutdown skip its ordinary bounded drain and enter
+/// the fallback path immediately.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn force_next_reactor_shutdown_fallback() {
+    FORCE_REACTOR_SHUTDOWN_FALLBACKS.with(|forces| {
+        forces.set(forces.get().saturating_add(1));
+    });
 }
 
 #[inline(always)]
@@ -161,6 +172,14 @@ pub fn ring_wait_failures_remaining() -> usize {
     FAIL_RING_WAITS.with(Cell::get)
 }
 
+/// Returns the number of injected ring-submit failures not yet consumed on
+/// this thread.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn ring_submit_failures_remaining() -> usize {
+    FAIL_RING_SUBMITS.with(Cell::get)
+}
+
 #[inline(always)]
 pub(crate) fn take_iobuff_pool_slab_alloc_failure() -> bool {
     FAIL_IOBUFF_POOL_SLAB_ALLOCS.with(|fails| {
@@ -185,4 +204,25 @@ pub(crate) fn take_reactor_ext_arg_probe_failure() -> bool {
             true
         }
     })
+}
+
+#[inline(always)]
+pub(crate) fn take_reactor_shutdown_fallback() -> bool {
+    FORCE_REACTOR_SHUTDOWN_FALLBACKS.with(|forces| {
+        let remaining = forces.get();
+        if remaining == 0 {
+            false
+        } else {
+            forces.set(remaining - 1);
+            true
+        }
+    })
+}
+
+/// Returns the number of forced reactor-shutdown fallbacks not yet consumed on
+/// this thread.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn reactor_shutdown_fallbacks_remaining() -> usize {
+    FORCE_REACTOR_SHUTDOWN_FALLBACKS.with(Cell::get)
 }

@@ -85,7 +85,7 @@ macro_rules! impl_stream_rw {
             buffer: B,
             len: usize,
         ) -> (io::Result<usize>, B) {
-            stream::try_read_once(self.fd.as_raw_fd(), buffer, len)
+            stream::try_read_once(self.fd.raw_fd(), buffer, len)
         }
 
         /// Attempts one nonblocking read syscall into the current payload
@@ -120,7 +120,7 @@ macro_rules! impl_stream_rw {
             buffer: IoBuffMut,
             len: usize,
         ) -> (io::Result<usize>, IoBuffMut) {
-            stream::try_read_append_once(self.fd.as_raw_fd(), buffer, len)
+            stream::try_read_append_once(self.fd.raw_fd(), buffer, len)
         }
 
         /// Attempts one nonblocking write syscall and returns immediately.
@@ -149,7 +149,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             buffer: B,
         ) -> (io::Result<usize>, B) {
-            stream::try_write_once(self.fd.as_raw_fd(), buffer)
+            stream::try_write_once(self.fd.raw_fd(), buffer)
         }
 
         /// Attempts one nonblocking projected gather-write syscall.
@@ -206,7 +206,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             source: T,
         ) -> (io::Result<usize>, T) {
-            stream::try_writev_projected_once(self.fd.as_raw_fd(), source)
+            stream::try_writev_projected_once(self.fd.raw_fd(), source)
         }
 
         /// Reads up to `len` bytes into `buffer`.
@@ -229,7 +229,7 @@ macro_rules! impl_stream_rw {
             buffer: B,
             len: usize,
         ) -> stream::ReadFuture<'_, B, Self> {
-            stream::ReadFuture::new(self.fd.as_raw_fd(), buffer, len)
+            stream::ReadFuture::new(self.fd.raw_fd(), buffer, len)
         }
 
         /// Writes the initialized portion of `buffer`.
@@ -245,7 +245,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             buffer: B,
         ) -> stream::WriteFuture<'_, B, Self> {
-            stream::WriteFuture::new(self.fd.as_raw_fd(), buffer)
+            stream::WriteFuture::new(self.fd.raw_fd(), buffer)
         }
 
         /// Writes the entire buffer, handling partial writes internally.
@@ -261,7 +261,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             buffer: B,
         ) -> stream::WriteAllFuture<'_, B, Self> {
-            stream::WriteAllFuture::new(self.fd.as_raw_fd(), buffer)
+            stream::WriteAllFuture::new(self.fd.raw_fd(), buffer)
         }
 
         /// Reads exactly `len` bytes, handling partial reads internally.
@@ -282,7 +282,7 @@ macro_rules! impl_stream_rw {
             buffer: B,
             len: usize,
         ) -> stream::ReadExactFuture<'_, B, Self> {
-            stream::ReadExactFuture::new(self.fd.as_raw_fd(), buffer, len)
+            stream::ReadExactFuture::new(self.fd.raw_fd(), buffer, len)
         }
 
         /// Appends exactly `len` bytes to the current payload end of
@@ -304,7 +304,7 @@ macro_rules! impl_stream_rw {
             buffer: IoBuffMut,
             len: usize,
         ) -> stream::ReadExactAppendFuture<'_, Self> {
-            stream::ReadExactAppendFuture::new(self.fd.as_raw_fd(), buffer, len)
+            stream::ReadExactAppendFuture::new(self.fd.raw_fd(), buffer, len)
         }
 
         /// Scatter-read into a vectored buffer chain.
@@ -322,7 +322,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             buffer: IoBuffVecMut<N>,
         ) -> stream::ReadvFuture<'_, N, Self> {
-            stream::ReadvFuture::new(self.fd.as_raw_fd(), buffer)
+            stream::ReadvFuture::new(self.fd.raw_fd(), buffer)
         }
 
         /// Gather-write from an owned vectored buffer chain.
@@ -340,7 +340,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             buffer: C,
         ) -> stream::WritevFuture<'_, C, N, Self> {
-            stream::WritevFuture::new(self.fd.as_raw_fd(), buffer)
+            stream::WritevFuture::new(self.fd.raw_fd(), buffer)
         }
 
         /// Gather-write projected pieces from one compact owned source.
@@ -360,7 +360,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             source: T,
         ) -> stream::WritevProjectedFuture<'_, T, Self> {
-            stream::WritevProjectedFuture::new(self.fd.as_raw_fd(), source)
+            stream::WritevProjectedFuture::new(self.fd.raw_fd(), source)
         }
 
         /// Gather-write an entire owned vectored chain, handling partial
@@ -379,7 +379,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             buffer: C,
         ) -> stream::WritevAllFuture<'_, C, N, Self> {
-            stream::WritevAllFuture::new(self.fd.as_raw_fd(), buffer)
+            stream::WritevAllFuture::new(self.fd.raw_fd(), buffer)
         }
 
         /// Gather-write all projected pieces from one compact owned
@@ -399,7 +399,7 @@ macro_rules! impl_stream_rw {
             &mut self,
             source: T,
         ) -> stream::WritevAllProjectedFuture<'_, T, Self> {
-            stream::WritevAllProjectedFuture::new(self.fd.as_raw_fd(), source)
+            stream::WritevAllProjectedFuture::new(self.fd.raw_fd(), source)
         }
 
         /// Scatter-read exactly `len` total bytes into a vectored chain.
@@ -416,7 +416,7 @@ macro_rules! impl_stream_rw {
             buffer: IoBuffVecMut<N>,
             len: usize,
         ) -> stream::ReadvExactFuture<'_, N, Self> {
-            stream::ReadvExactFuture::new(self.fd.as_raw_fd(), buffer, len)
+            stream::ReadvExactFuture::new(self.fd.raw_fd(), buffer, len)
         }
     };
 }

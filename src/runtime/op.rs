@@ -38,7 +38,7 @@ pub struct CompletionState {
     pub result: i32,
     /// CQE flags copied from the completion entry.
     pub cqe_flags: u32,
-    /// Internal state bits such as completed/orphaned/detached.
+    /// Internal state bits such as completed/orphaned.
     pub state_flags: u32,
     /// Index in the owner's bounded live-operation registry.
     pub(crate) registry_index: u32,
@@ -64,18 +64,15 @@ impl CompletionState {
     pub const FLAG_COMPLETED: u32 = 1 << 0;
     /// Owning future was dropped before the kernel retired the submission.
     pub const FLAG_ORPHANED: u32 = 1 << 1;
-    /// Operation has no waiting task and should be reclaimed on completion.
+    /// Operation has no waiting task and is reclaimed when its CQE retires.
     pub const FLAG_DETACHED: u32 = 1 << 2;
-    /// Orphaned operation returns an owned file descriptor in a non-negative
-    /// CQE result; the reactor must close it before reclaiming the op.
-    pub const FLAG_CLOSE_RESULT_FD_ON_ORPHAN: u32 = 1 << 3;
     /// `ASYNC_CANCEL` submission failed and the reactor must retry it.
-    pub const FLAG_CANCEL_PENDING: u32 = 1 << 4;
+    pub const FLAG_CANCEL_PENDING: u32 = 1 << 3;
     /// Executor shutdown owns cancellation and no task may be woken.
-    pub const FLAG_RUNTIME_SHUTDOWN: u32 = 1 << 5;
+    pub const FLAG_RUNTIME_SHUTDOWN: u32 = 1 << 4;
     /// The future was polled without its originating FlowIO executor context.
     /// Completion still owns any retained payload until the original CQE.
-    pub const FLAG_CONTEXT_REJECTED: u32 = 1 << 6;
+    pub const FLAG_CONTEXT_REJECTED: u32 = 1 << 5;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -108,11 +105,6 @@ impl CompletionState {
     }
 
     #[inline(always)]
-    pub(crate) fn closes_result_fd_on_orphan(&self) -> bool {
-        self.state_flags & Self::FLAG_CLOSE_RESULT_FD_ON_ORPHAN != 0
-    }
-
-    #[inline(always)]
     pub(crate) fn is_cancel_pending(&self) -> bool {
         self.state_flags & Self::FLAG_CANCEL_PENDING != 0
     }
@@ -135,11 +127,6 @@ impl CompletionState {
     #[inline(always)]
     pub fn set_detached(&mut self) {
         self.state_flags |= Self::FLAG_DETACHED;
-    }
-
-    #[inline(always)]
-    pub(crate) fn set_close_result_fd_on_orphan(&mut self) {
-        self.state_flags |= Self::FLAG_CLOSE_RESULT_FD_ON_ORPHAN;
     }
 
     #[inline(always)]
@@ -377,9 +364,8 @@ impl CompletionState {
     /// intentionally preserved so retrying futures can keep one caller-owned
     /// buffer alive across multiple sequential SQEs.
     ///
-    /// All state flags are cleared. This includes close-result-fd-on-orphan,
-    /// which is only set by one-shot accept operations and must not leak into
-    /// retrying read/write submissions that reuse a completion slot.
+    /// All state flags are cleared so one-shot lifecycle state does not leak
+    /// into retrying read/write submissions that reuse a completion slot.
     #[inline(always)]
     pub fn reset_for_resubmit(&mut self) {
         debug_assert!(

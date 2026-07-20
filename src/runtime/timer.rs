@@ -901,14 +901,6 @@ impl TimerRuntime {
         Ok(())
     }
 
-    unsafe fn free_fired_sleep(&mut self, entry: *mut TimerEntry) {
-        unsafe {
-            (*entry).state = TimerState::Idle;
-            (*entry).clear_waiter();
-            self.timer_pool.free(entry);
-        }
-    }
-
     /// Expires timers up to `now`, respecting the provided per-pass budget.
     ///
     /// Returns `true` when timer work remains pending for a later pass.
@@ -1217,6 +1209,84 @@ impl Sleep {
             entry: std::ptr::null_mut(),
         }
     }
+
+    /// Returns an armed entry to its recorded origin timer runtime.
+    #[inline(always)]
+    fn reclaim_entry(&mut self) {
+        if self.entry.is_null() {
+            return;
+        }
+
+        let entry = self.entry;
+        self.entry = std::ptr::null_mut();
+        let (owner, timers) = unsafe { timer_runtime_for_entry(entry) };
+        if !timers.is_null() {
+            let _ = unsafe { &mut *timers }.cancel_sleep(entry);
+        }
+        drop(owner);
+    }
+
+    /// Validates one timer poll without arming or advancing the timer.
+    #[inline(always)]
+    fn validate_poll_context(&mut self, cx: &Context<'_>) -> io::Result<PollCtx> {
+        let pctx = match poll_ctx_from_waker(cx) {
+            Ok(pctx) => pctx,
+            Err(err) => {
+                self.reclaim_entry();
+                return Err(err);
+            }
+        };
+
+        if !self.entry.is_null() && unsafe { (*self.entry).owner_ptr() } != pctx.owner_ptr() {
+            self.reclaim_entry();
+            return Err(io::Error::from(io::ErrorKind::NotConnected));
+        }
+
+        Ok(pctx)
+    }
+
+    /// Polls a timer after its current and origin contexts have been checked.
+    #[inline(always)]
+    fn poll_validated(&mut self, pctx: &PollCtx) -> Poll<io::Result<()>> {
+        if !self.entry.is_null() {
+            let state = unsafe { (*self.entry).state };
+            if state == TimerState::Fired {
+                self.reclaim_entry();
+                return Poll::Ready(Ok(()));
+            }
+            if state == TimerState::Cancelled {
+                self.reclaim_entry();
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+            }
+            unsafe { refresh_sleep_waiter(self.entry, pctx) };
+            return Poll::Pending;
+        }
+
+        let timers = pctx.timers();
+
+        if let Some(duration) = self.duration.take() {
+            if duration == Duration::ZERO {
+                return Poll::Ready(Ok(()));
+            }
+
+            let entry =
+                unsafe { &mut *timers }.submit_sleep_duration(pctx.owner_task(), duration)?;
+            self.entry = entry;
+            return Poll::Pending;
+        }
+
+        let Some(deadline) = self.deadline.take() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        match unsafe { &mut *timers }.submit_sleep_deadline(pctx.owner_task(), deadline)? {
+            Some(entry) => {
+                self.entry = entry;
+                Poll::Pending
+            }
+            None => Poll::Ready(Ok(())),
+        }
+    }
 }
 
 /// Error returned when a timeout expires or its runtime timer fails.
@@ -1235,8 +1305,8 @@ pub enum TimeoutError {
     /// The runtime could not arm or drive the deadline timer.
     ///
     /// The contained [`io::Error`] preserves the original runtime failure,
-    /// including resource-pressure errors such as
-    /// [`io::ErrorKind::OutOfMemory`].
+    /// including an inactive or foreign executor context and resource-pressure
+    /// errors such as [`io::ErrorKind::OutOfMemory`].
     Runtime(io::Error),
 }
 
@@ -1263,95 +1333,17 @@ impl Future for Sleep {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        let pctx = match poll_ctx_from_waker(cx) {
+        let pctx = match this.validate_poll_context(cx) {
             Ok(pctx) => pctx,
-            Err(err) => {
-                if !this.entry.is_null() {
-                    let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
-                    if !timers.is_null() {
-                        let _ = unsafe { &mut *timers }.cancel_sleep(this.entry);
-                    }
-                    this.entry = std::ptr::null_mut();
-                    drop(owner);
-                }
-                return Poll::Ready(Err(err));
-            }
+            Err(err) => return Poll::Ready(Err(err)),
         };
-
-        if !this.entry.is_null() && unsafe { (*this.entry).owner_ptr() } != pctx.owner_ptr() {
-            let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
-            if !timers.is_null() {
-                let _ = unsafe { &mut *timers }.cancel_sleep(this.entry);
-            }
-            this.entry = std::ptr::null_mut();
-            drop(owner);
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-        }
-
-        if !this.entry.is_null() {
-            let state = unsafe { (*this.entry).state };
-            if state == TimerState::Fired {
-                let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
-                debug_assert!(!timers.is_null());
-                unsafe {
-                    (*timers).free_fired_sleep(this.entry);
-                }
-                this.entry = std::ptr::null_mut();
-                drop(owner);
-                return Poll::Ready(Ok(()));
-            }
-            if state == TimerState::Cancelled {
-                let (owner, timers) = unsafe { timer_runtime_for_entry(this.entry) };
-                debug_assert!(!timers.is_null());
-                unsafe {
-                    (*timers).free_fired_sleep(this.entry);
-                }
-                this.entry = std::ptr::null_mut();
-                drop(owner);
-                return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
-            }
-            unsafe { refresh_sleep_waiter(this.entry, &pctx) };
-            return Poll::Pending;
-        }
-
-        let timers = pctx.timers();
-
-        if let Some(duration) = this.duration.take() {
-            if duration == Duration::ZERO {
-                return Poll::Ready(Ok(()));
-            }
-
-            let entry =
-                unsafe { &mut *timers }.submit_sleep_duration(pctx.owner_task(), duration)?;
-            this.entry = entry;
-            return Poll::Pending;
-        }
-
-        let Some(deadline) = this.deadline.take() else {
-            return Poll::Ready(Ok(()));
-        };
-
-        match unsafe { &mut *timers }.submit_sleep_deadline(pctx.owner_task(), deadline)? {
-            Some(entry) => {
-                this.entry = entry;
-                Poll::Pending
-            }
-            None => Poll::Ready(Ok(())),
-        }
+        this.poll_validated(&pctx)
     }
 }
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        if !self.entry.is_null() {
-            let (owner, timers) = unsafe { timer_runtime_for_entry(self.entry) };
-            if !timers.is_null() {
-                let _ = unsafe { &mut *timers }.cancel_sleep(self.entry);
-            }
-            self.entry = std::ptr::null_mut();
-            drop(owner);
-        }
+        self.reclaim_entry();
     }
 }
 
@@ -1408,7 +1400,12 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 /// The wrapper must be polled inside an active
 /// [`crate::runtime::executor::Executor::run`]. [`TimeoutError::Elapsed`]
 /// reports deadline expiry, while [`TimeoutError::Runtime`] preserves timer
-/// allocation and runtime failures.
+/// allocation and runtime failures. Context validation happens before the
+/// wrapped future is polled; an inactive or foreign poll returns
+/// `TimeoutError::Runtime` containing [`io::ErrorKind::NotConnected`] without
+/// reaching that future. After successful validation, the wrapped future is
+/// polled first and wins a same-poll deadline race. An immediately ready
+/// wrapped future allocates and arms no timer entry.
 ///
 /// # Example
 /// ```no_run
@@ -1453,12 +1450,17 @@ impl<F: Future> Future for Timeout<F> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        let pctx = match this.sleep.validate_poll_context(cx) {
+            Ok(pctx) => pctx,
+            Err(err) => return Poll::Ready(Err(TimeoutError::Runtime(err))),
+        };
+
         let mut future = unsafe { Pin::new_unchecked(&mut this.future) };
         if let Poll::Ready(output) = future.as_mut().poll(cx) {
             return Poll::Ready(Ok(output));
         }
 
-        match Pin::new(&mut this.sleep).poll(cx) {
+        match this.sleep.poll_validated(&pctx) {
             Poll::Ready(Ok(())) => Poll::Ready(Err(TimeoutError::Elapsed)),
             Poll::Ready(Err(err)) => Poll::Ready(Err(TimeoutError::Runtime(err))),
             Poll::Pending => Poll::Pending,
@@ -1474,7 +1476,9 @@ impl<F: Future> Future for Timeout<F> {
 /// Returns [`TimeoutError::Elapsed`] when the deadline wins and
 /// [`TimeoutError::Runtime`] when the timer cannot be armed or driven.
 /// The returned wrapper must be polled inside an active
-/// [`crate::runtime::executor::Executor::run`].
+/// [`crate::runtime::executor::Executor::run`]. Invalid context is reported
+/// before the wrapped future is polled. In a valid context, an immediately
+/// ready wrapped future completes without allocating or arming a timer.
 ///
 /// # Example
 /// ```no_run
@@ -1504,7 +1508,9 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
 /// Returns [`TimeoutError::Elapsed`] when the deadline wins and
 /// [`TimeoutError::Runtime`] when the timer cannot be armed or driven.
 /// The returned wrapper must be polled inside an active
-/// [`crate::runtime::executor::Executor::run`].
+/// [`crate::runtime::executor::Executor::run`]. Invalid context is reported
+/// before the wrapped future is polled. In a valid context, an immediately
+/// ready wrapped future completes without allocating or arming a timer.
 ///
 /// # Example
 /// ```no_run
@@ -1529,6 +1535,361 @@ pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(miri))]
+    use crate::runtime::executor::Executor;
+    use std::cell::Cell;
+    #[cfg(not(miri))]
+    use std::cell::RefCell;
+
+    enum ScriptedMode {
+        Ready(usize),
+        #[cfg(not(miri))]
+        AlwaysPending,
+        #[cfg(not(miri))]
+        PendingThenReady(usize),
+    }
+
+    struct ScriptedFuture {
+        mode: ScriptedMode,
+        polls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Future for ScriptedFuture {
+        type Output = usize;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let prior_polls = this.polls.get();
+            this.polls.set(prior_polls + 1);
+            match this.mode {
+                ScriptedMode::Ready(value) => Poll::Ready(value),
+                #[cfg(not(miri))]
+                ScriptedMode::AlwaysPending => Poll::Pending,
+                #[cfg(not(miri))]
+                ScriptedMode::PendingThenReady(value) => {
+                    if prior_polls == 0 {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(value)
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for ScriptedFuture {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    fn scripted_future(
+        mode: ScriptedMode,
+        polls: &Rc<Cell<usize>>,
+        drops: &Rc<Cell<usize>>,
+    ) -> ScriptedFuture {
+        ScriptedFuture {
+            mode,
+            polls: Rc::clone(polls),
+            drops: Rc::clone(drops),
+        }
+    }
+
+    #[cfg(not(miri))]
+    struct StageFiredTimeout {
+        timeout: Option<Timeout<ScriptedFuture>>,
+        staged: Rc<RefCell<Option<Timeout<ScriptedFuture>>>>,
+        armed: bool,
+    }
+
+    #[cfg(not(miri))]
+    impl Future for StageFiredTimeout {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.armed {
+                *this.staged.borrow_mut() = this.timeout.take();
+                return Poll::Ready(());
+            }
+
+            let timeout = this.timeout.as_mut().expect("staged timeout missing");
+            assert!(Pin::new(timeout).poll(cx).is_pending());
+            this.armed = true;
+            Poll::Pending
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn stage_armed_timeout(
+        executor: &mut Executor,
+        polls: &Rc<Cell<usize>>,
+        drops: &Rc<Cell<usize>>,
+    ) -> Timeout<ScriptedFuture> {
+        let staged = Rc::new(RefCell::new(None));
+        let staged_slot = Rc::clone(&staged);
+        let future = scripted_future(ScriptedMode::AlwaysPending, polls, drops);
+
+        let err = executor
+            .run(async move {
+                let mut timed = timeout(Duration::from_secs(60), future);
+                std::future::poll_fn(|cx| {
+                    assert!(Pin::new(&mut timed).poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                *staged_slot.borrow_mut() = Some(timed);
+                crate::runtime::test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            })
+            .expect_err("injected wait error should leave the timeout armed");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+        staged
+            .borrow_mut()
+            .take()
+            .expect("armed timeout did not escape")
+    }
+
+    #[cfg(not(miri))]
+    fn assert_timer_entry_reused(executor: &mut Executor, expected: *mut TimerEntry) {
+        executor
+            .run(async move {
+                let mut probe = sleep(Duration::from_secs(60));
+                std::future::poll_fn(|cx| {
+                    assert!(Pin::new(&mut probe).poll(cx).is_pending());
+                    assert_eq!(
+                        probe.entry, expected,
+                        "origin timer pool did not reuse the reclaimed entry"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(probe);
+            })
+            .expect("origin executor failed while proving timer-entry reuse");
+    }
+
+    #[test]
+    fn timeout_rejects_inactive_context_before_polling_ready_inner() {
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let future = scripted_future(ScriptedMode::Ready(7), &polls, &drops);
+        let mut timed = timeout(Duration::from_secs(1), future);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            Pin::new(&mut timed).poll(&mut cx),
+            Poll::Ready(Err(TimeoutError::Runtime(err)))
+                if err.kind() == io::ErrorKind::NotConnected
+        ));
+        assert_eq!(polls.get(), 0, "inactive poll reached the wrapped future");
+
+        drop(timed);
+        assert_eq!(
+            drops.get(),
+            1,
+            "wrapped future was not dropped exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn runtime_timeout_ready_inner_does_not_arm_timer() {
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let polls_flag = Rc::clone(&polls);
+        let drops_flag = Rc::clone(&drops);
+        let mut executor = Executor::new().expect("failed to construct executor");
+
+        executor
+            .run(async move {
+                crate::runtime::test_hooks::fail_next_timer_alloc();
+                let future = scripted_future(ScriptedMode::Ready(7), &polls_flag, &drops_flag);
+                let mut timed = timeout(Duration::from_secs(1), future);
+                let result = std::future::poll_fn(|cx| match Pin::new(&mut timed).poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => panic!("ready inner future left timeout pending"),
+                })
+                .await;
+
+                assert_eq!(result.expect("ready timeout failed"), 7);
+                assert_eq!(polls_flag.get(), 1);
+                assert!(
+                    timed.sleep.entry.is_null(),
+                    "ready inner future allocated a timer entry"
+                );
+
+                let err = sleep(Duration::from_millis(1))
+                    .await
+                    .expect_err("ready timeout consumed the timer-allocation failure");
+                assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+                drop(timed);
+            })
+            .expect("executor failed while checking immediate timeout completion");
+
+        assert_eq!(
+            drops.get(),
+            1,
+            "wrapped future was not dropped exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn runtime_timeout_armed_foreign_repoll_reclaims_origin_slot() {
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let mut origin = Executor::new().expect("failed to construct origin executor");
+        let mut timed = stage_armed_timeout(&mut origin, &polls, &drops);
+        let origin_entry = timed.sleep.entry;
+        assert!(!origin_entry.is_null());
+        assert!(unsafe { (*origin_entry).state } == TimerState::Armed);
+        assert_eq!(polls.get(), 1);
+
+        let returned = Rc::new(RefCell::new(None));
+        let returned_slot = Rc::clone(&returned);
+        let mut foreign = Executor::new().expect("failed to construct foreign executor");
+        foreign
+            .run(async move {
+                let result = std::future::poll_fn(|cx| match Pin::new(&mut timed).poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => panic!("foreign timeout repoll remained pending"),
+                })
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(TimeoutError::Runtime(err))
+                        if err.kind() == io::ErrorKind::NotConnected
+                ));
+                assert!(
+                    timed.sleep.entry.is_null(),
+                    "foreign rejection retained the origin timer entry"
+                );
+                *returned_slot.borrow_mut() = Some(timed);
+            })
+            .expect("foreign executor failed while rejecting timeout");
+
+        assert_eq!(
+            polls.get(),
+            1,
+            "foreign rejection polled the wrapped future"
+        );
+        let timed = returned
+            .borrow_mut()
+            .take()
+            .expect("rejected timeout was not returned");
+        assert_timer_entry_reused(&mut origin, origin_entry);
+        drop(timed);
+        assert_eq!(
+            drops.get(),
+            1,
+            "wrapped future was not dropped exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn runtime_timeout_inner_wins_when_timer_already_fired() {
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let staged = Rc::new(RefCell::new(None));
+        let future = scripted_future(ScriptedMode::PendingThenReady(11), &polls, &drops);
+        let mut executor = Executor::new().expect("failed to construct executor");
+
+        executor
+            .run(StageFiredTimeout {
+                timeout: Some(timeout(Duration::from_millis(1), future)),
+                staged: Rc::clone(&staged),
+                armed: false,
+            })
+            .expect("executor failed while staging fired timeout");
+
+        let mut timed = staged
+            .borrow_mut()
+            .take()
+            .expect("fired timeout did not escape");
+        let fired_entry = timed.sleep.entry;
+        assert!(!fired_entry.is_null());
+        assert!(unsafe { (*fired_entry).state } == TimerState::Fired);
+        assert_eq!(polls.get(), 1);
+
+        let returned = Rc::new(RefCell::new(None));
+        let returned_slot = Rc::clone(&returned);
+        executor
+            .run(async move {
+                let result = std::future::poll_fn(|cx| match Pin::new(&mut timed).poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => panic!("ready inner lost the fired-deadline race"),
+                })
+                .await;
+                assert_eq!(result.expect("inner-first timeout failed"), 11);
+                assert_eq!(
+                    timed.sleep.entry, fired_entry,
+                    "inner-first completion consumed the fired timer early"
+                );
+                *returned_slot.borrow_mut() = Some(timed);
+            })
+            .expect("executor failed while resolving fired timeout race");
+
+        assert_eq!(polls.get(), 2);
+        let timed = returned
+            .borrow_mut()
+            .take()
+            .expect("completed timeout was not returned");
+        drop(timed);
+        assert_timer_entry_reused(&mut executor, fired_entry);
+        assert_eq!(
+            drops.get(),
+            1,
+            "wrapped future was not dropped exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn runtime_timeout_drop_reclaims_armed_slot_and_inner_once() {
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let polls_flag = Rc::clone(&polls);
+        let drops_flag = Rc::clone(&drops);
+        let mut executor = Executor::new().expect("failed to construct executor");
+
+        executor
+            .run(async move {
+                let future = scripted_future(ScriptedMode::AlwaysPending, &polls_flag, &drops_flag);
+                let mut timed = timeout(Duration::from_secs(60), future);
+                std::future::poll_fn(|cx| {
+                    assert!(Pin::new(&mut timed).poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let entry = timed.sleep.entry;
+                assert!(!entry.is_null());
+                drop(timed);
+                assert_eq!(drops_flag.get(), 1);
+
+                let mut probe = sleep(Duration::from_secs(60));
+                std::future::poll_fn(|cx| {
+                    assert!(Pin::new(&mut probe).poll(cx).is_pending());
+                    assert_eq!(
+                        probe.entry, entry,
+                        "drop did not return the timer entry to its origin pool"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(probe);
+            })
+            .expect("executor failed while checking timeout drop reclamation");
+
+        assert_eq!(polls.get(), 1);
+        assert_eq!(
+            drops.get(),
+            1,
+            "wrapped future was not dropped exactly once"
+        );
+    }
 
     #[test]
     fn timer_waiter_reference_pairing_is_exact() {

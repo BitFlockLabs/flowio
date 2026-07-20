@@ -68,6 +68,7 @@ const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_AAAA: u16 = 28;
 const DNS_FLAG_QR: u16 = 0x8000;
 const DNS_FLAG_TC: u16 = 0x0200;
+const DNS_OPCODE_MASK: u16 = 0x7800;
 const DNS_RCODE_MASK: u16 = 0x000F;
 const DNS_RCODE_FORMERR: u8 = 1;
 const DNS_RCODE_SERVFAIL: u8 = 2;
@@ -191,16 +192,21 @@ impl DnsResolver {
     /// malformed unless its encoded (possibly compressed) name consumes its
     /// declared RDATA length exactly; malformed responses participate in the
     /// existing nameserver and address-family error selection.
+    /// A matching-ID response must be marked as a response and use the QUERY
+    /// opcode. The allocation-free UDP candidate gate drains other opcodes;
+    /// full parsing rejects them with `InvalidData` before question,
+    /// response-code, or resource-record handling.
     /// Every present echoed question is matched by name, type, and class before
     /// its response code is applied. Questionless FORMERR, SERVFAIL, NOTIMP,
     /// and REFUSED replies remain prompt nameserver-failover results, while a
     /// questionless NXDOMAIN is drained as an unrelated datagram.
     /// Every literal label in a response name, including a compressed suffix,
-    /// must be valid UTF-8. The shared name walker rejects an invalid echoed
-    /// question before comparison and rejects an invalid record owner or CNAME
-    /// target with `InvalidData` before response-code or chain processing.
-    /// Valid non-ASCII label text is preserved; name comparison folds ASCII case
-    /// only.
+    /// must be valid UTF-8 and contain no literal `.`; dots are inserted only
+    /// between wire labels in the decoded presentation. The shared name walker
+    /// rejects an invalid echoed question before comparison and rejects an
+    /// invalid record owner or CNAME target with `InvalidData` before
+    /// response-code or chain processing. Valid non-ASCII label text is
+    /// preserved; name comparison folds ASCII case only.
     /// Every declared Answer, Authority, and Additional record is structurally
     /// validated before NXDOMAIN or another response code is applied. Known A
     /// and AAAA records require their exact wire lengths, and CNAME RDATA must
@@ -687,8 +693,9 @@ fn byte_range_eof(err: BufferRangeError) -> io::Error {
 /// Performs the bounded header/question prefilter used while draining UDP
 /// responses for one query ID.
 ///
-/// This validates enough structure to decide whether full parsing is useful;
-/// it does not authenticate or fully validate the response packet.
+/// This validates the matching ID, QR and QUERY-opcode gates plus enough
+/// question structure to decide whether full parsing is useful; it does not
+/// authenticate or fully validate the response packet.
 pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
     if packet.len() < 12 {
         return false;
@@ -705,6 +712,9 @@ pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> b
         return false;
     };
     if flags & DNS_FLAG_QR == 0 {
+        return false;
+    }
+    if !dns_response_opcode_is_query(flags) {
         return false;
     }
 
@@ -728,7 +738,7 @@ pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> b
 
 /// Validated DNS header counts plus the optional echoed question.
 struct DnsResponseEnvelope {
-    /// Response flags containing QR, truncation, and response-code bits.
+    /// Response flags containing QR, opcode, truncation, and response-code bits.
     flags: u16,
     /// Number of answer resource records declared by the header.
     ancount: usize,
@@ -773,6 +783,12 @@ fn parse_response_envelope(packet: &[u8], query_id: u16) -> io::Result<DnsRespon
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response packet was not marked as a response",
+        ));
+    }
+    if !dns_response_opcode_is_query(flags) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response opcode was not QUERY",
         ));
     }
 
@@ -824,6 +840,11 @@ fn parse_response_envelope(packet: &[u8], query_id: u16) -> io::Result<DnsRespon
 #[cfg(feature = "fuzzing")]
 pub(crate) fn response_envelope_is_decodable(packet: &[u8], query_id: u16) -> bool {
     parse_response_envelope(packet, query_id).is_ok()
+}
+
+#[inline(always)]
+fn dns_response_opcode_is_query(flags: u16) -> bool {
+    flags & DNS_OPCODE_MASK == 0
 }
 
 #[inline(always)]
@@ -1203,7 +1224,8 @@ fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
 ///
 /// Compression recursion, packet bounds, backward pointers, and the maximum
 /// presentation length are validated by [`walk_dns_name`]. Every label must be
-/// valid UTF-8 before its exact text is added to the presentation string.
+/// valid UTF-8 and contain no literal `.` before its exact text is added to the
+/// presentation string.
 pub(crate) fn decode_name(
     packet: &[u8],
     offset: usize,
@@ -1230,6 +1252,7 @@ enum DnsNameWalkError {
     NameLengthOverflow,
     UnsupportedLabelEncoding,
     InvalidUtf8Label,
+    LiteralDotLabel,
     NameTooLong,
     PacketArithmeticOverflow,
     PacketEndedUnexpectedly,
@@ -1264,6 +1287,10 @@ impl DnsNameWalkError {
                 "DNS label used an unsupported length encoding",
             ),
             Self::InvalidUtf8Label => (io::ErrorKind::InvalidData, "DNS label was not valid UTF-8"),
+            Self::LiteralDotLabel => (
+                io::ErrorKind::InvalidData,
+                "DNS literal label contained a dot",
+            ),
             Self::NameTooLong => (
                 io::ErrorKind::InvalidData,
                 "DNS name exceeded maximum length",
@@ -1349,6 +1376,9 @@ fn walk_dns_name(
             .ok_or(DnsNameWalkError::NameLengthOverflow)?;
         let label = std::str::from_utf8(&packet[label_start..label_end])
             .map_err(|_| DnsNameWalkError::InvalidUtf8Label)?;
+        if label.as_bytes().contains(&b'.') {
+            return Err(DnsNameWalkError::LiteralDotLabel);
+        }
         if let Some(labels) = labels.as_mut() {
             labels.push(label.to_owned());
         }
@@ -1596,6 +1626,16 @@ mod tests {
                 false,
             ),
             (
+                "literal-dot question",
+                response_with_question_name(QUERY_ID, b"\x0bexample.com\0"),
+                false,
+            ),
+            (
+                "compressed literal-dot question",
+                response_with_compressed_literal_dot_question(QUERY_ID),
+                false,
+            ),
+            (
                 "valid compressed root question",
                 response_with_question_name(QUERY_ID, b"\xc0\x04"),
                 true,
@@ -1674,6 +1714,160 @@ mod tests {
                 parse_response_envelope(&packet, QUERY_ID).is_ok(),
                 expected,
                 "envelope result for {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_opcode_must_be_query_across_candidate_and_full_parsing() {
+        const QUERY_ID: u16 = 0x1234;
+        let shapes = [
+            ("question with NOERROR", true, 0u8),
+            ("question with SERVFAIL", true, DNS_RCODE_SERVFAIL),
+            ("questionless SERVFAIL", false, DNS_RCODE_SERVFAIL),
+        ];
+
+        for opcode in 0u16..=15 {
+            for (shape, include_question, rcode) in shapes {
+                let mut packet = if include_question {
+                    response_with_question_name(QUERY_ID, b"\x07example\x03com\0")
+                } else {
+                    response_header(QUERY_ID, DNS_FLAG_QR, 0)
+                };
+                let flags = DNS_FLAG_QR | (opcode << 11) | u16::from(rcode);
+                write_u16_be_at(&mut packet, 2, flags).expect("test flags should fit");
+
+                if opcode == 0 {
+                    assert!(
+                        response_is_decodable_candidate(&packet, QUERY_ID),
+                        "QUERY candidate rejected {shape}"
+                    );
+                    parse_response_envelope(&packet, QUERY_ID)
+                        .unwrap_or_else(|err| panic!("QUERY envelope rejected {shape}: {err}"));
+                    match parse_response_packet(&packet, QUERY_ID, "example.com", DNS_TYPE_A) {
+                        Ok(_) if rcode == 0 => {}
+                        Err(err)
+                            if rcode == DNS_RCODE_SERVFAIL
+                                && err.kind() == io::ErrorKind::Other
+                                && err.to_string().contains("response code 2") => {}
+                        Ok(_) => panic!("QUERY {shape} ignored its response code"),
+                        Err(err) => panic!("QUERY {shape} changed behavior: {err}"),
+                    }
+                    continue;
+                }
+
+                assert!(
+                    !response_is_decodable_candidate(&packet, QUERY_ID),
+                    "candidate accepted opcode {opcode} for {shape}"
+                );
+                for err in [
+                    parse_response_envelope(&packet, QUERY_ID)
+                        .err()
+                        .unwrap_or_else(|| panic!("envelope accepted opcode {opcode} for {shape}")),
+                    parse_response_packet(&packet, QUERY_ID, "example.com", DNS_TYPE_A)
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!("full parser accepted opcode {opcode} for {shape}")
+                        }),
+                ] {
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                    assert_eq!(err.to_string(), "DNS response opcode was not QUERY");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn response_opcode_validation_preserves_header_precedence_and_precedes_body() {
+        const QUERY_ID: u16 = 0x1234;
+        const OPCODE_ONE: u16 = 1 << 11;
+
+        let mut wrong_id = response_header(QUERY_ID.wrapping_add(1), DNS_FLAG_QR | OPCODE_ONE, 0);
+        let err = parse_response_envelope(&wrong_id, QUERY_ID)
+            .err()
+            .expect("transaction ID mismatch should remain first");
+        assert_eq!(err.to_string(), "DNS response ID did not match query ID");
+
+        write_u16_be_at(&mut wrong_id, 0, QUERY_ID).expect("test query ID should fit");
+        write_u16_be_at(&mut wrong_id, 2, OPCODE_ONE).expect("test flags should fit");
+        let err = parse_response_envelope(&wrong_id, QUERY_ID)
+            .err()
+            .expect("QR rejection should precede opcode rejection");
+        assert_eq!(
+            err.to_string(),
+            "DNS response packet was not marked as a response"
+        );
+
+        let mut truncated_question = response_header(QUERY_ID, DNS_FLAG_QR | OPCODE_ONE, 1);
+        truncated_question.extend_from_slice(&[3, b'x']);
+        assert_opcode_error(&truncated_question, QUERY_ID);
+
+        let mut missing_record = response_with_question_name(QUERY_ID, b"\x07example\x03com\0");
+        write_u16_be_at(
+            &mut missing_record,
+            2,
+            DNS_FLAG_QR | OPCODE_ONE | u16::from(DNS_RCODE_NXDOMAIN),
+        )
+        .expect("test flags should fit");
+        write_u16_be_at(&mut missing_record, 6, 1).expect("test Answer count should fit");
+        assert_opcode_error(&missing_record, QUERY_ID);
+
+        let mut truncated_query = response_with_question_name(QUERY_ID, b"\x07example\x03com\0");
+        write_u16_be_at(&mut truncated_query, 2, DNS_FLAG_QR | DNS_FLAG_TC)
+            .expect("test flags should fit");
+        let err = parse_response_packet(&truncated_query, QUERY_ID, "example.com", DNS_TYPE_A)
+            .err()
+            .expect("QUERY truncation should remain rejected");
+        assert_eq!(
+            err.to_string(),
+            "DNS response was truncated; TCP fallback is not implemented"
+        );
+    }
+
+    fn assert_opcode_error(packet: &[u8], query_id: u16) {
+        assert!(!response_is_decodable_candidate(packet, query_id));
+        let err = parse_response_packet(packet, query_id, "example.com", DNS_TYPE_A)
+            .err()
+            .expect("non-QUERY opcode should fail before body parsing");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS response opcode was not QUERY");
+    }
+
+    #[test]
+    fn literal_dot_question_cannot_alias_two_wire_labels() {
+        const QUERY_ID: u16 = 0x1234;
+
+        let split_labels = response_with_question_name(QUERY_ID, b"\x07example\x03com\0");
+        parse_response_packet(&split_labels, QUERY_ID, "example.com", DNS_TYPE_A)
+            .expect("two wire labels should retain their dotted presentation");
+
+        let cases = [
+            (
+                "direct one-label example.com",
+                response_with_question_name(QUERY_ID, b"\x0bexample.com\0"),
+                "example.com",
+            ),
+            (
+                "compressed literal-dot label",
+                response_with_compressed_literal_dot_question(QUERY_ID),
+                "a.b",
+            ),
+        ];
+
+        for (case, packet, query_host) in cases {
+            assert!(
+                !response_is_decodable_candidate(&packet, QUERY_ID),
+                "candidate accepted {case}"
+            );
+            let err = match parse_response_packet(&packet, QUERY_ID, query_host, DNS_TYPE_A) {
+                Ok(_) => panic!("literal-dot label aliased dotted presentation"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
+            assert_eq!(
+                err.to_string(),
+                "DNS literal label contained a dot",
+                "{case}"
             );
         }
     }
@@ -1982,6 +2176,18 @@ mod tests {
                 true,
             ),
             ("invalid UTF-8", vec![1, 0xff, 0], 0, false),
+            (
+                "direct literal-dot label",
+                b"\x0bexample.com\0".to_vec(),
+                0,
+                false,
+            ),
+            (
+                "compressed literal-dot label",
+                b"\x0bexample.com\0\xc0\x00".to_vec(),
+                13,
+                false,
+            ),
             ("compressed root", vec![0, 0xc0, 0], 1, true),
             (
                 "compressed invalid UTF-8 suffix",
@@ -2055,6 +2261,11 @@ mod tests {
                 "DNS label was not valid UTF-8",
             ),
             (
+                DnsNameWalkError::LiteralDotLabel,
+                io::ErrorKind::InvalidData,
+                "DNS literal label contained a dot",
+            ),
+            (
                 DnsNameWalkError::NameTooLong,
                 io::ErrorKind::InvalidData,
                 "DNS name exceeded maximum length",
@@ -2115,6 +2326,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn literal_dot_cname_target_is_rejected_before_chain_selection_or_rcode() {
+        for rcode in [0, DNS_RCODE_NXDOMAIN] {
+            let packet = response_with_single_test_rr(
+                DnsRecordSection::Answer,
+                rcode,
+                true,
+                DNS_TYPE_A,
+                DNS_TYPE_CNAME,
+                DNS_CLASS_IN,
+                b"\x0bexample.com\0",
+            );
+            let err = match parse_response_packet(&packet, 0x1234, "db.example.test", DNS_TYPE_A) {
+                Ok(_) => {
+                    panic!("literal-dot CNAME entered chain selection or RCODE handling")
+                }
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "DNS literal label contained a dot");
+        }
+
+        let packet = response_with_compressed_literal_dot_cname();
+        let err = match parse_response_packet(&packet, 0x1234, "db.example.test", DNS_TYPE_A) {
+            Ok(_) => panic!("compressed literal-dot CNAME target entered chain selection"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS literal label contained a dot");
+    }
+
+    #[test]
+    fn literal_dot_rr_owner_is_rejected_before_selection_or_rcode() {
+        for rcode in [0, DNS_RCODE_NXDOMAIN] {
+            let packet = response_with_literal_dot_rr_owner(rcode);
+            let err = match parse_response_packet(&packet, 0x1234, "db.example.test", DNS_TYPE_A) {
+                Ok(_) => panic!("literal-dot RR owner entered record selection or RCODE handling"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "DNS literal label contained a dot");
+        }
+    }
+
     fn response_header(query_id: u16, flags: u16, qdcount: u16) -> Vec<u8> {
         let mut packet = Vec::with_capacity(12);
         for field in [query_id, flags, qdcount, 0, 0, 0] {
@@ -2128,6 +2383,67 @@ mod tests {
         packet.extend_from_slice(name);
         packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
         packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        packet
+    }
+
+    fn response_with_compressed_literal_dot_question(query_id: u16) -> Vec<u8> {
+        let mut packet = response_header(query_id, DNS_FLAG_QR, 1);
+        // The question points backward into header count bytes that encode one
+        // structurally valid literal label `a.b` followed by a root octet.
+        packet[6..10].copy_from_slice(&[3, b'a', b'.', b'b']);
+        packet.extend_from_slice(&0xC006u16.to_be_bytes());
+        packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        packet
+    }
+
+    fn response_with_compressed_literal_dot_cname() -> Vec<u8> {
+        let mut packet = response_header(0x1234, DNS_FLAG_QR, 1);
+        write_u16_be_at(&mut packet, 6, 2).expect("test Answer count should fit");
+        push_test_wire_name(&mut packet, "db.example.test");
+        packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+
+        let literal_dot_name = b"\x0bexample.com\0";
+        let literal_dot_offset = packet.len() + 12;
+        assert!(
+            literal_dot_offset < 0x4000,
+            "test compression target should fit"
+        );
+        push_single_test_rr(
+            &mut packet,
+            true,
+            16,
+            DNS_CLASS_IN,
+            u16::try_from(literal_dot_name.len()).expect("test RDATA length should fit"),
+            literal_dot_name,
+        );
+
+        let pointer = (0xC000 | literal_dot_offset as u16).to_be_bytes();
+        push_single_test_rr(
+            &mut packet,
+            true,
+            DNS_TYPE_CNAME,
+            DNS_CLASS_IN,
+            u16::try_from(pointer.len()).expect("test CNAME RDATA length should fit"),
+            &pointer,
+        );
+        packet
+    }
+
+    fn response_with_literal_dot_rr_owner(rcode: u8) -> Vec<u8> {
+        let mut packet = response_header(0x1234, DNS_FLAG_QR | u16::from(rcode), 1);
+        write_u16_be_at(&mut packet, 6, 1).expect("test Answer count should fit");
+        push_test_wire_name(&mut packet, "db.example.test");
+        packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+
+        packet.extend_from_slice(b"\x0bexample.com\0");
+        packet.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        packet.extend_from_slice(&[192, 0, 2, 1]);
         packet
     }
 

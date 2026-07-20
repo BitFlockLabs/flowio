@@ -153,10 +153,11 @@ pub fn sctp_parse_assoc_addrs(data: &[u8]) {
 /// Fuzz entry: the DNS response prefilter (`response_is_decodable_candidate`),
 /// which uses the non-materializing mode of the shared question-name walker
 /// before `parse_response_packet` in the drain loop. The query id is derived
-/// from the packet's first two bytes so the id/QR gate passes and the name walk
-/// is reached; the mismatch call also covers the early-return path. Property:
-/// candidate and full-envelope structural acceptance stay identical, pointer
-/// recursion stays bounded, and arbitrary input cannot panic or read OOB.
+/// from the packet's first two bytes so the ID gate passes; QR, QUERY-opcode,
+/// and name-walk acceptance remain input-controlled. The mismatch call also
+/// covers the early-return path. Property: candidate and full-envelope
+/// structural acceptance stay identical, pointer recursion stays bounded, and
+/// arbitrary input cannot panic or read OOB.
 pub fn dns_response_prefilter(data: &[u8]) {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();

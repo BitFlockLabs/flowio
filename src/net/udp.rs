@@ -175,7 +175,7 @@ impl UdpSocket {
         };
 
         Ok(Self {
-            fd: RuntimeFd::new(fd),
+            fd: RuntimeFd::from_fresh_raw_fd(fd),
             local_addr,
             peer_addr: None,
         })
@@ -205,7 +205,7 @@ impl UdpSocket {
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
         let rc = unsafe {
             libc::connect(
-                self.fd.as_raw_fd(),
+                self.fd.raw_fd(),
                 &sockaddr as *const _ as *const libc::sockaddr,
                 sockaddr_len,
             )
@@ -223,7 +223,7 @@ impl UdpSocket {
     /// This is socket configuration/control-plane work. Apply it during
     /// socket setup instead of changing it per datagram.
     pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
-        super::set_sock_send_buffer_size(self.fd.as_raw_fd(), size)
+        super::set_sock_send_buffer_size(self.fd.raw_fd(), size)
     }
 
     /// Returns the current `SO_SNDBUF` socket send buffer size.
@@ -231,7 +231,7 @@ impl UdpSocket {
     /// This is socket status/control-plane lookup, not the per-datagram data
     /// fast path.
     pub fn send_buffer_size(&self) -> io::Result<usize> {
-        super::sock_send_buffer_size(self.fd.as_raw_fd())
+        super::sock_send_buffer_size(self.fd.raw_fd())
     }
 
     /// Sets the `SO_RCVBUF` socket receive buffer size.
@@ -239,7 +239,7 @@ impl UdpSocket {
     /// This is socket configuration/control-plane work. Apply it during
     /// socket setup instead of changing it per datagram.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
-        super::set_sock_recv_buffer_size(self.fd.as_raw_fd(), size)
+        super::set_sock_recv_buffer_size(self.fd.raw_fd(), size)
     }
 
     /// Returns the current `SO_RCVBUF` socket receive buffer size.
@@ -247,7 +247,7 @@ impl UdpSocket {
     /// This is socket status/control-plane lookup, not the per-datagram data
     /// fast path.
     pub fn recv_buffer_size(&self) -> io::Result<usize> {
-        super::sock_recv_buffer_size(self.fd.as_raw_fd())
+        super::sock_recv_buffer_size(self.fd.raw_fd())
     }
 
     /// Enables or disables `SO_BROADCAST`.
@@ -256,7 +256,7 @@ impl UdpSocket {
     /// socket setup instead of toggling it per datagram.
     pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         set_sock_opt(
-            self.fd.as_raw_fd(),
+            self.fd.raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_BROADCAST,
             &(broadcast as libc::c_int),
@@ -269,7 +269,7 @@ impl UdpSocket {
     /// fast path.
     pub fn broadcast(&self) -> io::Result<bool> {
         let val: libc::c_int =
-            get_sock_opt(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BROADCAST)?;
+            get_sock_opt(self.fd.raw_fd(), libc::SOL_SOCKET, libc::SO_BROADCAST)?;
         Ok(val != 0)
     }
 
@@ -291,7 +291,7 @@ impl UdpSocket {
             }
         };
         RecvFuture {
-            fd: self.fd.as_raw_fd(),
+            fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
@@ -323,7 +323,7 @@ impl UdpSocket {
             }
         };
         RecvMsgFuture {
-            fd: self.fd.as_raw_fd(),
+            fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
@@ -346,7 +346,7 @@ impl UdpSocket {
             }
         };
         SendFuture {
-            fd: self.fd.as_raw_fd(),
+            fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
@@ -377,7 +377,7 @@ impl UdpSocket {
             }
         };
         RecvFromFuture {
-            fd: self.fd.as_raw_fd(),
+            fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             len,
@@ -398,7 +398,7 @@ impl UdpSocket {
     ) -> SendToFuture<'_, B> {
         let (storage, addrlen) = socket_addr_to_c(addr);
         SendToFuture {
-            fd: self.fd.as_raw_fd(),
+            fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             addr: storage,
@@ -410,7 +410,7 @@ impl UdpSocket {
 
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd.expose_raw_fd()
     }
 }
 

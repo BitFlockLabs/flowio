@@ -1,11 +1,13 @@
 mod common;
 
 use common::{
-    HugeReadOnly, InitializationTrackedReadWrite, TestIoBuffMut as IoBuffMut, TestProjected,
+    InitializationTrackedReadWrite, TestIoBuffMut as IoBuffMut, TestProjected,
     TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
     assert_poll_after_ready_parks, fill_try_send_buffer, make_payload_chain, make_read_chain,
-    make_read_only_chain, run_test,
+    make_read_only_chain, run_test, set_positive_linger,
 };
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -26,6 +28,51 @@ fn connected_try_unix_stream() -> (UnixStream, std::os::unix::net::UnixStream) {
 }
 
 #[test]
+fn runtime_unix_fresh_pair_drop_skips_linger_query() {
+    let (left, right) = UnixStream::pair().expect("runtime socketpair failed");
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(left);
+            drop(right);
+        })
+        .expect("fresh Unix pair close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 2);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
+fn runtime_unix_saved_public_fd_positive_linger_routes_to_worker() {
+    let (left, right) = UnixStream::pair().expect("runtime socketpair failed");
+    let saved_raw = left.as_raw_fd();
+    set_positive_linger(saved_raw);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(left);
+        })
+        .expect("positive-linger Unix close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_worker_admissions, 1);
+        assert_eq!(stats.close_ring_submissions, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+    }
+    drop(executor);
+    drop(right);
+}
+
+#[test]
 fn runtime_unix_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
     let (standard, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair failed");
     standard
@@ -35,7 +82,6 @@ fn runtime_unix_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
     let raw = standard.as_raw_fd();
     let owned: OwnedFd = standard.into();
     let stream = UnixStream::from_owned_fd(owned);
-    assert_eq!(stream.as_raw_fd(), raw);
     let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     assert!(status >= 0, "F_GETFL failed for adopted Unix fd");
     assert_ne!(
@@ -44,7 +90,22 @@ fn runtime_unix_owned_fd_adoption_preserves_nonblocking_and_close_ownership() {
         "adopted Unix fd became blocking"
     );
 
-    drop(stream);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor
+        .run(async move {
+            drop(stream);
+        })
+        .expect("runtime-owned Unix close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+    drop(executor);
+
     peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
         .expect("set_read_timeout failed");
     let mut byte = [0u8; 1];
@@ -617,18 +678,30 @@ fn runtime_unix_readv_exact_rejects_oversize_chain() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 fn runtime_unix_write_rejects_oversize_iobuff() {
-    run_test(async move {
-        let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+    let oversized =
+        SparseOversizedReadOnly::new().expect("failed to reserve sparse oversized mapping");
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-        let (res, _buf) = writer.write(HugeReadOnly).await;
-        let err = res.expect_err("oversize write should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let (_oversized, _writer, _reader) = run_test_output(&mut executor, async move {
+        let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
 
-        let (res, _buf) = writer.write_all(HugeReadOnly).await;
-        let err = res.expect_err("oversize write_all should fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let (res, oversized) = writer.write(oversized).await;
+        assert_oversized_send_rejected(res, &oversized);
+
+        let (res, oversized) = writer.write_all(oversized).await;
+        assert_oversized_send_rejected(res, &oversized);
+
+        (oversized, writer, reader)
     });
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().sqe_submits,
+        0,
+        "oversized Unix writes should submit no SQE"
+    );
 }
 
 // ============================================================================

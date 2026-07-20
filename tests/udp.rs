@@ -1,9 +1,12 @@
 mod common;
 
 use common::{
-    DropTrackedReadOnly, DropTrackedReadWrite, HugeReadOnly, TestIoBuffMut as IoBuffMut,
-    assert_poll_after_ready_parks, wait_for_drop_count,
+    DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
+    assert_poll_after_ready_parks, ipv6_loopback_capability_unavailable, set_positive_linger,
+    wait_for_drop_count,
 };
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::{sleep, timeout};
@@ -12,10 +15,15 @@ use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
+
+const UDP_PUBLIC_RAW_CLOSE_CHILD_ENV: &str = "FLOWIO_UDP_PUBLIC_RAW_CLOSE_CHILD";
+const UDP_PUBLIC_RAW_CLOSE_TEST: &str =
+    "runtime_udp_public_raw_exposure_classifies_then_uses_ring_close";
 
 fn is_connection_refused(err: &io::Error) -> bool {
     err.raw_os_error() == Some(libc::ECONNREFUSED) || err.kind() == io::ErrorKind::ConnectionRefused
@@ -37,6 +45,94 @@ fn connected_udp_pair() -> (UdpSocket, StdUdpSocket, SocketAddr) {
     socket.connect(peer_addr).expect("runtime connect failed");
     peer.connect(local_addr).expect("std peer connect failed");
     (socket, peer, peer_addr)
+}
+
+fn raw_fd_is_closed(fd: RawFd) -> bool {
+    // SAFETY: F_GETFD accepts any integer descriptor and reads no pointed-to
+    // memory; EBADF is the expected closed-descriptor result.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+}
+
+#[test]
+fn runtime_udp_fresh_drop_skips_linger_query() {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime UDP socket");
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(socket);
+        })
+        .expect("fresh UDP close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+}
+
+#[test]
+fn runtime_udp_saved_public_fd_positive_linger_routes_to_worker() {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime UDP socket");
+    let saved_raw = socket.as_raw_fd();
+    set_positive_linger(saved_raw);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(socket);
+        })
+        .expect("positive-linger UDP close failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_worker_admissions, 1);
+        assert_eq!(stats.close_ring_submissions, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+    }
+    drop(executor);
+}
+
+#[test]
+fn runtime_udp_public_raw_exposure_classifies_then_uses_ring_close() {
+    if std::env::var_os(UDP_PUBLIC_RAW_CLOSE_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            UDP_PUBLIC_RAW_CLOSE_TEST,
+            UDP_PUBLIC_RAW_CLOSE_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime udp socket");
+    let raw = socket.as_raw_fd();
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            drop(socket);
+        })
+        .expect("runtime-owned UDP close run failed");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_linger_queries, 1);
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+    }
+    assert!(
+        raw_fd_is_closed(raw),
+        "publicly exposed UDP descriptor was not closed"
+    );
+    drop(executor);
 }
 
 #[test]
@@ -81,18 +177,109 @@ fn runtime_udp_ping_pong() {
 }
 
 #[test]
+fn runtime_udp_ipv6_connected_bidirectional_ping_pong() {
+    const TEST_NAME: &str = "runtime_udp_ipv6_connected_bidirectional_ping_pong";
+    const FORWARD: &[u8] = b"flowio-udp-ipv6-forward";
+    const REVERSE: &[u8] = b"flowio-udp-ipv6-reverse";
+
+    let probe = match StdUdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        Ok(probe) => probe,
+        Err(err) if ipv6_loopback_capability_unavailable(&err) => {
+            eprintln!("skipping {TEST_NAME}: IPv6 loopback unavailable ({err})");
+            return;
+        }
+        Err(err) => panic!("IPv6 UDP capability probe failed for {TEST_NAME}: {err}"),
+    };
+    drop(probe);
+
+    let mut left = UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+        .expect("left FlowIO IPv6 UDP bind failed after the capability probe succeeded");
+    let mut right = UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+        .expect("right FlowIO IPv6 UDP bind failed after the capability probe succeeded");
+    let left_addr = left.local_addr();
+    let right_addr = right.local_addr();
+
+    assert_ne!(left_addr.port(), 0);
+    assert_ne!(right_addr.port(), 0);
+    assert_ne!(left_addr, right_addr);
+    assert_eq!(
+        left_addr,
+        SocketAddr::from((Ipv6Addr::LOCALHOST, left_addr.port()))
+    );
+    assert_eq!(
+        right_addr,
+        SocketAddr::from((Ipv6Addr::LOCALHOST, right_addr.port()))
+    );
+
+    left.connect(right_addr)
+        .expect("left FlowIO IPv6 UDP connect failed");
+    right
+        .connect(left_addr)
+        .expect("right FlowIO IPv6 UDP connect failed");
+    assert_eq!(left.peer_addr(), Some(right_addr));
+    assert_eq!(right.peer_addr(), Some(left_addr));
+
+    let mut executor = Executor::new().expect("failed to construct IPv6 UDP executor");
+    executor
+        .run(async move {
+            timeout(Duration::from_secs(2), async move {
+                let (send_result, sent) = left.send(FORWARD.to_vec()).await;
+                assert_eq!(
+                    send_result.expect("left IPv6 UDP send failed"),
+                    FORWARD.len()
+                );
+                assert_eq!(sent.as_slice(), FORWARD);
+
+                let (recv_result, received) =
+                    right.recv(vec![0u8; FORWARD.len()], FORWARD.len()).await;
+                assert_eq!(
+                    recv_result.expect("right IPv6 UDP recv failed"),
+                    FORWARD.len()
+                );
+                assert_eq!(received.as_slice(), FORWARD);
+
+                let (send_result, sent) = right.send(REVERSE.to_vec()).await;
+                assert_eq!(
+                    send_result.expect("right IPv6 UDP send failed"),
+                    REVERSE.len()
+                );
+                assert_eq!(sent.as_slice(), REVERSE);
+
+                let (recv_result, received) =
+                    left.recv(vec![0u8; REVERSE.len()], REVERSE.len()).await;
+                assert_eq!(
+                    recv_result.expect("left IPv6 UDP recv failed"),
+                    REVERSE.len()
+                );
+                assert_eq!(received.as_slice(), REVERSE);
+            })
+            .await
+            .expect("bidirectional FlowIO IPv6 UDP exchange timed out");
+        })
+        .expect("FlowIO IPv6 UDP executor run failed");
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 fn runtime_udp_send_rejects_oversize_iobuff() {
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind udp socket");
+    let oversized =
+        SparseOversizedReadOnly::new().expect("failed to reserve sparse oversized mapping");
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    executor
-        .run(async move {
-            let (res, _buf) = socket.send(HugeReadOnly).await;
-            let err = res.expect_err("oversize udp send should fail");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        })
-        .expect("executor run failed");
+    let (_oversized, _socket) = run_test_output(&mut executor, async move {
+        let (res, oversized) = socket.send(oversized).await;
+        assert_oversized_send_rejected(res, &oversized);
+        (oversized, socket)
+    });
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().sqe_submits,
+        0,
+        "oversized UDP send should submit no SQE"
+    );
 }
 
 #[test]

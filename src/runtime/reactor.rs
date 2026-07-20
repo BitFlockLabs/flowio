@@ -9,9 +9,10 @@ use crate::runtime::task::release_task;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
 use io_uring::{IoUring, opcode, types};
+use std::collections::VecDeque;
 use std::io;
 use std::mem::ManuallyDrop;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 /// Default number of submission and completion ring entries requested from
@@ -30,25 +31,6 @@ pub(crate) enum ReactorSubmitStatus {
 #[inline(always)]
 fn is_raw_os_error(err: &io::Error, code: libc::c_int) -> bool {
     err.raw_os_error() == Some(code)
-}
-
-#[inline(always)]
-fn close_result_fd(fd: RawFd) {
-    // SAFETY: the caller transfers one owned, non-negative descriptor from a
-    // successful orphaned accept CQE; ignoring close errors is drop semantics.
-    unsafe {
-        libc::close(fd);
-    }
-}
-
-#[inline(always)]
-fn close_unclaimed_result_fd_if_needed(state: &CompletionState) {
-    if (state.is_orphaned() || state.is_runtime_shutdown())
-        && state.closes_result_fd_on_orphan()
-        && state.result >= 0
-    {
-        close_result_fd(state.result as RawFd);
-    }
 }
 
 #[inline]
@@ -303,15 +285,29 @@ impl Default for ReactorConfig {
     }
 }
 
+/// Sole userspace owner for a plain socket-close SQE that has not yet crossed
+/// the `io_uring_enter` admission boundary.
+struct PendingClose {
+    /// Wrapping sequence assigned to the corresponding userspace SQ entry.
+    sequence: u64,
+    /// Descriptor ownership retained until the kernel consumes that entry.
+    fd: OwnedFd,
+}
+
 #[doc(hidden)]
 pub(crate) struct Reactor {
     /// Owned io_uring instance used for submission and completion handling.
     ring: Option<IoUring>,
     /// Stable owner containing this reactor, or null in standalone unit tests.
     owner: *const ExecutorOwner,
-    /// True when SQEs have been queued in userspace but not flushed to the
-    /// kernel yet.
-    pending: bool,
+    /// Wrapping sequence of the first userspace SQE not consumed by the kernel.
+    queued_head: u64,
+    /// Wrapping sequence assigned to the next successfully queued SQE.
+    next_sequence: u64,
+    /// Bounded owners for close SQEs that remain in the userspace SQ.
+    pending_closes: VecDeque<PendingClose>,
+    /// Explicit close-marker bound, independent of allocator capacity details.
+    max_pending_closes: usize,
     /// Bounded FIFO of orphaned operations whose `ASYNC_CANCEL` SQE could not
     /// be submitted.
     pending_cancels: PendingCancelQueue,
@@ -338,11 +334,18 @@ impl Reactor {
         live_registry
             .try_reserve_exact(config.ring_entries as usize)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let mut pending_closes = VecDeque::new();
+        pending_closes
+            .try_reserve_exact(config.ring_entries as usize)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
 
         Ok(Self {
             ring: Some(ring),
             owner: std::ptr::null(),
-            pending: false,
+            queued_head: 0,
+            next_sequence: 0,
+            pending_closes,
+            max_pending_closes: config.ring_entries as usize,
             pending_cancels: PendingCancelQueue::new(),
             op_pool: ManuallyDrop::new(op_pool),
             max_live_ops: config.ring_entries as usize,
@@ -457,13 +460,77 @@ impl Reactor {
     }
 
     #[inline(always)]
+    fn queued_sqe_count(&self) -> u64 {
+        self.next_sequence.wrapping_sub(self.queued_head)
+    }
+
+    #[inline(always)]
+    fn has_queued_sqes(&self) -> bool {
+        self.queued_head != self.next_sequence
+    }
+
+    /// Relinquishes userspace ownership for the prefix consumed by one
+    /// successful `io_uring_enter` call.
+    ///
+    /// A valid plain socket-close SQE removes its fd-table entry while the
+    /// kernel consumes the SQE. Until this function suppresses the matching
+    /// `OwnedFd`, that numeric fd may already be reusable. Keep this loop free
+    /// of allocation, callbacks, logging, and panic-capable invariant checks.
+    #[inline(always)]
+    fn retire_submitted(&mut self, submitted: usize) -> io::Result<()> {
+        let old_head = self.queued_head;
+        let submitted = submitted as u64;
+        let queued = self.queued_sqe_count();
+        let consumed_prefix = submitted.min(queued);
+
+        loop {
+            let consumed = match self.pending_closes.front() {
+                Some(marker) => marker.sequence.wrapping_sub(old_head) < consumed_prefix,
+                None => false,
+            };
+            if !consumed {
+                break;
+            }
+            let Some(marker) = self.pending_closes.pop_front() else {
+                break;
+            };
+            let _ = marker.fd.into_raw_fd();
+        }
+
+        self.queued_head = old_head.wrapping_add(consumed_prefix);
+        if submitted > queued {
+            return Err(io::Error::other(
+                "io_uring reported more submissions than FlowIO queued",
+            ));
+        }
+        if self.queued_head == self.next_sequence {
+            debug_assert!(self.pending_closes.is_empty());
+            self.queued_head = 0;
+            self.next_sequence = 0;
+        }
+        Ok(())
+    }
+
+    /// Releases close owners whose SQEs never crossed into the kernel.
+    ///
+    /// The ring must already be gone (or SQPOLL must remain disabled, as it is
+    /// for every FlowIO reactor), so no queued SQE can consume these fds later.
+    fn drop_unsubmitted_close_owners(&mut self) {
+        self.pending_closes.clear();
+        self.queued_head = 0;
+        self.next_sequence = 0;
+    }
+
+    #[inline(always)]
     fn submit_ring(&mut self) -> io::Result<usize> {
         #[cfg(debug_assertions)]
         if let Some(err) = crate::runtime::test_hooks::take_ring_submit_failure() {
             return Err(err);
         }
 
-        self.ring_mut()?.submit()
+        let submitted = self.ring_mut()?.submit()?;
+        self.retire_submitted(submitted)?;
+        Ok(submitted)
     }
 
     #[inline(always)]
@@ -479,7 +546,15 @@ impl Reactor {
         let mut retried_after_busy = false;
         loop {
             match self.submit_ring() {
-                Ok(_) => return Ok(()),
+                Ok(submitted) => {
+                    let full = self.ring_mut()?.submission().is_full();
+                    if !full {
+                        return Ok(());
+                    }
+                    if submitted == 0 {
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                    }
+                }
                 Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
                 Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
                     if retried_after_busy {
@@ -527,9 +602,12 @@ impl Reactor {
             return Err(err);
         }
 
-        self.ring_mut()?
+        let submitted = self
+            .ring_mut()?
             .submitter()
-            .submit_with_args(min_complete, args)
+            .submit_with_args(min_complete, args)?;
+        self.retire_submitted(submitted)?;
+        Ok(submitted)
     }
 
     #[inline(always)]
@@ -539,7 +617,9 @@ impl Reactor {
             return Err(err);
         }
 
-        self.ring_mut()?.submit_and_wait(min_complete)
+        let submitted = self.ring_mut()?.submit_and_wait(min_complete)?;
+        self.retire_submitted(submitted)?;
+        Ok(submitted)
     }
 
     /// Return a retired `CompletionState` to the pool.
@@ -597,20 +677,80 @@ impl Reactor {
             return Err(err);
         }
 
-        let mut sq = self.ring_mut()?.submission();
-        if sq.is_full() {
-            drop(sq);
+        let is_full = self.ring_mut()?.submission().is_full();
+        if is_full {
             self.submit_ring_for_sqe_capacity()?;
-            self.pending = false;
-            sq = self.ring_mut()?.submission();
         }
+
+        let Some(ring) = self.ring.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "io_uring reactor is shut down",
+            ));
+        };
+        let next_sequence = &mut self.next_sequence;
+        let mut sq = ring.submission();
         unsafe {
             if sq.push(&sqe).is_err() {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
         }
+        *next_sequence = next_sequence.wrapping_add(1);
         drop(sq);
-        self.pending = true;
+        Ok(())
+    }
+
+    /// Queues one private plain socket-close SQE while retaining ownership
+    /// until a successful kernel submission consumes its exact SQ position.
+    ///
+    /// This method constructs the only accepted entry shape itself:
+    /// `IORING_OP_CLOSE` over this owner's valid socket fd, without ASYNC,
+    /// DRAIN, LINK, FIXED, IOPOLL, or SQPOLL semantics.
+    pub(crate) fn submit_close_sqe(
+        &mut self,
+        fd: OwnedFd,
+        user_data: u64,
+    ) -> Result<(), (io::Error, OwnedFd)> {
+        #[cfg(debug_assertions)]
+        if let Some(err) = crate::runtime::test_hooks::take_raw_sqe_submit_failure() {
+            return Err((err, fd));
+        }
+
+        let sqe = opcode::Close::new(types::Fd(fd.as_raw_fd()))
+            .build()
+            .user_data(user_data);
+        let is_full = match self.ring_mut() {
+            Ok(ring) => ring.submission().is_full(),
+            Err(err) => return Err((err, fd)),
+        };
+        if is_full && let Err(err) = self.submit_ring_for_sqe_capacity() {
+            return Err((err, fd));
+        }
+
+        if self.pending_closes.len() >= self.max_pending_closes {
+            return Err((io::Error::from(io::ErrorKind::WouldBlock), fd));
+        }
+
+        let Some(ring) = self.ring.as_mut() else {
+            return Err((
+                io::Error::new(io::ErrorKind::NotConnected, "io_uring reactor is shut down"),
+                fd,
+            ));
+        };
+        let pending_closes = &mut self.pending_closes;
+        let next_sequence = &mut self.next_sequence;
+        let sequence = *next_sequence;
+        pending_closes.push_back(PendingClose { sequence, fd });
+        let mut sq = ring.submission();
+        if unsafe { sq.push(&sqe) }.is_err() {
+            // SAFETY: this function appended exactly one marker immediately
+            // before the failed push, and no code can mutate the deque between
+            // those two operations.
+            let marker = unsafe { pending_closes.pop_back().unwrap_unchecked() };
+            return Err((io::Error::from(io::ErrorKind::WouldBlock), marker.fd));
+        }
+        *next_sequence = next_sequence.wrapping_add(1);
+        drop(sq);
         Ok(())
     }
 
@@ -618,18 +758,16 @@ impl Reactor {
     /// Flushes any queued SQEs to the kernel submission queue.
     pub fn flush_sqes(&mut self) -> io::Result<ReactorSubmitStatus> {
         self.retry_pending_cancels();
-        if self.pending {
-            loop {
-                match self.submit_ring() {
-                    Ok(_) => break,
-                    Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
-                    Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
-                        return Ok(ReactorSubmitStatus::Busy);
-                    }
-                    Err(err) => return Err(err),
+        while self.has_queued_sqes() {
+            match self.submit_ring() {
+                Ok(0) => return Ok(ReactorSubmitStatus::Busy),
+                Ok(_) => {}
+                Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
+                Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
+                    return Ok(ReactorSubmitStatus::Busy);
                 }
+                Err(err) => return Err(err),
             }
-            self.pending = false;
         }
         if self.has_pending_cancels() {
             return Ok(ReactorSubmitStatus::Busy);
@@ -649,8 +787,10 @@ impl Reactor {
         &mut self,
         timeout: Option<Duration>,
     ) -> io::Result<ReactorSubmitStatus> {
-        self.retry_pending_cancels();
-        if self.has_pending_cancels() {
+        // Timed `io_uring_enter` errors do not carry a submitted-prefix count.
+        // Flush ownership-bearing closes first with the count-returning submit
+        // path, then wait with an empty userspace SQ.
+        if self.flush_sqes()? == ReactorSubmitStatus::Busy {
             return Ok(ReactorSubmitStatus::Busy);
         }
         if let Some(timeout) = timeout {
@@ -674,13 +814,16 @@ impl Reactor {
                 let timespec = types::Timespec::from(timeout);
                 let args = types::SubmitArgs::new().timespec(&timespec);
                 match self.submit_with_args(1, &args) {
-                    Ok(_) => {
-                        self.pending = false;
-                        return Ok(ReactorSubmitStatus::Ready);
+                    Ok(_) if self.has_queued_sqes() => {
+                        return Ok(ReactorSubmitStatus::Busy);
                     }
+                    Ok(_) => return Ok(ReactorSubmitStatus::Ready),
                     Err(err) if is_raw_os_error(&err, libc::ETIME) => {
-                        self.pending = false;
-                        return Ok(ReactorSubmitStatus::Ready);
+                        return Ok(if self.has_queued_sqes() {
+                            ReactorSubmitStatus::Busy
+                        } else {
+                            ReactorSubmitStatus::Ready
+                        });
                     }
                     Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
                     Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
@@ -694,10 +837,10 @@ impl Reactor {
         } else {
             loop {
                 match self.submit_and_wait(1) {
-                    Ok(_) => {
-                        self.pending = false;
-                        return Ok(ReactorSubmitStatus::Ready);
+                    Ok(_) if self.has_queued_sqes() => {
+                        return Ok(ReactorSubmitStatus::Busy);
                     }
+                    Ok(_) => return Ok(ReactorSubmitStatus::Ready),
                     Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
                     Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
                         return Ok(ReactorSubmitStatus::Busy);
@@ -722,7 +865,6 @@ impl Reactor {
                 (*state).clear_waiter();
                 (*state).set_runtime_shutdown();
                 if (*state).is_completed() {
-                    close_unclaimed_result_fd_if_needed(&*state);
                     (*state).result = -libc::ECANCELED;
                 } else {
                     self.request_cancel(state);
@@ -746,8 +888,15 @@ impl Reactor {
         }
 
         self.prepare_shutdown();
+        #[cfg(any(test, feature = "test-support"))]
+        let force_fallback = crate::runtime::test_hooks::take_reactor_shutdown_fallback();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let force_fallback = false;
         let deadline = Instant::now() + Duration::from_secs(1);
-        while unsafe { (*runtime_state).inflight_ops > 0 } && Instant::now() < deadline {
+        while !force_fallback
+            && unsafe { (*runtime_state).inflight_ops > 0 }
+            && Instant::now() < deadline
+        {
             if self.flush_sqes().is_err() {
                 break;
             }
@@ -770,8 +919,11 @@ impl Reactor {
 
         if unsafe { (*runtime_state).inflight_ops > 0 } {
             // Closing the ring is the bounded fallback that ends all remaining
-            // kernel access before retained payloads or state slots are touched.
+            // kernel access before retained payloads or state slots are
+            // touched. Readiness operations retain their source descriptor,
+            // and their CQEs never create a process resource.
             drop(self.ring.take());
+            self.drop_unsubmitted_close_owners();
             unsafe {
                 (*runtime_state).inflight_ops = 0;
             }
@@ -796,12 +948,11 @@ impl Reactor {
             }
             debug_assert!(self.pending_cancels.is_empty());
             self.pending_cancels = PendingCancelQueue::new();
-            self.pending = false;
             return;
         }
 
         drop(self.ring.take());
-        self.pending = false;
+        self.drop_unsubmitted_close_owners();
     }
 
     /// Drains completed CQEs, updates `CompletionState`, and wakes waiting
@@ -856,13 +1007,11 @@ impl Reactor {
                 retire_tracked_completion(&mut *runtime_state)?;
 
                 if (*state).is_runtime_shutdown() {
-                    close_unclaimed_result_fd_if_needed(&*state);
                     (*state).result = -libc::ECANCELED;
                     self.pending_cancels.unlink(state);
                 } else if (*state).is_orphaned() || (*state).is_detached() {
-                    // Cancelled/abandoned or detached op — free the pool slot,
-                    // no task wake.
-                    close_unclaimed_result_fd_if_needed(&*state);
+                    // Cancelled or abandoned op — free the pool slot, with no
+                    // task wake.
                     free_op_fields(
                         &mut self.pending_cancels,
                         &mut self.retained_pool,
@@ -900,6 +1049,10 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
+        if self.ring.is_some() {
+            drop(self.ring.take());
+        }
+        self.drop_unsubmitted_close_owners();
         debug_assert!(
             self.live_registry.is_empty(),
             "reactor dropped with live completion states"
@@ -1140,6 +1293,7 @@ mod tests {
     use crate::runtime::fd::{distinctive_closeable_test_fd, raw_fd_is_closed};
 
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
     fn runtime_state_with_inflight(inflight_ops: usize) -> RuntimeState {
         RuntimeState {
@@ -1157,6 +1311,13 @@ mod tests {
                 libc::close(fd);
             }
         }
+    }
+
+    fn distinctive_owner() -> (RawFd, OwnedFd) {
+        let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
+        // SAFETY: the helper returns one open descriptor whose sole ownership
+        // is transferred into this OwnedFd.
+        (raw, unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
     #[cfg(debug_assertions)]
@@ -1198,6 +1359,218 @@ mod tests {
 
         reactor.free_op(second);
         reactor.free_op(first);
+    }
+
+    #[test]
+    fn close_ledger_retires_only_markers_inside_a_partial_prefix() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let (first_raw, first) = distinctive_owner();
+        let (boundary_raw, boundary) = distinctive_owner();
+        let (suffix_raw, suffix) = distinctive_owner();
+
+        reactor.queued_head = 100;
+        reactor.next_sequence = 104;
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 100,
+            fd: first,
+        });
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 102,
+            fd: boundary,
+        });
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 103,
+            fd: suffix,
+        });
+
+        reactor
+            .retire_submitted(2)
+            .expect("partial ledger retirement failed");
+
+        assert_eq!(reactor.queued_head, 102);
+        assert_eq!(reactor.next_sequence, 104);
+        assert_eq!(reactor.pending_closes.len(), 2);
+        assert_eq!(reactor.pending_closes[0].sequence, 102);
+        assert_eq!(reactor.pending_closes[1].sequence, 103);
+        assert!(
+            !raw_fd_is_closed(first_raw),
+            "synthetic retirement suppresses the consumed userspace owner"
+        );
+        assert!(!raw_fd_is_closed(boundary_raw));
+        assert!(!raw_fd_is_closed(suffix_raw));
+
+        close_fd_if_open(first_raw);
+        drop(reactor.ring.take());
+        reactor.drop_unsubmitted_close_owners();
+        assert!(raw_fd_is_closed(boundary_raw));
+        assert!(raw_fd_is_closed(suffix_raw));
+    }
+
+    #[test]
+    fn close_ledger_offsets_remain_correct_across_sequence_wrap() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let (before_raw, before) = distinctive_owner();
+        let (inside_raw, inside) = distinctive_owner();
+        let (after_raw, after) = distinctive_owner();
+
+        reactor.queued_head = u64::MAX - 1;
+        reactor.next_sequence = 2;
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: u64::MAX - 1,
+            fd: before,
+        });
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 0,
+            fd: inside,
+        });
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 1,
+            fd: after,
+        });
+
+        reactor
+            .retire_submitted(3)
+            .expect("wrapped ledger retirement failed");
+
+        assert_eq!(reactor.queued_head, 1);
+        assert_eq!(reactor.next_sequence, 2);
+        assert_eq!(reactor.pending_closes.len(), 1);
+        assert_eq!(reactor.pending_closes[0].sequence, 1);
+        close_fd_if_open(before_raw);
+        close_fd_if_open(inside_raw);
+        drop(reactor.ring.take());
+        reactor.drop_unsubmitted_close_owners();
+        assert!(raw_fd_is_closed(after_raw));
+    }
+
+    #[test]
+    fn close_ledger_reconciles_multiple_partial_submissions() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let (first_raw, first) = distinctive_owner();
+        let (second_raw, second) = distinctive_owner();
+        let (third_raw, third) = distinctive_owner();
+
+        reactor.queued_head = 10;
+        reactor.next_sequence = 15;
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 11,
+            fd: first,
+        });
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 13,
+            fd: second,
+        });
+        reactor.pending_closes.push_back(PendingClose {
+            sequence: 14,
+            fd: third,
+        });
+
+        reactor
+            .retire_submitted(2)
+            .expect("first partial retirement failed");
+        assert_eq!(reactor.queued_head, 12);
+        assert_eq!(reactor.pending_closes.len(), 2);
+        reactor
+            .retire_submitted(2)
+            .expect("second partial retirement failed");
+        assert_eq!(reactor.queued_head, 14);
+        assert_eq!(reactor.pending_closes.len(), 1);
+        reactor
+            .retire_submitted(1)
+            .expect("final partial retirement failed");
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 0);
+        assert!(reactor.pending_closes.is_empty());
+
+        close_fd_if_open(first_raw);
+        close_fd_if_open(second_raw);
+        close_fd_if_open(third_raw);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn failed_close_push_returns_the_identical_owner_without_a_marker() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let (raw, owner) = distinctive_owner();
+        crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+
+        let (_err, returned) = reactor
+            .submit_close_sqe(owner, 0)
+            .expect_err("injected close push failure should return ownership");
+
+        assert_eq!(returned.as_raw_fd(), raw);
+        assert!(!raw_fd_is_closed(raw));
+        assert!(!reactor.has_queued_sqes());
+        assert!(reactor.pending_closes.is_empty());
+        drop(returned);
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn close_submit_error_preserves_the_queued_owner_and_sequence() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let (raw, owner) = distinctive_owner();
+        reactor
+            .submit_close_sqe(owner, 0)
+            .expect("queue close failed");
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+
+        assert_eq!(
+            reactor.flush_sqes().expect("flush status failed"),
+            ReactorSubmitStatus::Busy
+        );
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 1);
+        assert_eq!(reactor.pending_closes.len(), 1);
+        assert!(!raw_fd_is_closed(raw));
+
+        drop(reactor.ring.take());
+        reactor.drop_unsubmitted_close_owners();
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[test]
+    fn retired_close_owner_cannot_close_a_reused_numeric_fd_at_teardown() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let (raw, owner) = distinctive_owner();
+        reactor
+            .submit_close_sqe(owner, 0)
+            .expect("queue close failed");
+        assert_eq!(
+            reactor.flush_sqes().expect("flush close failed"),
+            ReactorSubmitStatus::Ready
+        );
+        assert!(reactor.pending_closes.is_empty());
+        assert!(raw_fd_is_closed(raw), "kernel did not consume close SQE");
+
+        let (source, peer) =
+            std::os::unix::net::UnixStream::pair().expect("replacement socketpair failed");
+        // SAFETY: dup2 atomically creates a new descriptor owner at `raw`.
+        let replacement = unsafe { libc::dup2(source.as_raw_fd(), raw) };
+        assert_eq!(replacement, raw, "numeric fd reuse failed");
+        assert!(!raw_fd_is_closed(raw));
+
+        drop(reactor);
+        assert!(
+            !raw_fd_is_closed(raw),
+            "reactor teardown closed a number whose ledger owner had retired"
+        );
+        close_fd_if_open(raw);
+        drop(source);
+        drop(peer);
     }
 
     #[test]
@@ -1286,74 +1659,6 @@ mod tests {
         assert_eq!(runtime_state.stats.cqe_completions, 0);
     }
 
-    #[test]
-    fn unclaimed_result_fd_helper_closes_positive_orphaned_accept_result() {
-        let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
-        let mut state = CompletionState::empty();
-        state.result = fd;
-        state.set_orphaned();
-        state.set_close_result_fd_on_orphan();
-
-        close_unclaimed_result_fd_if_needed(&state);
-
-        assert!(
-            raw_fd_is_closed(fd),
-            "orphaned accept result fd stayed open"
-        );
-    }
-
-    #[test]
-    fn unclaimed_result_fd_helper_ignores_negative_result() {
-        let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
-        let mut state = CompletionState::empty();
-        state.result = -libc::ECANCELED;
-        state.set_orphaned();
-        state.set_close_result_fd_on_orphan();
-
-        close_unclaimed_result_fd_if_needed(&state);
-
-        assert!(
-            !raw_fd_is_closed(fd),
-            "negative CQE result should not close unrelated fd"
-        );
-        close_fd_if_open(fd);
-    }
-
-    #[test]
-    fn unclaimed_result_fd_helper_requires_owner_state_and_close_flag() {
-        let fd_without_orphan = distinctive_closeable_test_fd().expect("socketpair fd failed");
-        let mut without_orphan = CompletionState::empty();
-        without_orphan.result = fd_without_orphan;
-        without_orphan.set_close_result_fd_on_orphan();
-        close_unclaimed_result_fd_if_needed(&without_orphan);
-        assert!(!raw_fd_is_closed(fd_without_orphan));
-        close_fd_if_open(fd_without_orphan);
-
-        let fd_without_flag = distinctive_closeable_test_fd().expect("socketpair fd failed");
-        let mut without_flag = CompletionState::empty();
-        without_flag.result = fd_without_flag;
-        without_flag.set_orphaned();
-        close_unclaimed_result_fd_if_needed(&without_flag);
-        assert!(!raw_fd_is_closed(fd_without_flag));
-        close_fd_if_open(fd_without_flag);
-    }
-
-    #[test]
-    fn unclaimed_result_fd_helper_closes_runtime_shutdown_accept_result() {
-        let fd = distinctive_closeable_test_fd().expect("socketpair fd failed");
-        let mut state = CompletionState::empty();
-        state.result = fd;
-        state.set_runtime_shutdown();
-        state.set_close_result_fd_on_orphan();
-
-        close_unclaimed_result_fd_if_needed(&state);
-
-        assert!(
-            raw_fd_is_closed(fd),
-            "shutdown-owned accept result fd stayed open"
-        );
-    }
-
     #[cfg(debug_assertions)]
     #[test]
     fn submit_sqe_full_queue_absorbs_eintr_before_push() {
@@ -1373,7 +1678,7 @@ mod tests {
             .submit_sqe(nop_sqe(3))
             .expect("EINTR while making SQ space should be absorbed");
         assert!(
-            reactor.pending,
+            reactor.has_queued_sqes(),
             "third NOP should remain pending after push"
         );
     }
@@ -1397,7 +1702,7 @@ mod tests {
             .submit_sqe(nop_sqe(3))
             .expect("transient EBUSY should be retried");
         assert!(
-            reactor.pending,
+            reactor.has_queued_sqes(),
             "third NOP should remain pending after transient submit pressure"
         );
     }
@@ -1423,7 +1728,7 @@ mod tests {
             .expect_err("persistent EBUSY should surface as pressure");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert!(
-            reactor.pending,
+            reactor.has_queued_sqes(),
             "existing queued SQEs should remain pending after pressure"
         );
     }
@@ -1467,7 +1772,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn wait_for_events_busy_keeps_queued_cancel_sqe_pending() {
+    fn wait_for_events_busy_flushes_cancel_before_the_countless_wait_error() {
         let mut reactor =
             Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
         reactor.init();
@@ -1483,11 +1788,40 @@ mod tests {
             .expect("wait_for_events should report busy wait pressure");
         assert_eq!(status, ReactorSubmitStatus::Busy);
         assert!(
-            reactor.pending,
-            "queued cancel SQE must stay pending after wait pressure"
+            !reactor.has_queued_sqes(),
+            "count-bearing submit must flush queued SQEs before a timed wait"
         );
 
         reactor.free_op(state);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn timed_wait_flushes_close_owner_before_the_countless_wait_error() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let raw = distinctive_closeable_test_fd().expect("close test fd failed");
+        // SAFETY: the helper returned one sole-owned live descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        reactor
+            .submit_close_sqe(owned, 0)
+            .expect("queue close owner failed");
+        assert_eq!(reactor.pending_closes.len(), 1);
+
+        crate::runtime::test_hooks::fail_next_ring_wait_errno(libc::EBUSY);
+        let status = reactor
+            .wait_for_events(Some(Duration::from_millis(1)))
+            .expect("wait_for_events should report busy wait pressure");
+        assert_eq!(status, ReactorSubmitStatus::Busy);
+        assert!(
+            reactor.pending_closes.is_empty(),
+            "count-bearing preflush must retire the accepted close owner"
+        );
+        assert!(
+            raw_fd_is_closed(raw),
+            "kernel-accepted close must retire the descriptor before timed wait"
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -1511,7 +1845,7 @@ mod tests {
         reactor.retry_pending_cancels();
 
         assert!(
-            reactor.pending,
+            reactor.has_queued_sqes(),
             "cancel retry should queue an SQE for the next reactor flush"
         );
         assert_eq!(reactor.pending_cancels.len(), 0);
@@ -1551,14 +1885,14 @@ mod tests {
             assert_eq!((*states[2]).cancel_prev(), states[1]);
         }
         assert!(
-            !reactor.pending,
+            !reactor.has_queued_sqes(),
             "failed retry pass should not have queued an SQE"
         );
 
         reactor.retry_pending_cancels();
         assert!(reactor.pending_cancels.is_empty());
         assert!(
-            reactor.pending,
+            reactor.has_queued_sqes(),
             "successful retries should queue cancel SQEs"
         );
 
