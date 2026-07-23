@@ -34,10 +34,21 @@ const NON_QUERY_OPCODE: &[u8] = &[
     b'c', b'o', b'm', 0, 0, 1, 0, 1,
 ];
 
+fn overlong_question() -> Vec<u8> {
+    let mut packet = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label_len in [63usize, 63, 63, 62] {
+        packet.push(label_len as u8);
+        packet.extend(std::iter::repeat_n(b'x', label_len));
+    }
+    packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+    packet
+}
+
 #[test]
 fn malformed_dns_candidates_are_allocation_free() {
     const ROUNDS: usize = 16_384;
-    const MALFORMED: [&[u8]; 8] = [
+    let overlong_question = overlong_question();
+    let malformed: [&[u8]; 9] = [
         TRUNCATED_POINTER,
         FORWARD_POINTER,
         BACKWARD_POINTER_LOOP,
@@ -46,15 +57,16 @@ fn malformed_dns_candidates_are_allocation_free() {
         LITERAL_DOT_LABEL,
         COMPRESSED_LITERAL_DOT_LABEL,
         NON_QUERY_OPCODE,
+        &overlong_question,
     ];
 
-    for packet in MALFORMED {
+    for packet in malformed {
         assert!(!response_is_decodable_candidate(packet, QUERY_ID));
     }
 
     let before = AllocationSnapshot::current();
     for _ in 0..ROUNDS {
-        for packet in MALFORMED {
+        for packet in malformed {
             assert!(!black_box(response_is_decodable_candidate(
                 black_box(packet),
                 QUERY_ID,

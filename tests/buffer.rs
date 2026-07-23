@@ -39,6 +39,47 @@ fn initialize_spare_prefix(spare: &mut [MaybeUninit<u8>], bytes: &[u8]) {
     }
 }
 
+#[cfg(not(debug_assertions))]
+struct DefaultInitializedWritable {
+    storage: Box<[u8]>,
+}
+
+#[cfg(not(debug_assertions))]
+impl DefaultInitializedWritable {
+    const WRITABLE: usize = 4;
+    const OVERSIZED: usize = 8;
+    const SENTINEL: u8 = 0xA5;
+
+    fn new() -> Self {
+        let backing_len = if cfg!(miri) {
+            Self::WRITABLE
+        } else {
+            Self::OVERSIZED
+        };
+        Self {
+            storage: vec![Self::SENTINEL; backing_len].into_boxed_slice(),
+        }
+    }
+}
+
+// SAFETY: the fixed boxed allocation is pointer-stable and contains the
+// complete advertised writable window. It models a downstream implementation
+// that inherits the trait's default userspace initializer.
+#[cfg(not(debug_assertions))]
+unsafe impl IoBuffReadWrite for DefaultInitializedWritable {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr()
+    }
+
+    fn writable_len(&self) -> usize {
+        Self::WRITABLE
+    }
+
+    unsafe fn set_written_len(&mut self, _len: usize) {
+        // This fixed-size test buffer has no separate logical length.
+    }
+}
+
 // ============================================================================
 // IoBuffMut — basic construction and payload operations
 // ============================================================================
@@ -198,6 +239,28 @@ fn buffer_spare_capacity_api_signatures_are_initialization_safe() {
     assert_eq!(unsafe { userspace(&mut buf, 1) }, &[0]);
     // SAFETY: publishing zero bytes exposes no new storage.
     unsafe { publish(&mut buf, 0).unwrap() };
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn default_initialized_writable_slice_clamps_oversized_request() {
+    let mut buffer = DefaultInitializedWritable::new();
+
+    // SAFETY: this deliberately exceeds the documented caller bound to prove
+    // the default implementation's release-mode defensive seam. Native runs
+    // retain initialized guard bytes so the pre-fix implementation fails
+    // deterministically without leaving the allocation; release Miri uses an
+    // exact allocation and therefore also proves the raw write stays bounded.
+    let initialized =
+        unsafe { buffer.initialized_writable_slice(DefaultInitializedWritable::OVERSIZED) };
+    assert_eq!(initialized.len(), DefaultInitializedWritable::WRITABLE);
+    assert_eq!(initialized, &[0; DefaultInitializedWritable::WRITABLE]);
+
+    #[cfg(not(miri))]
+    assert_eq!(
+        &buffer.storage[DefaultInitializedWritable::WRITABLE..],
+        &[DefaultInitializedWritable::SENTINEL; 4]
+    );
 }
 
 #[test]

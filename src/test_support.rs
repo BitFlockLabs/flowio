@@ -73,7 +73,10 @@ pub mod runtime {
 
 pub mod net {
     pub mod resolver {
-        pub use crate::net::resolver::test_support::response_is_decodable_candidate;
+        pub use crate::net::resolver::test_support::{
+            decode_name, extend_unique_socket_addrs, lookup_ipv4, parse_ipv4_response,
+            response_is_decodable_candidate,
+        };
     }
 
     pub mod tcp {
@@ -82,12 +85,13 @@ pub mod net {
 
     pub mod sctp {
         pub use crate::net::sctp::test_support::{
-            capability_unavailable, test_accept_slot_drop_cached_state_preserves_unrelated_fd,
+            SctpSocketOptionSnapshot, capability_unavailable,
+            test_accept_slot_drop_cached_state_preserves_unrelated_fd,
             test_accept_slot_drop_future_preserves_unrelated_fd, test_adaptation_indication_type,
-            test_assoc_change_type, test_assoc_reset_event_type,
+            test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
             test_connect_slot_drop_future_closes_socket_fd, test_parse_notification,
             test_parse_recv_meta, test_partial_delivery_event_type, test_peer_addr_change_type,
-            test_peer_addr_params_rejects_optlen, test_remote_error_type,
+            test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
             test_sctp_socket_receive_options, test_send_failed_error_offset,
             test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
             test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,

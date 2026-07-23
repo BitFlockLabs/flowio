@@ -2,15 +2,15 @@ mod common;
 
 use common::{
     DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
-    assert_poll_after_ready_parks, ipv6_loopback_capability_unavailable, set_positive_linger,
-    wait_for_drop_count,
+    assert_poll_after_ready_parks, ipv6_loopback_capability_unavailable, poll_once_pending,
+    set_positive_linger, wait_for_drop_count,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
-use flowio::runtime::timer::{sleep, timeout};
-#[cfg(debug_assertions)]
+use flowio::runtime::timer::{TimeoutError, timeout};
+#[cfg(any(debug_assertions, feature = "test-support"))]
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::future::Future;
@@ -24,10 +24,6 @@ use std::time::Duration;
 const UDP_PUBLIC_RAW_CLOSE_CHILD_ENV: &str = "FLOWIO_UDP_PUBLIC_RAW_CLOSE_CHILD";
 const UDP_PUBLIC_RAW_CLOSE_TEST: &str =
     "runtime_udp_public_raw_exposure_classifies_then_uses_ring_close";
-
-fn is_connection_refused(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ECONNREFUSED) || err.kind() == io::ErrorKind::ConnectionRefused
-}
 
 fn prefilled_udp_buffer(writable: usize) -> flowio::runtime::buffer::IoBuffMut {
     let mut buffer = IoBuffMut::new(0, 4 + writable, 0);
@@ -45,6 +41,38 @@ fn connected_udp_pair() -> (UdpSocket, StdUdpSocket, SocketAddr) {
     socket.connect(peer_addr).expect("runtime connect failed");
     peer.connect(local_addr).expect("std peer connect failed");
     (socket, peer, peer_addr)
+}
+
+#[test]
+fn runtime_udp_initial_submissions_extract_poll_context_once() {
+    let mut connected = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("connected runtime bind failed");
+    let mut unconnected = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("unconnected runtime bind failed");
+    let peer =
+        StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("peer bind failed");
+    let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    connected
+        .connect(peer_addr)
+        .expect("runtime connect failed");
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            poll_once_pending(connected.recv(vec![0u8; 1], 1)).await;
+            poll_once_pending(connected.recv_msg(vec![0u8; 1], 1)).await;
+            poll_once_pending(connected.send(b"s".to_vec())).await;
+            poll_once_pending(unconnected.recv_from(vec![0u8; 1], 1)).await;
+            poll_once_pending(unconnected.send_to(b"t".to_vec(), peer_addr)).await;
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().poll_context_extractions,
+        5,
+        "each UDP submission should derive the validated context once"
+    );
 }
 
 fn raw_fd_is_closed(fd: RawFd) -> bool {
@@ -465,7 +493,10 @@ fn runtime_udp_cancelled_recv_retains_buffer_until_cqe() {
                 res
             })
             .await;
-            assert!(result.is_err(), "recv should time out without a datagram");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "recv should time out without a datagram: {result:?}"
+            );
             assert_eq!(
                 drops.get(),
                 0,
@@ -500,8 +531,8 @@ fn runtime_udp_cancelled_recv_from_retains_buffer_until_cqe() {
             })
             .await;
             assert!(
-                result.is_err(),
-                "recv_from should time out without a datagram"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "recv_from should time out without a datagram: {result:?}"
             );
             assert_eq!(
                 drops.get(),
@@ -540,8 +571,8 @@ fn runtime_udp_cancelled_recv_msg_retains_buffer_until_cqe() {
             })
             .await;
             assert!(
-                result.is_err(),
-                "recv_msg should time out without a datagram"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "recv_msg should time out without a datagram: {result:?}"
             );
             assert_eq!(
                 drops.get(),
@@ -639,57 +670,36 @@ fn runtime_udp_cancelled_send_to_retains_buffer_until_cqe() {
 #[test]
 fn runtime_udp_kernel_error_send_returns_payload_once() {
     let mut executor = Executor::new().expect("failed to construct executor");
-
-    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("failed to bind runtime udp socket");
-    let closed_peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("failed to bind closed udp peer");
-    let closed_addr = closed_peer
-        .local_addr()
-        .expect("closed peer local_addr failed");
-    drop(closed_peer);
-    socket.connect(closed_addr).expect("runtime connect failed");
+    let (mut socket, _peer, _peer_addr) = connected_udp_pair();
 
     executor
         .run(async move {
-            let (probe_res, _probe) = socket.send(b"probe".to_vec()).await;
-            if let Err(err) = probe_res
-                && !is_connection_refused(&err)
-            {
-                panic!("initial udp probe failed unexpectedly: {err}");
-            }
-
-            sleep(Duration::from_millis(20))
-                .await
-                .expect("udp refused wait sleep failed");
-
+            const OVERSIZED_IPV4_DATAGRAM_LEN: usize = 65_508;
             let drops = Rc::new(Cell::new(0));
-            let mut payload = DropTrackedReadOnly::new(b"kernel-error".to_vec(), &drops);
-            for _ in 0..16 {
-                let (res, returned) = socket.send(payload).await;
-                match res {
-                    Err(err) if is_connection_refused(&err) => {
-                        assert_eq!(drops.get(), 0, "udp payload dropped before return");
-                        drop(returned);
-                        assert_eq!(drops.get(), 1, "udp payload dropped exactly once");
-                        return;
-                    }
-                    Err(err) => panic!("udp send failed with unexpected error: {err}"),
-                    Ok(_) => {
-                        assert_eq!(
-                            drops.get(),
-                            0,
-                            "udp payload dropped after successful return"
-                        );
-                        payload = returned;
-                        sleep(Duration::from_millis(10))
-                            .await
-                            .expect("udp retry wait sleep failed");
-                    }
-                }
-            }
+            let bytes = (0..OVERSIZED_IPV4_DATAGRAM_LEN)
+                .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            let payload = DropTrackedReadOnly::new(bytes, &drops);
+            let original_ptr = payload.bytes().as_ptr();
 
-            panic!("connected udp send did not observe ECONNREFUSED from closed peer");
+            let (res, returned) = socket.send(payload).await;
+            let err = res.expect_err("oversized IPv4 UDP send should fail");
+            assert_eq!(err.raw_os_error(), Some(libc::EMSGSIZE));
+            assert_eq!(drops.get(), 0, "udp payload dropped before return");
+            assert_eq!(returned.bytes().as_ptr(), original_ptr);
+            assert_eq!(returned.bytes().len(), OVERSIZED_IPV4_DATAGRAM_LEN);
+            assert!(
+                returned
+                    .bytes()
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .all(|(index, byte)| byte == (index as u8).wrapping_mul(31).wrapping_add(7)),
+                "udp payload contents changed while retained by the failed send"
+            );
+
+            drop(returned);
+            assert_eq!(drops.get(), 1, "udp payload dropped exactly once");
         })
         .expect("executor run failed");
 }
@@ -985,11 +995,11 @@ fn runtime_udp_context_errors_preserve_prefilled_iobuff_for_all_apis() {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_udp_submission_errors_preserve_prefilled_iobuff_for_all_apis() {
     let mut executor = Executor::new().expect("failed to construct executor");
-    let (mut socket, _peer, _peer_addr) = connected_udp_pair();
+    let (mut socket, _peer, peer_addr) = connected_udp_pair();
 
     executor
         .run(async move {
@@ -1008,6 +1018,12 @@ fn runtime_udp_submission_errors_preserve_prefilled_iobuff_for_all_apis() {
             test_hooks::fail_next_sqe_submit();
             let (result, buffer) = socket.recv_from(prefilled_udp_buffer(4), 4).await;
             let error = result.expect_err("forced recv_from submission should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_sqe_submit();
+            let (result, buffer) = socket.send_to(prefilled_udp_buffer(4), peer_addr).await;
+            let error = result.expect_err("forced send_to submission should fail");
             assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
             assert_eq!(buffer.payload_bytes(), b"HEAD");
         })

@@ -4,7 +4,7 @@ use common::{
     InitializationTrackedReadWrite, TestIoBuffMut as IoBuffMut, TestProjected,
     TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
     assert_poll_after_ready_parks, fill_try_send_buffer, make_payload_chain, make_read_chain,
-    make_read_only_chain, run_test, set_positive_linger,
+    make_read_only_chain, poll_once_pending, run_test, set_positive_linger,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
@@ -16,6 +16,7 @@ use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
+use std::task::Poll;
 
 /// Returns a FlowIO UnixStream wrapping one nonblocking socketpair endpoint
 /// plus its connected std peer for one-shot tests that do not need a reactor.
@@ -25,6 +26,135 @@ fn connected_try_unix_stream() -> (UnixStream, std::os::unix::net::UnixStream) {
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
     (UnixStream::from_owned_fd(stream.into()), peer)
+}
+
+#[test]
+fn runtime_retry_initial_submissions_extract_poll_context_once() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            {
+                let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.write_all(b"w".to_vec())).await;
+            }
+            {
+                let (_peer, mut stream) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.read_exact(vec![0u8; 1], 1)).await;
+            }
+            {
+                let (_peer, mut stream) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.read_exact_append(IoBuffMut::new(0, 1, 0), 1)).await;
+            }
+            {
+                let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.writev_all(make_payload_chain([&b"v"[..]]))).await;
+            }
+            {
+                let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.writev_all_projected(TestProjected::new([&b"p"[..]])))
+                    .await;
+            }
+            {
+                let (_peer, mut stream) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.readv_exact(make_read_chain([1]), 1)).await;
+            }
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().poll_context_extractions,
+        6,
+        "each initial retry submission should derive the validated context once"
+    );
+}
+
+#[test]
+fn runtime_unix_one_shot_initial_submissions_extract_poll_context_once() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            {
+                let (_peer, mut stream) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.read(vec![0u8; 1], 1)).await;
+            }
+            {
+                let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.write(b"w".to_vec())).await;
+            }
+            {
+                let (_peer, mut stream) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.readv(make_read_chain([1]))).await;
+            }
+            {
+                let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.writev(make_payload_chain([&b"v"[..]]))).await;
+            }
+            {
+                let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+                poll_once_pending(stream.writev_projected(TestProjected::new([&b"p"[..]]))).await;
+            }
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().poll_context_extractions,
+        5,
+        "each one-shot stream submission should derive the validated context once"
+    );
+}
+
+#[test]
+fn runtime_retry_partial_resubmit_refreshes_waiter_without_reextracting_context() {
+    let (mut stream, mut peer) = connected_try_unix_stream();
+    peer.write_all(b"a").expect("initial peer write failed");
+    peer.set_nonblocking(true)
+        .expect("set peer nonblocking failed");
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let mut future = std::pin::pin!(stream.read_exact(vec![0u8; 2], 2));
+            let mut outer_polls = 0;
+            let (result, buffer) = std::future::poll_fn(|cx| {
+                outer_polls += 1;
+                match outer_polls {
+                    1 => {
+                        assert!(future.as_mut().poll(cx).is_pending());
+                        assert!(
+                            future.as_mut().poll(cx).is_pending(),
+                            "in-flight repoll should remain pending"
+                        );
+                        Poll::Pending
+                    }
+                    2 => {
+                        assert!(
+                            future.as_mut().poll(cx).is_pending(),
+                            "partial completion should resubmit the remaining read"
+                        );
+                        assert_eq!(peer.write(b"b").expect("second peer write failed"), 1);
+                        Poll::Pending
+                    }
+                    _ => future.as_mut().poll(cx),
+                }
+            })
+            .await;
+
+            assert_eq!(result.expect("read_exact failed"), 2);
+            assert_eq!(&buffer[..], b"ab");
+            assert_eq!(outer_polls, 3);
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().poll_context_extractions,
+        4,
+        "initial submit, pending repoll, partial retry, and final completion should each derive once"
+    );
 }
 
 #[test]
@@ -590,8 +720,8 @@ fn runtime_unix_shutdown_write() {
 
 /// In-process ponger using Executor::spawn — the production pattern for
 /// single-threaded async echo.  Validates write_all / read_exact with both
-/// ends on the same executor, exercising owner_task cycling in the executor's
-/// thread-local (TLS) context.
+/// ends on the same executor, exercising waker-derived task identity across
+/// interleaved polls in the executor's thread-local (TLS) context.
 #[test]
 fn runtime_unix_spawn_ponger_in_process() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
@@ -1029,6 +1159,109 @@ fn runtime_unix_writev_readv() {
             assert_eq!(chain.get(0).expect("seg0").payload_bytes(), b"hello");
             assert_eq!(chain.get(1).expect("seg1").payload_bytes(), b" ");
             assert_eq!(chain.get(2).expect("seg2").payload_bytes(), b"world");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_unix_readv_skips_nonwritable_segments() {
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+            let (res, _payload) = writer.write_all(b"abcde".to_vec()).await;
+            assert_eq!(res.expect("first write_all failed"), 5);
+
+            let mut full_prefix = IoBuffMut::new(0, 4, 0);
+            full_prefix
+                .payload_append(b"KEEP")
+                .expect("full prefix initialization failed");
+            let zero = IoBuffMut::new(0, 0, 0);
+            let first_writable = IoBuffMut::new(0, 2, 0);
+            let mut full_middle = IoBuffMut::new(0, 1, 0);
+            full_middle
+                .payload_append(b"X")
+                .expect("full middle initialization failed");
+            let second_writable = IoBuffMut::new(0, 3, 0);
+            let read_chain = IoBuffVecMut::from_array([
+                full_prefix,
+                zero,
+                first_writable,
+                full_middle,
+                second_writable,
+            ]);
+
+            let (res, chain) = reader.readv(read_chain).await;
+            assert_eq!(res.expect("readv failed"), 5);
+            assert_eq!(
+                chain.get(0).expect("full prefix missing").payload_bytes(),
+                b"KEEP"
+            );
+            assert_eq!(chain.get(1).expect("zero segment missing").payload_len(), 0);
+            assert_eq!(
+                chain
+                    .get(2)
+                    .expect("first writable missing")
+                    .payload_bytes(),
+                b"ab"
+            );
+            assert_eq!(
+                chain.get(3).expect("full middle missing").payload_bytes(),
+                b"X"
+            );
+            assert_eq!(
+                chain
+                    .get(4)
+                    .expect("second writable missing")
+                    .payload_bytes(),
+                b"cde"
+            );
+
+            let (res, _payload) = writer.write_all(b"uvwxyz".to_vec()).await;
+            assert_eq!(res.expect("second write_all failed"), 6);
+
+            let zero = IoBuffMut::new(0, 0, 0);
+            let first_writable = IoBuffMut::new(0, 3, 0);
+            let mut full_middle = IoBuffMut::new(0, 2, 0);
+            full_middle
+                .payload_append(b"OK")
+                .expect("exact full segment initialization failed");
+            let second_writable = IoBuffMut::new(0, 3, 0);
+            let exact_chain =
+                IoBuffVecMut::from_array([zero, first_writable, full_middle, second_writable]);
+
+            let (res, chain) = reader.readv_exact(exact_chain, 6).await;
+            assert_eq!(res.expect("readv_exact failed"), 6);
+            assert_eq!(chain.get(0).expect("exact zero missing").payload_len(), 0);
+            assert_eq!(
+                chain.get(1).expect("exact first missing").payload_bytes(),
+                b"uvw"
+            );
+            assert_eq!(
+                chain.get(2).expect("exact full missing").payload_bytes(),
+                b"OK"
+            );
+            assert_eq!(
+                chain.get(3).expect("exact second missing").payload_bytes(),
+                b"xyz"
+            );
+
+            let mut full = IoBuffMut::new(0, 2, 0);
+            full.payload_append(b"zz")
+                .expect("all-full segment initialization failed");
+            let all_full = IoBuffVecMut::from_array([full, IoBuffMut::new(0, 0, 0)]);
+            let (res, chain) = reader.readv(all_full).await;
+            let err = res.expect_err("all-full readv should reject an ambiguous EOF result");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                chain
+                    .get(0)
+                    .expect("all-full segment missing")
+                    .payload_bytes(),
+                b"zz"
+            );
         })
         .expect("executor run failed");
 }

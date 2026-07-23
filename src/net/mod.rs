@@ -25,6 +25,33 @@
 //! UDP remains single-datagram and therefore uses single-buffer sends and
 //! receives only.
 //!
+//! # Nameable TCP and Unix operation futures
+//!
+//! TCP and Unix stream methods return the concrete futures re-exported from
+//! this module, including [`ReadFuture`], [`ReadExactFuture`],
+//! [`WriteFuture`], and their vectored and projected variants. Directly
+//! awaiting these methods remains allocation-free without naming the return
+//! type. The public names additionally let downstream protocol libraries use
+//! the operations in concrete associated types or inline state machines
+//! without erasing them behind `Box<dyn Future>`.
+//!
+//! Each operation mutably borrows its parent [`tcp::TcpStream`] or
+//! [`unix::UnixStream`] and owns the submitted rental buffer, chain, or
+//! projection source until completion. It must be polled on the executor owner
+//! thread and, after submission, in its originating executor. Dropping an
+//! in-flight operation is nonblocking: FlowIO retains any kernel-visible
+//! payload until the target completion retires. Racing read bytes can be
+//! discarded after cancellation, so framed protocols should treat read
+//! cancellation as terminal unless they provide stronger recovery semantics.
+//!
+//! The operation fields and constructors remain private, their layouts are not
+//! stable, and exposing their names does not make them cross-thread values. The
+//! private implementation module is intentionally inaccessible:
+//!
+//! ```compile_fail
+//! use flowio::net::stream::ReadFuture;
+//! ```
+//!
 //! # Error Semantics
 //!
 //! Async transport operations return `io::Error` through their futures. For
@@ -39,13 +66,19 @@
 //! forgotten future. The first three cases may become available after the
 //! executor makes progress; a busy reusable slot becomes available only when
 //! the previous future completes or is dropped, or when the owning
-//! listener/connector is dropped.
+//! listener/connector is dropped. TCP/SCTP accept also surfaces the kernel's
+//! `WouldBlock` when a terminal `POLLERR`/`POLLHUP` readiness mask
+//! has no queued connection; the current accept future completes instead of
+//! rearming that continuously ready condition.
 //!
 //! [`io::ErrorKind::NotConnected`] also reports an invalid runtime poll context:
 //! transport futures must be polled inside the FlowIO executor that submitted
 //! them. An unsubmitted rental operation returns the buffer immediately. Once
 //! submitted, it keeps the buffer retained until the original CQE and then
-//! returns the buffer with `NotConnected`.
+//! returns the buffer with `NotConnected`. The exceptional bounded shutdown
+//! fallback cannot return ownership if it abandons a ring without observing
+//! that target CQE; the operation remains pending and its kernel-visible state
+//! and buffer are intentionally retained until process exit.
 //!
 //! # Fast-Path Guidance
 //!
@@ -147,6 +180,12 @@ pub(crate) mod send_sqe;
 pub(crate) mod stream;
 #[doc(hidden)]
 pub use stream::WriteBufferChain;
+#[doc(inline)]
+pub use stream::{
+    ReadExactAppendFuture, ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture,
+    WriteAllFuture, WriteFuture, WritevAllFuture, WritevAllProjectedFuture, WritevFuture,
+    WritevProjectedFuture,
+};
 pub mod tcp;
 pub mod tls;
 #[cfg(feature = "test-support")]
@@ -450,6 +489,141 @@ fn accept_readiness_sqe(fd: RawFd, user_data: u64) -> io_uring::squeue::Entry {
     io_uring::opcode::PollAdd::new(io_uring::types::Fd(fd), libc::POLLIN as u32)
         .build()
         .user_data(user_data)
+}
+
+/// Returns whether a failed owner-thread accept attempt may rearm its one-shot
+/// readiness poll.
+///
+/// `POLLERR` and `POLLHUP` are terminal poll conditions that can remain
+/// continuously ready. If `accept4` found no queued connection, rearming one of
+/// those masks would create a reactor-paced loop. The caller still attempts
+/// `accept4` before consulting this predicate so a queued connection wins when
+/// `POLLIN` and a terminal condition arrive together.
+#[inline(always)]
+fn accept_readiness_allows_rearm(readiness: i32, accept_error: &io::Error) -> bool {
+    debug_assert!(readiness >= 0, "accept readiness mask must be nonnegative");
+    const TERMINAL_EVENTS: i32 = libc::POLLERR as i32 | libc::POLLHUP as i32;
+
+    accept_error.kind() == io::ErrorKind::WouldBlock && readiness & TERMINAL_EVENTS == 0
+}
+
+/// Installs a completed readiness state without submitting an SQE.
+///
+/// This deterministic test seam lets each transport exercise its real
+/// completion branch against an empty nonblocking listener. Because no SQE is
+/// submitted, retiring the synthetic state cannot race a later kernel CQE.
+#[cfg(test)]
+fn completed_accept_readiness_for_test(
+    cx: &std::task::Context<'_>,
+    listener_fd: &std::rc::Rc<crate::runtime::fd::RuntimeFd>,
+    result: i32,
+) -> *mut crate::runtime::op::CompletionState {
+    let pctx = crate::runtime::executor::poll_ctx_from_waker(cx)
+        .expect("accept readiness test requires a FlowIO task context");
+    let reactor = pctx.reactor();
+    // SAFETY: `pctx` was extracted from the task context currently polling on
+    // this owner thread, so its reactor remains live for this synchronous call.
+    let state_ptr = unsafe { (*reactor).alloc_op() };
+    assert!(
+        !state_ptr.is_null(),
+        "accept readiness test completion allocation failed"
+    );
+
+    // SAFETY: the same live origin reactor owns both the completion state and
+    // the retained-payload allocation; no SQE is built or submitted here.
+    let payload = unsafe {
+        (*reactor).alloc_retained_payload(crate::runtime::fd::RetainedListenerFd::new(listener_fd))
+    };
+    // SAFETY: `state_ptr` is a fresh exclusive slot allocated above. The
+    // payload came from its reactor, and the synthetic completed state is
+    // consumed synchronously by the transport under test.
+    unsafe {
+        (*state_ptr).attach_retained_payload(payload);
+        (*state_ptr).result = result;
+        (*state_ptr).set_completed();
+    }
+    state_ptr
+}
+
+/// Runs the shared terminal-readiness regression through one transport's real
+/// accept future.
+#[cfg(all(test, not(miri)))]
+fn test_terminal_accept_readiness<A, T, M, P, R>(
+    transport: &'static str,
+    make_adapter: M,
+    mut poll_accept: P,
+    state_released: R,
+) where
+    A: 'static,
+    T: 'static,
+    M: FnOnce(std::rc::Rc<crate::runtime::fd::RuntimeFd>) -> A,
+    P: for<'cx> FnMut(
+            &mut A,
+            &mut std::task::Context<'cx>,
+            *mut crate::runtime::op::CompletionState,
+        ) -> std::task::Poll<io::Result<T>>
+        + 'static,
+    R: Fn(&A) -> bool + 'static,
+{
+    // The terminal-mask branch runs before transport-specific accepted-fd
+    // setup, so an empty TCP listener deterministically supplies EAGAIN for
+    // both TCP and SCTP without making the unit test kernel-SCTP-dependent.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap_or_else(|err| panic!("empty {transport}-path listener bind failed: {err}"));
+    listener.set_nonblocking(true).unwrap_or_else(|err| {
+        panic!("empty {transport}-path listener nonblocking setup failed: {err}")
+    });
+    let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_owned(
+        std::os::fd::OwnedFd::from(listener),
+    ));
+    let mut adapter = make_adapter(std::rc::Rc::clone(&listener_fd));
+    let terminal_masks = [
+        libc::POLLERR as i32,
+        libc::POLLHUP as i32,
+        (libc::POLLERR | libc::POLLHUP) as i32,
+        (libc::POLLIN | libc::POLLERR) as i32,
+        (libc::POLLIN | libc::POLLHUP) as i32,
+    ];
+    let mut executor = crate::runtime::executor::Executor::new()
+        .unwrap_or_else(|err| panic!("{transport} accept readiness executor failed: {err}"));
+
+    executor
+        .run(async move {
+            for readiness in terminal_masks {
+                let state_ptr = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(completed_accept_readiness_for_test(
+                        cx,
+                        &listener_fd,
+                        readiness,
+                    ))
+                })
+                .await;
+                let outcome = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(poll_accept(&mut adapter, cx, state_ptr))
+                })
+                .await;
+
+                let err = match outcome {
+                    std::task::Poll::Ready(Err(err)) => err,
+                    std::task::Poll::Ready(Ok(_)) => {
+                        panic!("terminal {transport} readiness unexpectedly accepted a peer")
+                    }
+                    std::task::Poll::Pending => {
+                        panic!("terminal {transport} readiness was rearmed")
+                    }
+                };
+                assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+                assert_eq!(err.raw_os_error(), Some(libc::EAGAIN));
+                assert!(
+                    state_released(&adapter),
+                    "terminal {transport} readiness retained its reusable slot"
+                );
+            }
+        })
+        .unwrap_or_else(|err| panic!("{transport} accept readiness run failed: {err}"));
+
+    #[cfg(debug_assertions)]
+    assert_eq!(executor.last_stats().accept_readiness_rearms, 0);
 }
 
 /// Accepts one ready connection without allowing the owner thread to block.

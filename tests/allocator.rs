@@ -1,7 +1,8 @@
+use flowio::test_support::utils::list::intrusive::slist::Link;
 use flowio::test_support::utils::memory::pool::*;
 use flowio::test_support::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
 use flowio::test_support::utils::memory::slab::{Slab, SlabAllocator};
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, size_of};
 
 // verbose memory provider
 struct VerboseProvider {
@@ -229,10 +230,14 @@ fn test_verbose_pool_logic() {
     let t2 = unsafe { pool.alloc(102).expect("T2 failed") };
     println!("  [Actual] T2 address: {:p}", t2);
 
-    // Verify distance (Should be obj_size = 8 with slist-based slab header link)
+    // Verify the second object came from the next slot in the same slab.
     let dist = (t2 as usize) - (t1 as usize);
     println!("  [Actual] Distance T1->T2: {} bytes", dist);
-    assert!(dist >= 8);
+    assert_eq!(
+        dist,
+        size_of::<Link>(),
+        "T2 did not use the next slist-sized pool slot"
+    );
 
     // ---------------------------------------------------------
     println!("\nStep 4: Free T1 and Re-allocate (Recycling)");

@@ -4,6 +4,11 @@
 //! whose memory may be referenced by the kernel after the owning future is
 //! dropped.
 //!
+//! Normal reclamation requires the referring target CQE. If bounded reactor
+//! shutdown abandons a ring before that CQE is observed, the reactor
+//! deliberately leaks this pool and every unresolved value rather than
+//! deallocating or recycling memory the kernel may still reference.
+//!
 //! The common path is slab-backed and heap-free after warmup. Payloads larger
 //! than 65536 bytes, payloads requiring alignment greater than 64 bytes, and
 //! slab-allocation failures fall back to the global heap. That fallback is
@@ -38,6 +43,35 @@ const RETAINED_SIZE_CLASSES: [usize; 11] = [
 ];
 pub(crate) const RETAINED_IOVEC_INLINE_COUNT: usize = 16;
 const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
+pub(crate) const RETAINED_IOVEC_MAX_COUNT: usize =
+    RETAINED_IOVEC_SIZE_CLASSES[RETAINED_IOVEC_SIZE_CLASSES.len() - 1];
+
+const _: () = {
+    assert!(RETAINED_IOVEC_INLINE_COUNT < RETAINED_IOVEC_SIZE_CLASSES[0]);
+    assert!(RETAINED_IOVEC_SIZE_CLASSES[0] < RETAINED_IOVEC_SIZE_CLASSES[1]);
+    assert!(RETAINED_IOVEC_SIZE_CLASSES[1] < RETAINED_IOVEC_SIZE_CLASSES[2]);
+    assert!(RETAINED_IOVEC_SIZE_CLASSES[2] < RETAINED_IOVEC_SIZE_CLASSES[3]);
+};
+
+/// Invariant lifetime brand for one synchronous retained-slot scope.
+///
+/// The lifetime appears in both a contravariant argument and covariant return
+/// position, so neither slot typestate can be widened and escape the
+/// higher-ranked reservation closure.
+type RetainedSlotBrand<'slot> = PhantomData<fn(&'slot ()) -> &'slot ()>;
+
+#[cfg(test)]
+const TEST_POISONED_HEAP_CAPACITY: usize = 8;
+
+/// Test-only deferred cleanup for heap backing deliberately poisoned after a
+/// partial write. The cleanup releases only `MaybeUninit<T>` storage and must
+/// never run a destructor for the incomplete `T`.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestPoisonedHeap {
+    ptr: *mut (),
+    cleanup: unsafe fn(*mut ()),
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RetainedPayloadVtable {
@@ -220,6 +254,16 @@ pub(crate) struct RetainedPayloadPool {
     #[cfg(any(debug_assertions, feature = "test-support"))]
     /// Debug/test-support counters exported through runtime stats and tests.
     stats: RetainedPayloadPoolStats,
+    /// Fixed, nonallocating cleanup records used only so deliberate
+    /// partial-initialization poison tests remain Miri leak-clean.
+    #[cfg(test)]
+    test_poisoned_heaps: [MaybeUninit<TestPoisonedHeap>; TEST_POISONED_HEAP_CAPACITY],
+    /// Number of initialized entries in `test_poisoned_heaps`.
+    #[cfg(test)]
+    test_poisoned_heap_len: usize,
+    /// Exact count of writing slots poisoned in this pool's unit tests.
+    #[cfg(test)]
+    test_poisoned_writes: usize,
 }
 
 impl RetainedPayloadPool {
@@ -241,6 +285,12 @@ impl RetainedPayloadPool {
             iovec_pool: RetainedIovecScratchPool::new()?,
             #[cfg(any(debug_assertions, feature = "test-support"))]
             stats: RetainedPayloadPoolStats::default(),
+            #[cfg(test)]
+            test_poisoned_heaps: [MaybeUninit::uninit(); TEST_POISONED_HEAP_CAPACITY],
+            #[cfg(test)]
+            test_poisoned_heap_len: 0,
+            #[cfg(test)]
+            test_poisoned_writes: 0,
         })
     }
 
@@ -250,6 +300,10 @@ impl RetainedPayloadPool {
     /// [`RetainedPayload::take`] or [`RetainedPayload::drop_and_free`].
     #[inline(always)]
     pub(crate) fn alloc<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
+        // Keep this established by-value path independent of the raw-slot RAII
+        // guard below. The Slice 68 optimized-code oracle proved that routing
+        // safe callers through that guard enlarged unaffected whole-payload
+        // stream transfers; this direct shape preserves their existing codegen.
         match class_index_for::<T>() {
             Some(class_index) => {
                 if let Some(result) = self.classes[class_index].alloc_block() {
@@ -286,6 +340,105 @@ impl RetainedPayloadPool {
 
         let ptr = Box::into_raw(Box::new(value));
         unsafe { RetainedPayload::from_raw_parts(ptr, heap_vtable::<T>()) }
+    }
+
+    /// Reserves uninitialized storage through the same pooled/heap policy as
+    /// [`Self::alloc`] without retaining a Rust borrow across the caller's
+    /// synchronous scope. The returned guard recycles untouched backing on
+    /// Drop.
+    ///
+    /// # Safety
+    ///
+    /// `pool` must point to a live pool on its executor owner thread and must
+    /// not move for the lifetime of the returned storage.
+    #[inline(always)]
+    unsafe fn alloc_storage_from_raw<T: 'static>(
+        pool: NonNull<RetainedPayloadPool>,
+    ) -> RetainedStorage<T> {
+        if let Some(class_index) = class_index_for::<T>() {
+            // SAFETY: guaranteed by the caller. This temporary borrow ends
+            // before the returned guard can be observed or re-entered.
+            let pool_ref = unsafe { &mut *pool.as_ptr() };
+            if let Some(result) = pool_ref.classes[class_index].alloc_block() {
+                #[cfg(any(debug_assertions, feature = "test-support"))]
+                {
+                    // Saturation keeps bookkeeping non-panicking after the
+                    // block has left its free list.
+                    pool_ref.stats.pooled_allocs = pool_ref.stats.pooled_allocs.saturating_add(1);
+                    if result.reused {
+                        pool_ref.stats.pooled_reuses =
+                            pool_ref.stats.pooled_reuses.saturating_add(1);
+                    }
+                    if result.new_slab {
+                        pool_ref.stats.slab_allocs = pool_ref.stats.slab_allocs.saturating_add(1);
+                    }
+                }
+
+                return unsafe {
+                    RetainedStorage::new(
+                        result.ptr.cast::<MaybeUninit<T>>(),
+                        pool,
+                        pooled_vtable::<T>(class_index),
+                        #[cfg(test)]
+                        None,
+                    )
+                };
+            }
+        }
+
+        unsafe { Self::alloc_heap_storage_from_raw(pool) }
+    }
+
+    #[inline(always)]
+    unsafe fn alloc_heap_storage_from_raw<T: 'static>(
+        pool: NonNull<RetainedPayloadPool>,
+    ) -> RetainedStorage<T> {
+        let ptr = Box::into_raw(Box::<T>::new_uninit());
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        {
+            // SAFETY: guaranteed by the caller. The borrow ends before the
+            // storage guard below becomes observable.
+            let pool_ref = unsafe { &mut *pool.as_ptr() };
+            pool_ref.stats.heap_fallbacks = pool_ref.stats.heap_fallbacks.saturating_add(1);
+        }
+
+        // SAFETY: `Box::into_raw` returns a non-null, correctly aligned live
+        // `MaybeUninit<T>` allocation, including its aligned dangling value for
+        // a zero-sized `T`.
+        unsafe {
+            RetainedStorage::new(
+                ptr,
+                pool,
+                heap_vtable::<T>(),
+                #[cfg(test)]
+                Some(test_cleanup_poisoned_heap::<T>),
+            )
+        }
+    }
+
+    /// Records one deliberately poisoned writing slot without allocating or
+    /// inspecting any partially initialized `T`.
+    #[cfg(test)]
+    #[inline(always)]
+    unsafe fn record_test_poison(
+        &mut self,
+        ptr: *mut (),
+        heap_cleanup: Option<unsafe fn(*mut ())>,
+    ) {
+        self.test_poisoned_writes = self.test_poisoned_writes.saturating_add(1);
+        let Some(cleanup) = heap_cleanup else {
+            return;
+        };
+
+        if self.test_poisoned_heap_len < TEST_POISONED_HEAP_CAPACITY {
+            self.test_poisoned_heaps[self.test_poisoned_heap_len]
+                .write(TestPoisonedHeap { ptr, cleanup });
+            self.test_poisoned_heap_len += 1;
+        } else {
+            // Tests never require more than the fixed record capacity. Keep an
+            // unexpected overflow leak-clean without dropping partial `T`.
+            unsafe { cleanup(ptr) };
+        }
     }
 
     #[inline(always)]
@@ -331,10 +484,26 @@ impl RetainedPayloadPool {
         &mut self,
         iov_count: usize,
     ) -> io::Result<RetainedIovecScratch> {
+        let init = self.alloc_iovec_scratch_init(iov_count)?;
+        Ok(init.into_scratch())
+    }
+
+    /// Reserves the compact ownership state needed to initialize retained
+    /// iovec scratch directly in its final payload allocation.
+    ///
+    /// The returned token owns any pooled sidecar until it is either dropped
+    /// or transferred into a fully initialized [`RetainedIovecScratch`]. It
+    /// deliberately carries no inline array, so payload-specific constructors
+    /// can populate the final inline destination without staging those bytes.
+    #[inline(always)]
+    pub(crate) fn alloc_iovec_scratch_init(
+        &mut self,
+        iov_count: usize,
+    ) -> io::Result<RetainedIovecScratchInit> {
         if iov_count <= RETAINED_IOVEC_INLINE_COUNT {
             #[cfg(any(debug_assertions, feature = "test-support"))]
             self.iovec_pool.record_inline_alloc();
-            return Ok(RetainedIovecScratch::inline(iov_count));
+            return Ok(RetainedIovecScratchInit::inline(iov_count));
         }
 
         let class_index = match iovec_class_index_for_count(iov_count) {
@@ -354,7 +523,7 @@ impl RetainedPayloadPool {
         };
 
         Ok(unsafe {
-            RetainedIovecScratch::pooled(
+            RetainedIovecScratchInit::pooled(
                 result.ptr,
                 iov_count,
                 class_index,
@@ -369,6 +538,210 @@ impl RetainedPayloadPool {
         self.iovec_pool.stats().apply_to(&mut stats);
         stats
     }
+}
+
+/// Owns one uninitialized retained allocation until it is converted to a
+/// closure-branded raw slot before user code can observe it.
+struct RetainedStorage<T: 'static> {
+    ptr: NonNull<MaybeUninit<T>>,
+    pool: NonNull<RetainedPayloadPool>,
+    vtable: RetainedPayloadVtable,
+    #[cfg(test)]
+    poison_cleanup: Option<unsafe fn(*mut ())>,
+}
+
+impl<T: 'static> RetainedStorage<T> {
+    /// # Safety
+    ///
+    /// `ptr` must own live, uninitialized storage for `T` allocated from
+    /// `pool`, and `vtable.free_storage` must release exactly that backing.
+    #[inline(always)]
+    unsafe fn new(
+        ptr: *mut MaybeUninit<T>,
+        pool: NonNull<RetainedPayloadPool>,
+        vtable: RetainedPayloadVtable,
+        #[cfg(test)] poison_cleanup: Option<unsafe fn(*mut ())>,
+    ) -> Self {
+        Self {
+            // SAFETY: guaranteed by the constructor contract. Pooled blocks
+            // are non-null, and Box supplies a non-null aligned dangling value
+            // for zero-sized heap fallback.
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            pool,
+            vtable,
+            #[cfg(test)]
+            poison_cleanup,
+        }
+    }
+
+    #[inline(always)]
+    fn into_raw_slot<'slot>(self) -> RawRetainedSlot<'slot, T> {
+        let this = ManuallyDrop::new(self);
+        RawRetainedSlot {
+            ptr: this.ptr,
+            pool: this.pool,
+            vtable: this.vtable,
+            _brand: PhantomData,
+            _owner_thread_only: PhantomData,
+            #[cfg(test)]
+            poison_cleanup: this.poison_cleanup,
+        }
+    }
+}
+
+impl<T: 'static> Drop for RetainedStorage<T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        unsafe { (self.vtable.free_storage)(self.ptr.as_ptr().cast::<()>(), self.pool.as_ptr()) };
+    }
+}
+
+/// Runs `f` with one uninitialized retained slot carrying a fresh invariant
+/// scope brand.
+///
+/// `f` may synchronously re-enter this function with the same pool pointer:
+/// the temporary pool borrow used to reserve the block ends before `f` starts,
+/// and the reserved block has already been removed from its free list.
+///
+/// # Safety
+///
+/// `pool` must identify a live, initialized retained pool for the complete
+/// synchronous call. The call and every nested use must remain on the pool's
+/// executor owner thread, and the pool allocation itself must not move while a
+/// raw or writing slot can still drop.
+#[inline(always)]
+pub(crate) unsafe fn with_raw_retained_slot<T: 'static, R>(
+    pool: NonNull<RetainedPayloadPool>,
+    f: impl for<'slot> FnOnce(RawRetainedSlot<'slot, T>) -> R,
+) -> R {
+    // SAFETY: the caller guarantees pool liveness and owner-thread access. The
+    // temporary exclusive borrow ends before the higher-ranked closure runs.
+    let storage = unsafe { RetainedPayloadPool::alloc_storage_from_raw::<T>(pool) };
+    f(storage.into_raw_slot())
+}
+
+/// Uninitialized retained storage that still contains no ownership-bearing
+/// `T` field.
+///
+/// Dropping this state recycles its untouched backing. The invariant closure
+/// brand prevents the state from escaping its synchronous reservation scope;
+/// the `Rc` marker preserves FlowIO's owner-thread-only contract.
+#[must_use = "dropping a raw retained slot recycles its untouched storage"]
+pub(crate) struct RawRetainedSlot<'slot, T: 'static> {
+    ptr: NonNull<MaybeUninit<T>>,
+    pool: NonNull<RetainedPayloadPool>,
+    vtable: RetainedPayloadVtable,
+    _brand: RetainedSlotBrand<'slot>,
+    _owner_thread_only: PhantomData<Rc<()>>,
+    #[cfg(test)]
+    poison_cleanup: Option<unsafe fn(*mut ())>,
+}
+
+impl<'slot, T: 'static> RawRetainedSlot<'slot, T> {
+    /// Returns the compiler-layout pointer used to prepare non-owning fields.
+    #[inline(always)]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr().cast::<T>()
+    }
+
+    /// Marks the point immediately before the first ownership-bearing field is
+    /// written. From this point, unexpected Drop poisons rather than recycles
+    /// the reservation.
+    #[inline(always)]
+    pub(crate) fn begin_writing(self) -> WritingRetainedSlot<'slot, T> {
+        let this = ManuallyDrop::new(self);
+        WritingRetainedSlot {
+            ptr: this.ptr,
+            pool: this.pool,
+            vtable: this.vtable,
+            _brand: PhantomData,
+            _owner_thread_only: PhantomData,
+            #[cfg(test)]
+            poison_cleanup: this.poison_cleanup,
+        }
+    }
+}
+
+impl<T: 'static> Drop for RawRetainedSlot<'_, T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        unsafe { (self.vtable.free_storage)(self.ptr.as_ptr().cast::<()>(), self.pool.as_ptr()) };
+    }
+}
+
+/// Retained storage whose payload-specific constructor may have transferred
+/// ownership into an unknown subset of `T`'s fields.
+///
+/// Drop deliberately runs no `T` destructor and does not recycle or deallocate
+/// the reservation. This leaks the unsubmitted partial payload rather than
+/// risking an uninitialized drop, double drop, or later block reuse.
+#[must_use = "a writing retained slot must be finished after every field is initialized"]
+pub(crate) struct WritingRetainedSlot<'slot, T: 'static> {
+    ptr: NonNull<MaybeUninit<T>>,
+    pool: NonNull<RetainedPayloadPool>,
+    vtable: RetainedPayloadVtable,
+    _brand: RetainedSlotBrand<'slot>,
+    _owner_thread_only: PhantomData<Rc<()>>,
+    #[cfg(test)]
+    poison_cleanup: Option<unsafe fn(*mut ())>,
+}
+
+impl<T: 'static> WritingRetainedSlot<'_, T> {
+    /// Returns the compiler-layout pointer used to initialize fields in place.
+    #[inline(always)]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr().cast::<T>()
+    }
+
+    /// Converts the slot to initialized retained ownership.
+    ///
+    /// # Safety
+    ///
+    /// Every field of `T` must be fully initialized, and no reference derived
+    /// from the incomplete payload may remain live. The recorded allocation
+    /// path and pool must still match this slot.
+    #[inline(always)]
+    pub(crate) unsafe fn finish(self) -> RetainedPayload<T> {
+        let this = ManuallyDrop::new(self);
+        RetainedPayload {
+            ptr: this.ptr.cast::<T>(),
+            vtable: this.vtable,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: 'static> Drop for WritingRetainedSlot<'_, T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(test)]
+        unsafe {
+            // Test-only cleanup is deferred in the pool and releases only raw
+            // heap backing. It never inspects or drops the partial `T`.
+            (*self.pool.as_ptr())
+                .record_test_poison(self.ptr.as_ptr().cast::<()>(), self.poison_cleanup);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RetainedPayloadPool {
+    fn drop(&mut self) {
+        for index in 0..self.test_poisoned_heap_len {
+            // SAFETY: exactly the prefix tracked by
+            // `test_poisoned_heap_len` was initialized once. Each record owns
+            // one distinct poisoned heap backing allocation.
+            let poisoned = unsafe { self.test_poisoned_heaps[index].assume_init_read() };
+            unsafe { (poisoned.cleanup)(poisoned.ptr) };
+        }
+    }
+}
+
+/// Releases test-only poisoned heap backing as `MaybeUninit<T>` so no partial
+/// field destructor can run.
+#[cfg(test)]
+unsafe fn test_cleanup_poisoned_heap<T>(ptr: *mut ()) {
+    unsafe { drop(Box::from_raw(ptr.cast::<MaybeUninit<T>>())) };
 }
 
 /// Retained vectored I/O scratch storing kernel-facing `iovec` metadata.
@@ -402,13 +775,40 @@ enum RetainedIovecScratchStorage {
     },
 }
 
-impl RetainedIovecScratch {
+impl Drop for RetainedIovecScratchStorage {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let Self::Pooled {
+            ptr,
+            class_index,
+            owner,
+        } = self
+        {
+            unsafe { owner.free_block(*class_index, ptr.as_ptr().cast::<u8>()) };
+        }
+    }
+}
+
+/// Compact allocation token for initializing retained iovec scratch in place.
+///
+/// Inline scratch carries only its active length. Pooled scratch additionally
+/// owns one sidecar block and its heap-stable owner reference. Dropping an
+/// unconsumed token releases that pooled ownership through the same storage
+/// destructor used by the final scratch value.
+#[must_use = "scratch initialization tokens own pooled sidecar storage"]
+pub(crate) struct RetainedIovecScratchInit {
+    /// Active iovec count for the final scratch value.
+    len: usize,
+    /// Inline selection or pooled sidecar ownership transferred on success.
+    storage: RetainedIovecScratchStorage,
+}
+
+impl RetainedIovecScratchInit {
     #[inline(always)]
     fn inline(len: usize) -> Self {
         debug_assert!(len <= RETAINED_IOVEC_INLINE_COUNT);
         Self {
             len,
-            inline: uninit_iovec_inline(),
             storage: RetainedIovecScratchStorage::Inline,
         }
     }
@@ -428,7 +828,6 @@ impl RetainedIovecScratch {
         debug_assert!(len <= RETAINED_IOVEC_SIZE_CLASSES[class_index]);
         Self {
             len,
-            inline: uninit_iovec_inline(),
             storage: RetainedIovecScratchStorage::Pooled {
                 ptr: unsafe { NonNull::new_unchecked(ptr as *mut MaybeUninit<libc::iovec>) },
                 class_index,
@@ -437,6 +836,85 @@ impl RetainedIovecScratch {
         }
     }
 
+    /// Returns the active iovec count carried into the final scratch value.
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the exact final destination used to populate iovec metadata.
+    ///
+    /// Inline tokens address the inline field of `destination` directly;
+    /// pooled tokens address their already-owned sidecar block. The token
+    /// retains ownership for the complete borrow.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be non-null, correctly aligned writable storage for
+    /// the final [`RetainedIovecScratch`], and it must remain live for the
+    /// returned borrow. No other access may overlap the returned slice. The
+    /// caller must end the borrow before initializing or abandoning that final
+    /// scratch value.
+    #[inline(always)]
+    pub(crate) unsafe fn destination_mut(
+        &mut self,
+        destination: *mut RetainedIovecScratch,
+    ) -> &mut [MaybeUninit<libc::iovec>] {
+        debug_assert!(
+            !destination.is_null(),
+            "retained iovec destination must be non-null"
+        );
+        match &mut self.storage {
+            RetainedIovecScratchStorage::Inline => unsafe {
+                slice::from_raw_parts_mut(
+                    std::ptr::addr_of_mut!((*destination).inline)
+                        .cast::<MaybeUninit<libc::iovec>>(),
+                    self.len,
+                )
+            },
+            RetainedIovecScratchStorage::Pooled { ptr, .. } => unsafe {
+                slice::from_raw_parts_mut(ptr.as_ptr(), self.len)
+            },
+        }
+    }
+
+    /// Transfers this token into an initialized scratch value at its final
+    /// destination without copying or writing the inline array.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be non-null, correctly aligned writable storage for
+    /// one uninitialized [`RetainedIovecScratch`]. Any initialized inline
+    /// prefix must already reside in that value's `inline` field, every borrow
+    /// returned by [`Self::destination_mut`] must have ended, and the caller
+    /// must subsequently treat `destination` as one initialized scratch value.
+    #[inline(always)]
+    pub(crate) unsafe fn initialize_at(self, destination: *mut RetainedIovecScratch) {
+        debug_assert!(
+            !destination.is_null(),
+            "retained iovec destination must be non-null"
+        );
+        let this = ManuallyDrop::new(self);
+        unsafe {
+            std::ptr::addr_of_mut!((*destination).len).write(this.len);
+            let storage = std::ptr::addr_of!(this.storage).read();
+            std::ptr::addr_of_mut!((*destination).storage).write(storage);
+        }
+    }
+
+    /// Builds the established movable scratch value for unaffected safe
+    /// callers while sharing the token's allocation and release policy.
+    #[inline(always)]
+    fn into_scratch(self) -> RetainedIovecScratch {
+        let mut scratch = MaybeUninit::<RetainedIovecScratch>::uninit();
+        unsafe {
+            self.initialize_at(scratch.as_mut_ptr());
+            scratch.assume_init()
+        }
+    }
+}
+
+impl RetainedIovecScratch {
     #[inline(always)]
     pub(crate) fn len(&self) -> usize {
         self.len
@@ -463,23 +941,12 @@ impl RetainedIovecScratch {
     }
 }
 
-impl Drop for RetainedIovecScratch {
-    fn drop(&mut self) {
-        if let RetainedIovecScratchStorage::Pooled {
-            ptr,
-            class_index,
-            owner,
-        } = &self.storage
-        {
-            unsafe { owner.free_block(*class_index, ptr.as_ptr() as *mut u8) };
-        }
-    }
-}
-
 #[cfg(target_pointer_width = "64")]
 const _: [(); 288] = [(); std::mem::size_of::<RetainedIovecScratch>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 24] = [(); std::mem::size_of::<RetainedIovecScratchStorage>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 32] = [(); std::mem::size_of::<RetainedIovecScratchInit>()];
 
 #[must_use = "retained payload handles own storage and must be consumed"]
 pub(crate) struct RetainedPayload<T: 'static> {
@@ -838,19 +1305,531 @@ fn iovec_class_index_for_count(iov_count: usize) -> Option<usize> {
         .position(|class_count| iov_count <= *class_count)
 }
 
-#[inline(always)]
-fn uninit_iovec_inline() -> [MaybeUninit<libc::iovec>; RETAINED_IOVEC_INLINE_COUNT] {
-    // SAFETY: an array of `MaybeUninit<libc::iovec>` may be left wholly
-    // uninitialized; callers track which entries they initialize.
-    unsafe { MaybeUninit::uninit().assume_init() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     struct ScratchPayload {
         _scratch: RetainedIovecScratch,
+    }
+
+    fn pooled_scratch_init_ptr(init: &RetainedIovecScratchInit) -> *mut MaybeUninit<libc::iovec> {
+        match &init.storage {
+            RetainedIovecScratchStorage::Inline => {
+                panic!("expected pooled scratch initialization token")
+            }
+            RetainedIovecScratchStorage::Pooled { ptr, .. } => ptr.as_ptr(),
+        }
+    }
+
+    fn test_iovec(len: usize) -> libc::iovec {
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: len,
+        }
+    }
+
+    #[test]
+    fn retained_iovec_max_count_is_the_largest_size_class() {
+        assert_eq!(RETAINED_IOVEC_MAX_COUNT, 1024);
+        assert_eq!(
+            iovec_class_index_for_count(RETAINED_IOVEC_MAX_COUNT),
+            Some(RETAINED_IOVEC_SIZE_CLASSES.len() - 1)
+        );
+        assert_eq!(
+            iovec_class_index_for_count(RETAINED_IOVEC_MAX_COUNT + 1),
+            None
+        );
+
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let scratch = pool
+            .alloc_iovec_scratch(RETAINED_IOVEC_MAX_COUNT)
+            .expect("largest retained iovec class should be accepted");
+        assert_eq!(scratch.len(), RETAINED_IOVEC_MAX_COUNT);
+        drop(scratch);
+
+        let err = match pool.alloc_iovec_scratch(RETAINED_IOVEC_MAX_COUNT + 1) {
+            Ok(_) => panic!("count above the largest retained iovec class should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let stats = pool.stats();
+        assert_eq!(stats.writev_scratch_pooled_allocs, 1);
+        assert_eq!(stats.writev_scratch_pooled_frees, 1);
+        assert_eq!(stats.writev_scratch_oversize_rejections, 1);
+    }
+
+    struct DropProbe {
+        drops: *const Cell<usize>,
+    }
+
+    impl DropProbe {
+        fn new(drops: &Cell<usize>) -> Self {
+            Self { drops }
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            // SAFETY: every test keeps its stack-local counter alive until all
+            // fully initialized probes have either dropped or been
+            // deliberately forgotten inside poisoned storage.
+            let drops = unsafe { &*self.drops };
+            drops.set(drops.get() + 1);
+        }
+    }
+
+    struct PooledSlotPayload {
+        value: usize,
+        owner: DropProbe,
+    }
+
+    #[repr(align(128))]
+    struct HeapSlotPayload {
+        value: usize,
+        owner: DropProbe,
+    }
+
+    struct PooledZst;
+
+    #[repr(align(128))]
+    struct HeapZst;
+
+    #[test]
+    fn raw_retained_slot_finishes_pooled_payload_exactly_once() {
+        let drops = Cell::new(0);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+
+        let payload = unsafe {
+            with_raw_retained_slot(pool_ptr, |slot: RawRetainedSlot<'_, PooledSlotPayload>| {
+                let mut writing = slot.begin_writing();
+                let dst = writing.as_mut_ptr();
+                std::ptr::addr_of_mut!((*dst).value).write(41);
+                std::ptr::addr_of_mut!((*dst).owner).write(DropProbe::new(&drops));
+                writing.finish()
+            })
+        };
+
+        assert_eq!(unsafe { payload.as_ref() }.value, 41);
+        assert_eq!(drops.get(), 0);
+        unsafe { payload.drop_and_free(&mut pool) };
+        assert_eq!(drops.get(), 1);
+        assert_eq!(pool.stats().pooled_allocs, 1);
+        assert_eq!(pool.stats().pooled_frees, 1);
+        assert_eq!(pool.test_poisoned_writes, 0);
+    }
+
+    #[test]
+    fn raw_retained_slot_recycles_untouched_pooled_storage() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+
+        let untouched = unsafe {
+            with_raw_retained_slot::<PooledSlotPayload, _>(pool_ptr, |mut slot| slot.as_mut_ptr())
+        };
+        let drops = Cell::new(0);
+        let replacement = pool.alloc(PooledSlotPayload {
+            value: 7,
+            owner: DropProbe::new(&drops),
+        });
+
+        assert_eq!(replacement.as_ptr(), untouched);
+        let stats = pool.stats();
+        assert_eq!(stats.pooled_allocs, 2);
+        assert_eq!(stats.pooled_reuses, 1);
+        assert_eq!(stats.pooled_frees, 1);
+
+        unsafe { replacement.drop_and_free(&mut pool) };
+        assert_eq!(drops.get(), 1);
+        assert_eq!(pool.stats().pooled_frees, 2);
+    }
+
+    #[test]
+    fn raw_retained_slot_poison_keeps_partial_pooled_payload_unreachable() {
+        let drops = Cell::new(0);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+        let mut poisoned_ptr = std::ptr::null_mut();
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            with_raw_retained_slot::<PooledSlotPayload, _>(pool_ptr, |slot| {
+                let mut writing = slot.begin_writing();
+                poisoned_ptr = writing.as_mut_ptr();
+                std::ptr::addr_of_mut!((*poisoned_ptr).owner).write(DropProbe::new(&drops));
+                panic!("inject partial pooled payload unwind");
+            })
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(drops.get(), 0, "partial owner must not be dropped");
+
+        let after_poison = pool.stats();
+        assert_eq!(after_poison.pooled_allocs, 1);
+        assert_eq!(after_poison.pooled_reuses, 0);
+        assert_eq!(after_poison.pooled_frees, 0);
+        assert_eq!(pool.test_poisoned_writes, 1);
+        assert_eq!(pool.test_poisoned_heap_len, 0);
+
+        let replacement = pool.alloc(PooledSlotPayload {
+            value: 9,
+            owner: DropProbe::new(&drops),
+        });
+        assert_ne!(replacement.as_ptr(), poisoned_ptr);
+        assert_eq!(pool.stats().pooled_allocs, 2);
+        assert_eq!(pool.stats().pooled_reuses, 0);
+        unsafe { replacement.drop_and_free(&mut pool) };
+        assert_eq!(pool.stats().pooled_frees, 1);
+        assert_eq!(drops.get(), 1);
+
+        drop(pool);
+        assert_eq!(drops.get(), 1, "pool teardown must not drop partial T");
+    }
+
+    #[test]
+    fn raw_retained_slot_finishes_heap_payload_exactly_once() {
+        let drops = Cell::new(0);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+
+        let payload = unsafe {
+            with_raw_retained_slot(pool_ptr, |slot: RawRetainedSlot<'_, HeapSlotPayload>| {
+                let mut writing = slot.begin_writing();
+                let dst = writing.as_mut_ptr();
+                std::ptr::addr_of_mut!((*dst).value).write(73);
+                std::ptr::addr_of_mut!((*dst).owner).write(DropProbe::new(&drops));
+                writing.finish()
+            })
+        };
+
+        assert_eq!(unsafe { payload.as_ref() }.value, 73);
+        unsafe { payload.drop_and_free(&mut pool) };
+        assert_eq!(drops.get(), 1);
+        assert_eq!(pool.stats().heap_fallbacks, 1);
+        assert_eq!(pool.stats().heap_frees, 1);
+        assert_eq!(pool.test_poisoned_writes, 0);
+    }
+
+    #[test]
+    fn raw_retained_slot_releases_untouched_heap_storage() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+
+        unsafe {
+            with_raw_retained_slot::<HeapSlotPayload, _>(pool_ptr, |_slot| {
+                // Dropping the untouched raw slot releases only its Box-backed
+                // `MaybeUninit<T>` allocation.
+            });
+        }
+
+        assert_eq!(pool.stats().heap_fallbacks, 1);
+        assert_eq!(pool.stats().heap_frees, 1);
+        assert_eq!(pool.test_poisoned_writes, 0);
+    }
+
+    #[test]
+    fn raw_retained_slot_poison_keeps_partial_heap_payload_unreachable() {
+        let drops = Cell::new(0);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+        let mut poisoned_ptr = std::ptr::null_mut();
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            with_raw_retained_slot::<HeapSlotPayload, _>(pool_ptr, |slot| {
+                let mut writing = slot.begin_writing();
+                poisoned_ptr = writing.as_mut_ptr();
+                std::ptr::addr_of_mut!((*poisoned_ptr).owner).write(DropProbe::new(&drops));
+                panic!("inject partial heap payload unwind");
+            })
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(drops.get(), 0, "partial owner must not be dropped");
+
+        let after_poison = pool.stats();
+        assert_eq!(after_poison.heap_fallbacks, 1);
+        assert_eq!(after_poison.heap_frees, 0);
+        assert_eq!(pool.test_poisoned_writes, 1);
+        assert_eq!(pool.test_poisoned_heap_len, 1);
+
+        let replacement = pool.alloc(HeapSlotPayload {
+            value: 11,
+            owner: DropProbe::new(&drops),
+        });
+        assert_ne!(replacement.as_ptr(), poisoned_ptr);
+        assert_eq!(pool.stats().heap_fallbacks, 2);
+        assert_eq!(pool.stats().heap_frees, 0);
+        unsafe { replacement.drop_and_free(&mut pool) };
+        assert_eq!(pool.stats().heap_frees, 1);
+        assert_eq!(drops.get(), 1);
+
+        // The test-only pool Drop releases the first allocation strictly as
+        // `MaybeUninit<T>`; it never calls the partial owner's destructor.
+        drop(pool);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn raw_retained_slot_preserves_pooled_and_overaligned_zst_provenance() {
+        assert_eq!(std::mem::size_of::<PooledZst>(), 0);
+        assert_eq!(std::mem::size_of::<HeapZst>(), 0);
+        assert!(std::mem::align_of::<HeapZst>() > RETAINED_BLOCK_ALIGN);
+
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+        let pooled = unsafe {
+            with_raw_retained_slot(pool_ptr, |slot: RawRetainedSlot<'_, PooledZst>| {
+                let mut writing = slot.begin_writing();
+                writing.as_mut_ptr().write(PooledZst);
+                writing.finish()
+            })
+        };
+        let heap = unsafe {
+            with_raw_retained_slot(pool_ptr, |mut slot: RawRetainedSlot<'_, HeapZst>| {
+                assert_eq!(
+                    slot.as_mut_ptr() as usize % std::mem::align_of::<HeapZst>(),
+                    0
+                );
+                let mut writing = slot.begin_writing();
+                writing.as_mut_ptr().write(HeapZst);
+                writing.finish()
+            })
+        };
+
+        let _pooled_value = unsafe { pooled.take(&mut pool) };
+        let _heap_value = unsafe { heap.take(&mut pool) };
+        let stats = pool.stats();
+        assert_eq!(stats.pooled_allocs, 1);
+        assert_eq!(stats.pooled_frees, 1);
+        assert_eq!(stats.heap_fallbacks, 1);
+        assert_eq!(stats.heap_frees, 1);
+    }
+
+    #[test]
+    fn raw_retained_slot_allows_synchronous_same_pool_reentry() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let pool_ptr = NonNull::from(&mut pool);
+
+        let outer = unsafe {
+            with_raw_retained_slot(pool_ptr, |mut outer: RawRetainedSlot<'_, usize>| {
+                let outer_ptr = outer.as_mut_ptr();
+                let nested =
+                    with_raw_retained_slot(pool_ptr, |slot: RawRetainedSlot<'_, usize>| {
+                        let mut writing = slot.begin_writing();
+                        writing.as_mut_ptr().write(19);
+                        writing.finish()
+                    });
+                assert_ne!(outer_ptr, nested.as_ptr());
+                assert_eq!(*nested.as_ref(), 19);
+                nested.drop_and_free(&mut *pool_ptr.as_ptr());
+
+                let mut writing = outer.begin_writing();
+                writing.as_mut_ptr().write(23);
+                writing.finish()
+            })
+        };
+
+        assert_eq!(unsafe { *outer.as_ref() }, 23);
+        unsafe { outer.drop_and_free(&mut pool) };
+        let stats = pool.stats();
+        assert_eq!(stats.pooled_allocs, 2);
+        assert_eq!(stats.pooled_frees, 2);
+        assert_eq!(stats.pooled_reuses, 0);
+    }
+
+    #[test]
+    fn iovec_scratch_init_populates_inline_final_destination() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let mut init = pool
+            .alloc_iovec_scratch_init(8)
+            .expect("inline scratch token allocation failed");
+        assert_eq!(init.len(), 8);
+        assert!(matches!(&init.storage, RetainedIovecScratchStorage::Inline));
+
+        let mut destination = MaybeUninit::<RetainedIovecScratch>::uninit();
+        let final_ptr = destination.as_mut_ptr();
+        let iovecs = unsafe { init.destination_mut(final_ptr) };
+        assert_eq!(iovecs.len(), 8);
+        iovecs[0].write(test_iovec(7));
+        iovecs[7].write(test_iovec(13));
+
+        unsafe { init.initialize_at(final_ptr) };
+        let scratch = unsafe { destination.assume_init() };
+        assert_eq!(scratch.len(), 8);
+        assert!(matches!(
+            &scratch.storage,
+            RetainedIovecScratchStorage::Inline
+        ));
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[0].assume_init_ref() }.iov_len,
+            7
+        );
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[7].assume_init_ref() }.iov_len,
+            13
+        );
+
+        drop(scratch);
+        let stats = pool.stats();
+        assert_eq!(stats.writev_scratch_inline_allocs, 1);
+        assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+        assert_eq!(stats.writev_scratch_pooled_frees, 0);
+    }
+
+    #[test]
+    fn iovec_scratch_init_transfers_pooled_storage_exactly_once() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let mut init = pool
+            .alloc_iovec_scratch_init(64)
+            .expect("pooled scratch token allocation failed");
+        let sidecar_ptr = pooled_scratch_init_ptr(&init);
+        assert_eq!(init.len(), 64);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 2);
+
+        let mut destination = MaybeUninit::<RetainedIovecScratch>::uninit();
+        let final_ptr = destination.as_mut_ptr();
+        let iovecs = unsafe { init.destination_mut(final_ptr) };
+        assert_eq!(iovecs.as_mut_ptr(), sidecar_ptr);
+        iovecs[0].write(test_iovec(17));
+        iovecs[63].write(test_iovec(29));
+
+        unsafe { init.initialize_at(final_ptr) };
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 0);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 2);
+
+        let scratch = unsafe { destination.assume_init() };
+        assert_eq!(scratch.len(), 64);
+        assert_eq!(scratch.as_uninit_slice().as_ptr(), sidecar_ptr);
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[0].assume_init_ref() }.iov_len,
+            17
+        );
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[63].assume_init_ref() }.iov_len,
+            29
+        );
+
+        drop(scratch);
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 1);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 1);
+
+        let replacement = pool
+            .alloc_iovec_scratch_init(64)
+            .expect("replacement scratch token allocation failed");
+        assert_eq!(pooled_scratch_init_ptr(&replacement), sidecar_ptr);
+        assert_eq!(pool.stats().writev_scratch_pooled_reuses, 1);
+        drop(replacement);
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 2);
+    }
+
+    #[test]
+    fn unconsumed_iovec_scratch_init_releases_pooled_storage() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let init = pool
+            .alloc_iovec_scratch_init(64)
+            .expect("pooled scratch token allocation failed");
+        let sidecar_ptr = pooled_scratch_init_ptr(&init);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 2);
+
+        drop(init);
+        let after_drop = pool.stats();
+        assert_eq!(after_drop.writev_scratch_pooled_allocs, 1);
+        assert_eq!(after_drop.writev_scratch_pooled_frees, 1);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 1);
+
+        let replacement = pool
+            .alloc_iovec_scratch_init(64)
+            .expect("replacement scratch token allocation failed");
+        assert_eq!(pooled_scratch_init_ptr(&replacement), sidecar_ptr);
+        assert_eq!(pool.stats().writev_scratch_pooled_reuses, 1);
+        drop(replacement);
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 2);
+    }
+
+    #[test]
+    fn iovec_scratch_init_allows_same_pool_activity_while_destination_is_live() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let mut pool_ptr = NonNull::from(&mut pool);
+        let mut outer = unsafe { pool_ptr.as_mut().alloc_iovec_scratch_init(64) }
+            .expect("outer scratch token allocation failed");
+        let outer_sidecar = pooled_scratch_init_ptr(&outer);
+        let mut destination = MaybeUninit::<RetainedIovecScratch>::uninit();
+
+        {
+            let outer_iovecs = unsafe { outer.destination_mut(destination.as_mut_ptr()) };
+            outer_iovecs[0].write(test_iovec(31));
+
+            let nested = unsafe { pool_ptr.as_mut().alloc_iovec_scratch_init(64) }
+                .expect("nested scratch token allocation failed");
+            assert_ne!(pooled_scratch_init_ptr(&nested), outer_sidecar);
+            drop(nested);
+
+            outer_iovecs[63].write(test_iovec(37));
+        }
+
+        unsafe { outer.initialize_at(destination.as_mut_ptr()) };
+        let scratch = unsafe { destination.assume_init() };
+        assert_eq!(scratch.as_uninit_slice().as_ptr(), outer_sidecar);
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[0].assume_init_ref() }.iov_len,
+            31
+        );
+        assert_eq!(
+            unsafe { scratch.as_uninit_slice()[63].assume_init_ref() }.iov_len,
+            37
+        );
+        drop(scratch);
+
+        let stats = pool.stats();
+        assert_eq!(stats.writev_scratch_pooled_allocs, 2);
+        assert_eq!(stats.writev_scratch_pooled_reuses, 0);
+        assert_eq!(stats.writev_scratch_pooled_frees, 2);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 1);
+    }
+
+    #[test]
+    fn poisoned_writing_slot_keeps_transferred_scratch_owned_and_unreused() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let mut init = pool
+            .alloc_iovec_scratch_init(64)
+            .expect("poisoned scratch token allocation failed");
+        let pool_ptr = NonNull::from(&mut pool);
+        let poisoned_sidecar = pooled_scratch_init_ptr(&init);
+        let mut poisoned_scratch = std::ptr::null_mut();
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            with_raw_retained_slot::<ScratchPayload, _>(pool_ptr, |mut slot| {
+                let payload = slot.as_mut_ptr();
+                poisoned_scratch = std::ptr::addr_of_mut!((*payload)._scratch);
+                let iovecs = init.destination_mut(poisoned_scratch);
+                iovecs[0].write(test_iovec(41));
+
+                let mut writing = slot.begin_writing();
+                init.initialize_at(std::ptr::addr_of_mut!((*writing.as_mut_ptr())._scratch));
+                panic!("inject unwind after pooled scratch ownership transfer");
+            })
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(pool.test_poisoned_writes, 1);
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 0);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 2);
+
+        let replacement = pool
+            .alloc_iovec_scratch_init(64)
+            .expect("post-poison scratch token allocation failed");
+        assert_ne!(pooled_scratch_init_ptr(&replacement), poisoned_sidecar);
+        assert_eq!(pool.stats().writev_scratch_pooled_reuses, 0);
+        drop(replacement);
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 1);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 2);
+
+        // Production poison deliberately leaves the transferred owner in the
+        // unreachable partial payload. This test knows that exact field was
+        // fully initialized, so release it explicitly after proving nonreuse
+        // to keep Miri's test allocation accounting clean.
+        unsafe { std::ptr::drop_in_place(poisoned_scratch) };
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, 2);
+        assert_eq!(Rc::strong_count(&pool.iovec_pool), 1);
     }
 
     #[test]
@@ -923,5 +1902,6 @@ mod tests {
     fn retained_iovec_scratch_layout_remains_fixed() {
         assert_eq!(std::mem::size_of::<RetainedIovecScratch>(), 288);
         assert_eq!(std::mem::size_of::<RetainedIovecScratchStorage>(), 24);
+        assert_eq!(std::mem::size_of::<RetainedIovecScratchInit>(), 32);
     }
 }

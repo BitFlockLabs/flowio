@@ -1,6 +1,9 @@
 mod common;
 
-use common::{DropTrackedReadOnly, DropTrackedReadWrite, wait_for_drop_count, wait_for_live_slots};
+use common::{
+    DropTrackedReadOnly, DropTrackedReadWrite, poll_once_pending,
+    run_exact_test_child_with_watchdog, wait_for_drop_count, wait_for_live_slots,
+};
 use flowio::net::unix::UnixStream;
 use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
@@ -18,7 +21,7 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -42,7 +45,15 @@ fn new_executor_with(process_quota: usize, cpu_affinity: Option<usize>) -> Execu
     .expect("failed to construct runtime executor")
 }
 
-#[cfg(debug_assertions)]
+fn new_one_slot_executor() -> Executor {
+    Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries: 1 },
+        ..ExecutorConfig::default()
+    })
+    .expect("failed to construct one-slot executor")
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
 fn fd_identity(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` points to writable storage and `fstat` accepts any integer
@@ -454,7 +465,7 @@ impl Drop for SignalHandlerGuard {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 fn write_all_raw_fd(fd: RawFd, mut bytes: &[u8]) {
     while !bytes.is_empty() {
         let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
@@ -632,6 +643,128 @@ impl<const N: usize> WritevProjection for ProjectedBytes<N> {
     }
 }
 
+/// Projected source with a task-local exact-drop counter for failure tests.
+struct DropTrackedProjected<const N: usize> {
+    bytes: [u8; N],
+    counted_pieces: usize,
+    counted_total: usize,
+    projected_len: usize,
+    drops: Rc<Cell<usize>>,
+}
+
+impl<const N: usize> DropTrackedProjected<N> {
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    fn matching(drops: &Rc<Cell<usize>>) -> Self {
+        Self::with_projection(N, N, N, drops)
+    }
+
+    fn with_projection(
+        counted_pieces: usize,
+        counted_total: usize,
+        projected_len: usize,
+        drops: &Rc<Cell<usize>>,
+    ) -> Self {
+        Self {
+            bytes: std::array::from_fn(|i| (i % 251) as u8),
+            counted_pieces,
+            counted_total,
+            projected_len,
+            drops: Rc::clone(drops),
+        }
+    }
+
+    fn expected(&self) -> &[u8] {
+        &self.bytes[..self.projected_len]
+    }
+}
+
+impl<const N: usize> Drop for DropTrackedProjected<N> {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+impl<const N: usize> WritevProjection for DropTrackedProjected<N> {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (self.counted_pieces, self.counted_total)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        for byte in &self.bytes[..self.projected_len] {
+            pieces.push(std::slice::from_ref(byte))?;
+        }
+        Ok(())
+    }
+}
+
+/// Read-only segment whose pointer callback can be counted or forced to panic.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+struct CallbackTrackedReadOnly {
+    bytes: &'static [u8],
+    as_ptr_calls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+    panic_on_as_ptr: bool,
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+impl CallbackTrackedReadOnly {
+    fn new(
+        bytes: &'static [u8],
+        as_ptr_calls: &Rc<Cell<usize>>,
+        drops: &Rc<Cell<usize>>,
+        panic_on_as_ptr: bool,
+    ) -> Self {
+        Self {
+            bytes,
+            as_ptr_calls: Rc::clone(as_ptr_calls),
+            drops: Rc::clone(drops),
+            panic_on_as_ptr,
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+impl Drop for CallbackTrackedReadOnly {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+unsafe impl IoBuffReadOnly for CallbackTrackedReadOnly {
+    fn as_ptr(&self) -> *const u8 {
+        self.as_ptr_calls.set(self.as_ptr_calls.get() + 1);
+        assert!(
+            !self.panic_on_as_ptr,
+            "forced writev pointer callback panic"
+        );
+        self.bytes.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+fn callback_tracked_chain(
+    bytes: &'static [u8],
+    as_ptr_calls: &Rc<Cell<usize>>,
+    drops: &Rc<Cell<usize>>,
+    panic_on_as_ptr: bool,
+) -> IoBuffReadOnlyVec<CallbackTrackedReadOnly, 1> {
+    let mut chain = IoBuffReadOnlyVec::new();
+    chain
+        .push(CallbackTrackedReadOnly::new(
+            bytes,
+            as_ptr_calls,
+            drops,
+            panic_on_as_ptr,
+        ))
+        .expect("single callback-tracked segment should fit");
+    chain
+}
+
 /// Test `WritevProjection` source backed by indices into `SMALL_TRACKED_BLOCKS`,
 /// projecting one static page per index at length `LEN`.
 struct ProjectedStaticSegments<const N: usize, const LEN: usize> {
@@ -693,7 +826,10 @@ async fn fill_unix_send_buffer(writer: &mut UnixStream) {
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => panic!("fill write failed: {err}"),
-            Err(_) => break,
+            Err(TimeoutError::Elapsed) => break,
+            Err(TimeoutError::Runtime(err)) => {
+                panic!("fill timeout runtime failed: {err}");
+            }
         }
     }
 }
@@ -1027,6 +1163,100 @@ fn runtime_executor_context_is_cleared_when_run_unwinds() {
     );
 }
 
+const ACTIVE_UNWIND_DROP_CHILD_ENV: &str = "FLOWIO_ACTIVE_UNWIND_DROP_CHILD";
+const ACTIVE_UNWIND_DROP_CHILD_TEST: &str =
+    "runtime_executor_drop_during_active_unwind_forgets_caught_task_panic_payload";
+
+#[test]
+fn runtime_executor_drop_during_active_unwind_forgets_caught_task_panic_payload() {
+    if std::env::var_os(ACTIVE_UNWIND_DROP_CHILD_ENV).is_none() {
+        run_exact_test_child_with_watchdog(
+            ACTIVE_UNWIND_DROP_CHILD_TEST,
+            ACTIVE_UNWIND_DROP_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    struct ShutdownPanicPayload(Arc<AtomicUsize>);
+
+    impl Drop for ShutdownPanicPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("shutdown panic payload must not be dropped during unwind");
+        }
+    }
+
+    struct PendingDropPanic {
+        task_drops: Rc<Cell<usize>>,
+        payload_drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingDropPanic {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropPanic {
+        fn drop(&mut self) {
+            self.task_drops.set(self.task_drops.get() + 1);
+            std::panic::panic_any(ShutdownPanicPayload(Arc::clone(&self.payload_drops)));
+        }
+    }
+
+    let task_drops = Rc::new(Cell::new(0));
+    let payload_drops = Arc::new(AtomicUsize::new(0));
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+        let task_drops = Rc::clone(&task_drops);
+        let payload_drops = Arc::clone(&payload_drops);
+        move || {
+            let mut executor = new_executor();
+            let err = executor
+                .run(PendingDropPanic {
+                    task_drops,
+                    payload_drops,
+                })
+                .expect_err("pending task should leave the executor stalled");
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+            panic!("outer unwind sentinel");
+        }
+    }))
+    .expect_err("outer panic should survive executor destruction");
+    let message = unwind
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| unwind.downcast_ref::<String>().map(String::as_str));
+
+    assert_eq!(message, Some("outer unwind sentinel"));
+    assert_eq!(task_drops.get(), 1, "pending task destructor count");
+    assert_eq!(
+        payload_drops.load(Ordering::SeqCst),
+        0,
+        "retained shutdown panic payload was dropped"
+    );
+}
+
+#[test]
+fn runtime_nop_initial_submission_extracts_poll_context_once() {
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            poll_once_pending(Nop::new()).await;
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().poll_context_extractions,
+        1,
+        "initial NOP submission should derive the validated context once"
+    );
+}
+
 #[test]
 fn runtime_executor_runs_nop_future() {
     let mut executor = new_executor();
@@ -1050,6 +1280,27 @@ fn runtime_executor_runs_nop_future() {
     {
         let _ = executor;
     }
+}
+
+#[test]
+fn runtime_io_wake_can_arm_timer_on_following_executor_pass() {
+    let completed = Rc::new(Cell::new(false));
+    let completed_probe = Rc::clone(&completed);
+    let mut executor = new_executor();
+
+    executor
+        .run(async move {
+            Nop::new().await.expect("nop failed");
+            sleep(Duration::from_millis(1))
+                .await
+                .expect("post-I/O timer failed");
+            completed_probe.set(true);
+        })
+        .expect("executor failed to process timer armed after I/O wake");
+
+    assert!(completed.get(), "post-I/O timer task did not complete");
+    #[cfg(debug_assertions)]
+    assert_eq!(executor.last_stats().timer_expired, 1);
 }
 
 #[test]
@@ -1126,7 +1377,7 @@ fn runtime_unsubmitted_zero_length_write_outside_run_returns_context_error_and_b
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_untimed_wait_eintr_does_not_abort_blocked_read() {
     let mut executor = new_executor();
@@ -1315,7 +1566,7 @@ fn runtime_submitted_read_delays_foreign_context_error_until_cqe() {
         .expect("origin executor failed after foreign-context read poll");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
     let drops = Rc::new(Cell::new(0));
@@ -1431,29 +1682,32 @@ fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
     drop(buffer);
     assert_eq!(drops.get(), 1, "read buffer was not returned exactly once");
 
-    let origin_stats = origin.last_stats();
-    assert_eq!(origin_stats.waiter_wakes, 1);
-    assert_eq!(
-        origin_stats.task_schedules, 0,
-        "origin runtime was charged for the foreign waiter schedule"
-    );
-    assert_eq!(origin_stats.task_allocs, 2);
-    assert_eq!(
-        origin_stats.task_frees, origin_stats.task_allocs,
-        "origin task reference leaked"
-    );
+    #[cfg(debug_assertions)]
+    {
+        let origin_stats = origin.last_stats();
+        assert_eq!(origin_stats.waiter_wakes, 1);
+        assert_eq!(
+            origin_stats.task_schedules, 0,
+            "origin runtime was charged for the foreign waiter schedule"
+        );
+        assert_eq!(origin_stats.task_allocs, 2);
+        assert_eq!(
+            origin_stats.task_frees, origin_stats.task_allocs,
+            "origin task reference leaked"
+        );
 
-    let foreign_stats = foreign.last_stats();
-    assert_eq!(foreign_stats.waiter_wakes, 0);
-    assert_eq!(
-        foreign_stats.task_schedules, 1,
-        "foreign runtime did not own its waiter schedule"
-    );
-    assert_eq!(foreign_stats.task_allocs, 2);
-    assert_eq!(
-        foreign_stats.task_frees, foreign_stats.task_allocs,
-        "foreign task reference leaked"
-    );
+        let foreign_stats = foreign.last_stats();
+        assert_eq!(foreign_stats.waiter_wakes, 0);
+        assert_eq!(
+            foreign_stats.task_schedules, 1,
+            "foreign runtime did not own its waiter schedule"
+        );
+        assert_eq!(foreign_stats.task_allocs, 2);
+        assert_eq!(
+            foreign_stats.task_frees, foreign_stats.task_allocs,
+            "foreign task reference leaked"
+        );
+    }
 
     origin
         .run(async {
@@ -1524,7 +1778,7 @@ fn runtime_nop_slot_op_pool_pressure_releases_slot() {
         .expect("executor run failed");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_nop_slot_submit_failure_releases_slot() {
     let mut executor = new_executor();
@@ -1879,7 +2133,7 @@ fn runtime_armed_sleep_rejects_foreign_flowio_waker() {
         .expect("origin executor failed after armed timer rejection");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_cancelled_sleep_rejects_outside_run_after_executor_drop() {
     let mut executor = new_executor();
@@ -1915,9 +2169,9 @@ fn runtime_cancelled_sleep_rejects_outside_run_after_executor_drop() {
     ));
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
-fn runtime_executor_drop_fallback_releases_inflight_read_resources_once() {
+fn runtime_executor_drop_fallback_abandons_inflight_read_payload() {
     let mut executor = new_executor();
     let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
     let reader_fd = reader.as_raw_fd();
@@ -1935,15 +2189,92 @@ fn runtime_executor_drop_fallback_releases_inflight_read_resources_once() {
     assert_eq!(err.raw_os_error(), Some(libc::EIO));
     assert_eq!(buffer_drops.get(), 0, "in-flight buffer dropped early");
 
-    test_hooks::fail_next_ring_submit_errno(libc::EIO);
+    test_hooks::force_next_reactor_shutdown_fallback();
     drop(executor);
 
-    assert_eq!(buffer_drops.get(), 1, "in-flight buffer drop count");
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "forced reactor fallback was not consumed"
+    );
+    assert_eq!(
+        buffer_drops.get(),
+        0,
+        "ring-abandoned in-flight buffer was released without a target CQE"
+    );
     match fd_identity(reader_fd) {
         Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EBADF)),
         Ok(current_identity) => assert_ne!(
             current_identity, reader_identity,
             "reader descriptor stayed open after executor drop"
+        ),
+    }
+    drop(writer);
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_executor_drop_fallback_keeps_escaped_read_pending() {
+    let mut executor = new_executor();
+    let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+    let reader_fd = reader.as_raw_fd();
+    let reader_identity = fd_identity(reader_fd).expect("reader fstat failed");
+    let buffer_drops = Rc::new(Cell::new(0usize));
+    let read_drops = Rc::clone(&buffer_drops);
+    let staged = Rc::new(RefCell::new(Some(Box::pin(async move {
+        reader
+            .read(DropTrackedReadWrite::zeroed(64, &read_drops), 64)
+            .await
+    }))));
+
+    let staged_for_run = Rc::clone(&staged);
+    let err = executor
+        .run(async move {
+            poll_fn(|cx| {
+                let mut slot = staged_for_run.borrow_mut();
+                let read = slot.as_mut().expect("staged read missing");
+                assert!(
+                    read.as_mut().poll(cx).is_pending(),
+                    "staged read completed before fallback"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            test_hooks::fail_next_ring_wait_errno(libc::EIO);
+        })
+        .expect_err("injected reactor error should end the run");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    assert_eq!(buffer_drops.get(), 0, "in-flight buffer dropped early");
+
+    test_hooks::force_next_reactor_shutdown_fallback();
+    drop(executor);
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "forced reactor fallback was not consumed"
+    );
+
+    let mut read = staged
+        .borrow_mut()
+        .take()
+        .expect("escaped read disappeared");
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(
+        read.as_mut().poll(&mut cx).is_pending(),
+        "ring-abandoned read fabricated completion and exposed its buffer"
+    );
+    drop(read);
+    assert_eq!(
+        buffer_drops.get(),
+        0,
+        "dropping an escaped ring-abandoned read released its buffer"
+    );
+    match fd_identity(reader_fd) {
+        Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EBADF)),
+        Ok(current_identity) => assert_ne!(
+            current_identity, reader_identity,
+            "escaped reader descriptor stayed open after future drop"
         ),
     }
     drop(writer);
@@ -1968,7 +2299,7 @@ fn runtime_clean_runs_reset_generation_task_counters() {
     assert_eq!(second.task_slab_frees, 0);
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_write_alloc_op_failure_returns_payload() {
     let mut executor = new_executor();
@@ -1990,7 +2321,7 @@ fn runtime_write_alloc_op_failure_returns_payload() {
         .expect("executor run failed");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_write_submit_failure_returns_retained_payload() {
     let mut executor = new_executor();
@@ -2012,7 +2343,265 @@ fn runtime_write_submit_failure_returns_retained_payload() {
         .expect("executor run failed");
 }
 
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_vectored_submit_failures_return_owners_and_reuse_one_op_slot() {
+    let mut executor = new_one_slot_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+            let projected_drops = Rc::new(Cell::new(0));
+            let projected = DropTrackedProjected::<2>::matching(&projected_drops);
+            test_hooks::fail_next_sqe_submit();
+            let (res, projected) = writer.writev_projected(projected).await;
+            assert_eq!(
+                res.expect_err("projected writev forced submit should fail")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(projected.expected(), &[0, 1]);
+            assert_eq!(projected_drops.get(), 0, "projected source dropped early");
+            drop(projected);
+            assert_eq!(projected_drops.get(), 1, "projected source dropped once");
+
+            let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 8,
+                tailroom: 0,
+                objs_per_slab: 1,
+            })
+            .expect("pool config invalid");
+            pool.init();
+
+            let recv = IoBuffVecMut::<1>::from_array([pool
+                .alloc()
+                .expect("readv pool allocation failed")]);
+            test_hooks::fail_next_sqe_submit();
+            let (res, recv) = reader.readv(recv).await;
+            assert_eq!(
+                res.expect_err("readv forced submit should fail").kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(pool.live_slots_for_test(), 1, "readv lost its buffer");
+            drop(recv);
+            assert_eq!(pool.live_slots_for_test(), 0, "readv buffer not returned");
+
+            let writev_drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([b"writev".to_vec()], &writev_drops);
+            test_hooks::fail_next_sqe_submit();
+            let (res, chain) = writer.writev(chain).await;
+            assert_eq!(
+                res.expect_err("writev forced submit should fail").kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(writev_drops.get(), 0, "writev source dropped early");
+            drop(chain);
+            assert_eq!(writev_drops.get(), 1, "writev source dropped once");
+
+            let writev_all_drops = Rc::new(Cell::new(0));
+            let chain = tracked_chain([b"writev-all".to_vec()], &writev_all_drops);
+            test_hooks::fail_next_sqe_submit();
+            let (res, chain) = writer.writev_all(chain).await;
+            assert_eq!(
+                res.expect_err("writev_all forced submit should fail")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(writev_all_drops.get(), 0, "writev_all source dropped early");
+            drop(chain);
+            assert_eq!(writev_all_drops.get(), 1, "writev_all source dropped once");
+
+            let recv = IoBuffVecMut::<1>::from_array([pool
+                .alloc()
+                .expect("readv_exact pool allocation failed")]);
+            test_hooks::fail_next_sqe_submit();
+            let (res, recv) = reader.readv_exact(recv, 1).await;
+            assert_eq!(
+                res.expect_err("readv_exact forced submit should fail")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(pool.live_slots_for_test(), 1, "readv_exact lost its buffer");
+            drop(recv);
+            assert_eq!(
+                pool.live_slots_for_test(),
+                0,
+                "readv_exact buffer not returned"
+            );
+
+            assert_eq!(Nop::new().await.expect("one op slot was not reusable"), 0);
+        })
+        .expect("executor run failed");
+}
+
 #[cfg(debug_assertions)]
+#[test]
+fn runtime_direct_writev_callback_panics_preserve_sources_and_reuse_one_op_slot() {
+    let mut executor = new_one_slot_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+
+            let writev_calls = Rc::new(Cell::new(0));
+            let writev_drops = Rc::new(Cell::new(0));
+            let chain = callback_tracked_chain(b"writev-panic", &writev_calls, &writev_drops, true);
+            let mut writev = Box::pin(writer.writev(chain));
+            let unwind = poll_fn(|cx| {
+                Poll::Ready(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || writev.as_mut().poll(cx),
+                )))
+            })
+            .await;
+            assert!(unwind.is_err(), "writev callback should unwind");
+            assert_eq!(writev_calls.get(), 1, "writev callback count changed");
+            assert_eq!(writev_drops.get(), 0, "writev source moved before panic");
+            drop(writev);
+            assert_eq!(writev_drops.get(), 1, "writev source dropped once");
+            assert_eq!(
+                Nop::new()
+                    .await
+                    .expect("writev panic left its op slot unavailable"),
+                0
+            );
+
+            let writev_all_calls = Rc::new(Cell::new(0));
+            let writev_all_drops = Rc::new(Cell::new(0));
+            let chain = callback_tracked_chain(
+                b"writev-all-panic",
+                &writev_all_calls,
+                &writev_all_drops,
+                true,
+            );
+            let mut writev_all = Box::pin(writer.writev_all(chain));
+            let unwind = poll_fn(|cx| {
+                Poll::Ready(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || writev_all.as_mut().poll(cx),
+                )))
+            })
+            .await;
+            assert!(unwind.is_err(), "writev_all callback should unwind");
+            assert_eq!(
+                writev_all_calls.get(),
+                1,
+                "writev_all callback count changed"
+            );
+            assert_eq!(
+                writev_all_drops.get(),
+                0,
+                "writev_all source moved before panic"
+            );
+            drop(writev_all);
+            assert_eq!(writev_all_drops.get(), 1, "writev_all source dropped once");
+            assert_eq!(
+                Nop::new()
+                    .await
+                    .expect("writev_all panic left published or cancellable state"),
+                0
+            );
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_direct_writev_op_alloc_failure_preserves_callback_order() {
+    let mut executor = new_one_slot_executor();
+
+    executor
+        .run(async move {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+
+            let writev_calls = Rc::new(Cell::new(0));
+            let writev_drops = Rc::new(Cell::new(0));
+            let chain = callback_tracked_chain(b"writev", &writev_calls, &writev_drops, false);
+            test_hooks::fail_next_op_alloc();
+            let (res, chain) = writer.writev(chain).await;
+            assert_eq!(
+                res.expect_err("writev forced op allocation should fail")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                writev_calls.get(),
+                1,
+                "one-shot writev must invoke its callback before op allocation"
+            );
+            assert_eq!(writev_drops.get(), 0, "writev source dropped early");
+            drop(chain);
+            assert_eq!(writev_drops.get(), 1, "writev source dropped once");
+
+            let writev_all_calls = Rc::new(Cell::new(0));
+            let writev_all_drops = Rc::new(Cell::new(0));
+            let chain =
+                callback_tracked_chain(b"writev-all", &writev_all_calls, &writev_all_drops, false);
+            test_hooks::fail_next_op_alloc();
+            let (res, chain) = writer.writev_all(chain).await;
+            assert_eq!(
+                res.expect_err("writev_all forced op allocation should fail")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                writev_all_calls.get(),
+                0,
+                "writev_all must allocate its op before invoking callbacks"
+            );
+            assert_eq!(writev_all_drops.get(), 0, "writev_all source dropped early");
+            drop(chain);
+            assert_eq!(writev_all_drops.get(), 1, "writev_all source dropped once");
+
+            assert_eq!(
+                Nop::new()
+                    .await
+                    .expect("forced failures leaked the op slot"),
+                0
+            );
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_readv_exact_op_alloc_failure_precedes_scratch_materialization() {
+    let mut executor = new_one_slot_executor();
+
+    executor
+        .run(async move {
+            let (mut reader, _writer) = UnixStream::pair().expect("socketpair failed");
+            let recv = read_chain([8usize]);
+
+            test_hooks::fail_next_op_alloc();
+            let (res, recv) = reader.readv_exact(recv, 1).await;
+            assert_eq!(
+                res.expect_err("readv_exact forced op allocation should fail")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(recv.segments(), 1, "readv_exact did not return its chain");
+            drop(recv);
+
+            assert_eq!(Nop::new().await.expect("readv_exact leaked the op slot"), 0);
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.writev_scratch_inline_allocs, 0,
+            "readv_exact allocated scratch before its forced op failure"
+        );
+        assert_eq!(
+            stats.writev_scratch_pooled_allocs, 0,
+            "readv_exact allocated sidecar scratch before its forced op failure"
+        );
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_write_ring_submit_eintr_is_absorbed() {
     let mut executor = new_executor();
@@ -2031,9 +2620,14 @@ fn runtime_write_ring_submit_eintr_is_absorbed() {
             assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
         })
         .expect("executor run failed");
+    assert_eq!(
+        test_hooks::ring_submit_failures_remaining(),
+        0,
+        "ring-submit EINTR hook was not consumed"
+    );
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_write_ring_submit_ebusy_is_absorbed() {
     let mut executor = new_executor();
@@ -2052,6 +2646,11 @@ fn runtime_write_ring_submit_ebusy_is_absorbed() {
             assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
         })
         .expect("executor run failed");
+    assert_eq!(
+        test_hooks::ring_submit_failures_remaining(),
+        0,
+        "ring-submit EBUSY hook was not consumed"
+    );
 }
 
 #[test]
@@ -2371,7 +2970,9 @@ fn runtime_sleep_zero_completes_without_timer_wake() {
 fn runtime_signal_interrupt_does_not_abort_wait() {
     const SLEEP_TARGET: Duration = Duration::from_millis(80);
     const MIN_ELAPSED: Duration = Duration::from_millis(60);
-    const MAX_ELAPSED: Duration = Duration::from_millis(100);
+    const MAX_ELAPSED: Duration = SLEEP_TARGET.saturating_mul(2);
+    const MAX_SIGNALS: usize = 64;
+    const SIGNAL_INTERVAL: Duration = Duration::from_millis(2);
 
     let _signal_lock = SIGNAL_TEST_LOCK
         .lock()
@@ -2391,22 +2992,24 @@ fn runtime_signal_interrupt_does_not_abort_wait() {
             std::thread::yield_now();
         }
 
-        std::thread::sleep(Duration::from_millis(2));
-        while !sender_done.load(Ordering::Acquire) && sender_sent.load(Ordering::Relaxed) < 32 {
+        std::thread::sleep(SIGNAL_INTERVAL);
+        while !sender_done.load(Ordering::Acquire)
+            && sender_sent.load(Ordering::Relaxed) < MAX_SIGNALS
+        {
             let rc = unsafe { libc::pthread_kill(target_thread, libc::SIGUSR1) };
             assert_eq!(rc, 0, "pthread_kill failed");
             sender_sent.fetch_add(1, Ordering::Relaxed);
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(SIGNAL_INTERVAL);
         }
     });
 
     let mut executor = new_executor();
     let observed = Rc::new(RefCell::new(None));
     let observed_flag = Rc::clone(&observed);
-    let start = Instant::now();
     let run_result = executor.run({
         let armed = Arc::clone(&armed);
         async move {
+            let start = Instant::now();
             armed.store(true, Ordering::Release);
             sleep(SLEEP_TARGET)
                 .await
@@ -2796,8 +3399,8 @@ fn runtime_nop_slot_can_be_reused() {
 }
 
 /// Multiple concurrent spawned tasks performing I/O simultaneously.
-/// Validates that the pointer-based TLS context correctly cycles owner_task
-/// across interleaved task polls.
+/// Validates that the pointer-based TLS context derives the correct task
+/// identity from each waker across interleaved task polls.
 #[test]
 fn runtime_concurrent_io_tasks() {
     let mut executor = new_executor();
@@ -2992,7 +3595,10 @@ fn runtime_cancel_in_flight_read_on_drop() {
             .await;
 
             // Timeout should fire — the inner read future is dropped while in-flight.
-            assert!(result.is_err(), "should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "should have timed out: {result:?}"
+            );
 
             // Executor continues to work after the cancel.
             sleep(Duration::from_millis(5))
@@ -3020,7 +3626,10 @@ fn runtime_cancelled_read_retains_payload_until_original_cqe() {
             })
             .await;
 
-            assert!(result.is_err(), "read should time out with no writer");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "read should time out with no writer: {result:?}"
+            );
             assert_eq!(
                 drops.get(),
                 0,
@@ -3085,9 +3694,15 @@ fn runtime_cancel_in_flight_write_on_drop() {
                 })
                 .await;
 
-                if result.is_err() {
-                    // Timed out — the write future was dropped while in-flight.
-                    break;
+                match result {
+                    Err(TimeoutError::Elapsed) => {
+                        // Timed out — the write future was dropped while in-flight.
+                        break;
+                    }
+                    Err(TimeoutError::Runtime(err)) => {
+                        panic!("write timeout runtime failed: {err}");
+                    }
+                    Ok(_) => {}
                 }
             }
 
@@ -3124,9 +3739,21 @@ fn runtime_cancel_multiple_concurrent() {
                 s3.read(buf, 8).await
             });
 
-            assert!(t1.await.is_err());
-            assert!(t2.await.is_err());
-            assert!(t3.await.is_err());
+            let result1 = t1.await;
+            assert!(
+                matches!(result1, Err(TimeoutError::Elapsed)),
+                "first concurrent read should time out: {result1:?}"
+            );
+            let result2 = t2.await;
+            assert!(
+                matches!(result2, Err(TimeoutError::Elapsed)),
+                "second concurrent read should time out: {result2:?}"
+            );
+            let result3 = t3.await;
+            assert!(
+                matches!(result3, Err(TimeoutError::Elapsed)),
+                "third concurrent read should time out: {result3:?}"
+            );
 
             // Executor is still healthy.
             sleep(Duration::from_millis(5))
@@ -3173,7 +3800,10 @@ fn runtime_cancel_write_all_mid_flight() {
             })
             .await;
 
-            assert!(result.is_err(), "write_all should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "write_all should have timed out: {result:?}"
+            );
 
             // Executor continues to function after the mid-flight cancel.
             sleep(Duration::from_millis(5))
@@ -3726,7 +4356,7 @@ fn runtime_writev_projected_rejects_oversized_iovec_count() {
 
 #[test]
 fn runtime_writev_projected_rejects_projection_mismatches() {
-    let mut executor = new_executor();
+    let mut executor = new_one_slot_executor();
 
     executor
         .run(async move {
@@ -3767,8 +4397,50 @@ fn runtime_writev_projected_rejects_projection_mismatches() {
                 std::io::ErrorKind::InvalidInput
             );
             assert_eq!(source.expected(), vec![0, 1]);
+
+            let drops = Rc::new(Cell::new(0));
+            let pooled_wrong_total =
+                DropTrackedProjected::<17>::with_projection(17, 18, 17, &drops);
+            let (res, source) = writer.writev_projected(pooled_wrong_total).await;
+            assert_eq!(
+                res.expect_err("pooled projected byte-total mismatch should fail")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(source.expected().len(), 17);
+            assert_eq!(drops.get(), 0, "mismatched projected source dropped early");
+            drop(source);
+            assert_eq!(drops.get(), 1, "mismatched projected source dropped once");
+
+            assert_eq!(
+                Nop::new()
+                    .await
+                    .expect("projected mismatch leaked its one op slot"),
+                0
+            );
         })
         .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.writev_scratch_pooled_allocs, 1,
+            "pooled projected mismatch should allocate one sidecar"
+        );
+        assert_eq!(
+            stats.writev_scratch_pooled_frees, stats.writev_scratch_pooled_allocs,
+            "projected mismatch did not return pooled scratch exactly once"
+        );
+        assert!(
+            stats.retained_pooled_allocs > 0,
+            "projected mismatches did not reserve retained payload slots"
+        );
+        assert_eq!(
+            stats.retained_pooled_frees, stats.retained_pooled_allocs,
+            "projected mismatches did not recycle retained payload slots"
+        );
+    }
 }
 
 #[test]
@@ -3825,7 +4497,10 @@ fn runtime_cancelled_write_retains_payload_until_original_cqe() {
             })
             .await;
 
-            assert!(result.is_err(), "write should time out under backpressure");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "write should time out under backpressure: {result:?}"
+            );
             assert_eq!(
                 drops.get(),
                 0,
@@ -3891,8 +4566,8 @@ fn runtime_cancelled_write_all_retains_payload_until_original_cqe() {
             .await;
 
             assert!(
-                result.is_err(),
-                "write_all should time out under backpressure"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "write_all should time out under backpressure: {result:?}"
             );
             assert_eq!(
                 drops.get(),
@@ -3926,8 +4601,8 @@ fn runtime_cancelled_writev_readonly_chain_retains_payload_until_original_cqe() 
             .await;
 
             assert!(
-                result.is_err(),
-                "read-only chain writev should time out under backpressure"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "read-only chain writev should time out under backpressure: {result:?}"
             );
             assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
 
@@ -3988,8 +4663,8 @@ fn runtime_cancelled_writev_all_readonly_chain_retains_payload_until_original_cq
             .await;
 
             assert!(
-                result.is_err(),
-                "read-only chain writev_all should time out under backpressure"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "read-only chain writev_all should time out under backpressure: {result:?}"
             );
             assert_eq!(drops.get(), 0, "chain dropped while original SQE was live");
 
@@ -4026,8 +4701,8 @@ fn runtime_cancelled_writev_readonly_chain_512_retains_payload_and_scratch_until
             .await;
 
             assert!(
-                result.is_err(),
-                "512-segment read-only chain writev should time out under backpressure"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "512-segment read-only chain writev should time out under backpressure: {result:?}"
             );
             let drops_after_timeout = drops.load(Ordering::Relaxed);
             assert!(
@@ -4099,8 +4774,8 @@ fn runtime_cancelled_writev_projected_512_retains_source_and_scratch_until_origi
             .await;
 
             assert!(
-                result.is_err(),
-                "512 projected writev should time out under backpressure"
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "512 projected writev should time out under backpressure: {result:?}"
             );
             let drops_after_timeout = PROJECTED_SOURCE_DROPS.load(Ordering::Relaxed);
             assert!(
@@ -4171,7 +4846,10 @@ fn runtime_cancel_read_exact_mid_flight() {
             })
             .await;
 
-            assert!(result.is_err(), "read_exact should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "read_exact should have timed out: {result:?}"
+            );
             assert_eq!(
                 drops.get(),
                 0,
@@ -4202,7 +4880,10 @@ fn runtime_cancel_read_exact_append_mid_flight() {
             })
             .await;
 
-            assert!(result.is_err(), "read_exact_append should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "read_exact_append should have timed out: {result:?}"
+            );
 
             release_writer.set(true);
             sleep(Duration::from_millis(10))
@@ -4243,7 +4924,10 @@ fn runtime_cancel_read_exact_append_retains_pool_buffer_until_cqe() {
             })
             .await;
 
-            assert!(result.is_err(), "read_exact_append should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "read_exact_append should have timed out: {result:?}"
+            );
             assert_eq!(
                 pool.live_slots_for_test(),
                 1,
@@ -4274,7 +4958,10 @@ fn runtime_cancel_readv_mid_flight() {
             })
             .await;
 
-            assert!(result.is_err(), "readv should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "readv should have timed out: {result:?}"
+            );
 
             release_writer.set(true);
             sleep(Duration::from_millis(10))
@@ -4369,7 +5056,10 @@ fn runtime_cancel_readv_exact_mid_flight() {
             })
             .await;
 
-            assert!(result.is_err(), "readv_exact should have timed out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "readv_exact should have timed out: {result:?}"
+            );
             assert_eq!(
                 pool.live_slots_for_test(),
                 2,

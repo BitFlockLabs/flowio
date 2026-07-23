@@ -40,6 +40,7 @@
 
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::{Reactor, ReactorConfig, ReactorSubmitStatus};
+use crate::runtime::retained::RetainedPayload;
 use crate::runtime::task::{
     Task, TaskHeader, TaskVTable, cached_waker_ref, init_cached_waker, release_task,
     task_ptr_from_waker,
@@ -50,13 +51,16 @@ use crate::utils::memory::provider::MemoryProvider;
 use crate::utils::memory::provider_owned_pool::{ProviderOwnedPool, ProviderOwnedPoolControl};
 use io_uring::squeue;
 use std::alloc::{Layout, alloc};
+use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::mem::{align_of, size_of};
 use std::os::fd::OwnedFd;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::task::{Context, Poll, Waker};
@@ -94,8 +98,7 @@ macro_rules! define_runtime_stats {
         /// # {
         /// use flowio::runtime::executor::RuntimeStats;
         ///
-        /// let stats = RuntimeStats::default();
-        /// assert_eq!(stats.task_polls, 0);
+        /// let _stats = RuntimeStats::default();
         /// # }
         /// ```
         #[derive(Clone, Copy, Default)]
@@ -131,6 +134,9 @@ macro_rules! define_runtime_stats {
             /// expired timer.
             #[cfg(debug_assertions)]
             pub waiter_wakes: usize,
+            /// Successful FlowIO task poll-context extractions.
+            #[cfg(debug_assertions)]
+            pub poll_context_extractions: usize,
             /// Readiness completions whose owner-thread `accept4` found no
             /// queued connection or association and rearmed the one-shot poll.
             #[cfg(debug_assertions)]
@@ -515,7 +521,7 @@ fn close_worker_loop(receiver: Receiver<OwnedFd>) {
 }
 
 /// Ensures a worker cannot remain reachable through unfinished task cycles if
-/// a user future's destructor unwinds during executor shutdown.
+/// any earlier executor shutdown phase unwinds.
 struct CloseWorkerShutdownGuard {
     worker: *mut CloseWorker,
 }
@@ -532,6 +538,49 @@ impl Drop for CloseWorkerShutdownGuard {
         // ExecutorState and keeps that state alive until after guard drop.
         unsafe {
             (*self.worker).shutdown();
+        }
+    }
+}
+
+type TaskPanic = Box<dyn Any + Send + 'static>;
+
+/// Owns the executor's reference while a task completes or is cancelled.
+///
+/// Taking the pointer before release prevents a panic from the final task
+/// destructor from causing a second release while this guard unwinds.
+struct ExecutorTaskRefGuard {
+    task: *mut TaskHeader,
+}
+
+impl ExecutorTaskRefGuard {
+    #[inline(always)]
+    fn new(task: *mut TaskHeader) -> Self {
+        Self { task }
+    }
+
+    #[inline(always)]
+    fn release(mut self) {
+        let task = std::mem::replace(&mut self.task, std::ptr::null_mut());
+        if !task.is_null() {
+            // SAFETY: the task lifecycle transition transfers exactly the
+            // executor-owned reference for this live task into the guard.
+            unsafe {
+                release_task(task);
+            }
+        }
+    }
+}
+
+impl Drop for ExecutorTaskRefGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !self.task.is_null() {
+            // SAFETY: a non-null pointer still represents the one
+            // executor-owned reference transferred into this guard.
+            unsafe {
+                release_task(self.task);
+            }
+            self.task = std::ptr::null_mut();
         }
     }
 }
@@ -566,12 +615,39 @@ struct ExecutorState {
     timers: TimerRuntime,
     /// Persistent counters and run lifecycle state.
     runtime_state: RuntimeState,
-    /// Task currently being polled, or null outside a task poll.
-    owner_task: *mut TaskHeader,
     /// Set after one-time intrusive/runtime initialization is complete.
     initialized: bool,
     /// Prevents teardown wakeups from re-entering the ready queue.
     shutting_down: bool,
+    /// Set only after tasks, timers, reactor, and close worker all shut down.
+    shutdown_complete: bool,
+}
+
+/// Completes timer cancellation and reactor retirement after task shutdown.
+///
+/// The guard preserves the required tasks -> timers -> reactor ordering even
+/// if task cancellation or task-reference release unwinds unexpectedly.
+struct RuntimeShutdownGuard {
+    state: *mut ExecutorState,
+}
+
+impl RuntimeShutdownGuard {
+    fn new(state: *mut ExecutorState) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for RuntimeShutdownGuard {
+    fn drop(&mut self) {
+        // SAFETY: shutdown_owner creates this guard from its heap-stable
+        // ExecutorState and keeps the state alive until after guard drop.
+        unsafe {
+            (*self.state).timers.cancel_all_for_shutdown();
+            let runtime_state = std::ptr::addr_of_mut!((*self.state).runtime_state);
+            let ready_queue = std::ptr::addr_of_mut!((*self.state).ready_queue);
+            (*self.state).reactor.shutdown(runtime_state, ready_queue);
+        }
+    }
 }
 
 /// Stable origin identity retained by runtime-owned slots.
@@ -741,7 +817,12 @@ pub(crate) fn poll_ctx_from_waker(cx: &std::task::Context<'_>) -> io::Result<Pol
         return Err(inactive_poll_context_error());
     }
 
-    Ok(PollCtx { owner, task })
+    let pctx = PollCtx { owner, task };
+    #[cfg(debug_assertions)]
+    unsafe {
+        (*pctx.runtime_state()).stats.poll_context_extractions += 1;
+    }
+    Ok(pctx)
 }
 
 /// Validates the current FlowIO poll context before an I/O future completes
@@ -828,7 +909,9 @@ pub(crate) unsafe fn completed_op_ctx_from_waker(
 /// Invalid or foreign polls are remembered so completion returns
 /// `NotConnected`; a valid foreign FlowIO task may still be registered so the
 /// original reactor can notify it through its stable executor owner after the
-/// CQE.
+/// CQE. Returns `true` when reactor teardown abandoned the operation without
+/// observing its target CQE; callers may report that terminal condition only
+/// when doing so cannot expose a retained kernel-visible caller payload.
 ///
 /// # Safety
 ///
@@ -837,13 +920,13 @@ pub(crate) unsafe fn completed_op_ctx_from_waker(
 pub(crate) unsafe fn refresh_op_waiter_from_waker(
     cx: &std::task::Context<'_>,
     state_ptr: *mut CompletionState,
-) {
+) -> bool {
     debug_assert!(
         !state_ptr.is_null(),
         "cannot refresh waiter for a missing completion state"
     );
     if state_ptr.is_null() {
-        return;
+        return false;
     }
 
     let state = unsafe { &mut *state_ptr };
@@ -851,6 +934,9 @@ pub(crate) unsafe fn refresh_op_waiter_from_waker(
         !state.is_completed(),
         "cannot refresh a completed operation"
     );
+    if state.is_ring_abandoned() {
+        return true;
+    }
     match poll_ctx_from_waker(cx) {
         Ok(pctx) => {
             if state.owner_ptr() != pctx.owner_ptr() {
@@ -860,6 +946,7 @@ pub(crate) unsafe fn refresh_op_waiter_from_waker(
         }
         Err(_) => state.set_context_rejected(),
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +964,45 @@ struct JoinTask<F: Future> {
     /// Last join-handle waker registered while waiting for the result. Woken
     /// once when the spawned future stores its output.
     join_waker: Option<Waker>,
+}
+
+/// Clears a pinned future slot after destroying its value at the pinned
+/// address, including when that destructor unwinds.
+struct PinnedFutureSlotClearGuard<F> {
+    slot: *mut Option<F>,
+}
+
+impl<F> Drop for PinnedFutureSlotClearGuard<F> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: drop_join_future_in_place creates this guard for its live,
+        // exclusively borrowed slot after selecting the contained value. That
+        // value has completed drop (normally or by unwind), so overwrite the
+        // stale representation without attempting a second drop.
+        unsafe {
+            self.slot.write(None);
+        }
+    }
+}
+
+/// Destroys a previously pinned join-task future without moving it.
+///
+/// # Safety
+///
+/// `slot` must point to a live, exclusively borrowed `Option<F>`. Its `Some`
+/// value, if present, must no longer be polled or otherwise accessed after
+/// this call begins.
+#[inline(always)]
+unsafe fn drop_join_future_in_place<F>(slot: *mut Option<F>) {
+    let future_ptr = match unsafe { &mut *slot } {
+        Some(future) => future as *mut F,
+        None => return,
+    };
+    let clear_slot = PinnedFutureSlotClearGuard { slot };
+    unsafe {
+        std::ptr::drop_in_place(future_ptr);
+    }
+    drop(clear_slot);
 }
 
 /// Error returned when a spawned task cannot produce its output.
@@ -1084,6 +1210,11 @@ pub struct Executor {
     last_stats: RuntimeStats,
 }
 
+#[inline(always)]
+fn timers_pending_after_processing(timers_pending: bool, recheck: impl FnOnce() -> bool) -> bool {
+    timers_pending && recheck()
+}
+
 impl Executor {
     /// Returns the configured process quota for repository tests.
     #[cfg(any(test, feature = "test-support"))]
@@ -1160,9 +1291,9 @@ impl Executor {
                 all_tasks,
                 timers,
                 runtime_state: RuntimeState::new(),
-                owner_task: std::ptr::null_mut(),
                 initialized: false,
                 shutting_down: false,
+                shutdown_complete: false,
             }),
             // The owner is constructed on the executor's owner thread.
             #[cfg(debug_assertions)]
@@ -1449,15 +1580,11 @@ impl Executor {
                     (header.flags.get() & !(TaskHeader::FLAG_QUEUED | TaskHeader::FLAG_NOTIFIED))
                         | TaskHeader::FLAG_RUNNING,
                 );
-                unsafe { std::ptr::addr_of_mut!((*state_ptr).owner_task).write(header_ptr) };
                 #[cfg(debug_assertions)]
                 unsafe {
                     (*state_ptr).runtime_state.stats.task_polls += 1;
                 }
                 let poll_res = unsafe { (header.vtable.poll)(header_ptr) };
-                unsafe {
-                    std::ptr::addr_of_mut!((*state_ptr).owner_task).write(std::ptr::null_mut())
-                };
                 if let Poll::Ready(()) = poll_res {
                     // Batch: clear RUNNING+NOTIFIED+QUEUED, set COMPLETED.
                     header.flags.set(
@@ -1470,8 +1597,24 @@ impl Executor {
                     unsafe {
                         debug_assert!((*state_ptr).runtime_state.live_tasks > 0);
                         (*state_ptr).runtime_state.live_tasks -= 1;
-                        (header.vtable.finish)(header_ptr);
-                        release_task(header_ptr);
+                    }
+                    let task_ref = ExecutorTaskRefGuard::new(header_ptr);
+                    let finish = header.vtable.finish;
+                    let mut first_panic = None;
+                    retain_first_task_panic(
+                        &mut first_panic,
+                        catch_unwind(AssertUnwindSafe(|| unsafe {
+                            finish(header_ptr);
+                        })),
+                    );
+                    retain_first_task_panic(
+                        &mut first_panic,
+                        catch_unwind(AssertUnwindSafe(|| {
+                            task_ref.release();
+                        })),
+                    );
+                    if let Some(payload) = first_panic {
+                        resume_unwind(payload);
                     }
                 } else {
                     let flags = header.flags.get();
@@ -1513,7 +1656,9 @@ impl Executor {
                 false
             };
             let queue_empty = unsafe { (*state_ptr).ready_queue.is_empty() };
-            let timers_pending_after = unsafe { (*state_ptr).timers.has_pending() };
+            let timers_pending_after = timers_pending_after_processing(timers_pending, || unsafe {
+                (*state_ptr).timers.has_pending()
+            });
             let drained = unsafe { (*state_ptr).runtime_state.live_tasks == 0 }
                 && unsafe { (*state_ptr).runtime_state.inflight_ops == 0 }
                 && !timers_pending_after
@@ -1608,12 +1753,14 @@ impl Executor {
     }
 
     /// Cancels every unfinished task while leaving completed slots available
-    /// to escaped join handles.
-    fn shutdown_tasks(&mut self) {
+    /// to escaped join handles. The first cancellation panic is retained while
+    /// the remaining tasks are drained.
+    fn shutdown_tasks(&mut self) -> Option<TaskPanic> {
         let state_ptr = self.owner.state_ptr();
         unsafe {
             (*state_ptr).shutting_down = true;
         }
+        let mut first_panic = None;
 
         loop {
             let task_ptr = unsafe {
@@ -1649,35 +1796,71 @@ impl Executor {
             unsafe {
                 debug_assert!((*state_ptr).runtime_state.live_tasks > 0);
                 (*state_ptr).runtime_state.live_tasks -= 1;
-                (header.vtable.cancel)(task_ptr);
-                release_task(task_ptr);
             }
+            let task_ref = ExecutorTaskRefGuard::new(task_ptr);
+            let cancel = header.vtable.cancel;
+            let cancel_result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                cancel(task_ptr);
+            }));
+            retain_first_task_panic(&mut first_panic, cancel_result);
+
+            let release_result = catch_unwind(AssertUnwindSafe(|| {
+                task_ref.release();
+            }));
+            retain_first_task_panic(&mut first_panic, release_result);
         }
 
         unsafe {
-            (*state_ptr).owner_task = std::ptr::null_mut();
             (*state_ptr).ready_queue.unlink_all_for_drop();
         }
+        first_panic
     }
 
     fn shutdown_owner(&mut self) {
         let state_ptr = self.owner.state_ptr();
-        if unsafe { !(*state_ptr).initialized || (*state_ptr).shutting_down } {
+        if unsafe { !(*state_ptr).initialized || (*state_ptr).shutdown_complete } {
             return;
         }
 
         let owner_ptr = Rc::as_ptr(&self.owner);
-        let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
-        let _close_worker_guard = CloseWorkerShutdownGuard::new(unsafe {
-            std::ptr::addr_of_mut!((*state_ptr).close_worker)
-        });
-        self.shutdown_tasks();
+        let first_panic = {
+            let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
+            let _close_worker_guard = CloseWorkerShutdownGuard::new(unsafe {
+                std::ptr::addr_of_mut!((*state_ptr).close_worker)
+            });
+            let _runtime_shutdown_guard = RuntimeShutdownGuard::new(state_ptr);
+            self.shutdown_tasks()
+        };
+
         unsafe {
-            (*state_ptr).timers.cancel_all_for_shutdown();
-            let runtime_state = std::ptr::addr_of_mut!((*state_ptr).runtime_state);
-            let ready_queue = std::ptr::addr_of_mut!((*state_ptr).ready_queue);
-            (*state_ptr).reactor.shutdown(runtime_state, ready_queue);
+            (*state_ptr).shutdown_complete = true;
         }
+        if let Some(payload) = first_panic {
+            if std::thread::panicking() {
+                // Executor::drop may run while another panic is already
+                // unwinding this thread. Resuming, or merely dropping, a user
+                // panic payload here could start a second panic and abort the
+                // process after teardown has otherwise completed.
+                std::mem::forget(payload);
+            } else {
+                resume_unwind(payload);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn retain_first_task_panic(first_panic: &mut Option<TaskPanic>, result: Result<(), TaskPanic>) {
+    let Err(payload) = result else {
+        return;
+    };
+    if first_panic.is_none() {
+        *first_panic = Some(payload);
+    } else {
+        // Panic payloads may themselves have a panicking destructor. Once the
+        // first user panic is retained, intentionally leak later payloads so
+        // they cannot replace it or interrupt the remaining shutdown phases.
+        std::mem::forget(payload);
     }
 }
 
@@ -1762,7 +1945,9 @@ unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
 
 /// Release a future-owned `CompletionState` pointer from `Drop`.
 /// Completed ops are freed immediately; pending ops are orphaned and cancelled.
-/// The caller's pointer is always cleared.
+/// Ring-abandoned ops remain leaked because no target CQE proved that their
+/// kernel-visible storage may be reclaimed. The caller's pointer is always
+/// cleared.
 ///
 /// # Safety
 ///
@@ -1777,7 +1962,10 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
     }
 
     unsafe {
-        if (*state_ptr).is_completed() {
+        if (*state_ptr).is_ring_abandoned() {
+            // Ring-abandoned state and payload storage are deliberately leaked:
+            // no target CQE proved that the kernel released its references.
+        } else if (*state_ptr).is_completed() {
             free_op_unchecked(state_ptr);
         } else {
             cancel_op_unchecked(state_ptr);
@@ -1785,6 +1973,58 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
     }
 
     *ptr = std::ptr::null_mut();
+}
+
+/// Owns an allocated completion-state slot until its target SQE is submitted.
+///
+/// The guard is shared by I/O families that must keep the state local while
+/// fallible or user-controlled preparation runs. Dropping it returns the
+/// unsubmitted slot; successful submission consumes it without a conditional
+/// drop branch and publishes the state pointer to the future.
+pub(crate) struct UnsubmittedOpGuard {
+    /// Reactor that owns the allocated completion-state slot.
+    reactor: NonNull<Reactor>,
+    /// Allocated slot that must be returned unless submission succeeds.
+    state: NonNull<CompletionState>,
+}
+
+impl UnsubmittedOpGuard {
+    /// # Safety
+    ///
+    /// `reactor` and `state` must be non-null; `state` must be a live,
+    /// unsubmitted completion state allocated by `reactor` and uniquely owned
+    /// by the returned guard.
+    #[inline(always)]
+    pub(crate) unsafe fn new(reactor: *mut Reactor, state: *mut CompletionState) -> Self {
+        debug_assert!(
+            !reactor.is_null(),
+            "unsubmitted op reactor must be non-null"
+        );
+        debug_assert!(!state.is_null(), "unsubmitted op state must be non-null");
+        Self {
+            reactor: unsafe { NonNull::new_unchecked(reactor) },
+            state: unsafe { NonNull::new_unchecked(state) },
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn state_ptr(&self) -> *mut CompletionState {
+        self.state.as_ptr()
+    }
+
+    /// Transfers the successfully submitted state to its future owner.
+    #[inline(always)]
+    pub(crate) fn into_state_ptr(self) -> *mut CompletionState {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.state.as_ptr()
+    }
+}
+
+impl Drop for UnsubmittedOpGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        unsafe { self.reactor.as_mut().free_op(self.state.as_ptr()) };
+    }
 }
 
 /// Submit an SQE and account for one tracked in-flight operation.
@@ -1835,6 +2075,34 @@ where
 {
     let reactor = pctx.reactor();
     let payload = unsafe { (*reactor).alloc_retained_payload(payload_value) };
+    unsafe { submit_initialized_retained_sqe(pctx, state_ptr, payload, build) }
+}
+
+/// Attach an already initialized retained payload, build its SQE, and submit
+/// it with normal in-flight accounting.
+///
+/// On error the retained payload is detached and returned to the caller so
+/// ownership and completion-state cleanup remain identical to the safe
+/// by-value submission path.
+///
+/// # Safety
+///
+/// `pctx` and `state_ptr` must belong to the same active reactor;
+/// `state_ptr` must be a live, exclusively owned state with no attached
+/// payload. `payload` must have been allocated by that reactor's retained
+/// pool. `build` may expose pointers into its payload only through the SQE
+/// returned for immediate submission.
+#[inline(always)]
+pub(crate) unsafe fn submit_initialized_retained_sqe<T: 'static, F>(
+    pctx: &PollCtx,
+    state_ptr: *mut crate::runtime::op::CompletionState,
+    payload: RetainedPayload<T>,
+    build: F,
+) -> Result<(), (io::Error, T)>
+where
+    F: FnOnce(&mut T) -> io::Result<squeue::Entry>,
+{
+    let reactor = pctx.reactor();
     unsafe { (*state_ptr).attach_retained_payload(payload) };
 
     let sqe = match build(unsafe { (*state_ptr).retained_payload_mut::<T>() }) {
@@ -2143,7 +2411,6 @@ where
                 let mut cx = Context::from_waker(waker);
                 match fut_pin.as_mut().poll(&mut cx) {
                     Poll::Ready(value) => {
-                        jt.future = None;
                         jt.result = Some(Ok(value));
                         if let Some(join_waker) = jt.join_waker.take() {
                             join_waker.wake();
@@ -2159,15 +2426,27 @@ where
                 // Drop only the future. The result and join_waker must survive
                 // for the JoinHandle to consume. They are cleaned up in destroy
                 // when the last reference (executor or JoinHandle) is released.
-                jt.future = None;
+                drop_join_future_in_place(std::ptr::addr_of_mut!(jt.future));
             },
             cancel: |ptr| unsafe {
                 let slot = &mut *(ptr as *mut Task<TASK_POOL_SIZE>);
                 let jt = &mut *(slot.data.as_mut_ptr() as *mut JoinTask<F>);
-                jt.future = None;
                 jt.result = Some(Err(JoinError::Cancelled));
+                let mut first_panic = None;
+                retain_first_task_panic(
+                    &mut first_panic,
+                    catch_unwind(AssertUnwindSafe(|| {
+                        drop_join_future_in_place(std::ptr::addr_of_mut!(jt.future));
+                    })),
+                );
                 if let Some(join_waker) = jt.join_waker.take() {
-                    join_waker.wake();
+                    retain_first_task_panic(
+                        &mut first_panic,
+                        catch_unwind(AssertUnwindSafe(|| join_waker.wake())),
+                    );
+                }
+                if let Some(payload) = first_panic {
+                    resume_unwind(payload);
                 }
             },
             destroy: |ptr| unsafe {
@@ -2206,6 +2485,9 @@ unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
         return;
     };
     let state = owner.state_ptr();
+    // `try_spawn`'s `shutting_down` check is the load-bearing gate that rejects
+    // new tasks during teardown. This wake-side check remains defense in depth
+    // against notifications raised while cancellation drains existing tasks.
     if unsafe { (*state).shutting_down } {
         return;
     }
@@ -2398,14 +2680,38 @@ pub(crate) unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    use crate::net::unix::UnixStream;
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    use crate::runtime::buffer::IoBuffReadWrite;
     #[cfg(not(miri))]
     use crate::runtime::fd::{RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed};
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    use crate::runtime::test_hooks;
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    use crate::runtime::timer::sleep;
     use std::cell::Cell;
+    #[cfg(not(miri))]
+    use std::cell::RefCell;
     use std::mem::ManuallyDrop;
     #[cfg(not(miri))]
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::rc::Rc;
     use std::task::{RawWaker, RawWakerVTable};
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    use std::time::Duration;
+
+    #[test]
+    fn ring_abandoned_waiter_refresh_reports_without_registering_waiter() {
+        let mut state = CompletionState::empty();
+        state.set_ring_abandoned();
+        let cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(unsafe { refresh_op_waiter_from_waker(&cx, &mut state) });
+        assert!(state.is_ring_abandoned());
+        assert!(!state.is_completed());
+        assert!(state.waiter.is_null());
+    }
 
     #[derive(Default)]
     struct CountedWakerStats {
@@ -2448,6 +2754,99 @@ mod tests {
     fn counted_waker(stats: &Rc<CountedWakerStats>) -> Waker {
         let data = Rc::into_raw(Rc::clone(stats)).cast();
         unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
+    }
+
+    #[test]
+    fn panicking_pinned_future_drop_stays_in_place_and_clears_its_slot() {
+        struct AddressSensitiveFuture {
+            pinned_at: Rc<Cell<*const Self>>,
+            drops: Rc<Cell<usize>>,
+            _pin: std::marker::PhantomPinned,
+        }
+
+        impl Future for AddressSensitiveFuture {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.as_ref().get_ref();
+                this.pinned_at.set(std::ptr::from_ref(this));
+                Poll::Ready(())
+            }
+        }
+
+        impl Drop for AddressSensitiveFuture {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.pinned_at.get(),
+                    std::ptr::from_ref(self),
+                    "pinned future moved before destruction"
+                );
+                self.drops.set(self.drops.get() + 1);
+                panic!("intentional pinned-future destructor panic");
+            }
+        }
+
+        let pinned_at = Rc::new(Cell::new(std::ptr::null()));
+        let drops = Rc::new(Cell::new(0));
+        let mut slot = Some(AddressSensitiveFuture {
+            pinned_at: Rc::clone(&pinned_at),
+            drops: Rc::clone(&drops),
+            _pin: std::marker::PhantomPinned,
+        });
+        let slot_ptr = std::ptr::addr_of_mut!(slot);
+        {
+            let future = unsafe {
+                // SAFETY: slot remains at this stack address until the helper
+                // destroys its contained future, and no other reference exists.
+                (*slot_ptr).as_mut().unwrap_unchecked()
+            };
+            let mut future = unsafe {
+                // SAFETY: the value remains in slot until it is dropped in place.
+                Pin::new_unchecked(future)
+            };
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(future.as_mut().poll(&mut cx).is_ready());
+        }
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            // SAFETY: slot is live and exclusively owned, and its completed
+            // future must never be polled again.
+            drop_join_future_in_place(slot_ptr);
+        }))
+        .expect_err("future destructor should unwind");
+        let message = unwind
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| unwind.downcast_ref::<String>().map(String::as_str));
+
+        assert_eq!(message, Some("intentional pinned-future destructor panic"));
+        assert_eq!(drops.get(), 1);
+        assert!(slot.is_none(), "panicking future remained in its task slot");
+    }
+
+    #[test]
+    fn absent_initial_timer_skips_post_processing_probe() {
+        let probes = Cell::new(0);
+        let pending = timers_pending_after_processing(false, || {
+            probes.set(probes.get() + 1);
+            true
+        });
+
+        assert!(!pending);
+        assert_eq!(probes.get(), 0);
+    }
+
+    #[test]
+    fn present_initial_timer_rechecks_after_processing() {
+        let probes = Cell::new(0);
+        let pending = timers_pending_after_processing(true, || {
+            probes.set(probes.get() + 1);
+            false
+        });
+
+        assert!(!pending);
+        assert_eq!(probes.get(), 1);
     }
 
     #[cfg(not(miri))]
@@ -2535,7 +2934,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(debug_assertions, not(miri)))]
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
     #[test]
     fn rejected_ring_close_returns_owner_for_direct_fallback() {
         let mut executor = Executor::new().expect("executor construction failed");
@@ -2548,11 +2947,19 @@ mod tests {
             })
             .expect("ring-close fallback run failed");
 
-        let stats = executor.last_stats();
-        assert_eq!(stats.close_linger_queries, 0);
-        assert_eq!(stats.close_ring_submissions, 0);
-        assert_eq!(stats.close_ring_fallbacks, 1);
-        assert_eq!(stats.close_direct_closes, 1);
+        assert_eq!(
+            test_hooks::raw_sqe_submit_failures_remaining(),
+            0,
+            "ring-close rejection hook was not consumed"
+        );
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.close_linger_queries, 0);
+            assert_eq!(stats.close_ring_submissions, 0);
+            assert_eq!(stats.close_ring_fallbacks, 1);
+            assert_eq!(stats.close_direct_closes, 1);
+        }
         assert!(raw_fd_is_closed(raw));
     }
 
@@ -2586,6 +2993,126 @@ mod tests {
         assert!(
             raw_fd_is_closed(raw),
             "joined close worker must retire the pending task descriptor"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn normal_completion_destructor_panic_releases_task_and_owner() {
+        struct ReadyThenPanic {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for ReadyThenPanic {
+            type Output = usize;
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Ready(77)
+            }
+        }
+
+        impl Drop for ReadyThenPanic {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                panic!("intentional normal-completion destructor panic");
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<usize>>));
+        let mut executor =
+            ManuallyDrop::new(Executor::new().expect("executor construction failed"));
+        let weak_owner = Rc::downgrade(&executor.owner);
+        let initial_owner_refs = Rc::strong_count(&executor.owner);
+        assert_eq!(initial_owner_refs, 1);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            executor.run({
+                let polls = Rc::clone(&polls);
+                let drops = Rc::clone(&drops);
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    let handle = Executor::spawn(ReadyThenPanic { polls, drops })
+                        .expect("ready task spawn failed");
+                    *handle_slot.borrow_mut() = Some(handle);
+                }
+            })
+        }))
+        .expect_err("normal-completion destructor should unwind the run");
+        let message = unwind
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| unwind.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("intentional normal-completion destructor panic"),
+            "executor must preserve the user destructor panic"
+        );
+        assert_eq!(polls.get(), 1, "ready future poll count");
+        assert_eq!(drops.get(), 1, "ready future destructor count");
+
+        let state_ptr = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 0);
+            assert!((*state_ptr).ready_queue.is_empty());
+            assert!(
+                !(*state_ptr).all_tasks.is_empty(),
+                "surviving join handle should retain the completed task slot"
+            );
+            #[cfg(debug_assertions)]
+            {
+                assert_eq!((*state_ptr).runtime_state.stats.task_allocs, 2);
+                assert_eq!((*state_ptr).runtime_state.stats.task_frees, 1);
+            }
+        }
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs + 1,
+            "only the surviving completed task may retain the executor owner"
+        );
+
+        let mut handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("completed task handle disappeared");
+        assert!(handle.is_finished(), "completed output was not published");
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut cx),
+            Poll::Ready(Ok(77))
+        ));
+        drop(handle);
+
+        unsafe {
+            assert!((*state_ptr).all_tasks.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                (*state_ptr).runtime_state.stats.task_frees,
+                (*state_ptr).runtime_state.stats.task_allocs,
+                "normal-completion panic leaked a task slot"
+            );
+        }
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs,
+            "completed task retained the executor owner after handle drop"
+        );
+
+        executor
+            .run(async {})
+            .expect("executor should remain reusable after completion unwind");
+        let drop_result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut executor);
+        }));
+        assert!(drop_result.is_ok(), "executor shutdown panicked again");
+        assert_eq!(drops.get(), 1, "future destructor ran more than once");
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "completed task retained an executor owner pin"
         );
     }
 
@@ -2636,6 +3163,407 @@ mod tests {
             raw_fd_is_closed(raw),
             "unwind guard must join after the descriptor reaches the worker"
         );
+    }
+
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    #[test]
+    fn shutdown_drains_io_timer_and_worker_before_resuming_task_destructor_panic() {
+        struct DropTrackedBuffer {
+            bytes: Vec<u8>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Drop for DropTrackedBuffer {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        // SAFETY: bytes owns pointer-stable initialized storage and these
+        // methods never grow its allocation. The runtime publishes no more
+        // than writable_len() bytes.
+        unsafe impl IoBuffReadWrite for DropTrackedBuffer {
+            fn as_mut_ptr(&mut self) -> *mut u8 {
+                self.bytes.as_mut_ptr()
+            }
+
+            fn writable_len(&self) -> usize {
+                self.bytes.capacity()
+            }
+
+            unsafe fn set_written_len(&mut self, len: usize) {
+                unsafe {
+                    self.bytes.set_len(len);
+                }
+            }
+        }
+
+        struct PanicAfterFuture<F, P: Any + Send> {
+            future: ManuallyDrop<F>,
+            payload: Option<P>,
+            panics: Rc<Cell<usize>>,
+        }
+
+        impl<F: Future, P: Any + Send> Future for PanicAfterFuture<F, P> {
+            type Output = F::Output;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = unsafe { self.get_unchecked_mut() };
+                // SAFETY: the wrapper never moves the inner future after it is
+                // pinned, and Drop destroys it exactly once.
+                unsafe { Pin::new_unchecked(&mut *this.future) }.poll(cx)
+            }
+        }
+
+        impl<F, P: Any + Send> Drop for PanicAfterFuture<F, P> {
+            fn drop(&mut self) {
+                // Drop the submitted operation first so shutdown must retire
+                // its retained payload after catching the intentional panic.
+                unsafe {
+                    ManuallyDrop::drop(&mut self.future);
+                }
+                self.panics.set(self.panics.get() + 1);
+                std::panic::panic_any(
+                    self.payload
+                        .take()
+                        .expect("panicking future payload already taken"),
+                );
+            }
+        }
+
+        struct SecondaryPanicPayload;
+
+        impl Drop for SecondaryPanicPayload {
+            fn drop(&mut self) {
+                panic!("secondary panic payload must not be dropped");
+            }
+        }
+
+        struct DropCounter(Rc<Cell<usize>>);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let mut executor = Executor::new().expect("executor construction failed");
+        let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+        let buffer_drops = Rc::new(Cell::new(0));
+        let panic_count = Rc::new(Cell::new(0));
+        let secondary_panic_count = Rc::new(Cell::new(0));
+        let timer_task_drops = Rc::new(Cell::new(0));
+        let tail_task_drops = Rc::new(Cell::new(0));
+        let read_handle = Rc::new(RefCell::new(None::<JoinHandle<()>>));
+
+        let err = executor
+            .run({
+                let buffer_drops = Rc::clone(&buffer_drops);
+                let panic_count = Rc::clone(&panic_count);
+                let secondary_panic_count = Rc::clone(&secondary_panic_count);
+                let timer_task_drops = Rc::clone(&timer_task_drops);
+                let tail_task_drops = Rc::clone(&tail_task_drops);
+                let read_handle_slot = Rc::clone(&read_handle);
+                async move {
+                    let read = async move {
+                        let buffer = DropTrackedBuffer {
+                            bytes: vec![0; 64],
+                            drops: buffer_drops,
+                        };
+                        let _ = reader.read(buffer, 64).await;
+                    };
+                    let handle = Executor::spawn(PanicAfterFuture {
+                        future: ManuallyDrop::new(read),
+                        payload: Some("intentional submitted-task destructor panic"),
+                        panics: panic_count,
+                    })
+                    .expect("submitted read task spawn failed");
+                    *read_handle_slot.borrow_mut() = Some(handle);
+
+                    let timer = async move {
+                        let _drop_counter = DropCounter(timer_task_drops);
+                        let _ = sleep(Duration::from_secs(3_600)).await;
+                    };
+                    let timer_handle = Executor::spawn(PanicAfterFuture {
+                        future: ManuallyDrop::new(timer),
+                        payload: Some(SecondaryPanicPayload),
+                        panics: secondary_panic_count,
+                    })
+                    .expect("timer task spawn failed");
+                    drop(timer_handle);
+
+                    let tail_handle = Executor::spawn(async move {
+                        let _drop_counter = DropCounter(tail_task_drops);
+                        std::future::pending::<()>().await;
+                    })
+                    .expect("tail task spawn failed");
+                    drop(tail_handle);
+
+                    test_hooks::fail_next_ring_wait_errno(libc::EIO);
+                }
+            })
+            .expect_err("injected post-submit wait error should stop the run");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(test_hooks::ring_wait_failures_remaining(), 0);
+        assert_eq!(buffer_drops.get(), 0, "retained buffer dropped early");
+        assert_eq!(panic_count.get(), 0, "task dropped before shutdown");
+        assert_eq!(secondary_panic_count.get(), 0, "timer task dropped early");
+        assert_eq!(timer_task_drops.get(), 0, "timer task dropped early");
+        assert_eq!(tail_task_drops.get(), 0, "tail task dropped early");
+
+        let state_ptr = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 3);
+            assert_eq!((*state_ptr).runtime_state.inflight_ops, 1);
+            assert!((*state_ptr).timers.has_pending(), "timer was not armed");
+            assert!(!(*state_ptr).shutdown_complete);
+        }
+        assert!(
+            !read_handle
+                .borrow()
+                .as_ref()
+                .expect("read handle missing")
+                .is_finished()
+        );
+        let join_waker_stats = Rc::new(CountedWakerStats::default());
+        {
+            let mut handle_slot = read_handle.borrow_mut();
+            let handle = handle_slot.as_mut().expect("read handle missing");
+            let waker = counted_waker(&join_waker_stats);
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(handle).poll(&mut cx).is_pending());
+        }
+        assert_eq!(join_waker_stats.wakes.get(), 0);
+        drop(writer);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| executor.shutdown_owner()))
+            .expect_err("submitted task destructor should unwind shutdown");
+        let message = unwind
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| unwind.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("intentional submitted-task destructor panic"),
+            "shutdown must preserve the first user panic"
+        );
+
+        assert_eq!(panic_count.get(), 1, "user destructor panic count");
+        assert_eq!(
+            secondary_panic_count.get(),
+            1,
+            "secondary destructor panic count"
+        );
+        assert_eq!(timer_task_drops.get(), 1, "later timer task drop count");
+        assert_eq!(tail_task_drops.get(), 1, "tail task drop count");
+        assert_eq!(buffer_drops.get(), 1, "retained buffer drop count");
+        assert_eq!(
+            join_waker_stats.wakes.get(),
+            1,
+            "cancelled join handle was not woken"
+        );
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 0);
+            assert_eq!((*state_ptr).runtime_state.inflight_ops, 0);
+            assert!(!(*state_ptr).timers.has_pending());
+            assert!((*state_ptr).all_tasks.is_empty());
+            assert!((*state_ptr).ready_queue.is_empty());
+            assert!((*state_ptr).close_worker.sender.is_none());
+            assert!((*state_ptr).close_worker.worker.is_none());
+            assert!((*state_ptr).shutdown_complete);
+        }
+
+        let mut handle = read_handle
+            .borrow_mut()
+            .take()
+            .expect("read handle disappeared");
+        assert!(
+            handle.is_finished(),
+            "cancellation was not published before the destructor panic"
+        );
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut cx),
+            Poll::Ready(Err(JoinError::Cancelled))
+        ));
+        drop(handle);
+        #[cfg(debug_assertions)]
+        unsafe {
+            assert_eq!(
+                (*state_ptr).runtime_state.stats.task_frees,
+                (*state_ptr).runtime_state.stats.task_allocs,
+                "shutdown leaked a task allocation"
+            );
+        }
+
+        executor.shutdown_owner();
+        assert_eq!(panic_count.get(), 1, "completed shutdown ran twice");
+        assert_eq!(
+            secondary_panic_count.get(),
+            1,
+            "secondary destructor ran twice"
+        );
+        assert_eq!(timer_task_drops.get(), 1, "timer task dropped twice");
+        assert_eq!(tail_task_drops.get(), 1, "tail task dropped twice");
+        assert_eq!(buffer_drops.get(), 1, "retained buffer dropped twice");
+        drop(executor);
+        assert_eq!(panic_count.get(), 1, "executor drop reran shutdown");
+        assert_eq!(
+            secondary_panic_count.get(),
+            1,
+            "executor drop reran secondary destructor"
+        );
+        assert_eq!(timer_task_drops.get(), 1, "executor drop reran timer task");
+        assert_eq!(tail_task_drops.get(), 1, "executor drop reran tail task");
+        assert_eq!(buffer_drops.get(), 1, "executor drop reran retained drop");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn shutdown_rejects_task_destructor_spawn_without_queueing_child() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum SpawnOutcome {
+            NotAttempted,
+            NoExecutor,
+            OtherError,
+            Admitted,
+        }
+
+        struct TrackedChild {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for TrackedChild {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Pending
+            }
+        }
+
+        impl Drop for TrackedChild {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        struct SpawnChildOnDrop {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+            child_polls: Rc<Cell<usize>>,
+            child_drops: Rc<Cell<usize>>,
+            outcome: Rc<Cell<SpawnOutcome>>,
+            expected_owner: *const ExecutorOwner,
+            saw_active_shutdown_context: Rc<Cell<bool>>,
+        }
+
+        impl Future for SpawnChildOnDrop {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Pending
+            }
+        }
+
+        impl Drop for SpawnChildOnDrop {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                let active_owner = EXECUTOR_CTX.with(Cell::get);
+                let active_owner_is_expected = active_owner == self.expected_owner;
+                let active_owner_is_shutting_down = active_owner_is_expected
+                    && unsafe { (*(*active_owner).state_ptr()).shutting_down };
+                self.saw_active_shutdown_context
+                    .set(active_owner_is_shutting_down);
+                let child = TrackedChild {
+                    polls: Rc::clone(&self.child_polls),
+                    drops: Rc::clone(&self.child_drops),
+                };
+                match Executor::try_spawn(child) {
+                    Err(TrySpawnError::NoExecutor { future }) => {
+                        self.outcome.set(SpawnOutcome::NoExecutor);
+                        drop(future);
+                    }
+                    Err(error) => {
+                        self.outcome.set(SpawnOutcome::OtherError);
+                        drop(error.into_future());
+                    }
+                    Ok(handle) => {
+                        self.outcome.set(SpawnOutcome::Admitted);
+                        drop(handle);
+                    }
+                }
+            }
+        }
+
+        let parent_polls = Rc::new(Cell::new(0));
+        let parent_drops = Rc::new(Cell::new(0));
+        let child_polls = Rc::new(Cell::new(0));
+        let child_drops = Rc::new(Cell::new(0));
+        let outcome = Rc::new(Cell::new(SpawnOutcome::NotAttempted));
+        let saw_active_shutdown_context = Rc::new(Cell::new(false));
+        let mut executor = Executor::new().expect("executor construction failed");
+        let expected_owner = Rc::as_ptr(&executor.owner);
+        assert!(size_of::<JoinTask<TrackedChild>>() <= TASK_POOL_SIZE);
+        assert!(align_of::<JoinTask<TrackedChild>>() <= TASK_DATA_ALIGN);
+
+        let err = executor
+            .run(SpawnChildOnDrop {
+                polls: Rc::clone(&parent_polls),
+                drops: Rc::clone(&parent_drops),
+                child_polls: Rc::clone(&child_polls),
+                child_drops: Rc::clone(&child_drops),
+                outcome: Rc::clone(&outcome),
+                expected_owner,
+                saw_active_shutdown_context: Rc::clone(&saw_active_shutdown_context),
+            })
+            .expect_err("pending task should leave the executor stalled");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+        assert_eq!(parent_polls.get(), 1);
+        assert_eq!(parent_drops.get(), 0);
+
+        let state_ptr = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 1);
+            assert!(!(*state_ptr).all_tasks.is_empty());
+            assert!((*state_ptr).ready_queue.is_empty());
+            assert!(!(*state_ptr).shutdown_complete);
+            #[cfg(debug_assertions)]
+            {
+                assert_eq!((*state_ptr).runtime_state.stats.task_allocs, 1);
+                assert_eq!((*state_ptr).runtime_state.stats.task_frees, 0);
+            }
+        }
+
+        executor.shutdown_owner();
+
+        assert!(
+            saw_active_shutdown_context.get(),
+            "task destructor did not observe its active owner in shutdown"
+        );
+        assert_eq!(outcome.get(), SpawnOutcome::NoExecutor);
+        assert_eq!(parent_drops.get(), 1);
+        assert_eq!(child_polls.get(), 0, "rejected child future was polled");
+        assert_eq!(child_drops.get(), 1, "returned child future drop count");
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 0);
+            assert!((*state_ptr).all_tasks.is_empty());
+            assert!((*state_ptr).ready_queue.is_empty());
+            assert!((*state_ptr).shutdown_complete);
+            #[cfg(debug_assertions)]
+            {
+                assert_eq!((*state_ptr).runtime_state.stats.task_allocs, 1);
+                assert_eq!((*state_ptr).runtime_state.stats.task_frees, 1);
+            }
+        }
+
+        executor.shutdown_owner();
+        drop(executor);
+        assert_eq!(parent_drops.get(), 1, "parent destructor ran twice");
+        assert_eq!(child_drops.get(), 1, "returned child was dropped twice");
     }
 
     #[cfg(not(miri))]

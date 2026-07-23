@@ -1,10 +1,11 @@
 use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
+use flowio::test_support::net::resolver::lookup_ipv4;
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -186,7 +187,7 @@ fn resolve_host_rejects_empty_host_name() {
 }
 
 #[test]
-fn resolve_host_rejects_overlong_name_without_sending_dns() {
+fn resolve_host_rejects_invalid_query_names_without_sending_dns() {
     let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind test dns socket");
     server
@@ -206,11 +207,13 @@ fn resolve_host_rejects_overlong_name_without_sending_dns() {
     executor
         .run(async move {
             let resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
-            let err = resolver
-                .resolve_host(&host, 5432)
-                .await
-                .expect_err("overlong host should fail before DNS send");
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            for invalid_host in [host.as_str(), "db.example.test.."] {
+                let err = resolver
+                    .resolve_host(invalid_host, 5432)
+                    .await
+                    .expect_err("invalid host should fail before DNS send");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{invalid_host}");
+            }
         })
         .expect("executor run failed");
 
@@ -275,6 +278,114 @@ fn resolver_stops_nameserver_failover_on_timer_out_of_memory() {
     let err = second_server
         .recv_from(&mut buffer)
         .expect_err("timer allocation failure should stop nameserver failover");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn resolver_reuses_identical_query_after_nameserver_timeout() {
+    let first_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind first dns socket");
+    let first_nameserver = first_server
+        .local_addr()
+        .expect("failed to read first dns socket addr");
+
+    let second_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind second dns socket");
+    let second_nameserver = second_server
+        .local_addr()
+        .expect("failed to read second dns socket addr");
+    let expected_ip = Ipv4Addr::new(192, 0, 2, 74);
+    let second_thread = thread::spawn(move || {
+        second_server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("failed to set second dns socket timeout");
+        let mut buffer = [0u8; 512];
+        let (len, peer) = second_server
+            .recv_from(&mut buffer)
+            .expect("second nameserver did not receive the retry");
+        let query = buffer[..len].to_vec();
+        let response = build_response(&query, TestAnswer::A(expected_ip));
+        second_server
+            .send_to(&response, peer)
+            .expect("second nameserver failed to answer");
+        query
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![first_nameserver, second_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(30));
+            let addresses = lookup_ipv4(&resolver, "retry.example.test")
+                .await
+                .expect("second nameserver should answer after the first timeout");
+            assert_eq!(addresses, vec![IpAddr::V4(expected_ip)]);
+        })
+        .expect("executor run failed");
+
+    first_server
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("failed to set first dns socket timeout");
+    let mut first_buffer = [0u8; 512];
+    let (first_len, _) = first_server
+        .recv_from(&mut first_buffer)
+        .expect("first nameserver did not receive the initial query");
+    let second_query = second_thread.join().expect("second dns thread panicked");
+    assert_eq!(&first_buffer[..first_len], second_query);
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn resolver_restores_query_after_send_submission_failure() {
+    let first_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind first dns socket");
+    let first_nameserver = first_server
+        .local_addr()
+        .expect("failed to read first dns socket addr");
+
+    let second_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind second dns socket");
+    let second_nameserver = second_server
+        .local_addr()
+        .expect("failed to read second dns socket addr");
+    let expected_ip = Ipv4Addr::new(192, 0, 2, 75);
+    let second_thread = thread::spawn(move || {
+        second_server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("failed to set second dns socket timeout");
+        let mut buffer = [0u8; 512];
+        let (len, peer) = second_server
+            .recv_from(&mut buffer)
+            .expect("second nameserver did not receive the restored query");
+        let response = build_response(&buffer[..len], TestAnswer::A(expected_ip));
+        second_server
+            .send_to(&response, peer)
+            .expect("second nameserver failed to answer");
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![first_nameserver, second_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(100));
+            test_hooks::fail_next_sqe_submit();
+            let addresses = lookup_ipv4(&resolver, "submission.example.test")
+                .await
+                .expect("second nameserver should receive the restored query");
+            assert_eq!(addresses, vec![IpAddr::V4(expected_ip)]);
+        })
+        .expect("executor run failed");
+
+    second_thread.join().expect("second dns thread panicked");
+    first_server
+        .set_nonblocking(true)
+        .expect("failed to make first dns socket nonblocking");
+    let mut unexpected = [0u8; 512];
+    let err = first_server
+        .recv_from(&mut unexpected)
+        .expect_err("failed submission must not emit a first-server datagram");
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 }
 
@@ -1044,29 +1155,61 @@ fn resolve_host_accepts_sixteen_total_cname_hops() {
 }
 
 #[test]
-fn resolve_host_rejects_seventeen_total_cname_hops() {
-    let err = resolve_with_mock_dns(4, Duration::from_millis(200), |name, qtype| {
-        match (name, qtype) {
-            ("db.example.test", 1) => Some(TestAnswer::CnameChain {
+fn resolve_host_rejects_seventeen_total_cname_hops_without_nameserver_retry() {
+    let first_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind first dns socket");
+    let first_nameserver = first_server
+        .local_addr()
+        .expect("failed to read first dns socket addr");
+    let first_thread = thread::spawn(move || {
+        serve_dns_queries(first_server, 4, |name, qtype| match (name, qtype) {
+            ("db.example.test", 1) => TestAnswer::CnameChain {
                 names: &CNAME_TOTAL_INITIAL_15,
                 address: None,
-            }),
-            ("db.example.test", 28) => Some(TestAnswer::Empty),
-            ("total-followup.example.test", 1) => Some(TestAnswer::CnameChain {
+            },
+            ("db.example.test", 28) => TestAnswer::Empty,
+            ("total-followup.example.test", 1) => TestAnswer::CnameChain {
                 names: &CNAME_TOTAL_FOLLOWUP_2,
                 address: Some(Ipv4Addr::new(198, 51, 100, 117)),
-            }),
-            ("total-followup.example.test", 28) => Some(TestAnswer::Empty),
-            _ => Some(TestAnswer::NxDomain),
-        }
-    })
-    .expect_err("a CNAME chain above the total hop limit should fail");
+            },
+            ("total-followup.example.test", 28) => TestAnswer::Empty,
+            _ => TestAnswer::NxDomain,
+        })
+    });
 
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(
-        err.to_string(),
-        "DNS resolution exceeded maximum total CNAME hop count",
-    );
+    let second_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind second dns socket");
+    let second_nameserver = second_server
+        .local_addr()
+        .expect("failed to read second dns socket addr");
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![first_nameserver, second_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let err = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect_err("a CNAME chain above the total hop limit should fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                err.to_string(),
+                "DNS resolution exceeded maximum total CNAME hop count",
+            );
+        })
+        .expect("executor run failed");
+
+    first_thread.join().expect("first dns thread panicked");
+    second_server
+        .set_nonblocking(true)
+        .expect("failed to make second dns socket nonblocking");
+    let mut unexpected = [0u8; 512];
+    let err = second_server
+        .recv_from(&mut unexpected)
+        .expect_err("CNAME hop-budget exhaustion must stop nameserver failover");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 }
 
 #[test]

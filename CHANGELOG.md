@@ -59,9 +59,39 @@ Alpha prereleases carry no compatibility guarantee.
   syscall.
 - Runtime dependencies have been refreshed while retaining the existing
   feature set and minimum supported Rust version.
+- Compatibility documentation now consistently states the binding Linux 5.11
+  runtime floor imposed by `IORING_ENTER_EXT_ARG`. The older
+  `IORING_OP_CLOSE` and 14-byte `SCTP_EVENTS` requirements do not lower that
+  floor or require a legacy SCTP subscription fallback.
+- Rich SCTP message operations now construct kernel-visible iovecs,
+  address/control storage, and self-referential message headers directly in
+  their retained completion payloads. Vectored receive and send futures no
+  longer stage iovec arrays, and scalar/vectored send moves the caller-owned
+  buffer only after every non-owning field is initialized; public API, wire
+  behavior, and completion-time ownership are unchanged.
+- Rich SCTP receive now decodes each caller-visible notification once and
+  reuses that result for discard recovery and returned metadata. FlowIO-only
+  forced notifications remain internal and parse-free; framing, visibility,
+  public API, and wire behavior are unchanged.
+- DNS response parsing now validates Authority and Additional record owners
+  and CNAME targets without materializing discarded strings. Answer-section
+  name handling, structural validation, response-code precedence, and
+  resolution behavior are unchanged.
 
 ### Fixed
 
+- DNS resolution now stops retrying other nameservers when a successfully
+  parsed CNAME chain exceeds the remaining total-hop budget. This local policy
+  failure still allows the sibling address family to supply a usable address.
+- DNS query normalization now removes at most one optional trailing root dot.
+  Names with repeated trailing dots return `InvalidInput` before query
+  allocation or DNS network I/O, while undotted and single-root-dot names retain
+  their existing wire form.
+- SCTP receive APIs now reject zero-length caller receive windows with
+  `InvalidInput` before kernel submission. This keeps a successful zero-byte
+  lean receive unambiguous as clean peer EOF and returns the rental buffer
+  unchanged on validation failure. Callers that used a zero-length lean
+  receive as a no-op now receive this error instead.
 - DNS response parsing now rejects non-QUERY opcodes before question,
   response-code, or resource-record handling. Candidate filtering remains
   allocation-free, while valid QUERY response behavior is unchanged.

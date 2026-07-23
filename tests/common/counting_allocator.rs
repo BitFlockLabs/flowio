@@ -10,6 +10,7 @@ static DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static FAIL_NEXT_SIZE: Cell<usize> = const { Cell::new(0) };
+    static COUNT_SIZE_ALLOCS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 fn should_fail(size: usize) -> bool {
@@ -22,6 +23,15 @@ fn should_fail(size: usize) -> bool {
     })
 }
 
+fn record_size_allocation(size: usize) {
+    COUNT_SIZE_ALLOCS.with(|state| {
+        let (target, allocations) = state.get();
+        if target == size {
+            state.set((target, allocations.saturating_add(1)));
+        }
+    });
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if should_fail(layout.size()) {
@@ -30,6 +40,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
+            record_size_allocation(layout.size());
         }
         ptr
     }
@@ -41,6 +52,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
+            record_size_allocation(layout.size());
         }
         ptr
     }
@@ -58,6 +70,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             DEALLOCS.fetch_add(1, Ordering::Relaxed);
+            record_size_allocation(new_size);
         }
         ptr
     }
@@ -82,6 +95,27 @@ pub fn assert_allocation_failure_consumed() {
     });
 }
 
+/// Starts counting successful allocations of exactly `size` bytes on this
+/// thread. Reallocations to that size count as allocations.
+#[allow(dead_code)]
+pub fn start_counting_allocations_of_size(size: usize) {
+    assert!(size > 0, "allocation count size must be nonzero");
+    COUNT_SIZE_ALLOCS.with(|state| {
+        let previous = state.replace((size, 0));
+        assert_eq!(previous.0, 0, "allocation-size counter already armed");
+    });
+}
+
+/// Stops the active size-specific counter and returns its allocation count.
+#[allow(dead_code)]
+pub fn finish_counting_allocations_of_size() -> usize {
+    COUNT_SIZE_ALLOCS.with(|state| {
+        let (size, allocations) = state.replace((0, 0));
+        assert_ne!(size, 0, "allocation-size counter was not armed");
+        allocations
+    })
+}
+
 #[derive(Clone, Copy)]
 pub struct AllocationSnapshot {
     allocs: usize,
@@ -89,6 +123,7 @@ pub struct AllocationSnapshot {
 }
 
 impl AllocationSnapshot {
+    #[allow(dead_code)]
     pub fn current() -> Self {
         Self {
             allocs: ALLOCS.load(Ordering::Relaxed),

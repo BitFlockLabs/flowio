@@ -138,16 +138,17 @@ pub fn sctp_parse_recv_meta(data: &[u8]) {
 pub fn sctp_parse_assoc_addrs(data: &[u8]) {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
-    let addr_count = data.first().map(|byte| (*byte as usize) % 8).unwrap_or(0);
-    let storage_len = match data.get(1).copied().unwrap_or_default() % 4 {
-        0 => 8,
-        1 => std::mem::size_of::<libc::sockaddr_in>(),
-        2 => std::mem::size_of::<libc::sockaddr_in6>(),
-        _ => std::mem::size_of::<libc::sockaddr_storage>(),
-    };
-    let payload = data.get(2..).unwrap_or_default();
+    let (addr_count, payload) = sctp_assoc_addrs_case(data);
 
-    let _ = crate::net::sctp::parse_assoc_addrs(payload, addr_count, storage_len);
+    let _ = crate::net::sctp::parse_assoc_addrs(payload, addr_count);
+}
+
+fn sctp_assoc_addrs_case(data: &[u8]) -> (usize, &[u8]) {
+    let addr_count = data.first().copied().unwrap_or_default() as usize;
+    // Byte one used to select synthetic entry layouts. Keep it reserved so
+    // the existing corpus continues to place packed address bytes at offset 2.
+    let payload = data.get(2..).unwrap_or_default();
+    (addr_count, payload)
 }
 
 /// Fuzz entry: the DNS response prefilter (`response_is_decodable_candidate`),
@@ -251,6 +252,12 @@ mod tests {
         input
     }
 
+    fn zero_reported_control_input(flag_byte: u8, reported_len: u8, payload: &[u8]) -> Vec<u8> {
+        let mut input = vec![flag_byte, 1, reported_len, 0xA5];
+        input.extend_from_slice(payload);
+        input
+    }
+
     fn checked_native_seed(seed: &'static [u8], synthesized: Vec<u8>) -> Vec<u8> {
         // The checked corpus encodes the 64-bit little-endian Linux C ABI used
         // by the full-hardening host. Other Linux ABIs exercise the same
@@ -324,6 +331,16 @@ mod tests {
     }
 
     #[test]
+    fn sctp_assoc_addrs_case_uses_full_count_byte_and_reserved_offset() {
+        let input = [u8::MAX, 0xA5, 0x11, 0x22, 0x33];
+        let (addr_count, payload) = sctp_assoc_addrs_case(&input);
+
+        assert_eq!(addr_count, u8::MAX as usize);
+        assert!(addr_count > 7);
+        assert_eq!(payload, &input[2..]);
+    }
+
+    #[test]
     fn sctp_recv_meta_wrapper_reaches_exact_data_and_notification_results() {
         let data_input = checked_native_seed(
             include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/valid_rcvinfo_unaligned"),
@@ -357,6 +374,48 @@ mod tests {
                 assoc_id: 42,
             })
         );
+    }
+
+    #[test]
+    fn sctp_recv_meta_wrapper_pins_zero_controllen_decision_seam() {
+        let no_rcvinfo = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/data_without_rcvinfo"),
+            zero_reported_control_input(0x08, 0, b"payload"),
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&no_rcvinfo)
+                .expect("EOR data without RCVINFO should parse"),
+            SctpRecvMeta::Data(SctpRecvInfo {
+                end_of_record: true,
+                ..SctpRecvInfo::default()
+            })
+        );
+
+        let missing_eor = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/data_without_rcvinfo_missing_eor"),
+            zero_reported_control_input(0, 0, b"payload"),
+        );
+        let error = observe_sctp_parse_recv_meta(&missing_eor)
+            .expect_err("nonempty data without EOR should still reject");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("end-of-record"));
+
+        let control_truncated = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/data_without_rcvinfo_ctrunc"),
+            zero_reported_control_input(0x0C, 0, b"payload"),
+        );
+        let error = observe_sctp_parse_recv_meta(&control_truncated)
+            .expect_err("MSG_CTRUNC without RCVINFO should still reject");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("control"));
+
+        let malformed_control = checked_native_seed(
+            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/malformed_present_control"),
+            zero_reported_control_input(0x08, 1, b"payload"),
+        );
+        let error = observe_sctp_parse_recv_meta(&malformed_control)
+            .expect_err("present malformed control should still reject");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -465,9 +524,8 @@ mod tests {
     fn sctp_recv_meta_wrapper_handles_empty_and_maximum_bounded_lengths() {
         assert_eq!(
             observe_sctp_parse_recv_meta(&[])
-                .expect_err("empty metadata must reject")
-                .kind(),
-            std::io::ErrorKind::InvalidData
+                .expect("empty data without ancillary metadata should parse"),
+            SctpRecvMeta::Data(SctpRecvInfo::default())
         );
 
         let maximum = checked_native_seed(

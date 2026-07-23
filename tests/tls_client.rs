@@ -7,10 +7,10 @@ use flowio::net::tls::{TlsClientOptions, TlsClientStream};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
-use flowio::runtime::timer::timeout;
+use flowio::runtime::timer::{TimeoutError, timeout};
 #[cfg(debug_assertions)]
 use flowio::test_support::net::tls_test_peer::{drain_available_client_hello, force_reset_on_drop};
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 use flowio::test_support::runtime::test_hooks;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
@@ -857,7 +857,7 @@ fn tls_partial_read_publishes_relative_iobuff_and_fresh_vec() {
     server.join().expect("server thread panicked");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn tls_staged_transport_future_drops_after_executor_teardown() {
     let (client_config, server_config, server_name, _) = make_client_server_configs();
@@ -1219,7 +1219,7 @@ fn tls_truncated_close_read_exact_returns_unexpected_eof() {
     server.join().expect("server thread panicked");
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn tls_userspace_destination_error_preserves_unpublished_length() {
     let (client_config, server_config, server_name, _) = make_client_server_configs();
@@ -1451,7 +1451,10 @@ fn tls_cancelled_read_does_not_poison_shutdown() {
                 res
             })
             .await;
-            assert!(result.is_err(), "silent peer read should time out");
+            assert!(
+                matches!(result, Err(TimeoutError::Elapsed)),
+                "silent peer read should time out: {result:?}"
+            );
 
             tls.shutdown()
                 .await

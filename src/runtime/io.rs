@@ -101,9 +101,13 @@ fn poll_nop_op(
                 return Poll::Ready(Err(e));
             }
         }
+        return Poll::Pending;
     }
 
-    unsafe { refresh_op_waiter_from_waker(cx, *state_ptr) };
+    if unsafe { refresh_op_waiter_from_waker(cx, *state_ptr) } {
+        unsafe { drop_op_ptr_unchecked(state_ptr) };
+        return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+    }
     Poll::Pending
 }
 
@@ -257,5 +261,43 @@ impl Drop for NopFuture<'_> {
     fn drop(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.slot.state_ptr) };
         self.slot.in_use = false;
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use crate::runtime::executor::Executor;
+
+    #[test]
+    fn ring_abandoned_nop_reports_not_connected_and_clears_its_pointer() {
+        let mut executor = Executor::new().expect("executor construction failed");
+
+        executor
+            .run(async {
+                std::future::poll_fn(|cx| {
+                    let pctx = poll_ctx_from_waker(cx).expect("FlowIO poll context missing");
+                    let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+                    assert!(!state_ptr.is_null(), "NOP test state allocation failed");
+                    unsafe { (*state_ptr).set_ring_abandoned() };
+                    let mut nop = Nop { state_ptr };
+
+                    assert!(matches!(
+                        Pin::new(&mut nop).poll(cx),
+                        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+                    ));
+                    assert!(nop.state_ptr.is_null());
+                    assert!(unsafe { (*state_ptr).is_ring_abandoned() });
+                    assert!(!unsafe { (*state_ptr).is_completed() });
+
+                    // This state was fabricated without an SQE or retained
+                    // payload, so the test may return it after observing the
+                    // production branch. Real abandoned states stay leaked.
+                    unsafe { (*pctx.reactor()).free_op(state_ptr) };
+                    Poll::Ready(())
+                })
+                .await;
+            })
+            .expect("ring-abandoned NOP test run failed");
     }
 }

@@ -5,7 +5,8 @@ use common::{
     TestIoBuffMut as IoBuffMut, TestProjected, TryCountMismatchedProjected, TryMismatchedProjected,
     TryOversizedProjected, connect_bounded_tcp_peer, fill_try_send_buffer,
     ipv6_loopback_capability_unavailable, make_payload_chain, make_read_chain,
-    make_read_only_chain, run_test, run_test_output, set_positive_linger, spawn_bounded_tcp_peer,
+    make_read_only_chain, poll_once_pending, run_test, run_test_output, set_positive_linger,
+    spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -14,7 +15,7 @@ use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{sleep, timeout};
 use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_preserves_unrelated_fd;
 use flowio::test_support::runtime::test_hooks;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
@@ -26,7 +27,7 @@ use std::time::Duration;
 
 const TCP_SHUTDOWN_FALLBACK_CHILD_ENV: &str = "FLOWIO_TCP_SHUTDOWN_FALLBACK_CHILD";
 const TCP_SHUTDOWN_FALLBACK_TEST: &str =
-    "runtime_tcp_shutdown_fallback_reclaims_readiness_state_with_watchdog";
+    "runtime_tcp_shutdown_fallback_abandons_unretired_readiness_state_with_watchdog";
 const TCP_UNSUBMITTED_READINESS_CHILD_ENV: &str = "FLOWIO_TCP_UNSUBMITTED_READINESS_CHILD";
 const TCP_UNSUBMITTED_READINESS_TEST: &str =
     "runtime_tcp_unsubmitted_readiness_retains_listener_fd_until_ring_safe";
@@ -74,6 +75,30 @@ fn connected_try_tcp_stream() -> (TcpStream, BoundedTcpStream) {
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
     (TcpStream::from_owned_fd(stream.into_inner().into()), peer)
+}
+
+#[test]
+fn runtime_tcp_initial_submissions_extract_poll_context_once() {
+    let mut listener =
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 4).expect("bind failed");
+    let addr = listener.local_addr();
+    let mut connector = TcpConnector::new();
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            poll_once_pending(listener.accept()).await;
+            poll_once_pending(connector.connect(addr).expect("connect init failed")).await;
+            poll_once_pending(TcpStream::connect(addr).expect("owned connect init failed")).await;
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        executor.last_stats().poll_context_extractions,
+        3,
+        "each TCP accept/connect submission should derive the validated context once"
+    );
 }
 
 #[test]
@@ -1304,7 +1329,7 @@ fn runtime_tcp_unsubmitted_readiness_retains_listener_fd_until_ring_safe() {
 }
 
 #[test]
-fn runtime_tcp_shutdown_fallback_reclaims_readiness_state_with_watchdog() {
+fn runtime_tcp_shutdown_fallback_abandons_unretired_readiness_state_with_watchdog() {
     if std::env::var_os(TCP_SHUTDOWN_FALLBACK_CHILD_ENV).is_none() {
         common::run_exact_test_child_with_watchdog(
             TCP_SHUTDOWN_FALLBACK_TEST,
@@ -1317,32 +1342,39 @@ fn runtime_tcp_shutdown_fallback_reclaims_readiness_state_with_watchdog() {
     let mut listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind failed");
     let addr = listener.local_addr();
+    let listener_fd = listener.as_raw_fd();
     set_positive_linger(listener.as_raw_fd());
     let mut executor = Executor::new_with_config(ExecutorConfig {
         reactor: ReactorConfig { ring_entries: 1 },
         ..ExecutorConfig::default()
     })
     .expect("failed to construct one-slot executor");
+    let staged = Rc::new(RefCell::new(Some(Box::pin(async move {
+        listener.accept().await
+    }))));
+    let staged_for_run = Rc::clone(&staged);
 
     let err = executor
         .run(async move {
-            let mut accept = Box::pin(listener.accept());
-            std::future::poll_fn(|cx| match Future::poll(accept.as_mut(), cx) {
-                Poll::Pending => Poll::Ready(()),
-                Poll::Ready(_) => panic!("accept completed before shutdown peer"),
+            std::future::poll_fn(|cx| {
+                let mut slot = staged_for_run.borrow_mut();
+                let accept = slot.as_mut().expect("staged TCP accept missing");
+                match Future::poll(accept.as_mut(), cx) {
+                    Poll::Pending => Poll::Ready(()),
+                    Poll::Ready(_) => panic!("accept completed before shutdown peer"),
+                }
             })
             .await;
-            std::mem::forget(accept);
             test_hooks::fail_next_ring_wait_errno(libc::EIO);
             std::future::pending::<()>().await;
         })
         .expect_err("injected wait failure should stop the executor");
     assert_eq!(err.raw_os_error(), Some(libc::EIO));
 
-    // The readiness CQE may remain unread. It cannot own an accepted fd; the
-    // retained listener owner keeps its numeric identity valid through
-    // cancellation or ring teardown.
-    let mut peer = connect_bounded_tcp_peer("shutdown-fallback observer", addr)
+    // The readiness CQE may remain unread. Force the bounded fallback after a
+    // peer makes the listener ready so the retained readiness payload must be
+    // abandoned instead of reclaimed without its target CQE.
+    let peer = connect_bounded_tcp_peer("shutdown-fallback observer", addr)
         .expect("shutdown peer connect failed");
     test_hooks::force_next_reactor_shutdown_fallback();
     drop(executor);
@@ -1352,14 +1384,24 @@ fn runtime_tcp_shutdown_fallback_reclaims_readiness_state_with_watchdog() {
         "forced TCP shutdown fallback was not consumed"
     );
 
-    peer.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set shutdown peer read timeout");
-    let mut byte = [0u8; 1];
-    match peer.read(&mut byte) {
-        Ok(0) => {}
-        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
-        result => panic!("shutdown fallback left TCP listener backlog open: {result:?}"),
-    }
+    let mut accept = staged
+        .borrow_mut()
+        .take()
+        .expect("staged TCP accept disappeared");
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        Future::poll(accept.as_mut(), &mut cx),
+        Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+    ));
+    drop(accept);
+
+    let flags = unsafe { libc::fcntl(listener_fd, libc::F_GETFD) };
+    assert!(
+        flags >= 0,
+        "ring-abandoned TCP readiness owner was released without its target CQE: {}",
+        io::Error::last_os_error()
+    );
+    drop(peer);
 }
 
 /// Teardown probe: a completed readiness CQE must never be interpreted as an

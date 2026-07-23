@@ -42,6 +42,18 @@ where
         .expect("integration-test future did not return its output")
 }
 
+/// Polls one future exactly once, verifies that it submitted asynchronous work,
+/// and then drops it while still pending.
+#[allow(dead_code)]
+pub async fn poll_once_pending<F: Future>(future: F) {
+    let mut future = std::pin::pin!(future);
+    poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+
 /// Default absolute deadline for one blocking standard-library TCP peer.
 #[allow(dead_code)]
 pub const TCP_PEER_TIMEOUT: Duration = Duration::from_secs(5);

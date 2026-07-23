@@ -1,0 +1,89 @@
+#[path = "common/counting_allocator.rs"]
+mod counting_allocator;
+
+use counting_allocator::{
+    CountingAllocator, finish_counting_allocations_of_size, start_counting_allocations_of_size,
+};
+use flowio::test_support::net::resolver::parse_ipv4_response;
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+const QUERY_ID: u16 = 0x1234;
+const QUERY_HOST: &str = "db.example.test";
+const OWNER_LEN: usize = 47;
+const TARGET_LEN: usize = 59;
+
+#[derive(Clone, Copy)]
+enum RecordSection {
+    Answer,
+    Authority,
+    Additional,
+}
+
+fn push_wire_name(packet: &mut Vec<u8>, name: &str) {
+    for label in name.split('.') {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+}
+
+fn cname_response(section: RecordSection, owner: &str, target: &str) -> Vec<u8> {
+    let (answer_count, authority_count, additional_count) = match section {
+        RecordSection::Answer => (1u16, 0u16, 0u16),
+        RecordSection::Authority => (0u16, 1u16, 0u16),
+        RecordSection::Additional => (0u16, 0u16, 1u16),
+    };
+
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&QUERY_ID.to_be_bytes());
+    packet.extend_from_slice(&0x8180u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&answer_count.to_be_bytes());
+    packet.extend_from_slice(&authority_count.to_be_bytes());
+    packet.extend_from_slice(&additional_count.to_be_bytes());
+    push_wire_name(&mut packet, QUERY_HOST);
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+
+    push_wire_name(&mut packet, owner);
+    packet.extend_from_slice(&5u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&0u32.to_be_bytes());
+    let target_wire_len =
+        u16::try_from(target.len() + 2).expect("test target should fit DNS RDATA");
+    packet.extend_from_slice(&target_wire_len.to_be_bytes());
+    push_wire_name(&mut packet, target);
+    packet
+}
+
+fn counted_name_allocations(packet: &[u8], name_len: usize) -> usize {
+    start_counting_allocations_of_size(name_len);
+    let result = parse_ipv4_response(packet, QUERY_ID, QUERY_HOST);
+    let allocations = finish_counting_allocations_of_size();
+    result.expect("valid DNS response should parse");
+    allocations
+}
+
+#[test]
+fn ignored_record_sections_validate_names_without_materializing_them() {
+    let owner = "o".repeat(OWNER_LEN);
+    let target = "t".repeat(TARGET_LEN);
+    let authority = cname_response(RecordSection::Authority, &owner, &target);
+    let additional = cname_response(RecordSection::Additional, &owner, &target);
+    let answer = cname_response(RecordSection::Answer, &owner, &target);
+
+    // Warm the narrow parser seam before arming the thread-local counters.
+    parse_ipv4_response(&authority, QUERY_ID, QUERY_HOST).expect("warmup response should parse");
+
+    for packet in [&authority, &additional] {
+        assert_eq!(counted_name_allocations(packet, OWNER_LEN), 0);
+        assert_eq!(counted_name_allocations(packet, TARGET_LEN), 0);
+    }
+
+    // The Answer control proves the fixture observes both exact-capacity
+    // allocations when section policy requires materialization.
+    assert_eq!(counted_name_allocations(&answer, OWNER_LEN), 1);
+    assert_eq!(counted_name_allocations(&answer, TARGET_LEN), 1);
+}

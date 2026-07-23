@@ -68,8 +68,29 @@ use std::time::{Duration, Instant};
 pub const TIMER_TICK_NS: u64 = 1_000_000;
 const LVL0_SLOTS: usize = 256;
 const LVLN_SLOTS: usize = 64;
+const LVL0_SLOT_BITS: u32 = LVL0_SLOTS.trailing_zeros();
+const LVLN_SLOT_BITS: u32 = LVLN_SLOTS.trailing_zeros();
+const LVL1_SHIFT: u32 = LVL0_SLOT_BITS;
+const LVL2_SHIFT: u32 = LVL1_SHIFT + LVLN_SLOT_BITS;
+const LVL3_SHIFT: u32 = LVL2_SHIFT + LVLN_SLOT_BITS;
+const LVL0_SLOT_MASK: u64 = (LVL0_SLOTS as u64) - 1;
+const LVLN_SLOT_MASK: u64 = (LVLN_SLOTS as u64) - 1;
+const LVL1_TICK_MASK: u64 = (1u64 << LVL1_SHIFT) - 1;
+const LVL2_TICK_MASK: u64 = (1u64 << LVL2_SHIFT) - 1;
+const LVL3_TICK_MASK: u64 = (1u64 << LVL3_SHIFT) - 1;
 const TIMERS_PER_SLAB: usize = 1024;
 const INVALID_BUCKET_LEVEL: u8 = u8::MAX;
+
+const _: () = {
+    assert!(LVL0_SLOTS.is_power_of_two());
+    assert!(LVLN_SLOTS.is_power_of_two());
+    assert!(LVLN_SLOTS <= u64::BITS as usize);
+    assert!(LVL1_SHIFT == 8);
+    assert!(LVL2_SHIFT == 14);
+    assert!(LVL3_SHIFT == 20);
+    assert!(LVL3_SHIFT + LVLN_SLOT_BITS < u64::BITS);
+    assert!(LVL1_TICK_MASK == LVL0_SLOT_MASK);
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TimerState {
@@ -276,14 +297,14 @@ impl TimerWheel {
     fn insert(&mut self, entry: *mut TimerEntry) {
         let deadline = unsafe { (*entry).deadline_tick };
         let delta = deadline.saturating_sub(self.current_tick);
-        let (level, index) = if delta < LVL0_SLOTS as u64 {
-            (0u8, (deadline & ((LVL0_SLOTS as u64) - 1)) as usize)
-        } else if delta < (1u64 << 14) {
-            (1u8, ((deadline >> 8) & ((LVLN_SLOTS as u64) - 1)) as usize)
-        } else if delta < (1u64 << 20) {
-            (2u8, ((deadline >> 14) & ((LVLN_SLOTS as u64) - 1)) as usize)
+        let (level, index) = if delta < (1u64 << LVL1_SHIFT) {
+            (0u8, (deadline & LVL0_SLOT_MASK) as usize)
+        } else if delta < (1u64 << LVL2_SHIFT) {
+            (1u8, ((deadline >> LVL1_SHIFT) & LVLN_SLOT_MASK) as usize)
+        } else if delta < (1u64 << LVL3_SHIFT) {
+            (2u8, ((deadline >> LVL2_SHIFT) & LVLN_SLOT_MASK) as usize)
         } else {
-            (3u8, ((deadline >> 20) & ((LVLN_SLOTS as u64) - 1)) as usize)
+            (3u8, ((deadline >> LVL3_SHIFT) & LVLN_SLOT_MASK) as usize)
         };
 
         unsafe {
@@ -428,7 +449,7 @@ impl TimerWheel {
     }
 
     fn next_nonempty_lvl0_bucket(&self) -> Option<usize> {
-        let start = (self.current_tick & ((LVL0_SLOTS as u64) - 1)) as usize;
+        let start = (self.current_tick & LVL0_SLOT_MASK) as usize;
         let start_word = start / 64;
         let start_bit = start % 64;
 
@@ -459,29 +480,29 @@ impl TimerWheel {
 
     #[inline(always)]
     fn current_tick_has_occupied_cascade_bucket(&self) -> bool {
-        if (self.current_tick & ((LVL0_SLOTS as u64) - 1)) != 0 {
+        if (self.current_tick & LVL1_TICK_MASK) != 0 {
             return false;
         }
 
-        let idx1 = ((self.current_tick >> 8) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        let idx1 = ((self.current_tick >> LVL1_SHIFT) & LVLN_SLOT_MASK) as usize;
         if (self.lvl1_bits & (1u64 << idx1)) != 0 {
             return true;
         }
 
-        if (self.current_tick & ((1u64 << 14) - 1)) != 0 {
+        if (self.current_tick & LVL2_TICK_MASK) != 0 {
             return false;
         }
 
-        let idx2 = ((self.current_tick >> 14) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        let idx2 = ((self.current_tick >> LVL2_SHIFT) & LVLN_SLOT_MASK) as usize;
         if (self.lvl2_bits & (1u64 << idx2)) != 0 {
             return true;
         }
 
-        if (self.current_tick & ((1u64 << 20) - 1)) != 0 {
+        if (self.current_tick & LVL3_TICK_MASK) != 0 {
             return false;
         }
 
-        let idx3 = ((self.current_tick >> 20) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        let idx3 = ((self.current_tick >> LVL3_SHIFT) & LVLN_SLOT_MASK) as usize;
         (self.lvl3_bits & (1u64 << idx3)) != 0
     }
 
@@ -501,9 +522,9 @@ impl TimerWheel {
         }
 
         let first_boundary = Self::round_up_to_tick_unit(current_tick, shift)?;
-        let cycle = 1u64 << (shift + 6);
+        let cycle = 1u64 << (shift + LVLN_SLOT_BITS);
         let cycle_base = first_boundary & !(cycle - 1);
-        let start = ((first_boundary >> shift) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        let start = ((first_boundary >> shift) & LVLN_SLOT_MASK) as usize;
 
         if let Some(index) = Self::next_set_bit(bits, start) {
             return cycle_base.checked_add((index as u64) << shift);
@@ -516,17 +537,17 @@ impl TimerWheel {
     }
 
     fn next_upper_cascade_tick(&self) -> Option<u64> {
-        Self::next_occupied_cascade_tick(self.lvl1_bits, self.current_tick, 8)
+        Self::next_occupied_cascade_tick(self.lvl1_bits, self.current_tick, LVL1_SHIFT)
             .into_iter()
             .chain(Self::next_occupied_cascade_tick(
                 self.lvl2_bits,
                 self.current_tick,
-                14,
+                LVL2_SHIFT,
             ))
             .chain(Self::next_occupied_cascade_tick(
                 self.lvl3_bits,
                 self.current_tick,
-                20,
+                LVL3_SHIFT,
             ))
             .min()
     }
@@ -548,7 +569,7 @@ impl TimerWheel {
             return false;
         }
 
-        let idx = (self.current_tick & ((LVL0_SLOTS as u64) - 1)) as usize;
+        let idx = (self.current_tick & LVL0_SLOT_MASK) as usize;
         if self.lvl0_bucket_occupied(idx) {
             return false;
         }
@@ -591,20 +612,20 @@ impl TimerWheel {
         self.cascade_pos = 0;
         self.outer_cascade_tail = std::ptr::null_mut();
 
-        if (self.current_tick & ((LVL0_SLOTS as u64) - 1)) == 0 {
-            let idx1 = ((self.current_tick >> 8) & ((LVLN_SLOTS as u64) - 1)) as usize;
+        if (self.current_tick & LVL1_TICK_MASK) == 0 {
+            let idx1 = ((self.current_tick >> LVL1_SHIFT) & LVLN_SLOT_MASK) as usize;
             self.cascade_levels[self.cascade_count as usize] = 1;
             self.cascade_indices[self.cascade_count as usize] = idx1;
             self.cascade_count += 1;
 
-            if (self.current_tick & ((1u64 << 14) - 1)) == 0 {
-                let idx2 = ((self.current_tick >> 14) & ((LVLN_SLOTS as u64) - 1)) as usize;
+            if (self.current_tick & LVL2_TICK_MASK) == 0 {
+                let idx2 = ((self.current_tick >> LVL2_SHIFT) & LVLN_SLOT_MASK) as usize;
                 self.cascade_levels[self.cascade_count as usize] = 2;
                 self.cascade_indices[self.cascade_count as usize] = idx2;
                 self.cascade_count += 1;
 
-                if (self.current_tick & ((1u64 << 20) - 1)) == 0 {
-                    let idx3 = ((self.current_tick >> 20) & ((LVLN_SLOTS as u64) - 1)) as usize;
+                if (self.current_tick & LVL3_TICK_MASK) == 0 {
+                    let idx3 = ((self.current_tick >> LVL3_SHIFT) & LVLN_SLOT_MASK) as usize;
                     self.cascade_levels[self.cascade_count as usize] = 3;
                     self.cascade_indices[self.cascade_count as usize] = idx3;
                     self.cascade_count += 1;
@@ -732,8 +753,8 @@ define_timer_runtime!(pub(crate));
 struct ArmBase {
     /// `Instant` half of the paired absolute-deadline clock sample.
     instant: Instant,
-    /// Timer-wheel tick corresponding to `instant`.
-    tick: u64,
+    /// Raw monotonic nanoseconds sampled immediately after `instant`.
+    nanos: u64,
 }
 
 impl TimerRuntime {
@@ -806,14 +827,14 @@ impl TimerRuntime {
             };
             (*entry).register_waiter(task);
             (*entry).deadline_tick = deadline_tick;
-            (*entry).state = TimerState::Armed;
         }
         self.wheel.insert(entry);
         Ok(entry)
     }
 
-    fn sample_arm_tick(&mut self) -> io::Result<u64> {
-        let tick = now_tick()?;
+    fn sample_arm_nanos(&mut self) -> io::Result<u64> {
+        let nanos = now_nanos()?;
+        let tick = nanos / TIMER_TICK_NS;
 
         // When the wheel is empty, its current tick may be arbitrarily stale
         // after a long timer-free idle period. Snap it forward so newly armed
@@ -823,7 +844,7 @@ impl TimerRuntime {
             self.wheel.current_tick = tick;
         }
 
-        Ok(tick)
+        Ok(nanos)
     }
 
     fn absolute_arm_base(&mut self) -> io::Result<ArmBase> {
@@ -832,19 +853,18 @@ impl TimerRuntime {
         }
 
         // Absolute deadlines convert against one paired sample per executor
-        // pass. Relative durations sample their own arm tick instead.
+        // pass. Relative durations take their own raw clock sample instead.
         let instant = Instant::now();
-        let tick = self.sample_arm_tick()?;
+        let nanos = self.sample_arm_nanos()?;
 
-        let base = ArmBase { instant, tick };
+        let base = ArmBase { instant, nanos };
         self.absolute_arm_base = Some(base);
         Ok(base)
     }
 
     fn deadline_tick_for_duration(&mut self, duration: Duration) -> io::Result<u64> {
-        let ticks = duration_to_ticks(duration);
-        let arm_tick = self.sample_arm_tick()?;
-        Ok(arm_tick.saturating_add(ticks))
+        let arm_nanos = self.sample_arm_nanos()?;
+        Ok(deadline_tick_from_nanos(arm_nanos, duration))
     }
 
     fn deadline_tick_for_instant(&mut self, deadline: Instant) -> io::Result<Option<u64>> {
@@ -854,7 +874,7 @@ impl TimerRuntime {
         }
 
         let delta = deadline.duration_since(base.instant);
-        Ok(Some(base.tick.saturating_add(duration_to_ticks(delta))))
+        Ok(Some(deadline_tick_from_nanos(base.nanos, delta)))
     }
 
     pub(crate) fn submit_sleep_duration(
@@ -953,7 +973,7 @@ impl TimerRuntime {
                 }
             }
 
-            let idx = (self.wheel.current_tick & ((LVL0_SLOTS as u64) - 1)) as usize;
+            let idx = (self.wheel.current_tick & LVL0_SLOT_MASK) as usize;
             while let Some(entry_ptr) =
                 unsafe { self.wheel.lvl0[idx].pop_front(TimerEntry::LINK_OFFSET) }
             {
@@ -992,7 +1012,13 @@ impl TimerRuntime {
             }
             self.wheel.current_tick = self.wheel.current_tick.saturating_add(1);
         }
-        self.wheel.next_deadline_dirty = true;
+        if self
+            .wheel
+            .next_deadline_tick
+            .is_some_and(|deadline_tick| deadline_tick <= target_tick)
+        {
+            self.wheel.next_deadline_dirty = true;
+        }
         false
     }
 
@@ -1082,8 +1108,11 @@ fn cancel_timer_bucket_entries(bucket: &mut DList<TimerEntry>) {
     }
 }
 
-fn duration_to_ticks(duration: Duration) -> u64 {
-    let nanos = duration.as_nanos();
+fn deadline_tick_from_nanos(arm_nanos: u64, duration: Duration) -> u64 {
+    // Expiry compares a floored current tick with this deadline. Round the
+    // complete raw target up so a fractional arm tick cannot shorten the
+    // caller's requested duration by as much as one timer tick.
+    let nanos = (arm_nanos as u128).saturating_add(duration.as_nanos());
     let tick_ns = TIMER_TICK_NS as u128;
     let ticks = nanos / tick_ns;
     let remainder = nanos % tick_ns;
@@ -1109,6 +1138,10 @@ fn tick_to_duration(ticks: u64) -> Duration {
 }
 
 fn now_tick() -> io::Result<u64> {
+    now_nanos().map(|nanos| nanos / TIMER_TICK_NS)
+}
+
+fn now_nanos() -> io::Result<u64> {
     note_timer_now_tick_call();
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -1121,7 +1154,9 @@ fn now_tick() -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(((ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)) / TIMER_TICK_NS)
+    Ok((ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000u64)
+        .saturating_add(ts.tv_nsec as u64))
 }
 
 #[inline(always)]
@@ -1935,15 +1970,58 @@ mod tests {
     }
 
     #[test]
-    fn duration_to_ticks_rounds_up_without_wrapping() {
-        assert_eq!(duration_to_ticks(Duration::ZERO), 0);
-        assert_eq!(duration_to_ticks(Duration::from_nanos(1)), 1);
-        assert_eq!(duration_to_ticks(Duration::from_nanos(TIMER_TICK_NS)), 1);
+    fn timer_wheel_derived_level_boundaries_preserve_bucket_selection() {
+        let cases = [
+            (LVL1_TICK_MASK, 0, LVL0_SLOT_MASK as u16),
+            (LVL1_TICK_MASK + 1, 1, 1),
+            (LVL2_TICK_MASK, 1, LVLN_SLOT_MASK as u16),
+            (LVL2_TICK_MASK + 1, 2, 1),
+            (LVL3_TICK_MASK, 2, LVLN_SLOT_MASK as u16),
+            (LVL3_TICK_MASK + 1, 3, 1),
+        ];
+
+        for (deadline, expected_level, expected_index) in cases {
+            let mut wheel = TimerWheel::new_uninit();
+            init_wheel_at(&mut wheel, 0);
+            let mut entry = timer_entry_at(deadline);
+            let entry_ptr = &mut entry as *mut TimerEntry;
+
+            wheel.insert(entry_ptr);
+            assert_eq!(entry.bucket_level, expected_level, "deadline {deadline}");
+            assert_eq!(entry.bucket_index, expected_index, "deadline {deadline}");
+            wheel.remove(entry_ptr);
+        }
+    }
+
+    #[test]
+    fn deadline_tick_from_nanos_rounds_the_complete_target_up() {
+        let half_tick = TIMER_TICK_NS / 2;
+
+        assert_eq!(deadline_tick_from_nanos(0, Duration::ZERO), 0);
+        assert_eq!(deadline_tick_from_nanos(0, Duration::from_nanos(1)), 1);
         assert_eq!(
-            duration_to_ticks(Duration::from_nanos(TIMER_TICK_NS + 1)),
+            deadline_tick_from_nanos(TIMER_TICK_NS, Duration::from_nanos(TIMER_TICK_NS)),
             2
         );
-        assert_eq!(duration_to_ticks(Duration::from_secs(u64::MAX)), u64::MAX);
+        assert_eq!(
+            deadline_tick_from_nanos(TIMER_TICK_NS - 1, Duration::from_nanos(1)),
+            1
+        );
+        assert_eq!(
+            deadline_tick_from_nanos(TIMER_TICK_NS - 1, Duration::from_nanos(2)),
+            2
+        );
+        assert_eq!(
+            deadline_tick_from_nanos(
+                TIMER_TICK_NS + half_tick,
+                Duration::from_nanos(TIMER_TICK_NS),
+            ),
+            3
+        );
+        assert_eq!(
+            deadline_tick_from_nanos(u64::MAX, Duration::from_secs(u64::MAX)),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -1951,7 +2029,11 @@ mod tests {
         let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
         runtime.init().expect("timer runtime init failed");
         let instant = Instant::now();
-        runtime.absolute_arm_base = Some(ArmBase { instant, tick: 41 });
+        let base_nanos = 41 * TIMER_TICK_NS + TIMER_TICK_NS / 2;
+        runtime.absolute_arm_base = Some(ArmBase {
+            instant,
+            nanos: base_nanos,
+        });
 
         assert_eq!(
             runtime
@@ -1967,18 +2049,58 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .deadline_tick_for_instant(instant + Duration::from_nanos(TIMER_TICK_NS))
+                .deadline_tick_for_instant(instant + Duration::from_nanos(TIMER_TICK_NS / 2))
                 .expect("deadline conversion failed"),
             Some(42)
         );
         assert_eq!(
             runtime
-                .deadline_tick_for_instant(
-                    instant + Duration::from_nanos(TIMER_TICK_NS.saturating_add(1)),
-                )
+                .deadline_tick_for_instant(instant + Duration::from_nanos(TIMER_TICK_NS))
                 .expect("deadline conversion failed"),
             Some(43)
         );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn fractional_duration_deadline_does_not_fire_at_floored_boundary() {
+        let mut executor = Executor::new().expect("failed to construct executor");
+
+        executor
+            .run(async {
+                let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+                runtime.init().expect("timer runtime init failed");
+
+                let arm_tick = 100;
+                let arm_nanos = arm_tick * TIMER_TICK_NS + TIMER_TICK_NS / 2;
+                let deadline_tick =
+                    deadline_tick_from_nanos(arm_nanos, Duration::from_nanos(TIMER_TICK_NS));
+                assert_eq!(deadline_tick, arm_tick + 2);
+
+                runtime.wheel.current_tick = arm_tick;
+                let entry = runtime
+                    .submit_sleep_at_tick(std::ptr::null_mut(), deadline_tick)
+                    .expect("fractional timer arm failed");
+
+                assert!(
+                    !runtime
+                        .process_at_with_budget(arm_tick + 1, usize::MAX)
+                        .expect("pre-deadline processing failed")
+                );
+                assert!(unsafe { (*entry).state == TimerState::Armed });
+
+                assert!(
+                    !runtime
+                        .process_at_with_budget(deadline_tick, usize::MAX)
+                        .expect("deadline processing failed")
+                );
+                assert!(unsafe { (*entry).state == TimerState::Fired });
+
+                runtime
+                    .cancel_sleep(entry)
+                    .expect("fractional timer reclamation failed");
+            })
+            .expect("executor failed while checking fractional timer rounding");
     }
 
     #[test]
@@ -2003,6 +2125,67 @@ mod tests {
         assert_eq!(entry.bucket_index, 0);
         assert_eq!(wheel.next_deadline_tick, None);
         assert_eq!(wheel.level0_candidate_deadline(), None);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn timer_runtime_collection_preserves_uncrossed_deadline_cache() {
+        let mut executor = Executor::new().expect("failed to construct executor");
+
+        executor
+            .run(async {
+                let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+                runtime.init().expect("timer runtime init failed");
+                runtime.wheel.current_tick = 100;
+
+                let earliest = runtime
+                    .submit_sleep_at_tick(std::ptr::null_mut(), 105)
+                    .expect("earliest timer arm failed");
+                let later = runtime
+                    .submit_sleep_at_tick(std::ptr::null_mut(), 120)
+                    .expect("later timer arm failed");
+
+                assert_eq!(runtime.wheel.next_deadline_tick, Some(105));
+                assert!(!runtime.wheel.next_deadline_dirty);
+                assert!(
+                    !runtime
+                        .process_at_with_budget(104, usize::MAX)
+                        .expect("pre-deadline collection failed")
+                );
+                assert_eq!(runtime.wheel.next_deadline_tick, Some(105));
+                assert!(
+                    !runtime.wheel.next_deadline_dirty,
+                    "processing before the cached deadline dirtied the cache"
+                );
+                assert_eq!(
+                    runtime.next_wait_duration(104),
+                    Some(Duration::from_nanos(TIMER_TICK_NS))
+                );
+
+                assert!(
+                    !runtime
+                        .process_at_with_budget(105, usize::MAX)
+                        .expect("deadline collection failed")
+                );
+                assert!(
+                    runtime.wheel.next_deadline_dirty,
+                    "crossing the cached deadline left the cache clean"
+                );
+                assert_eq!(
+                    runtime.next_wait_duration(105),
+                    Some(Duration::from_nanos(15 * TIMER_TICK_NS))
+                );
+                assert_eq!(runtime.wheel.next_deadline_tick, Some(120));
+                assert!(!runtime.wheel.next_deadline_dirty);
+
+                runtime
+                    .cancel_sleep(earliest)
+                    .expect("earliest timer reclamation failed");
+                runtime
+                    .cancel_sleep(later)
+                    .expect("later timer cancellation failed");
+            })
+            .expect("executor failed while checking timer deadline caching");
     }
 
     #[test]
@@ -2528,6 +2711,10 @@ mod tests {
         let entry = runtime
             .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
             .expect("arming test timer failed");
+        assert!(
+            unsafe { (*entry).state == TimerState::Armed },
+            "wheel insertion must publish the armed state"
+        );
         runtime
             .cancel_sleep(entry)
             .expect("canceling test timer failed");

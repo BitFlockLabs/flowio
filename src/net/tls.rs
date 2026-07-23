@@ -287,28 +287,23 @@ impl Write for TlsWriteScratch<'_> {
 }
 
 /// Drains at most one configured ciphertext chunk from rustls.
-#[derive(Debug)]
-enum TlsWriteScratchError {
-    Write(io::Error),
-    ZeroProgress,
-}
-
 fn drain_tls_write_scratch(
     connection: &mut ClientConnection,
     buffer: &mut Vec<u8>,
     limit: usize,
-) -> Result<usize, TlsWriteScratchError> {
+) -> io::Result<usize> {
     let initial_len = buffer.len();
 
     while connection.wants_write() && buffer.len() < limit {
         let written = {
             let mut scratch = TlsWriteScratch::new(buffer, limit);
-            connection
-                .write_tls(&mut scratch)
-                .map_err(TlsWriteScratchError::Write)?
+            connection.write_tls(&mut scratch)?
         };
         if written == 0 {
-            return Err(TlsWriteScratchError::ZeroProgress);
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "rustls produced zero TLS bytes while wants_write() was true",
+            ));
         }
     }
 
@@ -425,13 +420,14 @@ pub struct TlsClientOptions {
 /// its source while ciphertext remains staged; source return does not prove
 /// that nothing was or will be transmitted, so callers must not retry it.
 ///
-/// If a raw transport write fails after rustls has emitted TLS records, the
-/// stream is marked failed. Retrying the same plaintext on that stream could
-/// duplicate records that the kernel already accepted, so later TLS write,
-/// flush, and shutdown operations return `BrokenPipe`. The read side may still
-/// drain already-decrypted plaintext and continue reading the transport until
-/// EOF; if a read requires a TLS transport write to make progress after the
-/// write latch is set, that read returns `BrokenPipe`.
+/// If draining outbound TLS records fails, the stream is marked failed. A
+/// scratch-drain failure may have already consumed ciphertext from rustls, and
+/// a raw transport failure may mean the kernel accepted bytes. Retrying the
+/// same plaintext could therefore omit or duplicate records, so later TLS
+/// write, flush, and shutdown operations return `BrokenPipe`. The read side may
+/// still drain already-decrypted plaintext and continue reading the transport
+/// until EOF; if a read requires a TLS transport write to make progress after
+/// the write latch is set, that read returns `BrokenPipe`.
 ///
 /// Ordinary TLS operations reuse the two reserved ciphertext buffers. If an
 /// earlier exceptional path leaves one unavailable, the operation that needs
@@ -461,7 +457,7 @@ pub struct TlsClientStream {
     /// True after the TCP read side has returned EOF and rustls has been
     /// notified.
     transport_read_eof: bool,
-    /// True after a raw transport write failure made queued TLS records
+    /// True after an outbound ciphertext drain failure made queued TLS records
     /// non-retryable without risking record duplication.
     transport_write_failed: bool,
     /// True after rustls has started TLS-level close-notify shutdown.
@@ -739,7 +735,7 @@ impl TlsClientStream {
     /// Returns `NotConnected` if the TLS handshake has not completed or the
     /// future is polled without its active FlowIO executor task context.
     /// A clean TLS close returns `Ok(0)`.
-    /// After a raw transport write failure, already-decrypted plaintext may
+    /// After an outbound TLS write failure, already-decrypted plaintext may
     /// still be returned; if a read needs to emit TLS records to make progress
     /// after that latch is set, it returns `BrokenPipe`.
     ///
@@ -763,7 +759,7 @@ impl TlsClientStream {
     /// Returns `UnexpectedEof` if the TLS session reaches EOF before `len`
     /// plaintext bytes become available; any partial plaintext read into the
     /// caller buffer remains published in that returned buffer.
-    /// After a raw transport write failure, already-decrypted plaintext may
+    /// After an outbound TLS write failure, already-decrypted plaintext may
     /// still be returned; if a read needs to emit TLS records to make progress
     /// after that latch is set, it returns `BrokenPipe`.
     ///
@@ -788,8 +784,8 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` if called before handshake completion or polled
     /// without its active FlowIO executor task context, and `BrokenPipe` if
-    /// the TLS write side has already been shut down or a prior raw transport
-    /// write failed.
+    /// the TLS write side has already been shut down or a prior outbound
+    /// ciphertext drain failed.
     /// If rustls accepts plaintext but the following TLS-record flush fails,
     /// this future returns an error without a progress count; the stream is
     /// failed and callers must not retry the same plaintext on it.
@@ -809,8 +805,8 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` if called before handshake completion or polled
     /// without its active FlowIO executor task context, and `BrokenPipe` if
-    /// the TLS write side has already been shut down or a prior raw transport
-    /// write failed.
+    /// the TLS write side has already been shut down or a prior outbound
+    /// ciphertext drain failed.
     /// If rustls accepts plaintext but a later TLS-record flush fails, this
     /// future returns an error even though some plaintext may already be queued
     /// as TLS records; the stream is failed and callers must not retry the
@@ -835,7 +831,8 @@ impl TlsClientStream {
     ///
     /// # Errors
     /// Returns `NotConnected` when polled without its active FlowIO executor
-    /// task context and `BrokenPipe` if a prior raw transport write failed.
+    /// task context and `BrokenPipe` if a prior outbound ciphertext drain
+    /// failed.
     ///
     /// This is primarily a control-path API for callers that need an explicit
     /// flush boundary.
@@ -1006,17 +1003,10 @@ impl TlsClientStream {
             let written =
                 match drain_tls_write_scratch(&mut self.connection, &mut buffer, chunk_limit) {
                     Ok(written) => written,
-                    Err(TlsWriteScratchError::Write(err)) => {
-                        self.restore_write_tls_buffer(buffer);
-                        return Poll::Ready(Err(err));
-                    }
-                    Err(TlsWriteScratchError::ZeroProgress) => {
+                    Err(err) => {
                         self.transport_write_failed = true;
                         self.restore_write_tls_buffer(buffer);
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "rustls produced zero TLS bytes while wants_write() was true",
-                        )));
+                        return Poll::Ready(Err(err));
                     }
                 };
 
@@ -1811,6 +1801,88 @@ mod tests {
 
         assert!(chunks > 1, "test output fit in one bounded chunk");
         assert!(total > LIMIT);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_write_scratch_zero_progress_latches_and_restores_scratch() {
+        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("std bind failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let client = std::net::TcpStream::connect(addr).expect("std connect failed");
+        let (_server, _) = listener.accept().expect("std accept failed");
+
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut tls = TlsClientStream::new(
+            TcpStream::from_owned_fd(client.into()),
+            config,
+            ServerName::try_from("localhost").expect("invalid test server name"),
+            TlsClientOptions {
+                rustls_buffer_limit: Some(1024),
+                transport_read_buffer_size: 128,
+                transport_write_buffer_size: 128,
+            },
+        )
+        .expect("tls stream init failed");
+
+        assert!(
+            tls.connection.wants_write(),
+            "new client connection should have a ClientHello queued"
+        );
+        let mut constrained_scratch = Box::<[u8]>::from([0]).into_vec();
+        constrained_scratch.clear();
+        let scratch_allocation = constrained_scratch.as_ptr();
+        tls.write_tls_buffer = Some(constrained_scratch);
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let err = match tls.poll_flush_pending_tls(&mut cx) {
+            Poll::Ready(Err(err)) => err,
+            Poll::Ready(Ok(())) => panic!("capacity-exhausted scratch unexpectedly flushed"),
+            Poll::Pending => panic!("zero-progress scratch unexpectedly submitted a raw write"),
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(
+            err.to_string(),
+            "rustls produced zero TLS bytes while wants_write() was true"
+        );
+        assert!(
+            tls.transport_write_failed,
+            "scratch drain failure must latch the TLS write side"
+        );
+        assert!(
+            tls.pending_write_tls.is_none(),
+            "scratch drain failure must not create a raw write future"
+        );
+        assert!(
+            tls.connection.wants_write(),
+            "failed scratch drain must leave queued ciphertext protected by the latch"
+        );
+        let restored = tls
+            .write_tls_buffer
+            .as_ref()
+            .expect("scratch drain failure did not restore the reusable buffer");
+        assert!(restored.is_empty());
+        assert_eq!(restored.capacity(), 1);
+        assert_eq!(restored.as_ptr(), scratch_allocation);
+
+        let err = match tls.poll_flush_pending_tls(&mut cx) {
+            Poll::Ready(Err(err)) => err,
+            Poll::Ready(Ok(())) => panic!("latched TLS write unexpectedly recovered"),
+            Poll::Pending => panic!("latched TLS write unexpectedly remained pending"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            tls.write_tls_buffer
+                .as_ref()
+                .expect("latched TLS write lost its reusable buffer")
+                .as_ptr(),
+            scratch_allocation
+        );
     }
 
     struct DefaultUninitializedBuffer {

@@ -14,7 +14,11 @@
 //! or armed them. Polling without an active FlowIO run or with another
 //! executor's task waker returns [`std::io::ErrorKind::NotConnected`]. A
 //! submitted rental I/O future retains its caller-owned buffer until the
-//! original completion arrives, then returns that buffer with the error.
+//! original completion arrives, then returns that buffer with the error. The
+//! exceptional bounded shutdown fallback cannot promise that return if it
+//! abandons an `io_uring` without observing the target completion: the future
+//! remains pending and its kernel-visible state and buffer are intentionally
+//! retained until process exit rather than reclaimed unsafely.
 //! Standard task wakers must be cloned, woken, and dropped on their owner
 //! thread. Debug builds assert this contract; no cross-thread relay exists.
 //! Timeout wrappers distinguish deadline expiry ([`timer::TimeoutError::Elapsed`])

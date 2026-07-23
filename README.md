@@ -15,7 +15,11 @@ not recommended for production yet.
 Requires Linux kernel 5.11 or newer and Rust 1.88 or newer. The runtime is
 built on `io_uring` and requires `IORING_ENTER_EXT_ARG`; executor construction
 fails with `Unsupported` when the running kernel does not report that feature.
-The crate does not build or run on non-Linux targets.
+This is the binding kernel floor: `IORING_OP_CLOSE` is available since Linux
+5.6, and the 14-byte `SCTP_EVENTS` layout used by FlowIO is available since
+Linux 5.5. Both predate the runtime floor, so supported kernels need no legacy
+13-byte SCTP subscription fallback. The crate does not build or run on
+non-Linux targets.
 
 ```toml
 [dependencies]
@@ -155,7 +159,7 @@ workload is faster without measurement.
 | Payload shape | Contiguous APIs for one byte range; vectored/projected APIs for existing segmentation | Building a chain for one contiguous range or coalescing segmented data just to call `write` | Match the API to existing ownership; vectored paths construct bounded iovec metadata, while coalescing copies bytes. |
 | Immediate deadline edge | `try_read`, `try_write`, and `try_writev_projected` only after a deadline has already reached zero | Polling `try_*` as the normal async path | `try_*` makes one direct nonblocking syscall and returns `WouldBlock`; normal async methods register reactor work and wake the task. |
 | UDP peer selection | Connected `send` / `recv` for a stable peer; `recv_msg` when truncation must be detected | `send_to` / `recv_from` for a fixed peer | Connected calls avoid per-datagram address handling. Use address-bearing methods when the peer actually varies. |
-| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. Use `send_msg` / `recv_msg` when stream, PPID, flags, EOR, truncation, or notifications matter. |
+| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. A data-configured `recv_msg` reports EOR/truncation with default ancillary fields; enable receive metadata when stream, PPID, TSN, association data, notifications, or partial-delivery recovery matter. |
 | Timers | One `timeout_at` or `timeout` around a protocol phase when a deadline is required | A separate timeout around every tiny I/O step | Each armed deadline consumes timer-wheel state and expiry/cancellation work. Preserve finer timers when protocol semantics require them. |
 | DNS/TLS setup | Reuse `DnsResolver`, resolved addresses, connectors, and established TLS streams | Resolving names or handshaking in a per-message loop | Resolver setup/query construction and TLS handshakes may allocate and perform setup I/O. |
 
@@ -170,6 +174,10 @@ futures only through the executor that submitted or armed them. Polling without
 an active FlowIO run or through another executor returns `NotConnected`.
 Unsubmitted rental I/O returns its buffer immediately; submitted I/O retains
 the buffer until the original completion and then returns it with that error.
+If the exceptional bounded shutdown fallback abandons an `io_uring` without
+observing the target completion, it cannot safely return that ownership: the
+operation remains pending and its kernel-visible state and buffer are retained
+until process exit.
 TLS futures validate this boundary before touching rustls or a stream-owned
 staged raw TCP operation. A rejected TLS poll leaves that raw operation
 attached for the next valid TLS call. If a prior valid write poll already
@@ -272,8 +280,13 @@ when connected UDP must detect datagram truncation.
 
 For data-only SCTP associations, configure the socket with
 `SctpSocketConfig::data()` and use `SctpStream::send` and `SctpStream::recv`.
-Use `send_msg`, `recv_msg`, and their vectored variants when per-message SCTP
-metadata or notifications matter.
+Message receives remain available when EOR or truncation must be checked, but
+a data-configured socket returns default ancillary fields. Enable receive
+metadata (or use the rich/signaling configuration) when stream, PPID, TSN,
+association metadata, notifications, or partial-delivery recovery matter. All
+SCTP receive APIs reject a zero-length caller receive window with `InvalidInput`,
+so a successful zero-byte result from the flag-less lean `recv` path denotes
+clean peer EOF.
 
 On sockets configured by FlowIO, enabling `recv_rcvinfo` also keeps the SCTP
 partial-delivery event subscribed even when the requested notification mask
@@ -292,12 +305,14 @@ notification types are requested, a caller buffer that truncates an event
 before it can be parsed completely retains the normal `InvalidData` behavior.
 
 `SctpStream::from_owned_fd` and `SctpStream::from_raw_fd` adopt ownership but
-do not inspect or configure the socket. Before using metadata receive on an
-externally configured descriptor, the caller must provide nonblocking mode,
-`SCTP_RECVRCVINFO`, and the `SCTP_PARTIAL_DELIVERY_EVENT` subscription needed
-for discard resynchronization. Calling FlowIO's `set_notification_mask` later
-queries the descriptor's current receive-info setting and preserves that
-dependency, but adoption itself remains syscall-free.
+do not inspect or configure the socket. The caller must provide nonblocking
+mode before any runtime I/O. Before relying on ancillary receive fields or
+PDAPI-assisted discard recovery, it must enable `SCTP_RECVRCVINFO` to obtain
+ancillary fields and also subscribe to `SCTP_PARTIAL_DELIVERY_EVENT` for
+assisted recovery. Without receive-info, message receives return default
+ancillary fields. Calling FlowIO's `set_notification_mask` later queries the
+descriptor's current receive-info setting and preserves that dependency, but
+adoption itself remains syscall-free.
 
 SCTP stream reset is a setup/control-plane operation. The generic
 `SctpResetStreams::incoming`, `outgoing`, and `bidirectional` constructors are
@@ -325,7 +340,10 @@ SCTP send or receive paths.
 Keep DNS resolution in setup or control paths when the protocol permits.
 Resolve names once, retain the resulting addresses, and put timer deadlines
 around protocol phases rather than every individual message to reduce timer
-bookkeeping. Matching-ID responses must be marked as responses and retain the
+bookkeeping. Query normalization removes surrounding whitespace and at most
+one optional trailing root dot; a second trailing dot remains an empty label
+and returns `InvalidInput` before query allocation or DNS network I/O. Matching-ID
+responses must be marked as responses and retain the
 QUERY opcode; other opcodes are drained before question or record handling.
 The resolver validates every declared response record before using NXDOMAIN or
 another response code; malformed records in ignored sections/classes or
@@ -335,7 +353,10 @@ valid UTF-8 and contain no literal `.`, including labels reached through
 compression; dots are inserted only between wire labels in the decoded
 presentation. Invalid labels are rejected before echoed-question matching,
 response-code handling, or CNAME follow-up. Valid non-ASCII text is retained,
-with DNS name comparison folding ASCII case only.
+with DNS name comparison folding ASCII case only. Exceeding the 16-hop total
+CNAME budget is local resolver policy: it stops that address family's remaining
+nameserver attempts while still allowing the sibling family to supply an
+address.
 
 ## Configuration
 
@@ -376,10 +397,10 @@ one-to-one SCTP works through `SctpListener`, `SctpConnector`, and
 
 ## Limitations
 
-- Linux only. The runtime is built on `io_uring`.
-- Single-threaded task execution. A runtime instance and its tasks, buffers, and
-  wakers are owner-thread state and are not cross-thread APIs; a runtime is used
-  from the one thread that runs it.
+- Linux 5.11 or newer only. The runtime is built on `io_uring`.
+- Single-threaded task execution. A runtime instance and its tasks, buffers,
+  transport handles, and wakers are owner-thread state and are not cross-thread
+  APIs; a runtime is used from the one thread that runs it.
 - Alpha API; compatibility may change between alpha releases.
 - Task and timer pools acquire fixed-size slabs on demand and currently have no
   user-configurable total slab cap. Sleep allocation failure is an

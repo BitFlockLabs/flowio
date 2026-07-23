@@ -396,13 +396,11 @@ impl UdpSocket {
         buffer: B,
         addr: SocketAddr,
     ) -> SendToFuture<'_, B> {
-        let (storage, addrlen) = socket_addr_to_c(addr);
         SendToFuture {
             fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
-            addr: storage,
-            addrlen,
+            addr,
             _marker: PhantomData,
         }
     }
@@ -458,13 +456,41 @@ struct RetainedSendToPayload<B: IoBuffReadOnly> {
     /// Caller-owned source buffer retained while sendmsg is live.
     buffer: B,
     /// Prepared destination address retained for the kernel.
-    addr: libc::sockaddr_storage,
-    /// Length of the prepared destination address.
-    addrlen: libc::socklen_t,
+    addr: MaybeUninit<libc::sockaddr_storage>,
     /// Single kernel-facing iovec pointing into `buffer`.
     iovec: MaybeUninit<libc::iovec>,
     /// Message header whose pointers target fields in this retained payload.
     msghdr: MaybeUninit<libc::msghdr>,
+}
+
+/// Initializes an explicit-destination send payload at its retained address.
+///
+/// # Safety
+///
+/// `payload` must already occupy its final address and must not move until the
+/// target sendmsg CQE retires because its message header points into itself.
+#[inline(always)]
+unsafe fn initialize_retained_send_to_payload<B: IoBuffReadOnly>(
+    payload: &mut RetainedSendToPayload<B>,
+    destination: SocketAddr,
+) {
+    let (addr, addrlen) = socket_addr_to_c(destination);
+    payload.addr.write(addr);
+    payload.iovec.write(libc::iovec {
+        iov_base: payload.buffer.as_ptr() as *mut libc::c_void,
+        iov_len: payload.buffer.len(),
+    });
+    write_msghdr(
+        &mut payload.msghdr,
+        MsgHdrInit {
+            name: payload.addr.as_mut_ptr() as *mut libc::c_void,
+            namelen: addrlen,
+            iov: payload.iovec.as_mut_ptr(),
+            iovlen: 1,
+            control: std::ptr::null_mut(),
+            controllen: 0,
+        },
+    );
 }
 
 fn zeroed_sockaddr_storage() -> MaybeUninit<libc::sockaddr_storage> {
@@ -583,6 +609,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            return Poll::Pending;
         }
 
         unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -720,6 +747,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            return Poll::Pending;
         }
 
         unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -817,6 +845,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            return Poll::Pending;
         }
 
         unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -958,6 +987,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            return Poll::Pending;
         }
 
         unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -985,10 +1015,8 @@ pub struct SendToFuture<'a, B: IoBuffReadOnly> {
     state_ptr: *mut CompletionState,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
-    /// Prepared destination address for this datagram.
-    addr: libc::sockaddr_storage,
-    /// Length of the prepared destination address.
-    addrlen: libc::socklen_t,
+    /// Destination address prepared after the payload reaches retained storage.
+    addr: SocketAddr,
     /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
@@ -1033,42 +1061,22 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
-            let addr = this.addr;
+            let destination = this.addr;
+            let fd = this.fd;
             let payload = RetainedSendToPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
-                addr,
-                addrlen: this.addrlen,
+                addr: MaybeUninit::uninit(),
                 iovec: MaybeUninit::uninit(),
                 msghdr: MaybeUninit::uninit(),
             };
             unsafe {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let buffer_ptr = payload.buffer.as_ptr();
-                        let len = payload.buffer.len();
+                        initialize_retained_send_to_payload(payload, destination);
 
-                        payload.iovec.write(libc::iovec {
-                            iov_base: buffer_ptr as *mut libc::c_void,
-                            iov_len: len,
-                        });
-                        write_msghdr(
-                            &mut payload.msghdr,
-                            MsgHdrInit {
-                                name: &mut payload.addr as *mut libc::sockaddr_storage
-                                    as *mut libc::c_void,
-                                namelen: payload.addrlen,
-                                iov: payload.iovec.as_mut_ptr(),
-                                iovlen: 1,
-                                control: std::ptr::null_mut(),
-                                controllen: 0,
-                            },
-                        );
-
-                        Ok(
-                            opcode::SendMsg::new(types::Fd(this.fd), payload.msghdr.as_ptr())
-                                .build()
-                                .user_data(state_ptr as u64),
-                        )
+                        Ok(opcode::SendMsg::new(types::Fd(fd), payload.msghdr.as_ptr())
+                            .build()
+                            .user_data(state_ptr as u64))
                     })
                 {
                     (*pctx.reactor()).free_op(state_ptr);
@@ -1076,6 +1084,7 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            return Poll::Pending;
         }
 
         unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
@@ -1097,5 +1106,40 @@ mod tests {
     fn recv_from_addr_storage_starts_zeroed() {
         let addr = unsafe { zeroed_sockaddr_storage().assume_init() };
         assert_eq!(addr.ss_family, 0);
+    }
+
+    #[test]
+    fn retained_send_to_payload_uses_final_storage_pointers() {
+        let destination = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            5432,
+            17,
+            9,
+        ));
+        let mut payload = RetainedSendToPayload {
+            buffer: b"payload".to_vec(),
+            addr: MaybeUninit::uninit(),
+            iovec: MaybeUninit::uninit(),
+            msghdr: MaybeUninit::uninit(),
+        };
+
+        unsafe { initialize_retained_send_to_payload(&mut payload, destination) };
+
+        let addr = unsafe { payload.addr.assume_init_ref() };
+        let iovec = unsafe { payload.iovec.assume_init_ref() };
+        let msghdr = unsafe { payload.msghdr.assume_init_ref() };
+        assert_eq!(
+            msghdr.msg_name,
+            addr as *const libc::sockaddr_storage as *mut libc::c_void
+        );
+        assert_eq!(msghdr.msg_iov, iovec as *const libc::iovec as *mut _);
+        assert_eq!(iovec.iov_base, payload.buffer.as_ptr() as *mut libc::c_void);
+        assert_eq!(iovec.iov_len, payload.buffer.len());
+        assert_eq!(
+            socket_addr_from_c(addr, msghdr.msg_namelen).expect("destination should decode"),
+            destination
+        );
+        assert!(msghdr.msg_control.is_null());
+        assert_eq!(msghdr.msg_controllen, 0);
     }
 }

@@ -317,12 +317,13 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     /// changes the writable window.
     #[inline(always)]
     unsafe fn initialized_writable_slice(&mut self, len: usize) -> &mut [u8] {
+        let writable = self.writable_len();
         debug_assert!(len != 0, "initialized writable slices must be nonempty");
         debug_assert!(
-            len <= self.writable_len(),
-            "initialized writable length {len} exceeds capacity {}",
-            self.writable_len()
+            len <= writable,
+            "initialized writable length {len} exceeds capacity {writable}"
         );
+        let len = len.min(writable);
         let ptr = self.as_mut_ptr();
         unsafe {
             std::ptr::write_bytes(ptr, 0, len);

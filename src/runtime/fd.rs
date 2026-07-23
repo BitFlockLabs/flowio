@@ -15,12 +15,12 @@ use crate::runtime::executor::{
     note_close_linger_classification_failure, note_close_linger_query, note_close_linger_waiver,
     try_admit_close, try_submit_close,
 };
+use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
+use std::rc::Rc;
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::AtomicI32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[cfg(any(test, feature = "test-support"))]
 const DISTINCTIVE_TEST_FD_START: RawFd = 128;
@@ -43,9 +43,8 @@ pub(crate) enum LingerProvenance {
 pub(crate) struct RuntimeFd {
     /// Raw descriptor value, or `INVALID` after ownership has been moved out.
     fd: RawFd,
-    /// Monotonic uncertainty bit. Atomic storage preserves the wrapper's
-    /// existing `Send`/`Sync` auto traits when public raw access takes `&self`.
-    linger_uncertain: AtomicBool,
+    /// Owner-thread monotonic uncertainty bit updated through shared access.
+    linger_uncertain: Cell<bool>,
 }
 
 impl RuntimeFd {
@@ -55,7 +54,7 @@ impl RuntimeFd {
     pub(crate) const fn from_fresh_raw_fd(fd: RawFd) -> Self {
         Self {
             fd,
-            linger_uncertain: AtomicBool::new(false),
+            linger_uncertain: Cell::new(false),
         }
     }
 
@@ -73,7 +72,7 @@ impl RuntimeFd {
     pub(crate) fn from_owned_with_provenance(fd: OwnedFd, provenance: LingerProvenance) -> Self {
         Self {
             fd: fd.into_raw_fd(),
-            linger_uncertain: AtomicBool::new(provenance == LingerProvenance::Uncertain),
+            linger_uncertain: Cell::new(provenance == LingerProvenance::Uncertain),
         }
     }
 
@@ -92,12 +91,12 @@ impl RuntimeFd {
 
     #[inline(always)]
     pub(crate) fn mark_linger_uncertain(&self) {
-        self.linger_uncertain.store(true, Ordering::Relaxed);
+        self.linger_uncertain.set(true);
     }
 
     #[inline(always)]
     pub(crate) fn linger_provenance(&self) -> LingerProvenance {
-        if self.linger_uncertain.load(Ordering::Relaxed) {
+        if self.linger_uncertain.get() {
             LingerProvenance::Uncertain
         } else {
             LingerProvenance::KnownNonPositive
@@ -120,6 +119,10 @@ impl RuntimeFd {
     /// same ring, but uncertain positive linger must still use the bounded
     /// close worker.
     fn close_without_ring(mut self) {
+        self.close_taken(false);
+    }
+
+    fn close_taken(&mut self, allow_ring: bool) {
         let (fd, provenance) = self.take_for_drop();
         if fd < 0 {
             return;
@@ -134,27 +137,13 @@ impl RuntimeFd {
             return;
         }
 
-        close_owned_in_active_context(owned, provenance, false);
+        close_owned_in_active_context(owned, provenance, allow_ring);
     }
 }
 
 impl Drop for RuntimeFd {
     fn drop(&mut self) {
-        let (fd, provenance) = self.take_for_drop();
-        if fd < 0 {
-            return;
-        }
-
-        // SAFETY: `take_for_drop` moved this wrapper's sole valid descriptor
-        // ownership into the temporary owner.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        if !has_active_close_context() {
-            drop(owned);
-            return;
-        }
-
-        close_owned_in_active_context(owned, provenance, true);
+        self.close_taken(true);
     }
 }
 
@@ -165,14 +154,14 @@ impl Drop for RuntimeFd {
 /// no-ring close route because orphan completion reclamation can drop it while
 /// the reactor's completion queue is still borrowed.
 pub(crate) struct RetainedListenerFd {
-    fd: Option<Arc<RuntimeFd>>,
+    fd: Option<Rc<RuntimeFd>>,
 }
 
 impl RetainedListenerFd {
     #[inline(always)]
-    pub(crate) fn new(fd: &Arc<RuntimeFd>) -> Self {
+    pub(crate) fn new(fd: &Rc<RuntimeFd>) -> Self {
         Self {
-            fd: Some(Arc::clone(fd)),
+            fd: Some(Rc::clone(fd)),
         }
     }
 
@@ -190,7 +179,7 @@ impl Drop for RetainedListenerFd {
             return;
         };
 
-        match Arc::try_unwrap(fd) {
+        match Rc::try_unwrap(fd) {
             Ok(fd) => fd.close_without_ring(),
             Err(fd) => drop(fd),
         }
@@ -304,7 +293,11 @@ fn read_linger(fd: RawFd) -> io::Result<libc::linger> {
 
 #[inline(always)]
 fn classify_linger_value(linger: &libc::linger) -> CloseRoute {
-    if linger.l_onoff != 0 && linger.l_linger > 0 {
+    // Linux converts the enabled linger interval to an unsigned internal
+    // timeout. A negative value observed through this signed C ABI therefore
+    // denotes a very large, blocking-capable interval and must not reach the
+    // owner-thread ring.
+    if linger.l_onoff != 0 && linger.l_linger != 0 {
         CloseRoute::Worker
     } else {
         CloseRoute::Ring
@@ -513,7 +506,7 @@ mod tests {
     #[test]
     fn final_retained_listener_owner_closes_without_reentering_the_ring() {
         let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
-        let listener = Arc::new(RuntimeFd::from_fresh_raw_fd(raw));
+        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(raw));
         let retained = RetainedListenerFd::new(&listener);
         drop(listener);
 
@@ -640,16 +633,11 @@ mod tests {
 #[cfg(test)]
 mod policy_tests {
     use super::{
-        CloseRoute, LingerProvenance, RuntimeFd, classify_linger_result, classify_linger_value,
+        CloseRoute, LingerProvenance, RetainedListenerFd, RuntimeFd, classify_linger_result,
+        classify_linger_value,
     };
     use std::io;
-
-    fn assert_send_sync<T: Send + Sync>() {}
-
-    #[test]
-    fn runtime_fd_preserves_send_and_sync_auto_traits() {
-        assert_send_sync::<RuntimeFd>();
-    }
+    use std::rc::Rc;
 
     #[test]
     fn linger_provenance_is_monotonic_after_raw_exposure() {
@@ -665,7 +653,26 @@ mod policy_tests {
     }
 
     #[test]
-    fn only_enabled_positive_linger_requires_the_worker() {
+    fn retained_listener_observes_late_provenance_taint() {
+        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
+        let retained = RetainedListenerFd::new(&listener);
+
+        listener.mark_linger_uncertain();
+        assert_eq!(
+            retained
+                .fd
+                .as_ref()
+                .expect("retained listener owner")
+                .linger_provenance(),
+            LingerProvenance::Uncertain
+        );
+
+        drop(listener);
+        drop(retained);
+    }
+
+    #[test]
+    fn enabled_nonzero_linger_requires_the_worker() {
         for linger in [
             libc::linger {
                 l_onoff: 0,
@@ -675,20 +682,21 @@ mod policy_tests {
                 l_onoff: 1,
                 l_linger: 0,
             },
+        ] {
+            assert_eq!(classify_linger_value(&linger), CloseRoute::Ring);
+        }
+        for linger in [
             libc::linger {
                 l_onoff: 1,
                 l_linger: -1,
             },
-        ] {
-            assert_eq!(classify_linger_value(&linger), CloseRoute::Ring);
-        }
-        assert_eq!(
-            classify_linger_value(&libc::linger {
+            libc::linger {
                 l_onoff: 1,
                 l_linger: 3,
-            }),
-            CloseRoute::Worker
-        );
+            },
+        ] {
+            assert_eq!(classify_linger_value(&linger), CloseRoute::Worker);
+        }
     }
 
     #[test]

@@ -2,9 +2,11 @@
 
 use crate::runtime::executor::{ExecutorOwner, RuntimeState};
 use crate::runtime::op::CompletionState;
-#[cfg(debug_assertions)]
+#[cfg(all(test, not(miri)))]
+use crate::runtime::retained::RetainedIovecScratch;
+#[cfg(any(debug_assertions, feature = "test-support"))]
 use crate::runtime::retained::RetainedPayloadPoolStats;
-use crate::runtime::retained::{RetainedIovecScratch, RetainedPayload, RetainedPayloadPool};
+use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool};
 use crate::runtime::task::release_task;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
@@ -13,6 +15,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 /// Default number of submission and completion ring entries requested from
@@ -43,7 +46,7 @@ fn missing_ext_arg_error() -> io::Error {
 
 #[inline]
 fn validate_required_ring_features(ring: &IoUring) -> io::Result<()> {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     if crate::runtime::test_hooks::take_reactor_ext_arg_probe_failure() {
         return Err(missing_ext_arg_error());
     }
@@ -319,7 +322,11 @@ pub(crate) struct Reactor {
     live_registry: Vec<*mut CompletionState>,
     /// Pool of pointer-stable payload blocks referenced by in-flight
     /// operations, including operations whose owning futures were dropped.
-    retained_pool: RetainedPayloadPool,
+    retained_pool: ManuallyDrop<RetainedPayloadPool>,
+    /// True when shutdown closed the ring without observing every target CQE.
+    /// The operation and retained-payload pools must then be leaked because the
+    /// kernel may still hold pointers into their checked-out storage.
+    storage_abandoned: bool,
 }
 
 impl Reactor {
@@ -350,7 +357,8 @@ impl Reactor {
             op_pool: ManuallyDrop::new(op_pool),
             max_live_ops: config.ring_entries as usize,
             live_registry,
-            retained_pool,
+            retained_pool: ManuallyDrop::new(retained_pool),
+            storage_abandoned: false,
         })
     }
 
@@ -372,7 +380,7 @@ impl Reactor {
     /// Allocate a fresh `CompletionState` for one SQE submission.
     #[inline(always)]
     pub fn alloc_op(&mut self) -> *mut CompletionState {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         if crate::runtime::test_hooks::take_op_alloc_failure() {
             return std::ptr::null_mut();
         }
@@ -403,7 +411,27 @@ impl Reactor {
         self.retained_pool.alloc(value)
     }
 
+    /// Returns the active reactor's retained-pool address without creating a
+    /// Rust borrow that could overlap owner-thread callback re-entry.
+    ///
+    /// # Safety
+    ///
+    /// `reactor` must identify the live reactor for the currently polling
+    /// FlowIO task. The returned pointer may be used only synchronously on that
+    /// owner thread and must not outlive the active poll.
+    #[inline(always)]
+    pub(crate) unsafe fn retained_payload_pool_ptr(
+        reactor: *mut Self,
+    ) -> NonNull<RetainedPayloadPool> {
+        debug_assert!(!reactor.is_null(), "retained-pool reactor must be non-null");
+        let pool = unsafe {
+            std::ptr::addr_of_mut!((*reactor).retained_pool).cast::<RetainedPayloadPool>()
+        };
+        unsafe { NonNull::new_unchecked(pool) }
+    }
+
     /// Allocate retained kernel-facing `iovec` scratch for a vectored I/O op.
+    #[cfg(all(test, not(miri)))]
     #[inline(always)]
     pub(crate) fn alloc_iovec_scratch(
         &mut self,
@@ -443,7 +471,8 @@ impl Reactor {
         unsafe { (*ptr).take_retained_payload_with::<T, R>(&mut self.retained_pool, extract) }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn retained_payload_stats(&self) -> RetainedPayloadPoolStats {
         self.retained_pool.stats()
     }
@@ -523,7 +552,7 @@ impl Reactor {
 
     #[inline(always)]
     fn submit_ring(&mut self) -> io::Result<usize> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         if let Some(err) = crate::runtime::test_hooks::take_ring_submit_failure() {
             return Err(err);
         }
@@ -597,7 +626,7 @@ impl Reactor {
         min_complete: usize,
         args: &types::SubmitArgs<'_, '_>,
     ) -> io::Result<usize> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         if let Some(err) = crate::runtime::test_hooks::take_ring_wait_failure() {
             return Err(err);
         }
@@ -612,7 +641,7 @@ impl Reactor {
 
     #[inline(always)]
     fn submit_and_wait(&mut self, min_complete: usize) -> io::Result<usize> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         if let Some(err) = crate::runtime::test_hooks::take_ring_wait_failure() {
             return Err(err);
         }
@@ -672,7 +701,7 @@ impl Reactor {
     /// The executor calls [`Self::flush_sqes`] after each task-poll batch.
     #[inline(always)]
     pub fn submit_sqe(&mut self, sqe: io_uring::squeue::Entry) -> io::Result<()> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         if let Some(err) = crate::runtime::test_hooks::take_raw_sqe_submit_failure() {
             return Err(err);
         }
@@ -711,7 +740,7 @@ impl Reactor {
         fd: OwnedFd,
         user_data: u64,
     ) -> Result<(), (io::Error, OwnedFd)> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         if let Some(err) = crate::runtime::test_hooks::take_raw_sqe_submit_failure() {
             return Err((err, fd));
         }
@@ -799,9 +828,9 @@ impl Reactor {
             } else {
                 timeout
             };
-            let deadline = Instant::now() + initial_timeout;
+            let mut now = Instant::now();
+            let deadline = now + initial_timeout;
             loop {
-                let now = Instant::now();
                 if now >= deadline {
                     return Ok(ReactorSubmitStatus::Ready);
                 }
@@ -825,7 +854,10 @@ impl Reactor {
                             ReactorSubmitStatus::Ready
                         });
                     }
-                    Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
+                    Err(err) if is_raw_os_error(&err, libc::EINTR) => {
+                        now = Instant::now();
+                        continue;
+                    }
                     Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
                         return Ok(ReactorSubmitStatus::Busy);
                     }
@@ -874,8 +906,12 @@ impl Reactor {
         }
     }
 
-    /// Retires kernel-visible submissions and closes the ring while preserving
-    /// completed state still owned by escaped futures.
+    /// Attempts to retire kernel-visible submissions before closing the ring.
+    ///
+    /// Completed state still owned by escaped futures remains available. If
+    /// the bounded drain cannot observe every target CQE, unresolved state and
+    /// both backing pools are deliberately abandoned because ring close alone
+    /// does not prove that kernel-visible userspace memory is quiescent.
     pub(crate) fn shutdown(
         &mut self,
         runtime_state: *mut RuntimeState,
@@ -888,9 +924,9 @@ impl Reactor {
         }
 
         self.prepare_shutdown();
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(debug_assertions, feature = "test-support"))]
         let force_fallback = crate::runtime::test_hooks::take_reactor_shutdown_fallback();
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(debug_assertions, feature = "test-support")))]
         let force_fallback = false;
         let deadline = Instant::now() + Duration::from_secs(1);
         while !force_fallback
@@ -918,10 +954,12 @@ impl Reactor {
         }
 
         if unsafe { (*runtime_state).inflight_ops > 0 } {
-            // Closing the ring is the bounded fallback that ends all remaining
-            // kernel access before retained payloads or state slots are
-            // touched. Readiness operations retain their source descriptor,
-            // and their CQEs never create a process resource.
+            // Ring close bounds shutdown latency but does not synchronously
+            // prove that the kernel has stopped referencing submitted
+            // userspace memory. Abandon every state whose target CQE was not
+            // observed, along with both backing pools, rather than exposing or
+            // recycling storage that may still be kernel-visible.
+            self.storage_abandoned = true;
             drop(self.ring.take());
             self.drop_unsubmitted_close_owners();
             unsafe {
@@ -934,9 +972,10 @@ impl Reactor {
                 unsafe {
                     self.pending_cancels.unlink(state);
                     if !(*state).is_completed() {
-                        (*state).result = -libc::ECANCELED;
-                        (*state).cqe_flags = 0;
-                        (*state).set_completed();
+                        (*state).clear_waiter();
+                        (*state).set_ring_abandoned();
+                        index += 1;
+                        continue;
                     }
                 }
 
@@ -1001,7 +1040,6 @@ impl Reactor {
             let state = user_data as *mut CompletionState;
             unsafe {
                 (*state).result = cqe.result();
-                (*state).cqe_flags = cqe.flags();
                 (*state).set_completed();
 
                 retire_tracked_completion(&mut *runtime_state)?;
@@ -1054,10 +1092,15 @@ impl Drop for Reactor {
         }
         self.drop_unsubmitted_close_owners();
         debug_assert!(
-            self.live_registry.is_empty(),
+            self.storage_abandoned || self.live_registry.is_empty(),
             "reactor dropped with live completion states"
         );
-        unsafe { ManuallyDrop::drop(&mut self.op_pool) };
+        if !self.storage_abandoned {
+            unsafe {
+                ManuallyDrop::drop(&mut self.op_pool);
+                ManuallyDrop::drop(&mut self.retained_pool);
+            }
+        }
     }
 }
 
@@ -1293,7 +1336,9 @@ mod tests {
     use crate::runtime::fd::{distinctive_closeable_test_fd, raw_fd_is_closed};
 
     use super::*;
+    use std::cell::Cell;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::rc::Rc;
 
     fn runtime_state_with_inflight(inflight_ops: usize) -> RuntimeState {
         RuntimeState {
@@ -1320,7 +1365,7 @@ mod tests {
         (raw, unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     fn nop_sqe(user_data: u64) -> io_uring::squeue::Entry {
         opcode::Nop::new().build().user_data(user_data)
     }
@@ -1493,7 +1538,7 @@ mod tests {
         close_fd_if_open(third_raw);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn failed_close_push_returns_the_identical_owner_without_a_marker() {
         let mut reactor =
@@ -1514,7 +1559,7 @@ mod tests {
         assert!(raw_fd_is_closed(raw));
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn close_submit_error_preserves_the_queued_owner_and_sequence() {
         let mut reactor =
@@ -1659,7 +1704,7 @@ mod tests {
         assert_eq!(runtime_state.stats.cqe_completions, 0);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn submit_sqe_full_queue_absorbs_eintr_before_push() {
         let mut reactor =
@@ -1677,13 +1722,18 @@ mod tests {
         reactor
             .submit_sqe(nop_sqe(3))
             .expect("EINTR while making SQ space should be absorbed");
+        assert_eq!(
+            crate::runtime::test_hooks::ring_submit_failures_remaining(),
+            0,
+            "full-queue EINTR hook was not consumed"
+        );
         assert!(
             reactor.has_queued_sqes(),
             "third NOP should remain pending after push"
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn submit_sqe_full_queue_transient_ebusy_retries_and_pushes() {
         let mut reactor =
@@ -1701,13 +1751,18 @@ mod tests {
         reactor
             .submit_sqe(nop_sqe(3))
             .expect("transient EBUSY should be retried");
+        assert_eq!(
+            crate::runtime::test_hooks::ring_submit_failures_remaining(),
+            0,
+            "full-queue EBUSY hook was not consumed"
+        );
         assert!(
             reactor.has_queued_sqes(),
             "third NOP should remain pending after transient submit pressure"
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn submit_sqe_full_queue_persistent_ebusy_returns_would_block() {
         let mut reactor =
@@ -1733,7 +1788,7 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn flush_sqes_reports_busy_on_submit_ebusy() {
         let mut reactor =
@@ -1749,7 +1804,7 @@ mod tests {
         assert_eq!(status, ReactorSubmitStatus::Busy);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn wait_for_events_reports_busy_with_pending_cancel_retry() {
         let mut reactor =
@@ -1770,7 +1825,7 @@ mod tests {
         reactor.free_op(state);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn wait_for_events_busy_flushes_cancel_before_the_countless_wait_error() {
         let mut reactor =
@@ -1795,7 +1850,7 @@ mod tests {
         reactor.free_op(state);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn timed_wait_flushes_close_owner_before_the_countless_wait_error() {
         let mut reactor =
@@ -1824,7 +1879,7 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn failed_cancel_submission_is_queued_and_retried() {
         let mut reactor =
@@ -1856,7 +1911,7 @@ mod tests {
         reactor.free_op(state);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn failed_cancel_retry_uses_one_fifo_snapshot_per_pass() {
         let mut reactor =
@@ -1901,7 +1956,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn shutdown_prepare_preserves_links_for_already_queued_orphans() {
         let mut reactor =
@@ -1929,7 +1984,177 @@ mod tests {
         reactor.free_op(states[0]);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn shutdown_fallback_abandons_unretired_states_and_payload_storage() {
+        struct DropTrackedInlinePayload {
+            drops: Rc<Cell<usize>>,
+            _bytes: [u8; 8],
+        }
+
+        impl Drop for DropTrackedInlinePayload {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        #[repr(align(128))]
+        struct DropTrackedHeapPayload {
+            drops: Rc<Cell<usize>>,
+            _bytes: [u8; 8],
+        }
+
+        impl Drop for DropTrackedHeapPayload {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        struct DropTrackedScratchPayload {
+            drops: Rc<Cell<usize>>,
+            _scratch: RetainedIovecScratch,
+        }
+
+        impl Drop for DropTrackedScratchPayload {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+
+        let abandoned_drops = Rc::new(Cell::new(0));
+        let heap_drops = Rc::new(Cell::new(0));
+        let scratch_drops = Rc::new(Cell::new(0));
+        let orphaned = reactor.alloc_op();
+        let attached = reactor.alloc_op();
+        let heap_fallback = reactor.alloc_op();
+        let pooled_scratch = reactor.alloc_op();
+        assert!(!orphaned.is_null(), "orphaned op allocation failed");
+        assert!(!attached.is_null(), "attached op allocation failed");
+        assert!(!heap_fallback.is_null(), "heap op allocation failed");
+        assert!(!pooled_scratch.is_null(), "scratch op allocation failed");
+
+        let orphaned_payload = reactor.alloc_retained_payload(DropTrackedInlinePayload {
+            drops: Rc::clone(&abandoned_drops),
+            _bytes: [0; 8],
+        });
+        let orphaned_payload_ptr = orphaned_payload.as_ptr();
+        let attached_payload = reactor.alloc_retained_payload(DropTrackedInlinePayload {
+            drops: Rc::clone(&abandoned_drops),
+            _bytes: [0; 8],
+        });
+        let attached_payload_ptr = attached_payload.as_ptr();
+        let heap_payload = reactor.alloc_retained_payload(DropTrackedHeapPayload {
+            drops: Rc::clone(&heap_drops),
+            _bytes: [0; 8],
+        });
+        let scratch = reactor
+            .alloc_iovec_scratch(64)
+            .expect("pooled iovec scratch allocation failed");
+        let scratch_payload = reactor.alloc_retained_payload(DropTrackedScratchPayload {
+            drops: Rc::clone(&scratch_drops),
+            _scratch: scratch,
+        });
+        unsafe {
+            (*orphaned).attach_retained_payload(orphaned_payload);
+            (*orphaned).set_orphaned();
+            (*attached).attach_retained_payload(attached_payload);
+            (*heap_fallback).attach_retained_payload(heap_payload);
+            (*heap_fallback).set_orphaned();
+            (*pooled_scratch).attach_retained_payload(scratch_payload);
+            (*pooled_scratch).set_orphaned();
+        }
+
+        let mut runtime_state = runtime_state_with_inflight(4);
+        let mut ready_queue = crate::utils::list::intrusive::dlist::DList::<
+            crate::runtime::task::TaskHeader,
+        >::new_uninit();
+        ready_queue.init();
+        crate::runtime::test_hooks::force_next_reactor_shutdown_fallback();
+
+        reactor.shutdown(&mut runtime_state, &mut ready_queue);
+
+        assert_eq!(
+            crate::runtime::test_hooks::reactor_shutdown_fallbacks_remaining(),
+            0,
+            "forced reactor fallback was not consumed"
+        );
+        assert!(reactor.storage_abandoned);
+        assert!(reactor.ring.is_none());
+        assert_eq!(runtime_state.inflight_ops, 0);
+        assert_eq!(reactor.live_registry.len(), 4);
+        assert!(reactor.pending_cancels.is_empty());
+        unsafe {
+            assert!((*orphaned).is_ring_abandoned());
+            assert!(!(*orphaned).is_completed());
+            assert!((*attached).is_ring_abandoned());
+            assert!(!(*attached).is_completed());
+            assert!((*attached).is_runtime_shutdown());
+            assert!((*attached).waiter.is_null());
+            assert!((*heap_fallback).is_ring_abandoned());
+            assert!(!(*heap_fallback).is_completed());
+            assert!((*pooled_scratch).is_ring_abandoned());
+            assert!(!(*pooled_scratch).is_completed());
+        }
+        assert_eq!(
+            abandoned_drops.get(),
+            0,
+            "ring-abandoned payload value was dropped"
+        );
+
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        {
+            let stats = reactor.retained_payload_stats();
+            assert_eq!(stats.pooled_frees, 0);
+            assert_eq!(stats.pooled_reuses, 0);
+            assert_eq!(stats.heap_fallbacks, 1);
+            assert_eq!(stats.heap_frees, 0);
+            assert_eq!(stats.writev_scratch_pooled_allocs, 1);
+            assert_eq!(stats.writev_scratch_pooled_frees, 0);
+        }
+        assert_eq!(heap_drops.get(), 0);
+        assert_eq!(scratch_drops.get(), 0);
+
+        let replacement_drops = Rc::new(Cell::new(0));
+        let replacement_payload = reactor.alloc_retained_payload(DropTrackedInlinePayload {
+            drops: Rc::clone(&replacement_drops),
+            _bytes: [0; 8],
+        });
+        assert_ne!(replacement_payload.as_ptr(), orphaned_payload_ptr);
+        assert_ne!(replacement_payload.as_ptr(), attached_payload_ptr);
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        assert_eq!(reactor.retained_payload_stats().pooled_reuses, 0);
+        unsafe {
+            replacement_payload.drop_and_free(&mut reactor.retained_pool);
+        }
+        assert_eq!(replacement_drops.get(), 1);
+
+        let replacement_state = reactor.alloc_op();
+        assert!(
+            !replacement_state.is_null(),
+            "replacement op allocation failed"
+        );
+        assert_ne!(replacement_state, orphaned);
+        assert_ne!(replacement_state, attached);
+        assert_ne!(replacement_state, heap_fallback);
+        assert_ne!(replacement_state, pooled_scratch);
+        reactor.free_op(replacement_state);
+
+        drop(reactor);
+        assert_eq!(
+            abandoned_drops.get(),
+            0,
+            "reactor drop released ring-abandoned payload storage"
+        );
+        assert_eq!(heap_drops.get(), 0);
+        assert_eq!(scratch_drops.get(), 0);
+        assert_eq!(replacement_drops.get(), 1);
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn target_retirement_unlinks_pending_cancel_head_middle_and_tail() {
         let mut reactor =
@@ -1964,7 +2189,7 @@ mod tests {
         assert!(reactor.pending_cancels.tail.is_null());
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn failed_cancel_retry_keeps_reactor_busy() {
         let mut reactor =
@@ -1989,7 +2214,7 @@ mod tests {
         reactor.free_op(state);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn reactor_setup_rejects_missing_ext_arg_support() {
         crate::runtime::test_hooks::fail_next_reactor_ext_arg_probe();

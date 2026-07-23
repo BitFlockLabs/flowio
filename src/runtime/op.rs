@@ -28,6 +28,11 @@ use std::rc::Rc;
 /// reactor drops it when an orphaned original CQE retires. Cancel CQEs use
 /// `user_data == 0` and never release retained payloads.
 ///
+/// If bounded reactor shutdown closes the ring without observing a target CQE,
+/// the state remains incomplete and is marked ring-abandoned. Its state and
+/// payload storage are deliberately leaked: closing the ring does not prove
+/// that the kernel has stopped referencing submitted userspace memory.
+///
 /// Retained payload storage is backed by the reactor's private retained-payload
 /// pool for common payload sizes. Oversized or over-aligned payloads use the
 /// documented heap fallback carried by the same erased vtable.
@@ -36,8 +41,6 @@ use std::rc::Rc;
 pub struct CompletionState {
     /// CQE result value, stored exactly as returned by the kernel.
     pub result: i32,
-    /// CQE flags copied from the completion entry.
-    pub cqe_flags: u32,
     /// Internal state bits such as completed/orphaned.
     pub state_flags: u32,
     /// Index in the owner's bounded live-operation registry.
@@ -73,12 +76,14 @@ impl CompletionState {
     /// The future was polled without its originating FlowIO executor context.
     /// Completion still owns any retained payload until the original CQE.
     pub const FLAG_CONTEXT_REJECTED: u32 = 1 << 5;
+    /// Reactor teardown abandoned this submission without observing its target
+    /// CQE. The state and any retained payload must never be reclaimed.
+    pub const FLAG_RING_ABANDONED: u32 = 1 << 6;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
         Self {
             result: 0,
-            cqe_flags: 0,
             state_flags: 0,
             registry_index: u32::MAX,
             waiter: std::ptr::null_mut(),
@@ -112,6 +117,11 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn is_runtime_shutdown(&self) -> bool {
         self.state_flags & Self::FLAG_RUNTIME_SHUTDOWN != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_ring_abandoned(&self) -> bool {
+        self.state_flags & Self::FLAG_RING_ABANDONED != 0
     }
 
     #[inline(always)]
@@ -178,6 +188,11 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn set_runtime_shutdown(&mut self) {
         self.state_flags |= Self::FLAG_RUNTIME_SHUTDOWN;
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_ring_abandoned(&mut self) {
+        self.state_flags |= Self::FLAG_RING_ABANDONED;
     }
 
     #[inline(always)]
@@ -377,7 +392,6 @@ impl CompletionState {
             "cannot resubmit a linked completion state"
         );
         self.result = 0;
-        self.cqe_flags = 0;
         self.state_flags = 0;
         self.clear_waiter();
         self.cancel_next = std::ptr::null_mut();
@@ -435,5 +449,20 @@ mod tests {
         unsafe { state.register_waiter(first_ptr) };
         state.reset_for_resubmit();
         assert_eq!(first.refs.get(), 1, "resubmit reset leaked waiter");
+    }
+
+    #[test]
+    fn ring_abandonment_does_not_fabricate_target_completion() {
+        let mut state = CompletionState::empty();
+
+        state.set_runtime_shutdown();
+        state.set_ring_abandoned();
+
+        assert!(state.is_runtime_shutdown());
+        assert!(state.is_ring_abandoned());
+        assert!(
+            !state.is_completed(),
+            "ring abandonment must not expose a payload without a target CQE"
+        );
     }
 }

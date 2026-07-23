@@ -374,28 +374,51 @@ impl<const N: usize> IoBuffVecMut<N> {
             .sum()
     }
 
+    /// Returns the number of non-empty read iovecs and their total capacity.
+    #[inline(always)]
+    pub(crate) fn read_iovec_count_and_writable_len(&self) -> (usize, usize) {
+        let mut iov_count = 0;
+        let mut total = 0;
+        for buf in iter_inline(&self.buffers, self.count) {
+            let len = buf.payload_remaining();
+            if len == 0 {
+                continue;
+            }
+            iov_count += 1;
+            total += len;
+        }
+        (iov_count, total)
+    }
+
     /// Fills caller-provided `iovec` scratch for `readv`/`recvmsg`.
     ///
-    /// Returns `(iov_count, total_writable)` for the initialized entries.
+    /// Zero-length destinations are skipped. Returns
+    /// `(iov_count, total_writable)` for the initialized prefix.
     pub(crate) fn fill_read_iovecs_and_writable_len(
         &mut self,
         dst: &mut [MaybeUninit<libc::iovec>],
     ) -> (usize, usize) {
         debug_assert!(
-            dst.len() >= self.count,
-            "readv scratch has fewer entries than active segments"
+            dst.len() >= self.read_iovec_count_and_writable_len().0,
+            "readv scratch has fewer entries than non-empty segments"
         );
+        let mut iov_count = 0;
         let mut total = 0;
-        for (i, slot) in dst.iter_mut().enumerate().take(self.count) {
+        for i in 0..self.count {
             let buf = unsafe { self.buffers[i].assume_init_mut() };
             let len = buf.writable_len();
-            slot.write(libc::iovec {
+            if len == 0 {
+                continue;
+            }
+            dst[iov_count].write(libc::iovec {
                 iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                 iov_len: len,
             });
+            iov_count += 1;
             total += len;
         }
-        (self.count, total)
+        debug_assert_eq!((iov_count, total), self.read_iovec_count_and_writable_len());
+        (iov_count, total)
     }
 
     #[cfg(feature = "test-support")]
@@ -806,5 +829,61 @@ impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVecIntoIter<B, N>
         unsafe {
             drop_initialized_inline(&mut self.buffers[self.index..], self.count - self.index)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_iovec_fill_compacts_nonempty_segments_and_preserves_tail() {
+        let mut full = IoBuffMut::new(0, 4, 0).expect("full segment allocation failed");
+        full.payload_append(b"full")
+            .expect("full segment initialization failed");
+        let mut writable = IoBuffMut::new(0, 8, 0).expect("writable segment allocation failed");
+        let zero = IoBuffMut::new(0, 0, 0).expect("zero segment allocation failed");
+        let mut partial = IoBuffMut::new(0, 6, 0).expect("partial segment allocation failed");
+        partial
+            .payload_append(b"ok")
+            .expect("partial segment initialization failed");
+
+        let writable_ptr = writable.as_mut_ptr();
+        let partial_ptr = partial.as_mut_ptr();
+        let mut chain = IoBuffVecMut::from_array([full, writable, zero, partial]);
+        assert_eq!(chain.read_iovec_count_and_writable_len(), (2, 12));
+
+        let poison = libc::iovec {
+            iov_base: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            iov_len: usize::MAX,
+        };
+        let mut scratch: [MaybeUninit<libc::iovec>; 4] =
+            std::array::from_fn(|_| MaybeUninit::new(poison));
+        let (iov_count, writable_len) = chain.fill_read_iovecs_and_writable_len(&mut scratch);
+
+        assert_eq!((iov_count, writable_len), (2, 12));
+        let first = unsafe { scratch[0].assume_init_ref() };
+        assert_eq!(first.iov_base, writable_ptr.cast());
+        assert_eq!(first.iov_len, 8);
+        let second = unsafe { scratch[1].assume_init_ref() };
+        assert_eq!(second.iov_base, partial_ptr.cast());
+        assert_eq!(second.iov_len, 4);
+        for slot in &scratch[2..] {
+            let untouched = unsafe { slot.assume_init_ref() };
+            assert_eq!(untouched.iov_base, poison.iov_base);
+            assert_eq!(untouched.iov_len, poison.iov_len);
+        }
+        assert_eq!(chain.segments(), 4);
+        assert_eq!(
+            chain.get(0).expect("full segment missing").payload_bytes(),
+            b"full"
+        );
+        assert_eq!(
+            chain
+                .get(3)
+                .expect("partial segment missing")
+                .payload_bytes(),
+            b"ok"
+        );
     }
 }

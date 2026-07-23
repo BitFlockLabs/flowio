@@ -181,10 +181,10 @@
 
 use super::stream;
 use super::{
-    WriteBufferChain, WritevProjection, accept_nonblocking, accept_readiness_sqe, close_fd,
-    close_if_valid, connect_cqe_result, current_local_addr, current_peer_addr, get_sock_opt,
-    new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
-    socket_addr_to_c, socket_domain,
+    WriteBufferChain, WritevProjection, accept_nonblocking, accept_readiness_allows_rearm,
+    accept_readiness_sqe, close_fd, close_if_valid, connect_cqe_result, current_local_addr,
+    current_peer_addr, get_sock_opt, new_nonblocking_socket, set_reuse_addr, set_reuse_port,
+    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
@@ -202,7 +202,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -239,9 +239,9 @@ fn finish_accepted_stream(
 
 /// Reusable accept-side submission state kept by [`TcpListener`].
 struct AcceptSlot {
-    /// Shared listener owner retained by every readiness submission until its
+    /// Owner-thread listener retained by every readiness submission until its
     /// CQE or cancellation retires.
-    listener_fd: Arc<RuntimeFd>,
+    listener_fd: Rc<RuntimeFd>,
     /// Completion state for the current or last accept submission.
     state_ptr: *mut CompletionState,
     /// True while an [`AcceptFuture`] is borrowing this slot.
@@ -249,7 +249,7 @@ struct AcceptSlot {
 }
 
 impl AcceptSlot {
-    fn new(listener_fd: Arc<RuntimeFd>) -> Self {
+    fn new(listener_fd: Rc<RuntimeFd>) -> Self {
         Self {
             listener_fd,
             state_ptr: std::ptr::null_mut(),
@@ -324,7 +324,7 @@ impl AcceptSlot {
                             addrlen,
                         ));
                     }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    Err(err) if accept_readiness_allows_rearm(result, &err) => {
                         // Readiness is only a hint and can be stale. Rearm the
                         // one-shot poll without consuming slot ownership.
                         note_accept_readiness_rearm();
@@ -367,9 +367,13 @@ impl AcceptSlot {
                     return Poll::Ready(Err(e));
                 }
             }
+            return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) };
+        if unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) } {
+            self.drop_future();
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+        }
         Poll::Pending
     }
 }
@@ -515,9 +519,13 @@ impl ConnectSlot {
                     return Poll::Ready(Err(e));
                 }
             }
+            return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) };
+        if unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) } {
+            self.drop_future();
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+        }
         Poll::Pending
     }
 }
@@ -923,7 +931,7 @@ impl Drop for TcpConnector {
 /// ```
 pub struct TcpListener {
     /// Owned listening socket descriptor.
-    fd: Arc<RuntimeFd>,
+    fd: Rc<RuntimeFd>,
     /// Cached local address assigned after bind/listen.
     local_addr: SocketAddr,
     /// Reusable accept state kept across accepts.
@@ -985,9 +993,9 @@ impl TcpListener {
             }
         };
 
-        let fd = Arc::new(RuntimeFd::from_fresh_raw_fd(fd));
+        let fd = Rc::new(RuntimeFd::from_fresh_raw_fd(fd));
         Ok(Self {
-            accept_slot: AcceptSlot::new(Arc::clone(&fd)),
+            accept_slot: AcceptSlot::new(Rc::clone(&fd)),
             fd,
             local_addr,
         })
@@ -1009,7 +1017,9 @@ impl TcpListener {
     ///
     /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
     /// listener's reusable accept slot is still occupied by a previous future
-    /// or if runtime operation capacity cannot accept the submission.
+    /// or if runtime operation capacity cannot accept the submission. It also
+    /// preserves the kernel's `WouldBlock` if a terminal readiness condition
+    /// has no queued connection, ending this accept attempt without rearming.
     ///
     /// Dropping a pending accept cancels only its readiness wait; it does not
     /// consume a connection already queued in the listener backlog. If the
@@ -1087,8 +1097,8 @@ pub(crate) mod test_support {
         state.result = fd;
         state.set_completed();
 
-        let listener_fd = Arc::new(RuntimeFd::from_fresh_raw_fd(fd));
-        let mut slot = AcceptSlot::new(Arc::clone(&listener_fd));
+        let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(fd));
+        let mut slot = AcceptSlot::new(Rc::clone(&listener_fd));
         slot.in_use = true;
         slot.state_ptr = &mut state;
 
@@ -1283,9 +1293,14 @@ impl Future for OwnedConnectFuture {
                     return Poll::Ready(Err(e));
                 }
             }
+            return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        if unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) } {
+            unsafe { drop_op_ptr_unchecked(&mut this.state_ptr) };
+            this.cleanup_fd();
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+        }
         Poll::Pending
     }
 }
@@ -1319,6 +1334,70 @@ impl Future for OwnedConnectTimeoutFuture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(miri))]
+    #[test]
+    fn ring_abandoned_connects_close_owned_sockets_without_reclaiming_state() {
+        let reusable_fd = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("reusable connect fd creation failed");
+        let owned_fd = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("owned connect fd creation failed");
+        let mut reusable_state = CompletionState::empty();
+        reusable_state.set_ring_abandoned();
+        let mut owned_state = CompletionState::empty();
+        owned_state.set_ring_abandoned();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        let mut reusable = ConnectSlot::new();
+        reusable.state_ptr = &mut reusable_state;
+        reusable.in_use = true;
+        reusable.fd = reusable_fd;
+        assert!(matches!(
+            reusable.poll_connect(&mut cx),
+            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+        ));
+        assert!(reusable.state_ptr.is_null());
+        assert!(!reusable.in_use);
+        assert!(crate::runtime::fd::raw_fd_is_closed(reusable_fd));
+        assert!(reusable_state.is_ring_abandoned());
+        assert!(!reusable_state.is_completed());
+
+        let mut owned = OwnedConnectFuture {
+            state_ptr: &mut owned_state,
+            fd: owned_fd,
+            addr: None,
+        };
+        assert!(matches!(
+            Pin::new(&mut owned).poll(&mut cx),
+            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+        ));
+        assert!(owned.state_ptr.is_null());
+        assert!(crate::runtime::fd::raw_fd_is_closed(owned_fd));
+        assert!(owned_state.is_ring_abandoned());
+        assert!(!owned_state.is_completed());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn tcp_terminal_accept_readiness_would_block_is_not_rearmed() {
+        crate::net::test_terminal_accept_readiness(
+            "TCP",
+            AcceptSlot::new,
+            |slot, cx, state_ptr| {
+                slot.state_ptr = state_ptr;
+                slot.in_use = true;
+                let mut accept = AcceptFuture {
+                    slot,
+                    input_error: None,
+                    prepared: true,
+                };
+                let outcome = Future::poll(Pin::new(&mut accept), cx);
+                drop(accept);
+                outcome
+            },
+            |slot| slot.state_ptr.is_null() && !slot.in_use,
+        );
+    }
 
     #[test]
     fn accepted_owned_fd_closes_when_peer_address_decode_fails() {

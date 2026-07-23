@@ -135,6 +135,11 @@ pub(crate) fn take_raw_sqe_submit_failure() -> Option<io::Error> {
 }
 
 #[inline(always)]
+pub(crate) fn raw_sqe_submit_failures_remaining() -> usize {
+    FAIL_RAW_SQE_SUBMITS.with(Cell::get)
+}
+
+#[inline(always)]
 pub(crate) fn take_ring_submit_failure() -> Option<io::Error> {
     FAIL_RING_SUBMITS.with(|fails| {
         let remaining = fails.get();
