@@ -259,22 +259,23 @@ impl IoBuffPoolInner {
         } else {
             let slot_size = unsafe { (*pool_ptr).slot_size };
             let slab_pages = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_pages) };
-            let mut ptr = unsafe { (*slab_pages).try_alloc_current(slot_size) };
-
-            if ptr.is_none() {
+            let slab_factory = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_factory) };
+            let allocation = unsafe {
                 #[cfg(debug_assertions)]
-                if crate::runtime::test_hooks::take_iobuff_pool_slab_alloc_failure() {
-                    return Err(IoBuffError::AllocFailed);
+                {
+                    (*slab_pages).alloc_or_grow_with_debug_rejection(
+                        &mut *slab_factory,
+                        slot_size,
+                        crate::runtime::test_hooks::take_iobuff_pool_slab_alloc_failure,
+                    )
                 }
-
-                let slab_factory = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_factory) };
-                let new_ptr =
-                    unsafe { (*slab_pages).alloc_from_new_slab(&mut *slab_factory, slot_size) }
-                        .ok_or(IoBuffError::AllocFailed)?;
-                ptr = Some(new_ptr);
+                #[cfg(not(debug_assertions))]
+                {
+                    (*slab_pages).alloc_or_grow(&mut *slab_factory, slot_size)
+                }
             }
-
-            ptr.ok_or(IoBuffError::AllocFailed)?
+            .ok_or(IoBuffError::AllocFailed)?;
+            allocation.ptr
         };
 
         unsafe {
@@ -450,6 +451,53 @@ mod tests {
             .expect("forced failure should not poison later allocation");
         assert_eq!(pool.live_slots_for_test(), 1);
         drop(buf);
+        assert_eq!(pool.live_slots_for_test(), 0);
+    }
+
+    #[test]
+    fn iobuff_pool_debug_failure_waits_for_required_growth() {
+        let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+            headroom: 0,
+            payload: 16,
+            tailroom: 0,
+            objs_per_slab: 2,
+        })
+        .expect("pool config should be valid");
+        pool.init();
+
+        let first = pool.alloc().expect("first slab allocation failed");
+        let first_ptr = first.header.as_ptr();
+        crate::runtime::test_hooks::fail_next_iobuff_pool_slab_alloc();
+
+        let second = pool
+            .alloc()
+            .expect("current-slab allocation consumed the growth failure");
+        assert_eq!(pool.live_slots_for_test(), 2);
+        let err = match pool.alloc() {
+            Ok(_) => panic!("required slab growth ignored the forced failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err, IoBuffError::AllocFailed);
+        assert_eq!(pool.live_slots_for_test(), 2);
+
+        drop(first);
+        crate::runtime::test_hooks::fail_next_iobuff_pool_slab_alloc();
+        let reused = pool
+            .alloc()
+            .expect("free-list reuse consumed the growth failure");
+        assert_eq!(reused.header.as_ptr(), first_ptr);
+        let err = match pool.alloc() {
+            Ok(_) => panic!("growth after free-list reuse ignored the forced failure"),
+            Err(err) => err,
+        };
+        assert_eq!(err, IoBuffError::AllocFailed);
+        assert_eq!(pool.live_slots_for_test(), 2);
+
+        let third = pool
+            .alloc()
+            .expect("consumed failure should not poison later slab growth");
+        assert_eq!(pool.live_slots_for_test(), 3);
+        drop((second, reused, third));
         assert_eq!(pool.live_slots_for_test(), 0);
     }
 }

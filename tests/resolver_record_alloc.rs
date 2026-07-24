@@ -30,6 +30,15 @@ fn push_wire_name(packet: &mut Vec<u8>, name: &str) {
 }
 
 fn cname_response(section: RecordSection, owner: &str, target: &str) -> Vec<u8> {
+    cname_response_with_class(section, owner, target, 1)
+}
+
+fn cname_response_with_class(
+    section: RecordSection,
+    owner: &str,
+    target: &str,
+    class: u16,
+) -> Vec<u8> {
     let (answer_count, authority_count, additional_count) = match section {
         RecordSection::Answer => (1u16, 0u16, 0u16),
         RecordSection::Authority => (0u16, 1u16, 0u16),
@@ -49,7 +58,7 @@ fn cname_response(section: RecordSection, owner: &str, target: &str) -> Vec<u8> 
 
     push_wire_name(&mut packet, owner);
     packet.extend_from_slice(&5u16.to_be_bytes());
-    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&class.to_be_bytes());
     packet.extend_from_slice(&0u32.to_be_bytes());
     let target_wire_len =
         u16::try_from(target.len() + 2).expect("test target should fit DNS RDATA");
@@ -59,8 +68,12 @@ fn cname_response(section: RecordSection, owner: &str, target: &str) -> Vec<u8> 
 }
 
 fn counted_name_allocations(packet: &[u8], name_len: usize) -> usize {
+    counted_name_allocations_for_host(packet, name_len, QUERY_HOST)
+}
+
+fn counted_name_allocations_for_host(packet: &[u8], name_len: usize, query_host: &str) -> usize {
     start_counting_allocations_of_size(name_len);
-    let result = parse_ipv4_response(packet, QUERY_ID, QUERY_HOST);
+    let result = parse_ipv4_response(packet, QUERY_ID, query_host);
     let allocations = finish_counting_allocations_of_size();
     result.expect("valid DNS response should parse");
     allocations
@@ -73,11 +86,12 @@ fn ignored_record_sections_validate_names_without_materializing_them() {
     let authority = cname_response(RecordSection::Authority, &owner, &target);
     let additional = cname_response(RecordSection::Additional, &owner, &target);
     let answer = cname_response(RecordSection::Answer, &owner, &target);
+    let non_in_answer = cname_response_with_class(RecordSection::Answer, &owner, &target, 3);
 
     // Warm the narrow parser seam before arming the thread-local counters.
     parse_ipv4_response(&authority, QUERY_ID, QUERY_HOST).expect("warmup response should parse");
 
-    for packet in [&authority, &additional] {
+    for packet in [&authority, &additional, &non_in_answer] {
         assert_eq!(counted_name_allocations(packet, OWNER_LEN), 0);
         assert_eq!(counted_name_allocations(packet, TARGET_LEN), 0);
     }
@@ -86,4 +100,41 @@ fn ignored_record_sections_validate_names_without_materializing_them() {
     // allocations when section policy requires materialization.
     assert_eq!(counted_name_allocations(&answer, OWNER_LEN), 1);
     assert_eq!(counted_name_allocations(&answer, TARGET_LEN), 1);
+}
+
+#[test]
+fn cname_chain_clones_only_the_final_selected_target() {
+    const NAME_LEN: usize = 47;
+    let names = ["a", "b", "c", "d"].map(|fill| fill.repeat(NAME_LEN));
+    let query_host = &names[0];
+
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&QUERY_ID.to_be_bytes());
+    packet.extend_from_slice(&0x8180u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&3u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    push_wire_name(&mut packet, query_host);
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+
+    for pair in names.windows(2) {
+        push_wire_name(&mut packet, &pair[0]);
+        packet.extend_from_slice(&5u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        let target_wire_len =
+            u16::try_from(pair[1].len() + 2).expect("test target should fit DNS RDATA");
+        packet.extend_from_slice(&target_wire_len.to_be_bytes());
+        push_wire_name(&mut packet, &pair[1]);
+    }
+
+    // One question, three owners, three targets, and one final selected-target
+    // clone allocate at this exact name size. Cloning once per hop would make
+    // this count ten instead of eight.
+    assert_eq!(
+        counted_name_allocations_for_host(&packet, NAME_LEN, query_host),
+        8
+    );
 }

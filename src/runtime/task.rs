@@ -35,7 +35,7 @@ unsafe fn schedule_woken_task(task_ptr: *mut TaskHeader) {
     unsafe { crate::runtime::executor::schedule_woken_task(task_ptr) };
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 #[doc(hidden)]
 pub struct TaskHeader {
     /// Intrusive ready-queue link used by the executor scheduler.

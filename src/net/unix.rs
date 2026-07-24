@@ -28,6 +28,9 @@
 //! nonblocking syscall without reactor registration or retry. Use the async
 //! `read` / `write` APIs for normal FlowIO-managed Unix stream I/O.
 //!
+//! Setup uses the immediate [`UnixStream::pair`] API; once connected, the
+//! asynchronous stream I/O surface has TCP parity.
+//!
 //! # Example
 //! ```no_run
 //! use flowio::net::unix::UnixStream;
@@ -282,16 +285,7 @@ impl UnixStream {
     /// This is connection control-plane work, normally used for teardown or
     /// protocol half-close rather than steady-state data transfer.
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        let how = match how {
-            std::net::Shutdown::Read => libc::SHUT_RD,
-            std::net::Shutdown::Write => libc::SHUT_WR,
-            std::net::Shutdown::Both => libc::SHUT_RDWR,
-        };
-        let rc = unsafe { libc::shutdown(self.fd.raw_fd(), how) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        super::shutdown_socket(self.fd.raw_fd(), how)
     }
 }
 

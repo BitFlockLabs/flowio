@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn sctp_recv_meta_wrapper_reaches_exact_data_and_notification_results() {
         let data_input = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/valid_rcvinfo_unaligned"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/valid_rcvinfo_unaligned"),
             rcvinfo_input(sample_rcvinfo(), b"ping"),
         );
         #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
@@ -360,7 +360,7 @@ mod tests {
         );
 
         let notification_input = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/notification_assoc_change"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/notification_assoc_change"),
             assoc_change_input(),
         );
         assert_eq!(
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn sctp_recv_meta_wrapper_pins_zero_controllen_decision_seam() {
         let no_rcvinfo = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/data_without_rcvinfo"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/data_without_rcvinfo"),
             zero_reported_control_input(0x08, 0, b"payload"),
         );
         assert_eq!(
@@ -392,7 +392,9 @@ mod tests {
         );
 
         let missing_eor = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/data_without_rcvinfo_missing_eor"),
+            include_bytes!(
+                "../fixtures/fuzzing/sctp_parse_recv_meta/data_without_rcvinfo_missing_eor"
+            ),
             zero_reported_control_input(0, 0, b"payload"),
         );
         let error = observe_sctp_parse_recv_meta(&missing_eor)
@@ -401,7 +403,7 @@ mod tests {
         assert!(error.to_string().contains("end-of-record"));
 
         let control_truncated = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/data_without_rcvinfo_ctrunc"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/data_without_rcvinfo_ctrunc"),
             zero_reported_control_input(0x0C, 0, b"payload"),
         );
         let error = observe_sctp_parse_recv_meta(&control_truncated)
@@ -410,7 +412,7 @@ mod tests {
         assert!(error.to_string().contains("control"));
 
         let malformed_control = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/malformed_present_control"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/malformed_present_control"),
             zero_reported_control_input(0x08, 1, b"payload"),
         );
         let error = observe_sctp_parse_recv_meta(&malformed_control)
@@ -492,7 +494,7 @@ mod tests {
         );
 
         let short_header = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/truncated_cmsg_header"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/truncated_cmsg_header"),
             {
                 let mut input = rcvinfo_input(sample_rcvinfo(), b"ping");
                 input[0] |= 0x04;
@@ -505,7 +507,7 @@ mod tests {
         assert!(header_error.to_string().contains("control"));
 
         let short_rcvinfo = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/truncated_rcvinfo_payload"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/truncated_rcvinfo_payload"),
             {
                 let mut input = rcvinfo_input(sample_rcvinfo(), b"ping");
                 input[2] -= 1;
@@ -529,7 +531,7 @@ mod tests {
         );
 
         let maximum = checked_native_seed(
-            include_bytes!("../fuzz/seeds/sctp_parse_recv_meta/maximum_bounded_control"),
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/maximum_bounded_control"),
             {
                 let mut input = rcvinfo_input(sample_rcvinfo(), &[]);
                 input[1] = u8::MAX;
@@ -546,8 +548,10 @@ mod tests {
 
     #[test]
     fn tls_server_end_point_wrapper_reaches_valid_and_malformed_der() {
-        let rsa = include_bytes!("../fuzz/seeds/tls_server_end_point/valid_rsa_sha256_minimal");
-        let ecdsa = include_bytes!("../fuzz/seeds/tls_server_end_point/valid_ecdsa_sha256_minimal");
+        let rsa =
+            include_bytes!("../fixtures/fuzzing/tls_server_end_point/valid_rsa_sha256_minimal");
+        let ecdsa =
+            include_bytes!("../fixtures/fuzzing/tls_server_end_point/valid_ecdsa_sha256_minimal");
         assert_eq!(
             observe_tls_server_end_point(rsa)
                 .expect("RSA SHA-256 seed should derive a binding")
@@ -561,10 +565,10 @@ mod tests {
             32
         );
         assert!(!tls_server_end_point(include_bytes!(
-            "../fuzz/seeds/tls_server_end_point/unsupported_ed25519_minimal"
+            "../fixtures/fuzzing/tls_server_end_point/unsupported_ed25519_minimal"
         )));
         let malformed_tag =
-            include_bytes!("../fuzz/seeds/tls_server_end_point/malformed_signature_tag");
+            include_bytes!("../fixtures/fuzzing/tls_server_end_point/malformed_signature_tag");
         let mut expected_malformed_tag = maybe_decode_hex_seed(rsa).into_owned();
         assert_eq!(expected_malformed_tag.len(), 22);
         expected_malformed_tag[19] = 0x04;
@@ -574,8 +578,9 @@ mod tests {
         );
         assert!(!tls_server_end_point(malformed_tag));
 
-        let truncated_length =
-            include_bytes!("../fuzz/seeds/tls_server_end_point/malformed_truncated_long_length");
+        let truncated_length = include_bytes!(
+            "../fixtures/fuzzing/tls_server_end_point/malformed_truncated_long_length"
+        );
         assert_eq!(
             maybe_decode_hex_seed(truncated_length).as_ref(),
             &[0x30, 0x82, 0x01, 0x00]

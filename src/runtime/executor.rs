@@ -81,6 +81,7 @@ const TASKS_PER_SLAB: usize = 1024;
 /// payload boundary, so 64-bit task slots retain their pre-slice geometry.
 #[cfg(target_pointer_width = "64")]
 const _: [(); 4224] = [(); size_of::<Task<TASK_POOL_SIZE>>()];
+const _: () = assert!(std::mem::offset_of!(Task<TASK_POOL_SIZE>, data) % TASK_DATA_ALIGN == 0);
 
 #[allow(unused_macros)]
 macro_rules! define_runtime_stats {
@@ -585,6 +586,50 @@ impl Drop for ExecutorTaskRefGuard {
     }
 }
 
+/// Terminalizes one task if its type-erased poll hook unwinds.
+///
+/// Normal polls consume this guard with [`TaskPollPanicGuard::disarm`], which
+/// compiles to no state test. Only the unwind landing pad invokes `Drop`.
+struct TaskPollPanicGuard {
+    task: *mut TaskHeader,
+    runtime_state: *mut RuntimeState,
+}
+
+impl TaskPollPanicGuard {
+    #[inline(always)]
+    fn new(task: *mut TaskHeader, runtime_state: *mut RuntimeState) -> Self {
+        Self {
+            task,
+            runtime_state,
+        }
+    }
+
+    /// Suppresses exceptional cleanup after the poll hook returns normally.
+    #[inline(always)]
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TaskPollPanicGuard {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        let task = self.task;
+        let runtime_state = self.runtime_state;
+        // SAFETY: the scheduler installs this guard only after popping one
+        // live task and marking it RUNNING. Executor::run keeps RuntimeState
+        // and the executor-owned task reference alive through guard cleanup.
+        let cleanup_panic = unsafe { cancel_task_and_release_executor_ref(task, runtime_state) };
+        if let Some(payload) = cleanup_panic {
+            // A cleanup panic is secondary to the active poll unwind. Its
+            // payload may itself have a panicking destructor, so neither
+            // resuming nor dropping it is safe here.
+            std::mem::forget(payload);
+        }
+    }
+}
+
 enum CloseWorkerRejection {
     Full(OwnedFd),
     Disconnected(OwnedFd),
@@ -876,10 +921,12 @@ impl CompletedOpCtx {
 /// # Safety
 ///
 /// `state_ptr` must identify a live completed state allocated by a FlowIO
-/// reactor. Such states always retain a non-null executor owner.
+/// reactor. Such states always retain a non-null executor owner. `current`
+/// must be the result of validating the waker for this poll, or `None` when
+/// that validation failed.
 #[inline(always)]
-pub(crate) unsafe fn completed_op_ctx_from_waker(
-    cx: &std::task::Context<'_>,
+pub(crate) unsafe fn completed_op_ctx(
+    current: Option<PollCtx>,
     state_ptr: *mut CompletionState,
 ) -> CompletedOpCtx {
     debug_assert!(!state_ptr.is_null(), "completed operation state is missing");
@@ -888,7 +935,6 @@ pub(crate) unsafe fn completed_op_ctx_from_waker(
     let owner = state.owner_ptr();
     debug_assert!(!owner.is_null(), "completed operation has no origin owner");
 
-    let current = poll_ctx_from_waker(cx).ok();
     let current_matches = current.is_some_and(|current| current.owner_ptr() == owner);
     if !current_matches {
         state.set_context_rejected();
@@ -966,6 +1012,95 @@ struct JoinTask<F: Future> {
     join_waker: Option<Waker>,
 }
 
+/// Reclaims one zero-reference task after its join payload is destroyed.
+trait TaskDestroyCleanup {
+    /// # Safety
+    ///
+    /// `task` must identify one live zero-reference task allocation whose join
+    /// payload has completed destruction and has not already been reclaimed.
+    unsafe fn reclaim_destroyed_task(&self, task: *mut TaskHeader);
+}
+
+impl TaskDestroyCleanup for ExecutorOwner {
+    #[inline(always)]
+    unsafe fn reclaim_destroyed_task(&self, task: *mut TaskHeader) {
+        let state = self.state_ptr();
+        let all_link = unsafe { std::ptr::addr_of_mut!((*task).all_link) };
+        if unsafe { !(*all_link).is_unlinked() } {
+            unsafe {
+                (*state).all_tasks.remove(all_link);
+            }
+        }
+        #[cfg(debug_assertions)]
+        unsafe {
+            (*state).runtime_state.stats.task_frees += 1;
+        }
+        unsafe {
+            (*state).task_pool.free(task as *mut Task<TASK_POOL_SIZE>);
+        }
+    }
+}
+
+/// Runs task-allocation cleanup after the remaining join fields are destroyed,
+/// including when one of their destructors unwinds.
+struct TaskDestroyGuard<'cleanup, C: TaskDestroyCleanup + ?Sized> {
+    cleanup: &'cleanup C,
+    task: *mut TaskHeader,
+}
+
+impl<'cleanup, C: TaskDestroyCleanup + ?Sized> TaskDestroyGuard<'cleanup, C> {
+    #[inline(always)]
+    fn new(cleanup: &'cleanup C, task: *mut TaskHeader) -> Self {
+        Self { cleanup, task }
+    }
+
+    #[inline(always)]
+    fn cleanup(&self) {
+        unsafe {
+            // SAFETY: guard construction transfers exactly one live,
+            // zero-reference task allocation into this cleanup obligation.
+            self.cleanup.reclaim_destroyed_task(self.task);
+        }
+    }
+
+    /// Runs ordinary task cleanup inline without entering the cold drop shim.
+    #[inline(always)]
+    fn finish(self) {
+        // Suppress Drop before invoking cleanup so a cleanup panic cannot
+        // attempt a second unlink or slot return while unwinding.
+        let this = std::mem::ManuallyDrop::new(self);
+        this.cleanup();
+    }
+}
+
+impl<C: TaskDestroyCleanup + ?Sized> Drop for TaskDestroyGuard<'_, C> {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Destroys one join payload with exactly-once allocation cleanup.
+///
+/// # Safety
+///
+/// `join_task` must point to the live join payload for `task`, which must be a
+/// zero-reference task accepted by `cleanup`. No input may be accessed after
+/// cleanup reclaims the task.
+#[inline(always)]
+unsafe fn drop_join_task_with_cleanup<F: Future, C: TaskDestroyCleanup + ?Sized>(
+    join_task: *mut JoinTask<F>,
+    task: *mut TaskHeader,
+    cleanup: &C,
+) {
+    let guard = TaskDestroyGuard::new(cleanup, task);
+    unsafe {
+        std::ptr::drop_in_place(join_task);
+    }
+    guard.finish();
+}
+
 /// Clears a pinned future slot after destroying its value at the pinned
 /// address, including when that destructor unwinds.
 struct PinnedFutureSlotClearGuard<F> {
@@ -1008,7 +1143,11 @@ unsafe fn drop_join_future_in_place<F>(slot: *mut Option<F>) {
 /// Error returned when a spawned task cannot produce its output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinError {
-    /// The owning executor was dropped before the task completed.
+    /// The task was cancelled before publishing an output.
+    ///
+    /// This occurs when the owning executor shuts down or when the task's
+    /// [`Future::poll`] implementation panics. The original poll panic is
+    /// re-raised from [`Executor::run`].
     Cancelled,
 }
 
@@ -1382,7 +1521,8 @@ impl Executor {
     ///
     /// On success, ownership transfers to the executor exactly as with
     /// [`Executor::spawn`], and the returned [`JoinHandle`] yields
-    /// `Ok(future_output)` or [`JoinError::Cancelled`] if executor shutdown wins.
+    /// `Ok(future_output)` or [`JoinError::Cancelled`] if executor shutdown or
+    /// a panic from the task's [`Future::poll`] wins before output publication.
     /// On failure, the future has not been polled, pinned, stored in a task slot,
     /// or dropped by the executor path.
     ///
@@ -1521,6 +1661,14 @@ impl Executor {
     /// runtime-visible fd such as `signalfd` or `eventfd` for signal-driven
     /// shutdown instead of relying on `EINTR`.
     ///
+    /// # Panics
+    ///
+    /// Re-raises a panic from a spawned task's [`Future::poll`] after
+    /// terminalizing that task. A surviving [`JoinHandle`] observes
+    /// [`JoinError::Cancelled`] unless the task had already published its
+    /// output before a join-waker panic. Other queued tasks remain owned by
+    /// this executor and can run on a later call.
+    ///
     /// # Example
     /// ```no_run
     /// use flowio::runtime::executor::Executor;
@@ -1574,17 +1722,26 @@ impl Executor {
                     break;
                 };
 
-                let header = unsafe { &*header_ptr };
                 // Batch flag update: clear QUEUED+NOTIFIED, set RUNNING — one read + one write.
-                header.flags.set(
-                    (header.flags.get() & !(TaskHeader::FLAG_QUEUED | TaskHeader::FLAG_NOTIFIED))
-                        | TaskHeader::FLAG_RUNNING,
-                );
+                let flags = unsafe { (*header_ptr).flags.get() };
+                unsafe {
+                    (*header_ptr).flags.set(
+                        (flags & !(TaskHeader::FLAG_QUEUED | TaskHeader::FLAG_NOTIFIED))
+                            | TaskHeader::FLAG_RUNNING,
+                    );
+                }
+                let runtime_state = unsafe { std::ptr::addr_of_mut!((*state_ptr).runtime_state) };
+                let poll_guard = TaskPollPanicGuard::new(header_ptr, runtime_state);
                 #[cfg(debug_assertions)]
                 unsafe {
                     (*state_ptr).runtime_state.stats.task_polls += 1;
                 }
-                let poll_res = unsafe { (header.vtable.poll)(header_ptr) };
+                let poll = unsafe { (*header_ptr).vtable.poll };
+                let poll_res = unsafe { poll(header_ptr) };
+                poll_guard.disarm();
+                // A poll unwind may release the final task reference, so no
+                // reference into the task allocation may span the poll call.
+                let header = unsafe { &*header_ptr };
                 if let Poll::Ready(()) = poll_res {
                     // Batch: clear RUNNING+NOTIFIED+QUEUED, set COMPLETED.
                     header.flags.set(
@@ -1690,6 +1847,10 @@ impl Executor {
             }
 
             if matches!(timer_wait, Some(duration) if duration.is_zero()) {
+                // A due timer should normally have been consumed by the pass
+                // above. Keep this cheap defensive branch so a clock/tick
+                // boundary is processed locally instead of entering a
+                // nominally timed kernel wait.
                 let _ = unsafe { &mut (*state_ptr).timers }
                     // SAFETY: now_tick is Some when timer_wait is Some (set in the
                     // has_pending() branch above).
@@ -1782,32 +1943,28 @@ impl Executor {
             }
 
             let flags = header.flags.get();
-            header.flags.set(
-                (flags
-                    & !(TaskHeader::FLAG_RUNNING
-                        | TaskHeader::FLAG_NOTIFIED
-                        | TaskHeader::FLAG_QUEUED))
-                    | TaskHeader::FLAG_COMPLETED,
-            );
             if task_is_completed(flags) {
+                header.flags.set(
+                    (flags
+                        & !(TaskHeader::FLAG_RUNNING
+                            | TaskHeader::FLAG_NOTIFIED
+                            | TaskHeader::FLAG_QUEUED))
+                        | TaskHeader::FLAG_COMPLETED,
+                );
                 continue;
             }
 
-            unsafe {
-                debug_assert!((*state_ptr).runtime_state.live_tasks > 0);
-                (*state_ptr).runtime_state.live_tasks -= 1;
+            let task_panic = unsafe {
+                cancel_task_and_release_executor_ref(
+                    task_ptr,
+                    std::ptr::addr_of_mut!((*state_ptr).runtime_state),
+                )
+            };
+            if first_panic.is_none() {
+                first_panic = task_panic;
+            } else if let Some(payload) = task_panic {
+                std::mem::forget(payload);
             }
-            let task_ref = ExecutorTaskRefGuard::new(task_ptr);
-            let cancel = header.vtable.cancel;
-            let cancel_result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                cancel(task_ptr);
-            }));
-            retain_first_task_panic(&mut first_panic, cancel_result);
-
-            let release_result = catch_unwind(AssertUnwindSafe(|| {
-                task_ref.release();
-            }));
-            retain_first_task_panic(&mut first_panic, release_result);
         }
 
         unsafe {
@@ -1862,6 +2019,63 @@ fn retain_first_task_panic(first_panic: &mut Option<TaskPanic>, result: Result<(
         // they cannot replace it or interrupt the remaining shutdown phases.
         std::mem::forget(payload);
     }
+}
+
+/// Marks one unfinished task cancelled, publishes its join outcome, and
+/// releases the executor-owned task reference.
+///
+/// The state transition precedes user drop glue so any wake raised by future
+/// destruction sees a terminal task. Both cleanup phases run even if either
+/// unwinds; the first panic is returned and any later payload is forgotten.
+///
+/// # Safety
+///
+/// `task` must identify one live, unfinished task whose ready link is already
+/// unlinked. `runtime_state` must be the live state for that task's executor,
+/// and its `live_tasks` count must include this task.
+unsafe fn cancel_task_and_release_executor_ref(
+    task: *mut TaskHeader,
+    runtime_state: *mut RuntimeState,
+) -> Option<TaskPanic> {
+    let flags = unsafe { (*task).flags.get() };
+    let live_tasks = unsafe { (*runtime_state).live_tasks };
+    #[cfg(debug_assertions)]
+    if !std::thread::panicking() {
+        debug_assert!(
+            !task_is_completed(flags),
+            "completed task cannot consume the executor reference twice"
+        );
+        debug_assert!(live_tasks > 0, "live task accounting underflow");
+    }
+    unsafe {
+        (*task).flags.set(
+            (flags
+                & !(TaskHeader::FLAG_RUNNING
+                    | TaskHeader::FLAG_NOTIFIED
+                    | TaskHeader::FLAG_QUEUED))
+                | TaskHeader::FLAG_COMPLETED,
+        );
+        // Saturation keeps exceptional cleanup non-panicking if a separate
+        // internal accounting defect is encountered during an active unwind.
+        (*runtime_state).live_tasks = live_tasks.saturating_sub(1);
+    }
+
+    let cancel = unsafe { (*task).vtable.cancel };
+    let task_ref = ExecutorTaskRefGuard::new(task);
+    let mut first_panic = None;
+    retain_first_task_panic(
+        &mut first_panic,
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            cancel(task);
+        })),
+    );
+    retain_first_task_panic(
+        &mut first_panic,
+        catch_unwind(AssertUnwindSafe(|| {
+            task_ref.release();
+        })),
+    );
+    first_panic
 }
 
 #[cfg(target_os = "linux")]
@@ -1956,7 +2170,7 @@ unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
 /// that may free the same state.
 #[inline(always)]
 pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::CompletionState) {
-    let state_ptr = *ptr;
+    let state_ptr = std::mem::replace(ptr, std::ptr::null_mut());
     if state_ptr.is_null() {
         return;
     }
@@ -1971,8 +2185,6 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
             cancel_op_unchecked(state_ptr);
         }
     }
-
-    *ptr = std::ptr::null_mut();
 }
 
 /// Owns an allocated completion-state slot until its target SQE is submitted.
@@ -2431,7 +2643,13 @@ where
             cancel: |ptr| unsafe {
                 let slot = &mut *(ptr as *mut Task<TASK_POOL_SIZE>);
                 let jt = &mut *(slot.data.as_mut_ptr() as *mut JoinTask<F>);
-                jt.result = Some(Err(JoinError::Cancelled));
+                // A user poll panic leaves no result and is reported as
+                // cancellation. Preserve a result already published before a
+                // join-waker panic so cleanup cannot overwrite successful
+                // completion.
+                if jt.result.is_none() {
+                    jt.result = Some(Err(JoinError::Cancelled));
+                }
                 let mut first_panic = None;
                 retain_first_task_panic(
                     &mut first_panic,
@@ -2453,20 +2671,11 @@ where
                 let owner = (*ptr).owner.clone();
                 // Drop any remaining JoinTask fields (unclaimed result, waker).
                 let slot = &mut *(ptr as *mut Task<TASK_POOL_SIZE>);
-                let jt = &mut *(slot.data.as_mut_ptr() as *mut JoinTask<F>);
-                std::ptr::drop_in_place(jt);
-
-                if let Some(owner) = owner {
-                    let state = owner.state_ptr();
-                    let all_link = std::ptr::addr_of_mut!((*ptr).all_link);
-                    if !(*all_link).is_unlinked() {
-                        (*state).all_tasks.remove(all_link);
-                    }
-                    #[cfg(debug_assertions)]
-                    {
-                        (*state).runtime_state.stats.task_frees += 1;
-                    }
-                    (*state).task_pool.free(ptr as *mut Task<TASK_POOL_SIZE>);
+                let jt = slot.data.as_mut_ptr() as *mut JoinTask<F>;
+                if let Some(owner) = owner.as_deref() {
+                    drop_join_task_with_cleanup(jt, ptr, owner);
+                } else {
+                    std::ptr::drop_in_place(jt);
                 }
             },
         };
@@ -2754,6 +2963,303 @@ mod tests {
     fn counted_waker(stats: &Rc<CountedWakerStats>) -> Waker {
         let data = Rc::into_raw(Rc::clone(stats)).cast();
         unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
+    }
+
+    #[derive(Debug)]
+    struct TaskPollPanic;
+
+    #[cfg(not(miri))]
+    #[derive(Debug)]
+    struct TaskJoinWakePanic;
+
+    struct TaskPollCleanupPanic;
+
+    thread_local! {
+        static TASK_POLL_CLEANUP_PAYLOAD_DROPS: Cell<usize> = const { Cell::new(0) };
+        static SYNTHETIC_POLL_GUARD_CANCELS: Cell<usize> = const { Cell::new(0) };
+        static SYNTHETIC_POLL_GUARD_DESTROYS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    impl Drop for TaskPollCleanupPanic {
+        fn drop(&mut self) {
+            TASK_POLL_CLEANUP_PAYLOAD_DROPS.with(|drops| drops.set(drops.get() + 1));
+            panic!("secondary poll-cleanup payload must not be dropped");
+        }
+    }
+
+    #[cfg(not(miri))]
+    struct PollAndDropPanic {
+        polls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    #[cfg(not(miri))]
+    impl Future for PollAndDropPanic {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.set(self.polls.get() + 1);
+            // Exercise the wake-during-poll transition before unwinding.
+            cx.waker().wake_by_ref();
+            std::panic::panic_any(TaskPollPanic);
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for PollAndDropPanic {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            std::panic::panic_any(TaskPollCleanupPanic);
+        }
+    }
+
+    #[cfg(not(miri))]
+    unsafe fn panicking_wake_waker_clone(data: *const ()) -> RawWaker {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.clones.set(stats.clones.get() + 1);
+        let cloned = Rc::clone(&stats);
+        let _ = Rc::into_raw(stats);
+        RawWaker::new(Rc::into_raw(cloned).cast(), &PANICKING_WAKE_WAKER_VTABLE)
+    }
+
+    #[cfg(not(miri))]
+    unsafe fn panicking_wake_waker_wake(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.wakes.set(stats.wakes.get() + 1);
+        std::panic::panic_any(TaskJoinWakePanic);
+    }
+
+    #[cfg(not(miri))]
+    unsafe fn panicking_wake_waker_wake_by_ref(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.wakes.set(stats.wakes.get() + 1);
+        let _ = Rc::into_raw(stats);
+        std::panic::panic_any(TaskJoinWakePanic);
+    }
+
+    #[cfg(not(miri))]
+    unsafe fn panicking_wake_waker_drop(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.drops.set(stats.drops.get() + 1);
+    }
+
+    #[cfg(not(miri))]
+    static PANICKING_WAKE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        panicking_wake_waker_clone,
+        panicking_wake_waker_wake,
+        panicking_wake_waker_wake_by_ref,
+        panicking_wake_waker_drop,
+    );
+
+    #[cfg(not(miri))]
+    fn panicking_wake_waker(stats: &Rc<CountedWakerStats>) -> Waker {
+        let data = Rc::into_raw(Rc::clone(stats)).cast();
+        unsafe { Waker::from_raw(RawWaker::new(data, &PANICKING_WAKE_WAKER_VTABLE)) }
+    }
+
+    unsafe fn synthetic_poll_guard_cancel(_: *mut TaskHeader) {
+        SYNTHETIC_POLL_GUARD_CANCELS.with(|cancels| cancels.set(cancels.get() + 1));
+        std::panic::panic_any(TaskPollCleanupPanic);
+    }
+
+    unsafe fn synthetic_poll_guard_destroy(_: *mut TaskHeader) {
+        SYNTHETIC_POLL_GUARD_DESTROYS.with(|destroys| destroys.set(destroys.get() + 1));
+    }
+
+    static SYNTHETIC_POLL_GUARD_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Pending,
+        finish: |_| {},
+        cancel: synthetic_poll_guard_cancel,
+        destroy: synthetic_poll_guard_destroy,
+    };
+
+    struct TaskOutputDropPanic;
+
+    struct TaskWakerDropPanic;
+
+    struct PanickingTaskOutput {
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for PanickingTaskOutput {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            std::panic::panic_any(TaskOutputDropPanic);
+        }
+    }
+
+    unsafe fn panicking_drop_waker_clone(data: *const ()) -> RawWaker {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.clones.set(stats.clones.get() + 1);
+        let cloned = Rc::clone(&stats);
+        let _ = Rc::into_raw(stats);
+        RawWaker::new(Rc::into_raw(cloned).cast(), &PANICKING_DROP_WAKER_VTABLE)
+    }
+
+    unsafe fn panicking_drop_waker_wake(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.wakes.set(stats.wakes.get() + 1);
+    }
+
+    unsafe fn panicking_drop_waker_wake_by_ref(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.wakes.set(stats.wakes.get() + 1);
+        let _ = Rc::into_raw(stats);
+    }
+
+    unsafe fn panicking_drop_waker_drop(data: *const ()) {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.drops.set(stats.drops.get() + 1);
+        drop(stats);
+        std::panic::panic_any(TaskWakerDropPanic);
+    }
+
+    static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        panicking_drop_waker_clone,
+        panicking_drop_waker_wake,
+        panicking_drop_waker_wake_by_ref,
+        panicking_drop_waker_drop,
+    );
+
+    fn panicking_drop_waker(stats: &Rc<CountedWakerStats>) -> Waker {
+        let data = Rc::into_raw(Rc::clone(stats)).cast();
+        unsafe { Waker::from_raw(RawWaker::new(data, &PANICKING_DROP_WAKER_VTABLE)) }
+    }
+
+    struct CountingTaskDestroyCleanup {
+        cleanups: Cell<usize>,
+    }
+
+    impl TaskDestroyCleanup for CountingTaskDestroyCleanup {
+        unsafe fn reclaim_destroyed_task(&self, _task: *mut TaskHeader) {
+            self.cleanups.set(self.cleanups.get() + 1);
+        }
+    }
+
+    #[cfg(not(miri))]
+    struct RecordCurrentTask {
+        task: Rc<Cell<*mut TaskHeader>>,
+    }
+
+    #[cfg(not(miri))]
+    impl Future for RecordCurrentTask {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let task = task_ptr_from_waker(cx.waker())
+                .expect("recording future must receive its FlowIO task waker");
+            self.task.set(task);
+            Poll::Ready(())
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn assert_destroyed_task_slot_is_reused(
+        executor: &mut Executor,
+        expected_task: *mut TaskHeader,
+    ) {
+        let state = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state).runtime_state.live_tasks, 0);
+            assert!((*state).ready_queue.is_empty());
+            assert!((*state).all_tasks.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                (*state).runtime_state.stats.task_frees,
+                (*state).runtime_state.stats.task_allocs,
+                "task destroy must balance slot accounting"
+            );
+        }
+
+        let reused_task = Rc::new(Cell::new(std::ptr::null_mut()));
+        executor
+            .run(RecordCurrentTask {
+                task: Rc::clone(&reused_task),
+            })
+            .expect("executor must remain reusable after task-destroy unwind");
+        assert_eq!(
+            reused_task.get(),
+            expected_task,
+            "the next root task must reuse the destroyed task's exact slot"
+        );
+        unsafe {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                (*state).task_pool.provider_ref().request_count,
+                0,
+                "exact slot reuse must not request another task slab"
+            );
+            assert!((*state).all_tasks.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                (*state).runtime_state.stats.task_frees,
+                (*state).runtime_state.stats.task_allocs,
+                "reuse run must also balance task accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn task_destroy_guard_cleans_up_after_output_drop_panics() {
+        let drops = Rc::new(Cell::new(0));
+        let cleanup = CountingTaskDestroyCleanup {
+            cleanups: Cell::new(0),
+        };
+        let mut task = TaskHeader::new();
+        task.refs.set(0);
+        let mut join_task =
+            std::mem::MaybeUninit::new(JoinTask::<std::future::Ready<PanickingTaskOutput>> {
+                future: None,
+                result: Some(Ok(PanickingTaskOutput {
+                    drops: Rc::clone(&drops),
+                })),
+                join_waker: None,
+            });
+
+        let panic = catch_unwind(AssertUnwindSafe(|| unsafe {
+            // SAFETY: join_task is initialized, exclusively owned, and its
+            // storage is never read or dropped after destruction begins.
+            drop_join_task_with_cleanup(join_task.as_mut_ptr(), &mut task, &cleanup);
+        }))
+        .expect_err("stored output destructor must unwind");
+
+        assert!(panic.is::<TaskOutputDropPanic>());
+        assert_eq!(drops.get(), 1, "stored output must drop exactly once");
+        assert_eq!(
+            cleanup.cleanups.get(),
+            1,
+            "task cleanup must run exactly once"
+        );
+    }
+
+    #[test]
+    fn task_destroy_guard_cleans_up_after_waker_drop_panics() {
+        let stats = Rc::new(CountedWakerStats::default());
+        let cleanup = CountingTaskDestroyCleanup {
+            cleanups: Cell::new(0),
+        };
+        let mut task = TaskHeader::new();
+        task.refs.set(0);
+        let mut join_task = std::mem::MaybeUninit::new(JoinTask::<std::future::Ready<()>> {
+            future: None,
+            result: Some(Ok(())),
+            join_waker: Some(panicking_drop_waker(&stats)),
+        });
+
+        let panic = catch_unwind(AssertUnwindSafe(|| unsafe {
+            // SAFETY: join_task is initialized, exclusively owned, and its
+            // storage is never read or dropped after destruction begins.
+            drop_join_task_with_cleanup(join_task.as_mut_ptr(), &mut task, &cleanup);
+        }))
+        .expect_err("stored waker destructor must unwind");
+
+        assert!(panic.is::<TaskWakerDropPanic>());
+        assert_eq!(stats.drops.get(), 1, "stored waker must drop exactly once");
+        assert_eq!(
+            cleanup.cleanups.get(),
+            1,
+            "task cleanup must run exactly once"
+        );
     }
 
     #[test]
@@ -3113,6 +3619,410 @@ mod tests {
         assert!(
             weak_owner.upgrade().is_none(),
             "completed task retained an executor owner pin"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn poll_panic_cancels_task_preserves_original_and_leaves_executor_reusable() {
+        TASK_POLL_CLEANUP_PAYLOAD_DROPS.with(|drops| drops.set(0));
+        let polls = Rc::new(Cell::new(0));
+        let future_drops = Rc::new(Cell::new(0));
+        let sibling_polls = Rc::new(Cell::new(0));
+        let join_waker_stats = Rc::new(CountedWakerStats::default());
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<()>>));
+        let mut executor = Executor::new().expect("executor construction failed");
+        let initial_owner_refs = Rc::strong_count(&executor.owner);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            executor.run({
+                let polls = Rc::clone(&polls);
+                let future_drops = Rc::clone(&future_drops);
+                let sibling_polls = Rc::clone(&sibling_polls);
+                let join_waker_stats = Rc::clone(&join_waker_stats);
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    let mut handle = Executor::spawn(PollAndDropPanic {
+                        polls,
+                        drops: future_drops,
+                    })
+                    .expect("poll-panic task spawn failed");
+                    let waker = panicking_wake_waker(&join_waker_stats);
+                    let mut cx = Context::from_waker(&waker);
+                    assert!(
+                        Pin::new(&mut handle).poll(&mut cx).is_pending(),
+                        "unpolled task handle must start pending"
+                    );
+                    *handle_slot.borrow_mut() = Some(handle);
+
+                    Executor::spawn(async move {
+                        sibling_polls.set(sibling_polls.get() + 1);
+                    })
+                    .expect("sibling task spawn failed");
+                }
+            })
+        }))
+        .expect_err("user poll panic must unwind Executor::run");
+        assert!(
+            unwind.downcast_ref::<TaskPollPanic>().is_some(),
+            "cleanup replaced the original user poll panic"
+        );
+        assert_eq!(polls.get(), 1, "panicking future poll count");
+        assert_eq!(future_drops.get(), 1, "panicking future drop count");
+        TASK_POLL_CLEANUP_PAYLOAD_DROPS.with(|drops| {
+            assert_eq!(
+                drops.get(),
+                0,
+                "secondary cleanup panic payload was dropped during unwind"
+            );
+        });
+        assert_eq!(
+            join_waker_stats.wakes.get(),
+            1,
+            "cancelled task did not wake its registered join handle"
+        );
+        assert_eq!(
+            sibling_polls.get(),
+            0,
+            "later task ran after the first run had already unwound"
+        );
+
+        let state_ptr = executor.owner.state_ptr();
+        let mut handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("poll-panic join handle disappeared");
+        let panicked_task = handle.task_ptr;
+        unsafe {
+            assert_eq!(
+                (*panicked_task).flags.get(),
+                TaskHeader::FLAG_COMPLETED,
+                "wake-during-poll notification survived terminalization"
+            );
+            assert!((*panicked_task).ready_link.is_unlinked());
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 1);
+            assert!(
+                !(*state_ptr).ready_queue.is_empty(),
+                "queued sibling was discarded with the panicking task"
+            );
+        }
+        assert!(
+            handle.is_finished(),
+            "cancellation result was not published"
+        );
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut cx),
+            Poll::Ready(Err(JoinError::Cancelled))
+        ));
+
+        executor
+            .run(async {})
+            .expect("later run must resume sibling work after poll panic");
+        assert_eq!(sibling_polls.get(), 1, "queued sibling did not resume");
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 0);
+            assert!((*state_ptr).ready_queue.is_empty());
+        }
+
+        drop(handle);
+        assert_destroyed_task_slot_is_reused(&mut executor, panicked_task);
+        assert_eq!(future_drops.get(), 1, "panicking future was dropped twice");
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs,
+            "poll-panic cleanup retained a task owner reference"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn join_wake_panic_after_ready_preserves_published_output() {
+        let waker_stats = Rc::new(CountedWakerStats::default());
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<usize>>));
+        let mut executor = Executor::new().expect("executor construction failed");
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            executor.run({
+                let waker_stats = Rc::clone(&waker_stats);
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    let mut handle = Executor::spawn(std::future::ready(91usize))
+                        .expect("ready task spawn failed");
+                    let waker = panicking_wake_waker(&waker_stats);
+                    let mut cx = Context::from_waker(&waker);
+                    assert!(Pin::new(&mut handle).poll(&mut cx).is_pending());
+                    *handle_slot.borrow_mut() = Some(handle);
+                }
+            })
+        }))
+        .expect_err("registered join wake must unwind");
+        assert!(
+            unwind.downcast_ref::<TaskJoinWakePanic>().is_some(),
+            "terminal cleanup replaced the join-waker panic"
+        );
+        assert_eq!(waker_stats.clones.get(), 1);
+        assert_eq!(waker_stats.wakes.get(), 1);
+
+        let mut handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("ready task handle disappeared");
+        assert!(
+            handle.is_finished(),
+            "ready output was lost during wake unwind"
+        );
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut cx),
+            Poll::Ready(Ok(91))
+        ));
+        drop(handle);
+
+        let state = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state).runtime_state.live_tasks, 0);
+            assert!((*state).ready_queue.is_empty());
+            assert!((*state).all_tasks.is_empty());
+        }
+        executor
+            .run(async {})
+            .expect("executor must remain reusable after join-wake panic");
+    }
+
+    #[test]
+    fn poll_panic_guard_terminalizes_and_releases_one_reference_under_miri() {
+        TASK_POLL_CLEANUP_PAYLOAD_DROPS.with(|drops| drops.set(0));
+        SYNTHETIC_POLL_GUARD_CANCELS.with(|cancels| cancels.set(0));
+        SYNTHETIC_POLL_GUARD_DESTROYS.with(|destroys| destroys.set(0));
+
+        let mut task = TaskHeader::new();
+        task.vtable = &SYNTHETIC_POLL_GUARD_VTABLE;
+        task.refs.set(2);
+        task.flags
+            .set(TaskHeader::FLAG_RUNNING | TaskHeader::FLAG_NOTIFIED);
+        let task_ptr = &mut task as *mut TaskHeader;
+        let mut runtime_state = RuntimeState::new();
+        runtime_state.live_tasks = 1;
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = TaskPollPanicGuard::new(task_ptr, &mut runtime_state);
+            std::panic::panic_any(TaskPollPanic);
+        }))
+        .expect_err("synthetic poll did not unwind");
+        assert!(
+            unwind.downcast_ref::<TaskPollPanic>().is_some(),
+            "synthetic cleanup replaced the poll panic"
+        );
+        SYNTHETIC_POLL_GUARD_CANCELS.with(|cancels| assert_eq!(cancels.get(), 1));
+        SYNTHETIC_POLL_GUARD_DESTROYS.with(|destroys| assert_eq!(destroys.get(), 0));
+        TASK_POLL_CLEANUP_PAYLOAD_DROPS.with(|drops| assert_eq!(drops.get(), 0));
+        assert_eq!(runtime_state.live_tasks, 0);
+        assert_eq!(task.flags.get(), TaskHeader::FLAG_COMPLETED);
+        assert!(task.ready_link.is_unlinked());
+        assert_eq!(task.refs.get(), 1);
+
+        unsafe { release_task(task_ptr) };
+        SYNTHETIC_POLL_GUARD_DESTROYS.with(|destroys| assert_eq!(destroys.get(), 1));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn task_destroy_detached_output_panic_recycles_slot_and_owner() {
+        let output_drops = Rc::new(Cell::new(0));
+        let child_task = Rc::new(Cell::new(std::ptr::null_mut()));
+        let mut executor =
+            ManuallyDrop::new(Executor::new().expect("executor construction failed"));
+        let weak_owner = Rc::downgrade(&executor.owner);
+        let initial_owner_refs = Rc::strong_count(&executor.owner);
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            executor.run({
+                let output_drops = Rc::clone(&output_drops);
+                let child_task = Rc::clone(&child_task);
+                async move {
+                    let handle = Executor::spawn(async move {
+                        PanickingTaskOutput {
+                            drops: output_drops,
+                        }
+                    })
+                    .expect("detached drop-bomb task spawn failed");
+                    child_task.set(handle.task_ptr);
+                    drop(handle);
+                }
+            })
+        }))
+        .expect_err("detached unclaimed output destructor must unwind");
+
+        assert!(panic.is::<TaskOutputDropPanic>());
+        assert_eq!(
+            output_drops.get(),
+            1,
+            "detached output must drop exactly once"
+        );
+        assert!(!child_task.get().is_null());
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs,
+            "destroyed detached task retained its executor owner"
+        );
+        assert_destroyed_task_slot_is_reused(&mut executor, child_task.get());
+
+        let drop_result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut executor);
+        }));
+        assert!(
+            drop_result.is_ok(),
+            "clean executor teardown must not panic"
+        );
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "detached task retained the executor graph"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn task_destroy_final_handle_output_panic_recycles_slot_and_owner() {
+        let output_drops = Rc::new(Cell::new(0));
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<PanickingTaskOutput>>));
+        let mut executor =
+            ManuallyDrop::new(Executor::new().expect("executor construction failed"));
+        let weak_owner = Rc::downgrade(&executor.owner);
+        let initial_owner_refs = Rc::strong_count(&executor.owner);
+
+        executor
+            .run({
+                let output_drops = Rc::clone(&output_drops);
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    let handle = Executor::spawn(async move {
+                        PanickingTaskOutput {
+                            drops: output_drops,
+                        }
+                    })
+                    .expect("retained drop-bomb task spawn failed");
+                    *handle_slot.borrow_mut() = Some(handle);
+                }
+            })
+            .expect("drop-bomb task should complete before handle destruction");
+
+        let handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("completed drop-bomb handle disappeared");
+        assert!(handle.is_finished());
+        let task = handle.task_ptr;
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs + 1,
+            "completed task should retain one owner reference"
+        );
+
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(handle)))
+            .expect_err("final handle must expose the output destructor panic");
+        assert!(panic.is::<TaskOutputDropPanic>());
+        assert_eq!(
+            output_drops.get(),
+            1,
+            "unclaimed handle output must drop exactly once"
+        );
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs,
+            "final handle destruction retained its executor owner"
+        );
+        assert_destroyed_task_slot_is_reused(&mut executor, task);
+
+        let drop_result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut executor);
+        }));
+        assert!(
+            drop_result.is_ok(),
+            "clean executor teardown must not panic"
+        );
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "final output panic retained the executor graph"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn task_destroy_escaped_handle_waker_panic_releases_final_owner() {
+        let waker_stats = Rc::new(CountedWakerStats::default());
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<()>>));
+        let mut executor =
+            ManuallyDrop::new(Executor::new().expect("executor construction failed"));
+        let weak_owner = Rc::downgrade(&executor.owner);
+        let initial_owner_refs = Rc::strong_count(&executor.owner);
+
+        executor
+            .run({
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    let handle =
+                        Executor::spawn(async {}).expect("retained waker task spawn failed");
+                    *handle_slot.borrow_mut() = Some(handle);
+                }
+            })
+            .expect("stored-waker task should complete before handle destruction");
+
+        let handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("completed stored-waker handle disappeared");
+        assert!(handle.is_finished());
+        let task = handle.task_ptr;
+        unsafe {
+            let waker_slot = &mut *handle.waker_ptr;
+            assert!(
+                waker_slot.is_none(),
+                "completion should consume any ordinary stored join waker"
+            );
+            // A public completion normally takes and wakes this slot. Private
+            // injection directly covers destroy's obligation if a remaining
+            // Waker destructor unwinds on an exceptional internal path.
+            *waker_slot = Some(panicking_drop_waker(&waker_stats));
+        }
+        assert_eq!(
+            Rc::strong_count(&executor.owner),
+            initial_owner_refs + 1,
+            "completed task should retain one owner reference"
+        );
+
+        let drop_result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut executor);
+        }));
+        assert!(
+            drop_result.is_ok(),
+            "completed escaped handle must permit clean executor shutdown"
+        );
+        assert_eq!(
+            weak_owner.strong_count(),
+            1,
+            "the escaped task header must be the sole remaining owner"
+        );
+        unsafe {
+            assert!(
+                (*task).all_link.is_unlinked(),
+                "executor shutdown must unlink the completed escaped task"
+            );
+        }
+
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(handle)))
+            .expect_err("final handle must expose the waker destructor panic");
+        assert!(panic.is::<TaskWakerDropPanic>());
+        assert_eq!(
+            waker_stats.drops.get(),
+            1,
+            "stored waker must drop exactly once"
+        );
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "stored-waker panic retained the final executor graph owner"
         );
     }
 
@@ -3888,28 +4798,32 @@ mod tests {
         }
     }
 
-    #[repr(align(16))]
-    struct Align16Payload;
+    #[cfg(not(miri))]
+    #[repr(align(64))]
+    struct Align64Payload;
 
-    struct OveralignedSpawnFuture {
+    #[repr(align(128))]
+    struct Align128Payload;
+
+    struct AlignedSpawnFuture<A> {
         id: usize,
         drops: Rc<Cell<usize>>,
         polls: Rc<Cell<usize>>,
-        _payload: Align16Payload,
+        _payload: A,
     }
 
-    impl OveralignedSpawnFuture {
-        fn new(id: usize, drops: &Rc<Cell<usize>>, polls: &Rc<Cell<usize>>) -> Self {
+    impl<A> AlignedSpawnFuture<A> {
+        fn new(id: usize, drops: &Rc<Cell<usize>>, polls: &Rc<Cell<usize>>, payload: A) -> Self {
             Self {
                 id,
                 drops: Rc::clone(drops),
                 polls: Rc::clone(polls),
-                _payload: Align16Payload,
+                _payload: payload,
             }
         }
     }
 
-    impl Future for OveralignedSpawnFuture {
+    impl<A: Unpin> Future for AlignedSpawnFuture<A> {
         type Output = usize;
 
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -3919,7 +4833,7 @@ mod tests {
         }
     }
 
-    impl Drop for OveralignedSpawnFuture {
+    impl<A> Drop for AlignedSpawnFuture<A> {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
         }
@@ -3973,7 +4887,61 @@ mod tests {
     }
 
     #[test]
+    fn task_payload_storage_has_exact_64_byte_alignment() {
+        assert_eq!(TASK_DATA_ALIGN, 64);
+        assert_eq!(
+            std::mem::offset_of!(Task<TASK_POOL_SIZE>, data),
+            128,
+            "task payload offset changed"
+        );
+        assert_eq!(
+            size_of::<Task<TASK_POOL_SIZE>>(),
+            4224,
+            "task slot geometry grew"
+        );
+
+        let mut slot = std::mem::MaybeUninit::<Task<TASK_POOL_SIZE>>::uninit();
+        let data_ptr = unsafe { std::ptr::addr_of_mut!((*slot.as_mut_ptr()).data) };
+        assert_eq!(
+            data_ptr as usize % TASK_DATA_ALIGN,
+            0,
+            "placed task payload does not honor the advertised alignment"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn try_spawn_accepts_64_byte_aligned_future() {
+        let drops = Rc::new(Cell::new(0usize));
+        let polls = Rc::new(Cell::new(0usize));
+        let completed = Rc::new(Cell::new(0usize));
+        let completed_task = Rc::clone(&completed);
+        let future = AlignedSpawnFuture::new(313, &drops, &polls, Align64Payload);
+        assert_eq!(
+            align_of::<JoinTask<AlignedSpawnFuture<Align64Payload>>>(),
+            TASK_DATA_ALIGN
+        );
+
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run(async move {
+                let output = Executor::spawn(future)
+                    .expect("64-byte-aligned task should spawn")
+                    .await
+                    .expect("64-byte-aligned task should complete");
+                completed_task.set(output);
+            })
+            .expect("executor failed while running aligned task");
+
+        assert_eq!(completed.get(), 313);
+        assert_eq!(polls.get(), 1);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
     fn try_spawn_rejects_overaligned_future_before_task_slot_write() {
+        type OveralignedSpawnFuture = AlignedSpawnFuture<Align128Payload>;
+
         assert!(size_of::<JoinTask<OveralignedSpawnFuture>>() <= TASK_POOL_SIZE);
         assert!(align_of::<JoinTask<OveralignedSpawnFuture>>() > TASK_DATA_ALIGN);
 
@@ -3986,7 +4954,7 @@ mod tests {
         let _guard = ExecutorCtxGuard::install(owner)
             .expect("test executor context should install on an idle thread");
 
-        let future = OveralignedSpawnFuture::new(313, &drops, &polls);
+        let future = OveralignedSpawnFuture::new(313, &drops, &polls, Align128Payload);
         let returned = match Executor::try_spawn(future) {
             Ok(_) => panic!("over-aligned task should not spawn"),
             Err(TrySpawnError::TaskTooLarge { future }) => future,

@@ -80,6 +80,30 @@ unsafe impl IoBuffReadWrite for DefaultInitializedWritable {
     }
 }
 
+#[cfg(not(debug_assertions))]
+#[derive(Default)]
+struct NullEmptyInitializedWritable {
+    pointer_calls: usize,
+}
+
+// SAFETY: this buffer exposes no writable bytes, so the trait contract permits
+// its pointer to be null. Its zero-length window is stable.
+#[cfg(not(debug_assertions))]
+unsafe impl IoBuffReadWrite for NullEmptyInitializedWritable {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.pointer_calls += 1;
+        std::ptr::null_mut()
+    }
+
+    fn writable_len(&self) -> usize {
+        0
+    }
+
+    unsafe fn set_written_len(&mut self, _len: usize) {
+        // This empty test buffer has no logical length.
+    }
+}
+
 // ============================================================================
 // IoBuffMut — basic construction and payload operations
 // ============================================================================
@@ -261,6 +285,19 @@ fn default_initialized_writable_slice_clamps_oversized_request() {
         &buffer.storage[DefaultInitializedWritable::WRITABLE..],
         &[DefaultInitializedWritable::SENTINEL; 4]
     );
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn default_initialized_writable_slice_clamps_to_empty_without_pointer_access() {
+    let mut buffer = NullEmptyInitializedWritable::default();
+
+    // SAFETY: this deliberately exceeds the documented caller bound to prove
+    // that the default implementation's release-mode defensive clamp handles
+    // a permitted null empty window without consulting its pointer.
+    let initialized = unsafe { buffer.initialized_writable_slice(1) };
+    assert!(initialized.is_empty());
+    assert_eq!(buffer.pointer_calls, 0);
 }
 
 #[test]

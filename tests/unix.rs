@@ -495,6 +495,40 @@ fn runtime_unix_async_empty_projected_validation_uses_no_submission_or_retained_
 }
 
 #[test]
+fn runtime_unix_empty_read_write_complete_without_submission() {
+    let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let returned_stream = Rc::new(Cell::new(None));
+    let return_slot = Rc::clone(&returned_stream);
+
+    executor
+        .run(async move {
+            common::assert_empty_stream_io_cases!(stream);
+            return_slot.set(Some(stream));
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 0);
+        assert_eq!(stats.cqe_completions, 0);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(
+            stats.poll_context_extractions, 2,
+            "each local completion must still validate its FlowIO context"
+        );
+    }
+
+    drop(
+        returned_stream
+            .take()
+            .expect("empty stream I/O test did not return its Unix stream"),
+    );
+}
+
+#[test]
 fn runtime_unix_async_projected_shape_mismatches_return_source() {
     let (mut stream, _peer) = connected_try_unix_stream();
 
@@ -954,6 +988,30 @@ fn runtime_unix_read_exact_append_rejects_oversize_iobuff() {
             assert_eq!(buf.payload_len(), 4);
             assert_eq!(buf.payload_remaining(), 2);
             assert_eq!(buf.payload_bytes(), b"seed");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_unix_read_exact_append_rejects_tailroom_sealed_iobuff() {
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    executor
+        .run(async move {
+            let (_writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+
+            let mut recv = IoBuffMut::new(0, 8, 2);
+            recv.payload_append(b"seed").unwrap();
+            recv.tailroom_append(b":T").unwrap();
+            assert_eq!(recv.payload_remaining(), 0);
+
+            let (res, buf) = reader.read_exact_append(recv, 1).await;
+            let err = res.expect_err("tailroom-sealed read_exact_append should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(buf.payload_len(), 4);
+            assert_eq!(buf.payload_remaining(), 0);
+            assert_eq!(buf.payload_bytes(), b"seed");
+            assert_eq!(buf.bytes(), b"seed:T");
         })
         .expect("executor run failed");
 }

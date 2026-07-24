@@ -185,7 +185,12 @@ fn payload_capacity_after_advance(
 /// `isize::MAX` bytes. The pointer and range must remain valid for the entire
 /// lifetime of the buffer value and must not be invalidated by moves of that
 /// value (i.e. nonempty backing storage must be heap- or pool-allocated, not
-/// inline). When `len()` is zero, `as_ptr()` may return null.
+/// inline). While an operation owns the buffer, from its first inspection
+/// until FlowIO returns or destroys the value, repeated `len()` calls must
+/// report the same length and repeated `as_ptr()` calls for a nonempty range
+/// must identify the same base. Interior mutability must not change the
+/// readable range or its zero/nonzero shape during that interval. When `len()`
+/// is zero, `as_ptr()` may return null.
 ///
 /// # Example
 /// ```
@@ -324,6 +329,9 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
             "initialized writable length {len} exceeds capacity {writable}"
         );
         let len = len.min(writable);
+        if len == 0 {
+            return &mut [];
+        }
         let ptr = self.as_mut_ptr();
         unsafe {
             std::ptr::write_bytes(ptr, 0, len);

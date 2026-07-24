@@ -1275,6 +1275,10 @@ fn runtime_executor_runs_nop_future() {
         assert!(stats.sqe_submits > 0, "sqe_submits not recorded");
         assert!(stats.cqe_completions > 0, "cqe_completions not recorded");
         assert!(stats.waiter_wakes > 0, "waiter_wakes not recorded");
+        assert_eq!(
+            stats.poll_context_extractions, 2,
+            "NOP submission and completion should each validate the poll context once"
+        );
     }
     #[cfg(not(debug_assertions))]
     {
@@ -1362,8 +1366,42 @@ fn runtime_unsubmitted_validation_error_outside_run_returns_context_error_and_bu
 }
 
 #[test]
-fn runtime_unsubmitted_zero_length_write_outside_run_returns_context_error_and_buffer() {
+fn runtime_unsubmitted_zero_length_stream_io_outside_run_returns_context_error_and_buffers() {
     let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+
+    let mut read_buffer = Vec::with_capacity(8);
+    read_buffer.extend_from_slice(b"HEAD");
+    let read_ptr = read_buffer.as_ptr();
+    let mut read = Box::pin(writer.read(read_buffer, 0));
+    let mut cx = Context::from_waker(Waker::noop());
+
+    match read.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), buffer)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(buffer, b"HEAD");
+            assert_eq!(buffer.as_ptr(), read_ptr);
+        }
+        Poll::Ready((Ok(_), _)) => panic!("zero read unexpectedly succeeded outside run"),
+        Poll::Pending => panic!("zero read remained pending outside run"),
+    }
+    drop(read);
+
+    let write_buffer = Vec::with_capacity(1);
+    let write_ptr = write_buffer.as_ptr();
+    let mut write = Box::pin(writer.write(write_buffer));
+    let mut cx = Context::from_waker(Waker::noop());
+
+    match write.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), buffer)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.as_ptr(), write_ptr);
+        }
+        Poll::Ready((Ok(_), _)) => panic!("zero write unexpectedly succeeded outside run"),
+        Poll::Pending => panic!("zero write remained pending outside run"),
+    }
+    drop(write);
+
     let mut write = Box::pin(writer.write_all(Vec::<u8>::new()));
     let mut cx = Context::from_waker(Waker::noop());
 
@@ -4450,6 +4488,9 @@ fn runtime_writev_all_projected_large_512_advances_across_iovec_boundaries() {
     executor
         .run(async move {
             let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            writer
+                .set_send_buffer_size(4096)
+                .expect("set projected writer send buffer failed");
             let source = ProjectedStaticSegments::<512, 4096>::new(false);
             let expected = source.expected();
             let total = expected.len();
@@ -4476,6 +4517,12 @@ fn runtime_writev_all_projected_large_512_advances_across_iovec_boundaries() {
             assert_eq!(received, expected);
         })
         .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    assert!(
+        executor.last_stats().writev_partial_continuations > 0,
+        "large projected write must exercise retry resubmission"
+    );
 }
 
 /// A write cancelled under backpressure must retain its payload until the

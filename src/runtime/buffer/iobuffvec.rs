@@ -206,6 +206,23 @@ fn iter_inline<T, const N: usize>(
     (0..count).map(move |i| unsafe { storage[i].assume_init_ref() })
 }
 
+#[inline(always)]
+fn checked_length_sum<I>(lengths: I) -> Option<usize>
+where
+    I: IntoIterator<Item = usize>,
+{
+    lengths.into_iter().try_fold(0usize, usize::checked_add)
+}
+
+#[inline(always)]
+fn checked_readable_len<'a, B, I>(iter: I) -> Option<usize>
+where
+    B: IoBuffReadOnly + 'a,
+    I: IntoIterator<Item = &'a B>,
+{
+    checked_length_sum(iter.into_iter().map(IoBuffReadOnly::len))
+}
+
 /// Drops the initialized prefix of inline storage.
 ///
 /// # Safety
@@ -213,9 +230,9 @@ fn iter_inline<T, const N: usize>(
 /// `count` must not exceed `storage.len()`, and exactly the entries in
 /// `storage[..count]` must contain live `T` values owned by the caller.
 unsafe fn drop_initialized_inline<T>(storage: &mut [MaybeUninit<T>], count: usize) {
-    for slot in storage.iter_mut().take(count) {
-        unsafe { slot.assume_init_drop() };
-    }
+    debug_assert!(count <= storage.len());
+    let initialized = std::ptr::slice_from_raw_parts_mut(storage.as_mut_ptr().cast::<T>(), count);
+    unsafe { std::ptr::drop_in_place(initialized) };
 }
 
 // ============================================================================
@@ -531,17 +548,22 @@ impl<const N: usize> IoBuffVec<N> {
     }
 
     /// Returns the total number of readable bytes across all segments.
+    ///
+    /// An unrepresentable aggregate saturates at `usize::MAX`.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        iter_inline(&self.buffers, self.count)
-            .map(|buf| buf.len())
-            .sum()
+        self.checked_len().unwrap_or(usize::MAX)
+    }
+
+    #[inline(always)]
+    pub(crate) fn checked_len(&self) -> Option<usize> {
+        checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
     /// Returns `true` if the chain has no segments or all segments are empty.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.count == 0 || self.len() == 0
+        iter_inline(&self.buffers, self.count).all(IoBuffReadOnly::is_empty)
     }
 
     /// Returns a reference to the frozen buffer segment at the given index.
@@ -571,6 +593,10 @@ impl<const N: usize> IoBuffVec<N> {
         &self,
         dst: &mut [MaybeUninit<libc::iovec>; N],
     ) -> (usize, usize) {
+        debug_assert!(
+            self.checked_len().is_some(),
+            "overflowed IoBuffVec reached iovec materialization"
+        );
         let mut total = 0;
         let mut iov_count = 0;
         for i in 0..self.count {
@@ -662,6 +688,7 @@ impl<const N: usize> Drop for IoBuffVec<N> {
 /// let chain: IoBuffReadOnlyVec<Vec<u8>, 2> =
 ///     IoBuffReadOnlyVec::from_array([b"ab".to_vec(), b"cd".to_vec()]);
 /// assert_eq!(chain.segments(), 2);
+/// assert_eq!(chain.checked_len(), Some(4));
 /// assert_eq!(chain.len(), 4);
 /// ```
 pub struct IoBuffReadOnlyVec<B: IoBuffReadOnly, const N: usize> {
@@ -737,17 +764,25 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
     }
 
     /// Returns the total number of readable bytes across all segments.
+    ///
+    /// If the exact aggregate cannot be represented by `usize`, this returns
+    /// `usize::MAX`. Use [`Self::checked_len`] when overflow must be
+    /// distinguished from that exact boundary value.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        iter_inline(&self.buffers, self.count)
-            .map(|buf| buf.len())
-            .sum()
+        self.checked_len().unwrap_or(usize::MAX)
+    }
+
+    /// Returns the exact total readable length, or `None` on `usize` overflow.
+    #[inline(always)]
+    pub fn checked_len(&self) -> Option<usize> {
+        checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
     /// Returns `true` if the chain has no segments or all segments are empty.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.count == 0 || self.len() == 0
+        iter_inline(&self.buffers, self.count).all(IoBuffReadOnly::is_empty)
     }
 
     /// Returns an iterator over the read-only buffer segments.
@@ -835,6 +870,19 @@ impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVecIntoIter<B, N>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_length_sum_accepts_exact_max_and_rejects_overflow() {
+        assert_eq!(
+            checked_length_sum([isize::MAX as usize, isize::MAX as usize, 1]),
+            Some(usize::MAX)
+        );
+        assert_eq!(
+            checked_length_sum([isize::MAX as usize, isize::MAX as usize, 2]),
+            None
+        );
+        assert_eq!(checked_length_sum([0, 0]), Some(0));
+    }
 
     #[test]
     fn read_iovec_fill_compacts_nonempty_segments_and_preserves_tail() {

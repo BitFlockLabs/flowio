@@ -181,11 +181,47 @@ impl SlabPageChain {
         slab_factory: &mut SlabAllocator<'_, P>,
         obj_size: usize,
     ) -> Option<SlabPageAlloc> {
+        unsafe { self.alloc_or_grow_inner(slab_factory, obj_size, || false) }
+    }
+
+    /// Debug-only allocation variant that can reject a required page growth
+    /// before the backing provider is called.
+    ///
+    /// Current-page allocations never consult `reject_growth`; the callback
+    /// runs only after the current page cannot satisfy the request.
+    ///
+    /// # Safety
+    /// `slab_factory` must be the allocator that owns all pages in this chain.
+    #[cfg(debug_assertions)]
+    #[inline(always)]
+    pub(crate) unsafe fn alloc_or_grow_with_debug_rejection<
+        P: super::provider::MemoryProvider,
+        F: FnOnce() -> bool,
+    >(
+        &mut self,
+        slab_factory: &mut SlabAllocator<'_, P>,
+        obj_size: usize,
+        reject_growth: F,
+    ) -> Option<SlabPageAlloc> {
+        unsafe { self.alloc_or_grow_inner(slab_factory, obj_size, reject_growth) }
+    }
+
+    #[inline(always)]
+    unsafe fn alloc_or_grow_inner<P: super::provider::MemoryProvider, F: FnOnce() -> bool>(
+        &mut self,
+        slab_factory: &mut SlabAllocator<'_, P>,
+        obj_size: usize,
+        reject_growth: F,
+    ) -> Option<SlabPageAlloc> {
         if let Some(ptr) = unsafe { self.try_alloc_current(obj_size) } {
             return Some(SlabPageAlloc {
                 ptr,
                 new_slab: false,
             });
+        }
+
+        if reject_growth() {
+            return None;
         }
 
         let ptr = unsafe { self.alloc_from_new_slab(slab_factory, obj_size) }?;

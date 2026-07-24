@@ -26,7 +26,8 @@ fn resolver_address_deduplication_needs_no_scratch_allocation() {
     ];
 
     let before = AllocationSnapshot::current();
-    extend_unique_socket_addrs(&mut addrs, &ips, port);
+    extend_unique_socket_addrs(&mut addrs, &ips, port)
+        .expect("four unique addresses should remain within the result bound");
     let after = AllocationSnapshot::current();
 
     after.assert_unchanged_since(before);

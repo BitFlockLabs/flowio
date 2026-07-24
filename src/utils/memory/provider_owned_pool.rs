@@ -237,6 +237,35 @@ mod tests {
         }
     }
 
+    struct DropBombPanic;
+
+    struct DropBombSlot {
+        value: usize,
+        panic_on_drop: bool,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl InPlaceInit for DropBombSlot {
+        type Args = (usize, bool, Rc<Cell<usize>>);
+
+        fn init_at(slot: &mut MaybeUninit<Self>, (value, panic_on_drop, drops): Self::Args) {
+            slot.write(Self {
+                value,
+                panic_on_drop,
+                drops,
+            });
+        }
+    }
+
+    impl Drop for DropBombSlot {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if self.panic_on_drop {
+                std::panic::panic_any(DropBombPanic);
+            }
+        }
+    }
+
     #[test]
     fn provider_owned_pool_has_no_broad_mutable_deref() {
         let _ =
@@ -309,6 +338,67 @@ mod tests {
         assert_eq!(
             events.borrow().as_slice(),
             &["request_memory", "free_memory", "provider_drop"]
+        );
+    }
+
+    #[test]
+    fn provider_owned_pool_recovers_slot_when_value_drop_panics() {
+        let provider_drops = Rc::new(Cell::new(0));
+        let slot_drops = Rc::new(Cell::new(0));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let provider =
+            DropCountingProvider::with_events(Rc::clone(&provider_drops), Rc::clone(&events));
+        let mut pool = ProviderOwnedPool::<DropBombSlot, _>::new(provider, 1)
+            .expect("provider-owned pool construction failed");
+        pool.init();
+
+        let first = unsafe {
+            pool.alloc((7, true, Rc::clone(&slot_drops)))
+                .expect("first pool slot allocation failed")
+        };
+        assert_eq!(events.borrow().as_slice(), &["request_memory"]);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            pool.free(first);
+        }))
+        .expect_err("drop bomb must unwind through Pool::free");
+        assert!(
+            panic.is::<DropBombPanic>(),
+            "Pool::free must preserve the original destructor panic"
+        );
+        assert_eq!(slot_drops.get(), 1, "panicking value must drop once");
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["request_memory"],
+            "slot recycling must retain the live slab"
+        );
+
+        let reused = unsafe {
+            pool.alloc((11, false, Rc::clone(&slot_drops)))
+                .expect("panicking slot must remain reusable")
+        };
+        assert_eq!(reused, first, "free list must return the same raw slot");
+        unsafe {
+            assert_eq!((*reused).value, 11);
+            pool.free(reused);
+        }
+        assert_eq!(slot_drops.get(), 2, "reused value must drop exactly once");
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["request_memory"],
+            "slot reuse must not request a second slab"
+        );
+
+        let teardown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pool)));
+        assert!(
+            teardown.is_ok(),
+            "balanced live-slot accounting must permit clean pool teardown"
+        );
+        assert_eq!(provider_drops.get(), 1);
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["request_memory", "free_memory", "provider_drop"],
+            "pool teardown must return its sole slab before provider teardown"
         );
     }
 

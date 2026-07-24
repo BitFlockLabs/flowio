@@ -3,7 +3,8 @@ mod common;
 use common::{DropTrackedReadOnly, TestIoBuffMut as IoBuffMut};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut, PushError};
 use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly, IoBuffReadWrite};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 macro_rules! seg {
@@ -26,6 +27,96 @@ fn expect_chain_full<T>(result: Result<(), PushError<T>>) -> T {
     let (error, value) = err.into_parts();
     assert_eq!(error, IoBuffError::ChainFull);
     value
+}
+
+#[derive(Debug)]
+struct InlineDropPanic(usize);
+
+struct InlineDropState {
+    order: RefCell<Vec<usize>>,
+    panics: Cell<usize>,
+    panic_at: usize,
+}
+
+struct InlineDropBomb {
+    id: usize,
+    bytes: Box<[u8; 1]>,
+    state: Rc<InlineDropState>,
+}
+
+impl InlineDropBomb {
+    fn array(panic_at: usize) -> (Rc<InlineDropState>, [Self; 4]) {
+        let state = Rc::new(InlineDropState {
+            order: RefCell::new(Vec::new()),
+            panics: Cell::new(0),
+            panic_at,
+        });
+        let values = std::array::from_fn(|id| Self {
+            id,
+            bytes: Box::new([id as u8]),
+            state: Rc::clone(&state),
+        });
+        (state, values)
+    }
+}
+
+impl Drop for InlineDropBomb {
+    fn drop(&mut self) {
+        self.state.order.borrow_mut().push(self.id);
+        if self.id == self.state.panic_at {
+            self.state.panics.set(self.state.panics.get() + 1);
+            std::panic::panic_any(InlineDropPanic(self.id));
+        }
+    }
+}
+
+// SAFETY: the payload lives in a fixed-size heap allocation, so moving the
+// owning `Box` does not invalidate its pointer or change its readable length.
+unsafe impl IoBuffReadOnly for InlineDropBomb {
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+fn assert_inline_drop_panic(
+    unwind: Box<dyn std::any::Any + Send>,
+    state: &Rc<InlineDropState>,
+    expected: usize,
+) {
+    let panic = unwind
+        .downcast_ref::<InlineDropPanic>()
+        .expect("inline drop cleanup replaced the original panic");
+    assert_eq!(panic.0, expected);
+    assert_eq!(state.panics.get(), 1);
+    assert_eq!(*state.order.borrow(), [0, 1, 2, 3]);
+    assert_eq!(
+        Rc::strong_count(state),
+        1,
+        "an initialized inline element was not dropped exactly once"
+    );
+}
+
+fn assert_chain_drop_panic_releases_remaining(panic_at: usize) {
+    let (state, values) = InlineDropBomb::array(panic_at);
+    let chain = IoBuffReadOnlyVec::<InlineDropBomb, 4>::from_array(values);
+    let unwind = catch_unwind(AssertUnwindSafe(|| drop(chain)))
+        .expect_err("selected chain element destructor did not panic");
+    assert_inline_drop_panic(unwind, &state, panic_at);
+}
+
+fn assert_iterator_drop_panic_releases_remaining(panic_at: usize) {
+    let (state, values) = InlineDropBomb::array(panic_at);
+    let chain = IoBuffReadOnlyVec::<InlineDropBomb, 4>::from_array(values);
+    let mut iter = chain.into_iter();
+    drop(iter.next().expect("first inline element was not yielded"));
+
+    let unwind = catch_unwind(AssertUnwindSafe(|| drop(iter)))
+        .expect_err("selected iterator-tail element destructor did not panic");
+    assert_inline_drop_panic(unwind, &state, panic_at);
 }
 
 /// Materializes the chain's current writable regions as kernel-facing iovecs
@@ -303,6 +394,23 @@ fn vec_read_only_from_array() {
 }
 
 #[test]
+fn vec_read_only_checked_len_and_empty_follow_real_segments() {
+    let chain = IoBuffReadOnlyVec::<Vec<u8>, 3>::from_array([
+        b"header".to_vec(),
+        Vec::new(),
+        b"body".to_vec(),
+    ]);
+    assert_eq!(chain.checked_len(), Some(10));
+    assert_eq!(chain.len(), 10);
+    assert!(!chain.is_empty());
+
+    let empty = IoBuffReadOnlyVec::<Vec<u8>, 2>::from_array([Vec::new(), Vec::new()]);
+    assert_eq!(empty.checked_len(), Some(0));
+    assert_eq!(empty.len(), 0);
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn vec_read_only_push_multiple_and_get_mut() {
     let mut chain = IoBuffReadOnlyVec::<Vec<u8>, 3>::new();
     chain.push(b"one".to_vec()).unwrap();
@@ -414,6 +522,26 @@ fn vec_read_only_drop_only_initialized_segments() {
     }
 
     assert_eq!(drops.get(), 2);
+}
+
+#[test]
+fn vec_read_only_drop_first_panic_releases_remaining_once() {
+    assert_chain_drop_panic_releases_remaining(0);
+}
+
+#[test]
+fn vec_read_only_drop_middle_panic_releases_remaining_once() {
+    assert_chain_drop_panic_releases_remaining(1);
+}
+
+#[test]
+fn vec_read_only_into_iter_first_remaining_panic_releases_tail_once() {
+    assert_iterator_drop_panic_releases_remaining(1);
+}
+
+#[test]
+fn vec_read_only_into_iter_middle_remaining_panic_releases_tail_once() {
+    assert_iterator_drop_panic_releases_remaining(2);
 }
 
 // ============================================================================

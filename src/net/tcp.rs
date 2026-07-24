@@ -181,19 +181,18 @@
 
 use super::stream;
 use super::{
-    WriteBufferChain, WritevProjection, accept_nonblocking, accept_readiness_allows_rearm,
-    accept_readiness_sqe, close_fd, close_if_valid, connect_cqe_result, current_local_addr,
-    current_peer_addr, get_sock_opt, new_nonblocking_socket, set_reuse_addr, set_reuse_port,
-    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    AcceptReadinessSlot as AcceptSlot, WriteBufferChain, WritevProjection, close_fd,
+    close_if_valid, connect_cqe_result, current_local_addr, current_peer_addr, get_sock_opt,
+    new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
+    socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    completed_op_ctx_from_waker, drop_op_ptr_unchecked, note_accept_readiness_rearm,
-    poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_retained_sqe,
-    validate_local_io_result,
+    completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
+    submit_retained_sqe, validate_local_io_result,
 };
-use crate::runtime::fd::{LingerProvenance, RetainedListenerFd, RuntimeFd};
+use crate::runtime::fd::{LingerProvenance, RuntimeFd};
 use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Timeout, TimeoutError, timeout};
 use io_uring::{opcode, types};
@@ -235,147 +234,6 @@ fn finish_accepted_stream(
         addr,
         addrlen,
     )
-}
-
-/// Reusable accept-side submission state kept by [`TcpListener`].
-struct AcceptSlot {
-    /// Owner-thread listener retained by every readiness submission until its
-    /// CQE or cancellation retires.
-    listener_fd: Rc<RuntimeFd>,
-    /// Completion state for the current or last accept submission.
-    state_ptr: *mut CompletionState,
-    /// True while an [`AcceptFuture`] is borrowing this slot.
-    in_use: bool,
-}
-
-impl AcceptSlot {
-    fn new(listener_fd: Rc<RuntimeFd>) -> Self {
-        Self {
-            listener_fd,
-            state_ptr: std::ptr::null_mut(),
-            in_use: false,
-        }
-    }
-
-    fn prepare(&mut self) -> io::Result<()> {
-        if self.in_use || !self.state_ptr.is_null() {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        self.in_use = true;
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn inherited_accept_provenance(&self) -> LingerProvenance {
-        self.listener_fd.linger_provenance()
-    }
-
-    fn drop_future(&mut self) {
-        if !self.state_ptr.is_null() {
-            unsafe {
-                drop_op_ptr_unchecked(&mut self.state_ptr);
-            }
-        }
-
-        self.in_use = false;
-    }
-
-    fn drop_cached_state(&mut self) {
-        // Normal safe use drops AcceptFuture before TcpListener. This also
-        // handles safe `mem::forget(AcceptFuture)` teardown, where the slot can
-        // still hold an in-flight or completed readiness state when the
-        // listener is finally dropped. A readiness CQE never owns an accepted
-        // descriptor.
-        self.drop_future();
-    }
-
-    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        if !self.state_ptr.is_null() {
-            let state = unsafe { &*self.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, self.state_ptr) };
-                let poll_fd = unsafe {
-                    (*op_ctx.reactor()).take_retained_payload::<RetainedListenerFd>(self.state_ptr)
-                };
-                unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
-                self.state_ptr = std::ptr::null_mut();
-
-                if op_ctx.context_rejected() {
-                    self.in_use = false;
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-                }
-                if result < 0 {
-                    self.in_use = false;
-                    return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
-                }
-
-                let accepted_linger_provenance = self.inherited_accept_provenance();
-                match accept_nonblocking(
-                    poll_fd.raw_fd(),
-                    accepted_linger_provenance == LingerProvenance::Uncertain,
-                ) {
-                    Ok((accepted_fd, addr, addrlen)) => {
-                        self.in_use = false;
-                        return Poll::Ready(finish_accepted_stream_with_provenance(
-                            accepted_fd,
-                            accepted_linger_provenance,
-                            &addr,
-                            addrlen,
-                        ));
-                    }
-                    Err(err) if accept_readiness_allows_rearm(result, &err) => {
-                        // Readiness is only a hint and can be stale. Rearm the
-                        // one-shot poll without consuming slot ownership.
-                        note_accept_readiness_rearm();
-                    }
-                    Err(err) => {
-                        self.in_use = false;
-                        return Poll::Ready(Err(err));
-                    }
-                }
-            }
-        }
-
-        if self.state_ptr.is_null() {
-            let pctx = match poll_ctx_from_waker(cx) {
-                Ok(pctx) => pctx,
-                Err(err) => {
-                    self.in_use = false;
-                    return Poll::Ready(Err(err));
-                }
-            };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                self.in_use = false;
-                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-            self.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
-
-            let poll_fd = RetainedListenerFd::new(&self.listener_fd);
-            unsafe {
-                if let Err((e, _poll_fd)) =
-                    submit_retained_sqe(&pctx, state_ptr, poll_fd, |poll_fd| {
-                        Ok(accept_readiness_sqe(poll_fd.raw_fd(), state_ptr as u64))
-                    })
-                {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    self.state_ptr = std::ptr::null_mut();
-                    self.in_use = false;
-                    return Poll::Ready(Err(e));
-                }
-            }
-            return Poll::Pending;
-        }
-
-        if unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) } {
-            self.drop_future();
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-        }
-        Poll::Pending
-    }
 }
 
 /// Reusable connect-side submission state kept by [`TcpConnector`].
@@ -433,9 +291,7 @@ impl ConnectSlot {
     }
 
     fn drop_future(&mut self) {
-        if !self.state_ptr.is_null() {
-            unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
-        }
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
 
         self.addr = None;
         self.cleanup_fd();
@@ -452,7 +308,8 @@ impl ConnectSlot {
             let state = unsafe { &*self.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, self.state_ptr) };
+                let op_ctx =
+                    unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), self.state_ptr) };
                 unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
@@ -761,16 +618,7 @@ impl TcpStream {
     /// This is connection control-plane work, normally used for teardown or
     /// protocol half-close rather than steady-state data transfer.
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        let how = match how {
-            std::net::Shutdown::Read => libc::SHUT_RD,
-            std::net::Shutdown::Write => libc::SHUT_WR,
-            std::net::Shutdown::Both => libc::SHUT_RDWR,
-        };
-        let rc = unsafe { libc::shutdown(self.fd.raw_fd(), how) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        super::shutdown_socket(self.fd.raw_fd(), how)
     }
 
     stream::impl_stream_rw!(TcpStream, "flowio::net::tcp::TcpStream");
@@ -1055,7 +903,21 @@ impl Drop for TcpListener {
 // AcceptFuture
 // ---------------------------------------------------------------------------
 
-#[doc(hidden)]
+/// Future returned by [`TcpListener::accept`] for one incoming connection.
+///
+/// It resolves to the connected [`TcpStream`] and its peer address. The
+/// future borrows the listener's reusable accept slot, so a listener can have
+/// at most one live accept future. Dropping a pending future cancels its
+/// readiness wait without consuming a connection from the listener backlog.
+///
+/// # Example
+/// ```no_run
+/// use flowio::net::tcp::{AcceptFuture, TcpListener};
+///
+/// fn accept(listener: &mut TcpListener) -> AcceptFuture<'_> {
+///     listener.accept()
+/// }
+/// ```
 pub struct AcceptFuture<'a> {
     /// Borrowed reusable accept slot owned by the listener.
     slot: &'a mut AcceptSlot,
@@ -1073,7 +935,8 @@ impl Future for AcceptFuture<'_> {
         if let Some(err) = this.input_error.take() {
             return Poll::Ready(validate_local_io_result(cx, Err(err)));
         }
-        this.slot.poll_accept(cx)
+        this.slot
+            .poll_accept(cx, finish_accepted_stream_with_provenance)
     }
 }
 
@@ -1123,7 +986,24 @@ pub(crate) mod test_support {
 // ConnectFuture
 // ---------------------------------------------------------------------------
 
-#[doc(hidden)]
+/// Future returned by [`TcpConnector::connect`] for one connection attempt.
+///
+/// It resolves to a connected [`TcpStream`]. The future borrows the
+/// connector's reusable slot, so the connector becomes available for another
+/// attempt after this future completes or is dropped.
+///
+/// # Example
+/// ```no_run
+/// use flowio::net::tcp::{ConnectFuture, TcpConnector};
+/// use std::net::SocketAddr;
+///
+/// fn connect<'a>(
+///     connector: &'a mut TcpConnector,
+///     peer: SocketAddr,
+/// ) -> std::io::Result<ConnectFuture<'a>> {
+///     connector.connect(peer)
+/// }
+/// ```
 pub struct ConnectFuture<'a> {
     /// Borrowed reusable connect slot owned by the connector.
     slot: &'a mut ConnectSlot,
@@ -1154,8 +1034,26 @@ fn map_connect_timeout(
     }
 }
 
-/// Connect future with a relative timeout for a reusable [`TcpConnector`].
-#[doc(hidden)]
+/// Future returned by [`TcpConnector::connect_timeout`] for one timed
+/// connection attempt.
+///
+/// It resolves to a connected [`TcpStream`], or to
+/// [`io::ErrorKind::TimedOut`] when the relative timeout expires. The future
+/// borrows the connector's reusable slot for the duration of the attempt.
+///
+/// # Example
+/// ```no_run
+/// use flowio::net::tcp::{ConnectTimeoutFuture, TcpConnector};
+/// use std::net::SocketAddr;
+/// use std::time::Duration;
+///
+/// fn connect_with_timeout<'a>(
+///     connector: &'a mut TcpConnector,
+///     peer: SocketAddr,
+/// ) -> std::io::Result<ConnectTimeoutFuture<'a>> {
+///     connector.connect_timeout(peer, Duration::from_secs(1))
+/// }
+/// ```
 pub struct ConnectTimeoutFuture<'a> {
     /// Timeout wrapper around the reusable-slot connect future.
     inner: Timeout<ConnectFuture<'a>>,
@@ -1181,7 +1079,16 @@ impl Future for ConnectTimeoutFuture<'_> {
 /// Owns its socket and prepared address so no external [`TcpConnector`] is
 /// needed. Repeated connections should use [`TcpConnector`] to avoid rebuilding
 /// the reusable slot wrapper.
-#[doc(hidden)]
+///
+/// # Example
+/// ```no_run
+/// use flowio::net::tcp::{OwnedConnectFuture, TcpStream};
+/// use std::net::SocketAddr;
+///
+/// fn connect(peer: SocketAddr) -> std::io::Result<OwnedConnectFuture> {
+///     TcpStream::connect(peer)
+/// }
+/// ```
 pub struct OwnedConnectFuture {
     /// Completion state for the one-shot connect submission.
     state_ptr: *mut CompletionState,
@@ -1230,7 +1137,8 @@ impl Future for OwnedConnectFuture {
             let state = unsafe { &*this.state_ptr };
             if state.is_completed() {
                 let result = state.result;
-                let op_ctx = unsafe { completed_op_ctx_from_waker(cx, this.state_ptr) };
+                let op_ctx =
+                    unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), this.state_ptr) };
                 unsafe { (*op_ctx.reactor()).free_op(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
@@ -1312,8 +1220,24 @@ impl Drop for OwnedConnectFuture {
     }
 }
 
-/// Self-contained connect future with a relative timeout.
-#[doc(hidden)]
+/// Self-contained future returned by [`TcpStream::connect_timeout`].
+///
+/// It owns the socket and prepared address for one timed connection attempt
+/// and resolves to [`io::ErrorKind::TimedOut`] when the relative timeout
+/// expires.
+///
+/// # Example
+/// ```no_run
+/// use flowio::net::tcp::{OwnedConnectTimeoutFuture, TcpStream};
+/// use std::net::SocketAddr;
+/// use std::time::Duration;
+///
+/// fn connect_with_timeout(
+///     peer: SocketAddr,
+/// ) -> std::io::Result<OwnedConnectTimeoutFuture> {
+///     TcpStream::connect_timeout(peer, Duration::from_secs(1))
+/// }
+/// ```
 pub struct OwnedConnectTimeoutFuture {
     /// Timeout wrapper around the self-contained one-shot connect future.
     inner: Timeout<OwnedConnectFuture>,

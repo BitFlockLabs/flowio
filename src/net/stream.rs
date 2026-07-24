@@ -33,9 +33,9 @@ use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    PollCtx, UnsubmittedOpGuard, completed_op_ctx_from_waker, drop_op_ptr_unchecked,
-    poll_ctx_from_waker, refresh_op_waiter_from_waker, submit_initialized_retained_sqe,
-    submit_retained_sqe, submit_tracked_sqe, validate_local_io_result,
+    PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_initialized_retained_sqe, submit_retained_sqe,
+    submit_tracked_sqe, validate_local_io_result,
 };
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
@@ -150,7 +150,7 @@ macro_rules! impl_stream_rw {
             "# }\n",
             "```"
         )]
-        pub fn try_write<B: IoBuffReadOnly + 'static>(
+        pub fn try_write<B: IoBuffReadOnly>(
             &mut self,
             buffer: B,
         ) -> (io::Result<usize>, B) {
@@ -225,6 +225,9 @@ macro_rules! impl_stream_rw {
         /// A zero-byte completion or an error before progress leaves the
         /// buffer's existing logical contents unchanged; the returned count is
         /// relative to this operation rather than the resulting total length.
+        /// A request with `len == 0` completes locally with `Ok(0)` and no
+        /// kernel submission; that request-scoped result does not report peer
+        /// EOF.
         ///
         /// Preferred on the stream fast path when the caller tracks framing:
         /// this performs one contiguous submission and returns short reads
@@ -242,11 +245,13 @@ macro_rules! impl_stream_rw {
         /// The buffer is consumed and returned alongside the result on
         /// completion (rental pattern); the actual byte count is returned
         /// in the `Ok` variant.
+        /// An empty readable window completes locally with `Ok(0)` and no
+        /// kernel submission.
         ///
         /// Preferred on the stream fast path when the caller tracks progress:
         /// this performs one contiguous submission and returns a short write
         /// directly.
-        pub fn write<B: IoBuffReadOnly + 'static>(
+        pub fn write<B: IoBuffReadOnly>(
             &mut self,
             buffer: B,
         ) -> stream::WriteFuture<'_, B, Self> {
@@ -262,7 +267,7 @@ macro_rules! impl_stream_rw {
         /// This complete-buffer API may resubmit after partial writes. Avoid
         /// that retry bookkeeping when complete-buffer semantics are not
         /// required; use [`Self::write`] and track progress in the caller.
-        pub fn write_all<B: IoBuffReadOnly + 'static>(
+        pub fn write_all<B: IoBuffReadOnly>(
             &mut self,
             buffer: B,
         ) -> stream::WriteAllFuture<'_, B, Self> {
@@ -341,7 +346,12 @@ macro_rules! impl_stream_rw {
         /// Use this when the send path is already naturally segmented. For
         /// one contiguous payload, prefer [`Self::write`] to avoid iovec
         /// materialization.
-        pub fn writev<C: WriteBufferChain<N> + 'static, const N: usize>(
+        ///
+        /// # Errors
+        ///
+        /// Returns [`io::ErrorKind::InvalidInput`] when the aggregate readable
+        /// byte count cannot be represented by `usize`.
+        pub fn writev<C: WriteBufferChain<N>, const N: usize>(
             &mut self,
             buffer: C,
         ) -> stream::WritevFuture<'_, C, N, Self> {
@@ -380,7 +390,12 @@ macro_rules! impl_stream_rw {
         /// This complete-buffer vectored API may resubmit after partial writes.
         /// Avoid that retry bookkeeping when the caller handles partial
         /// progress; use [`Self::writev`] instead.
-        pub fn writev_all<C: WriteBufferChain<N> + 'static, const N: usize>(
+        ///
+        /// # Errors
+        ///
+        /// Returns [`io::ErrorKind::InvalidInput`] when the aggregate readable
+        /// byte count cannot be represented by `usize`.
+        pub fn writev_all<C: WriteBufferChain<N>, const N: usize>(
             &mut self,
             buffer: C,
         ) -> stream::WritevAllFuture<'_, C, N, Self> {
@@ -450,7 +465,7 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
     }
 
     let result = state.result;
-    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
     let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
     unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
@@ -481,7 +496,7 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     }
 
     let result = state.result;
-    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
     let value =
         unsafe { (*op_ctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
     unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
@@ -500,7 +515,7 @@ unsafe fn retry_poll_ctx_or_rejected_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
 ) -> Result<PollCtx, T> {
-    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
     if let Some(pctx) = op_ctx.matching_poll_ctx() {
         return Ok(pctx);
     }
@@ -523,7 +538,7 @@ unsafe fn retry_poll_ctx_or_rejected_payload_with<T: 'static, R>(
     state_ptr: &mut *mut CompletionState,
     extract: impl FnOnce(*mut T) -> R,
 ) -> Result<PollCtx, R> {
-    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
     if let Some(pctx) = op_ctx.matching_poll_ctx() {
         return Ok(pctx);
     }
@@ -564,6 +579,12 @@ fn classify_retry_cqe_result(result: i32) -> RetryCqeResult {
         return RetryCqeResult::Zero;
     }
     RetryCqeResult::Bytes(result as usize)
+}
+
+/// Completes a validated empty stream operation and returns its exact owner.
+#[inline(always)]
+fn complete_empty_stream_io<B>(cx: &Context<'_>, owner: B) -> Poll<(io::Result<usize>, B)> {
+    Poll::Ready((validate_local_io_result(cx, Ok(0)), owner))
 }
 
 #[inline(always)]
@@ -634,7 +655,6 @@ unsafe fn take_retained_payload_with_and_free_state<T: 'static, R>(
 /// for the next submission. `waiter` must point to a live task on its executor
 /// owner thread.
 unsafe fn reset_existing_retry_state(state: &mut CompletionState, waiter: *mut TaskHeader) {
-    debug_assert!(state.is_completed(), "retry state was not completed");
     debug_assert!(!waiter.is_null(), "retry waiter was missing");
     state.reset_for_resubmit();
     unsafe { state.register_waiter(waiter) };
@@ -718,8 +738,11 @@ mod write_buffer_chain_sealed {
     use super::*;
 
     pub trait Sealed<const N: usize>: Sized {
-        fn write_iovec_count_and_len(&self) -> (usize, usize);
-        fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]);
+        fn write_iovec_count_and_len(&self) -> Option<(usize, usize)>;
+        fn fill_write_iovecs(
+            &self,
+            dst: &mut [MaybeUninit<libc::iovec>],
+        ) -> io::Result<(usize, usize)>;
     }
 }
 
@@ -731,9 +754,12 @@ mod write_buffer_chain_sealed {
 /// downstream crates cannot implement it.
 #[doc(hidden)]
 #[allow(private_bounds)]
-pub trait WriteBufferChain<const N: usize>: write_buffer_chain_sealed::Sealed<N> {}
+pub trait WriteBufferChain<const N: usize>: write_buffer_chain_sealed::Sealed<N> + 'static {}
 
-impl<T, const N: usize> WriteBufferChain<N> for T where T: write_buffer_chain_sealed::Sealed<N> {}
+impl<T, const N: usize> WriteBufferChain<N> for T where
+    T: write_buffer_chain_sealed::Sealed<N> + 'static
+{
+}
 
 trait WriteBufferItem {
     fn write_ptr(&self) -> *const u8;
@@ -754,53 +780,62 @@ impl<T: IoBuffReadOnly> WriteBufferItem for T {
 }
 
 #[inline(always)]
-fn write_iovec_count_and_len<'a, I, T>(iter: I) -> (usize, usize)
+fn checked_write_iovec_count_and_len<'a, I, T>(iter: I) -> Option<(usize, usize)>
 where
     I: IntoIterator<Item = &'a T>,
     T: WriteBufferItem + 'a,
 {
     let mut iov_count = 0;
-    let mut total = 0;
+    let mut total = 0usize;
     for buf in iter {
         let len = buf.write_len();
-        total += len;
+        total = total.checked_add(len)?;
         if len != 0 {
             iov_count += 1;
         }
     }
-    (iov_count, total)
+    Some((iov_count, total))
 }
 
 #[inline(always)]
-fn fill_write_iovecs<'a, I, T>(iter: I, dst: &mut [MaybeUninit<libc::iovec>])
+fn fill_write_iovecs<'a, I, T>(
+    iter: I,
+    dst: &mut [MaybeUninit<libc::iovec>],
+) -> io::Result<(usize, usize)>
 where
     I: IntoIterator<Item = &'a T>,
     T: WriteBufferItem + 'a,
 {
     let mut iov_count = 0;
+    let mut total = 0usize;
     for buf in iter {
         let len = buf.write_len();
+        total = total.checked_add(len).ok_or_else(invalid_writev_shape)?;
         if len == 0 {
             continue;
         }
-        debug_assert!(iov_count < dst.len(), "writev scratch too small");
-        dst[iov_count].write(libc::iovec {
+        let iovec = dst.get_mut(iov_count).ok_or_else(invalid_writev_shape)?;
+        iovec.write(libc::iovec {
             iov_base: buf.write_ptr() as *mut libc::c_void,
             iov_len: len,
         });
         iov_count += 1;
     }
+    Ok((iov_count, total))
 }
 
 impl<const N: usize> write_buffer_chain_sealed::Sealed<N> for IoBuffVec<N> {
     #[inline(always)]
-    fn write_iovec_count_and_len(&self) -> (usize, usize) {
-        write_iovec_count_and_len(self.iter())
+    fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+        checked_write_iovec_count_and_len(self.iter())
     }
 
     #[inline(always)]
-    fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
-        fill_write_iovecs(self.iter(), dst);
+    fn fill_write_iovecs(
+        &self,
+        dst: &mut [MaybeUninit<libc::iovec>],
+    ) -> io::Result<(usize, usize)> {
+        fill_write_iovecs(self.iter(), dst)
     }
 }
 
@@ -808,14 +843,30 @@ impl<B: IoBuffReadOnly, const N: usize> write_buffer_chain_sealed::Sealed<N>
     for IoBuffReadOnlyVec<B, N>
 {
     #[inline(always)]
-    fn write_iovec_count_and_len(&self) -> (usize, usize) {
-        write_iovec_count_and_len(self.iter())
+    fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+        checked_write_iovec_count_and_len(self.iter())
     }
 
     #[inline(always)]
-    fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
-        fill_write_iovecs(self.iter(), dst);
+    fn fill_write_iovecs(
+        &self,
+        dst: &mut [MaybeUninit<libc::iovec>],
+    ) -> io::Result<(usize, usize)> {
+        fill_write_iovecs(self.iter(), dst)
     }
+}
+
+const WRITEV_SHAPE_CHANGED: &str = "write buffer chain shape changed before submission";
+const WRITEV_AGGREGATE_OVERFLOW: &str = "write buffer chain byte length exceeds usize::MAX";
+
+#[inline(always)]
+fn invalid_writev_shape() -> io::Error {
+    invalid_input(WRITEV_SHAPE_CHANGED)
+}
+
+#[inline(always)]
+fn invalid_writev_aggregate() -> io::Error {
+    invalid_input(WRITEV_AGGREGATE_OVERFLOW)
 }
 
 struct RetainedWritePayload<B: IoBuffReadOnly> {
@@ -910,20 +961,23 @@ unsafe fn emplace_retained_readv_payload<const N: usize>(
 /// # Safety
 ///
 /// `pool` must identify the live retained pool for the active owner-thread
-/// reactor. `buffer` must contain one `C`, `scratch_init` must match its active
-/// iovec count, and any ownership returned by `after_fill` must remain valid
-/// until the caller consumes it. `fill_write_iovecs` records each nonempty
-/// source item's base pointer before `C` moves into retained storage. Those
-/// pointers remain valid only because every supported source item satisfies
-/// [`IoBuffReadOnly`]'s requirement that its backing range is not invalidated
-/// by moving the item or its containing chain; every in-crate sealed chain
-/// implementation must preserve that invariant. The returned payload must be
-/// attached to the matching operation state or consumed through `pool`.
+/// reactor. `buffer` must contain one `C`; `scratch_init.len()` and
+/// `expected_total` must be the paired first-pass shape snapshot. A later
+/// materialization mismatch is handled as `InvalidInput`. Any ownership
+/// returned by `after_fill` must remain valid until the caller consumes it.
+/// `fill_write_iovecs` records each nonempty source item's base pointer before
+/// `C` moves into retained storage. Those pointers remain valid only because
+/// every supported source item satisfies [`IoBuffReadOnly`]'s requirement that
+/// its backing range is not invalidated by moving the item or its containing
+/// chain; every in-crate sealed chain implementation must preserve that
+/// invariant. The returned payload must be attached to the matching operation
+/// state or consumed through `pool`.
 #[inline(always)]
-unsafe fn emplace_retained_writev_payload<C: WriteBufferChain<N> + 'static, const N: usize, R>(
+unsafe fn emplace_retained_writev_payload<C: WriteBufferChain<N>, const N: usize, R>(
     pool: NonNull<RetainedPayloadPool>,
     buffer: &mut Option<C>,
     mut scratch_init: RetainedIovecScratchInit,
+    expected_total: usize,
     after_fill: impl FnOnce() -> io::Result<R>,
 ) -> io::Result<(RetainedPayload<RetainedWritevPayload<C>>, R)> {
     let msg = empty_sendmsg_header();
@@ -936,7 +990,11 @@ unsafe fn emplace_retained_writev_payload<C: WriteBufferChain<N> + 'static, cons
 
             {
                 let scratch = scratch_init.destination_mut(std::ptr::addr_of_mut!((*dst).scratch));
-                opt_ref(buffer).fill_write_iovecs(scratch);
+                let expected_shape = (scratch.len(), expected_total);
+                let actual_shape = opt_ref(buffer).fill_write_iovecs(scratch)?;
+                if actual_shape != expected_shape {
+                    return Err(invalid_writev_shape());
+                }
             }
             let after_fill = after_fill()?;
             let source = buffer.as_mut().unwrap_unchecked() as *mut C;
@@ -1531,6 +1589,9 @@ fn submit_initial_projected_writev<T: WritevProjection>(
 // ---------------------------------------------------------------------------
 
 /// Single read into a caller-provided buffer (rental pattern).
+///
+/// A zero-length request completes locally with `Ok(0)` and returns the
+/// buffer unchanged. That request-scoped result is not an EOF observation.
 pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
     /// Completion state for the submitted read SQE, if any.
     state_ptr: *mut CompletionState,
@@ -1586,6 +1647,10 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
+        }
+        if this.state_ptr.is_null() && this.len == 0 {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return complete_empty_stream_io(cx, buffer);
         }
 
         if let Some((result, payload, context_rejected)) = unsafe {
@@ -1657,6 +1722,9 @@ impl<B: IoBuffReadWrite, S> Drop for ReadFuture<'_, B, S> {
 // ---------------------------------------------------------------------------
 
 /// Single write from a caller-provided buffer (rental pattern).
+///
+/// An empty readable window completes locally with `Ok(0)` and returns the
+/// buffer unchanged.
 pub struct WriteFuture<'a, B: IoBuffReadOnly, S> {
     /// Completion state for the submitted write SQE, if any.
     state_ptr: *mut CompletionState,
@@ -1693,7 +1761,7 @@ impl<'a, B: IoBuffReadOnly, S> WriteFuture<'a, B, S> {
     }
 }
 
-impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
+impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
     type Output = (io::Result<usize>, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1708,6 +1776,10 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteFuture<'_, B, S> {
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
+        }
+        if this.state_ptr.is_null() && this.len == 0 {
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return complete_empty_stream_io(cx, buffer);
         }
 
         if let Some((result, payload, context_rejected)) = unsafe {
@@ -1821,7 +1893,7 @@ impl<'a, B: IoBuffReadOnly, S> WriteAllFuture<'a, B, S> {
     }
 }
 
-impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
+impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
     type Output = (io::Result<usize>, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1846,7 +1918,7 @@ impl<B: IoBuffReadOnly + 'static, S> Future for WriteAllFuture<'_, B, S> {
         // Zero-length write completes immediately.
         if this.state_ptr.is_null() && this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
+            return complete_empty_stream_io(cx, buffer);
         }
 
         let pctx = if this.state_ptr.is_null() {
@@ -2053,7 +2125,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
         // Zero-length read completes immediately.
         if this.state_ptr.is_null() && this.target == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
+            return complete_empty_stream_io(cx, buffer);
         }
 
         let pctx = if this.state_ptr.is_null() {
@@ -2422,7 +2494,7 @@ impl Drop for WritevOpState {
 }
 
 /// Gather-write from an owned vectored buffer chain (rental pattern).
-pub struct WritevFuture<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> {
+pub struct WritevFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state for the submitted writev/write SQE, if any.
     op: WritevOpState,
     /// Caller-owned read-only segment chain returned on completion.
@@ -2433,29 +2505,37 @@ pub struct WritevFuture<'a, C: WriteBufferChain<N> + 'static, const N: usize, S>
     total: usize,
     /// Stream descriptor written by this future.
     fd: RawFd,
+    /// Whether the sizing pass found an unrepresentable aggregate byte count.
+    invalid_aggregate: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
-impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevFuture<'a, C, N, S> {
+impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevFuture<'a, C, N, S> {
     pub(crate) fn new(fd: RawFd, buffer: C) -> Self {
-        let (iov_count, total) = buffer.write_iovec_count_and_len();
-        debug_assert!(
-            total == 0 || iov_count > 0,
-            "non-empty write chain produced no iovecs"
-        );
+        let (iov_count, total, invalid_aggregate) = match buffer.write_iovec_count_and_len() {
+            Some((iov_count, total)) => {
+                debug_assert!(
+                    total == 0 || iov_count > 0,
+                    "non-empty write chain produced no iovecs"
+                );
+                (iov_count, total, false)
+            }
+            None => (0, 0, true),
+        };
         Self {
             op: WritevOpState::new(),
             buffer: Some(buffer),
             iov_count,
             total,
             fd,
+            invalid_aggregate,
             _marker: PhantomData,
         }
     }
 }
 
-impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFuture<'_, C, N, S> {
+impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N, S> {
     type Output = (io::Result<usize>, C);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2481,9 +2561,15 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
             return Poll::Pending;
         }
 
+        if this.op.state_ptr.is_null() && this.invalid_aggregate {
+            let result = validate_local_io_result(cx, Err(invalid_writev_aggregate()));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((result, buffer));
+        }
+
         if this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
+            return complete_empty_stream_io(cx, buffer);
         }
 
         if this.op.state_ptr.is_null() {
@@ -2510,6 +2596,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
                     retained_pool,
                     &mut this.buffer,
                     scratch_init,
+                    this.total,
                     || {
                         let state_ptr = (*pctx.reactor()).alloc_op();
                         if state_ptr.is_null() {
@@ -2559,7 +2646,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevFutur
 // ---------------------------------------------------------------------------
 
 /// Gather-write an entire owned vectored chain, handling partial writes.
-pub struct WritevAllFuture<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> {
+pub struct WritevAllFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state reused across sequential retry submissions.
     op: WritevOpState,
     /// Caller-owned read-only segment chain returned when the operation finishes.
@@ -2570,29 +2657,37 @@ pub struct WritevAllFuture<'a, C: WriteBufferChain<N> + 'static, const N: usize,
     fd: RawFd,
     /// Total bytes that must be written before completion.
     total: usize,
+    /// Whether the sizing pass found an unrepresentable aggregate byte count.
+    invalid_aggregate: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
-impl<'a, C: WriteBufferChain<N> + 'static, const N: usize, S> WritevAllFuture<'a, C, N, S> {
+impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevAllFuture<'a, C, N, S> {
     pub(crate) fn new(fd: RawFd, buffer: C) -> Self {
-        let (iov_count, total) = buffer.write_iovec_count_and_len();
-        debug_assert!(
-            total == 0 || iov_count > 0,
-            "non-empty write-all chain produced no iovecs"
-        );
+        let (iov_count, total, invalid_aggregate) = match buffer.write_iovec_count_and_len() {
+            Some((iov_count, total)) => {
+                debug_assert!(
+                    total == 0 || iov_count > 0,
+                    "non-empty write-all chain produced no iovecs"
+                );
+                (iov_count, total, false)
+            }
+            None => (0, 0, true),
+        };
         Self {
             op: WritevOpState::new(),
             buffer: Some(buffer),
             iov_count,
             fd,
             total,
+            invalid_aggregate,
             _marker: PhantomData,
         }
     }
 }
 
-impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevAllFuture<'_, C, N, S> {
+impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C, N, S> {
     type Output = (io::Result<usize>, C);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2602,13 +2697,19 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevAllFu
             return Poll::Pending;
         }
 
+        if this.op.state_ptr.is_null() && this.invalid_aggregate {
+            let result = validate_local_io_result(cx, Err(invalid_writev_aggregate()));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((result, buffer));
+        }
+
         if unsafe { retry_state_is_in_flight(cx, this.op.state_ptr) } {
             return Poll::Pending;
         }
 
         if this.op.state_ptr.is_null() && this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((validate_local_io_result(cx, Ok(0)), buffer));
+            return complete_empty_stream_io(cx, buffer);
         }
 
         let pctx = if this.op.state_ptr.is_null() {
@@ -2730,6 +2831,7 @@ impl<C: WriteBufferChain<N> + 'static, const N: usize, S> Future for WritevAllFu
                     retained_pool,
                     &mut this.buffer,
                     scratch_init,
+                    this.total,
                     move || Ok(guard),
                 )
             } {
@@ -3072,11 +3174,8 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
 
         debug_assert!(
             !this.state_ptr.is_null(),
-            "projected writev retry state unexpectedly missing"
+            "transferred projected writev source must retain its retry state"
         );
-        if this.state_ptr.is_null() {
-            return Poll::Pending;
-        }
         unsafe { reset_existing_retry_state(&mut *this.state_ptr, pctx.owner_task()) };
 
         let payload = unsafe {
@@ -3386,6 +3485,10 @@ impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
 mod tests {
     use super::*;
     use crate::net::send_sqe::test_support::sqe_prefix;
+    #[cfg(not(miri))]
+    use crate::runtime::executor::{Executor, ExecutorConfig};
+    #[cfg(not(miri))]
+    use crate::runtime::reactor::ReactorConfig;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -3407,6 +3510,448 @@ mod tests {
             .payload_append(b"ok")
             .expect("partial segment initialization failed");
         IoBuffVecMut::from_array([full, writable, zero, partial])
+    }
+
+    #[derive(Clone, Copy)]
+    struct WritevShape {
+        initial: [usize; 2],
+        materialized: [usize; 2],
+    }
+
+    const WRITEV_SHAPE_SHRINK: WritevShape = WritevShape {
+        initial: [1, 1],
+        materialized: [1, 0],
+    };
+    const WRITEV_SHAPE_GROWTH: WritevShape = WritevShape {
+        initial: [1, 0],
+        materialized: [1, 1],
+    };
+    const WRITEV_SHAPE_TOTAL_DRIFT: WritevShape = WritevShape {
+        initial: [1, 1],
+        materialized: [2, 1],
+    };
+
+    struct AggregateLengthItem(usize);
+
+    impl WriteBufferItem for AggregateLengthItem {
+        fn write_ptr(&self) -> *const u8 {
+            NonNull::<u8>::dangling().as_ptr()
+        }
+
+        fn write_len(&self) -> usize {
+            self.0
+        }
+    }
+
+    struct AggregateOverflowWriteChain {
+        id: usize,
+        token: Box<u8>,
+        fill_calls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+        items: [AggregateLengthItem; 3],
+    }
+
+    impl AggregateOverflowWriteChain {
+        fn new(id: usize, fill_calls: &Rc<Cell<usize>>, drops: &Rc<Cell<usize>>) -> Self {
+            let half = isize::MAX as usize;
+            Self {
+                id,
+                token: Box::new(id as u8),
+                fill_calls: Rc::clone(fill_calls),
+                drops: Rc::clone(drops),
+                items: [
+                    AggregateLengthItem(half),
+                    AggregateLengthItem(half),
+                    AggregateLengthItem(2),
+                ],
+            }
+        }
+
+        fn token_ptr(&self) -> *const u8 {
+            self.token.as_ref()
+        }
+    }
+
+    impl write_buffer_chain_sealed::Sealed<3> for AggregateOverflowWriteChain {
+        fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+            checked_write_iovec_count_and_len(self.items.iter())
+        }
+
+        fn fill_write_iovecs(
+            &self,
+            _dst: &mut [MaybeUninit<libc::iovec>],
+        ) -> io::Result<(usize, usize)> {
+            self.fill_calls.set(self.fill_calls.get() + 1);
+            panic!("overflowed write chain reached iovec materialization");
+        }
+    }
+
+    impl Drop for AggregateOverflowWriteChain {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn writev_sizing_accepts_exact_usize_max_and_rejects_overflow() {
+        let half = isize::MAX as usize;
+        let exact = [
+            AggregateLengthItem(half),
+            AggregateLengthItem(half),
+            AggregateLengthItem(1),
+        ];
+        assert_eq!(
+            checked_write_iovec_count_and_len(exact.iter()),
+            Some((3, usize::MAX))
+        );
+
+        let overflow = [
+            AggregateLengthItem(half),
+            AggregateLengthItem(half),
+            AggregateLengthItem(2),
+        ];
+        assert_eq!(checked_write_iovec_count_and_len(overflow.iter()), None);
+
+        let compacted = [
+            AggregateLengthItem(0),
+            AggregateLengthItem(7),
+            AggregateLengthItem(0),
+        ];
+        assert_eq!(
+            checked_write_iovec_count_and_len(compacted.iter()),
+            Some((1, 7))
+        );
+    }
+
+    fn assert_overflow_context_rejection<F>(
+        future: F,
+        expected_id: usize,
+        expected_token: *const u8,
+        fill_calls: &Rc<Cell<usize>>,
+        drops: &Rc<Cell<usize>>,
+    ) where
+        F: Future<Output = (io::Result<usize>, AggregateOverflowWriteChain)>,
+    {
+        let mut future = Box::pin(future);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (result, chain) = match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("invalid aggregate parked outside FlowIO"),
+        };
+        assert_eq!(
+            result
+                .expect_err("FlowIO context rejection must precede aggregate validation")
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(chain.id, expected_id);
+        assert_eq!(chain.token_ptr(), expected_token);
+        assert_eq!(fill_calls.get(), 0);
+        assert_eq!(drops.get(), 0);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        drop(chain);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn writev_aggregate_overflow_preserves_context_precedence_and_post_ready_state() {
+        let fill_calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let chain = AggregateOverflowWriteChain::new(118, &fill_calls, &drops);
+        let token = chain.token_ptr();
+        assert_overflow_context_rejection(
+            WritevFuture::<_, 3, ()>::new(-1, chain),
+            118,
+            token,
+            &fill_calls,
+            &drops,
+        );
+
+        let fill_calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let chain = AggregateOverflowWriteChain::new(119, &fill_calls, &drops);
+        let token = chain.token_ptr();
+        assert_overflow_context_rejection(
+            WritevAllFuture::<_, 3, ()>::new(-1, chain),
+            119,
+            token,
+            &fill_calls,
+            &drops,
+        );
+    }
+
+    #[cfg(not(miri))]
+    async fn assert_overflow_inside_flowio<F>(
+        future: F,
+        expected_id: usize,
+        expected_token: *const u8,
+        fill_calls: &Rc<Cell<usize>>,
+        drops: &Rc<Cell<usize>>,
+    ) where
+        F: Future<Output = (io::Result<usize>, AggregateOverflowWriteChain)>,
+    {
+        #[cfg(debug_assertions)]
+        crate::runtime::test_hooks::fail_next_op_alloc();
+
+        let mut future = Box::pin(future);
+        let (result, chain) = future.as_mut().await;
+        let err = result.expect_err("overflowed aggregate must fail locally");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), WRITEV_AGGREGATE_OVERFLOW);
+        assert_eq!(chain.id, expected_id);
+        assert_eq!(chain.token_ptr(), expected_token);
+        assert_eq!(fill_calls.get(), 0);
+        assert_eq!(drops.get(), 0);
+
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        #[cfg(debug_assertions)]
+        assert!(
+            crate::runtime::test_hooks::take_op_alloc_failure(),
+            "invalid aggregate consumed an operation slot"
+        );
+
+        drop(chain);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn writev_aggregate_overflow_returns_exact_owner_without_runtime_allocation() {
+        let mut executor = Executor::new().expect("executor creation failed");
+        executor
+            .run(async move {
+                let fill_calls = Rc::new(Cell::new(0));
+                let drops = Rc::new(Cell::new(0));
+                let chain = AggregateOverflowWriteChain::new(120, &fill_calls, &drops);
+                let token = chain.token_ptr();
+                assert_overflow_inside_flowio(
+                    WritevFuture::<_, 3, ()>::new(-1, chain),
+                    120,
+                    token,
+                    &fill_calls,
+                    &drops,
+                )
+                .await;
+
+                let fill_calls = Rc::new(Cell::new(0));
+                let drops = Rc::new(Cell::new(0));
+                let chain = AggregateOverflowWriteChain::new(121, &fill_calls, &drops);
+                let token = chain.token_ptr();
+                assert_overflow_inside_flowio(
+                    WritevAllFuture::<_, 3, ()>::new(-1, chain),
+                    121,
+                    token,
+                    &fill_calls,
+                    &drops,
+                )
+                .await;
+            })
+            .expect("overflow validation executor run failed");
+
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.sqe_submits, 0);
+            assert_eq!(stats.cqe_completions, 0);
+            assert_eq!(stats.retained_pooled_allocs, 0);
+            assert_eq!(stats.retained_heap_fallbacks, 0);
+            assert_eq!(stats.writev_scratch_inline_allocs, 0);
+            assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+            assert_eq!(
+                stats.poll_context_extractions, 2,
+                "each invalid aggregate must validate its FlowIO context once"
+            );
+        }
+    }
+
+    // Exercise the defensive materialization seam without forging a public
+    // `IoBuffReadOnly` implementation that violates its tightened unsafe
+    // shape-stability contract.
+    struct ShapeDriftingWriteItem {
+        id: usize,
+        bytes: Box<[u8; 2]>,
+        initial_len: usize,
+        materialized_len: usize,
+        len_calls: Cell<usize>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl WriteBufferItem for ShapeDriftingWriteItem {
+        fn write_ptr(&self) -> *const u8 {
+            self.bytes.as_ptr()
+        }
+
+        fn write_len(&self) -> usize {
+            let call = self.len_calls.get();
+            self.len_calls.set(call + 1);
+            if call == 0 {
+                self.initial_len
+            } else {
+                self.materialized_len
+            }
+        }
+    }
+
+    impl Drop for ShapeDriftingWriteItem {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct ShapeDriftingWriteChain {
+        items: [ShapeDriftingWriteItem; 2],
+    }
+
+    impl ShapeDriftingWriteChain {
+        fn new(shape: WritevShape, drops: &Rc<Cell<usize>>) -> Self {
+            Self {
+                items: std::array::from_fn(|id| ShapeDriftingWriteItem {
+                    id,
+                    bytes: Box::new([id as u8, id as u8]),
+                    initial_len: shape.initial[id],
+                    materialized_len: shape.materialized[id],
+                    len_calls: Cell::new(0),
+                    drops: Rc::clone(drops),
+                }),
+            }
+        }
+
+        fn ids(&self) -> [usize; 2] {
+            self.items.each_ref().map(|item| item.id)
+        }
+
+        fn pointers(&self) -> [*const u8; 2] {
+            self.items.each_ref().map(|item| item.bytes.as_ptr())
+        }
+
+        fn len_calls(&self) -> [usize; 2] {
+            self.items.each_ref().map(|item| item.len_calls.get())
+        }
+    }
+
+    impl write_buffer_chain_sealed::Sealed<2> for ShapeDriftingWriteChain {
+        fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+            checked_write_iovec_count_and_len(self.items.iter())
+        }
+
+        fn fill_write_iovecs(
+            &self,
+            dst: &mut [MaybeUninit<libc::iovec>],
+        ) -> io::Result<(usize, usize)> {
+            fill_write_iovecs(self.items.iter(), dst)
+        }
+    }
+
+    #[test]
+    fn writev_shape_drift_recycles_raw_slot_before_ownership_transfer() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool creation failed");
+
+        for shape in [
+            WRITEV_SHAPE_SHRINK,
+            WRITEV_SHAPE_GROWTH,
+            WRITEV_SHAPE_TOTAL_DRIFT,
+        ] {
+            let drops = Rc::new(Cell::new(0));
+            let chain = ShapeDriftingWriteChain::new(shape, &drops);
+            let expected_pointers = chain.pointers();
+            let expected_shape =
+                write_buffer_chain_sealed::Sealed::write_iovec_count_and_len(&chain)
+                    .expect("initial shape should fit usize");
+            let mut buffer = Some(chain);
+            let scratch_init = pool
+                .alloc_iovec_scratch_init(expected_shape.0)
+                .expect("shape-drift scratch allocation failed");
+            let after_fill_calls = Cell::new(0);
+            let pool_ptr = NonNull::from(&mut pool);
+
+            let result = unsafe {
+                emplace_retained_writev_payload::<_, 2, _>(
+                    pool_ptr,
+                    &mut buffer,
+                    scratch_init,
+                    expected_shape.1,
+                    || {
+                        after_fill_calls.set(after_fill_calls.get() + 1);
+                        Ok(())
+                    },
+                )
+            };
+            let err = match result {
+                Ok(_) => panic!("shape drift must fail before ownership transfer"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(err.to_string(), WRITEV_SHAPE_CHANGED);
+            assert_eq!(after_fill_calls.get(), 0);
+            let returned = buffer.as_ref().expect("shape drift lost caller chain");
+            assert_eq!(returned.ids(), [0, 1]);
+            assert_eq!(returned.pointers(), expected_pointers);
+            assert_eq!(returned.len_calls(), [2, 2]);
+            assert_eq!(drops.get(), 0, "shape drift dropped caller ownership");
+            drop(buffer.take());
+            assert_eq!(drops.get(), 2, "returned chain did not drop exactly once");
+        }
+
+        let stats = pool.stats();
+        assert_eq!(stats.pooled_allocs, 3);
+        assert_eq!(stats.pooled_frees, 3);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn writev_shape_drift_futures_reject_before_submission_and_return_chain() {
+        let mut executor = Executor::new_with_config(ExecutorConfig {
+            reactor: ReactorConfig { ring_entries: 1 },
+            ..ExecutorConfig::default()
+        })
+        .expect("one-slot executor creation failed");
+
+        executor
+            .run(async move {
+                for write_all in [false, true] {
+                    for shape in [
+                        WRITEV_SHAPE_SHRINK,
+                        WRITEV_SHAPE_GROWTH,
+                        WRITEV_SHAPE_TOTAL_DRIFT,
+                    ] {
+                        let drops = Rc::new(Cell::new(0));
+                        let chain = ShapeDriftingWriteChain::new(shape, &drops);
+                        let expected_pointers = chain.pointers();
+
+                        let (result, chain) = if write_all {
+                            WritevAllFuture::<_, 2, ()>::new(-1, chain).await
+                        } else {
+                            WritevFuture::<_, 2, ()>::new(-1, chain).await
+                        };
+
+                        let err = result.expect_err("shape-drift write must fail locally");
+                        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                        assert_eq!(err.to_string(), WRITEV_SHAPE_CHANGED);
+                        assert_eq!(chain.ids(), [0, 1]);
+                        assert_eq!(chain.pointers(), expected_pointers);
+                        assert_eq!(chain.len_calls(), [2, 2]);
+                        assert_eq!(drops.get(), 0, "future dropped caller chain");
+                        drop(chain);
+                        assert_eq!(drops.get(), 2, "returned chain did not drop exactly once");
+                    }
+                }
+            })
+            .expect("shape-drift executor run failed");
+
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.sqe_submits, 0);
+            assert_eq!(stats.cqe_completions, 0);
+            assert_eq!(stats.retained_pooled_allocs, 6);
+            assert_eq!(stats.retained_pooled_frees, 6);
+        }
     }
 
     #[test]
@@ -3505,11 +4050,14 @@ mod tests {
     }
 
     impl super::write_buffer_chain_sealed::Sealed<1> for RetainedWritevConstructorChain {
-        fn write_iovec_count_and_len(&self) -> (usize, usize) {
-            (1, self.bytes.len())
+        fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+            Some((1, self.bytes.len()))
         }
 
-        fn fill_write_iovecs(&self, dst: &mut [MaybeUninit<libc::iovec>]) {
+        fn fill_write_iovecs(
+            &self,
+            dst: &mut [MaybeUninit<libc::iovec>],
+        ) -> io::Result<(usize, usize)> {
             self.fill_calls.set(self.fill_calls.get() + 1);
             if let Some(mut pool) = self.reenter_pool {
                 // SAFETY: the constructor callback runs synchronously on the
@@ -3525,6 +4073,7 @@ mod tests {
                 iov_base: self.bytes.as_ptr() as *mut libc::c_void,
                 iov_len: self.bytes.len(),
             });
+            Ok((1, self.bytes.len()))
         }
     }
 
@@ -3561,10 +4110,16 @@ mod tests {
         let pool_ptr = NonNull::from(&mut pool);
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            emplace_retained_writev_payload::<_, 1, _>(pool_ptr, &mut buffer, scratch_init, || {
-                after_fill_calls.set(after_fill_calls.get() + 1);
-                Ok(())
-            })
+            emplace_retained_writev_payload::<_, 1, _>(
+                pool_ptr,
+                &mut buffer,
+                scratch_init,
+                32,
+                || {
+                    after_fill_calls.set(after_fill_calls.get() + 1);
+                    Ok(())
+                },
+            )
         }));
         assert!(unwind.is_err(), "writev callback should unwind");
         assert!(buffer.is_some(), "callback panic moved caller source");
@@ -3582,10 +4137,16 @@ mod tests {
             .expect("retry scratch token allocation failed");
         let pool_ptr = NonNull::from(&mut pool);
         let (payload, ()) = unsafe {
-            emplace_retained_writev_payload::<_, 1, _>(pool_ptr, &mut buffer, scratch_init, || {
-                after_fill_calls.set(after_fill_calls.get() + 1);
-                Ok(())
-            })
+            emplace_retained_writev_payload::<_, 1, _>(
+                pool_ptr,
+                &mut buffer,
+                scratch_init,
+                32,
+                || {
+                    after_fill_calls.set(after_fill_calls.get() + 1);
+                    Ok(())
+                },
+            )
         }
         .expect("retry emplacement failed");
         assert!(buffer.is_none());
@@ -3631,9 +4192,13 @@ mod tests {
         ));
 
         let (payload, ()) = unsafe {
-            emplace_retained_writev_payload::<_, 1, _>(pool_ptr, &mut buffer, scratch_init, || {
-                Ok(())
-            })
+            emplace_retained_writev_payload::<_, 1, _>(
+                pool_ptr,
+                &mut buffer,
+                scratch_init,
+                32,
+                || Ok(()),
+            )
         }
         .expect("reentrant emplacement failed");
         assert!(buffer.is_none());
@@ -3729,6 +4294,11 @@ mod tests {
             std::mem::align_of::<WritevOpState>(),
             std::mem::align_of::<*mut CompletionState>()
         );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::size_of::<OneShot>(), 112);
+            assert_eq!(std::mem::size_of::<All>(), 112);
+        }
         assert_eq!(std::mem::size_of::<OneShot>(), std::mem::size_of::<All>());
         assert_eq!(std::mem::align_of::<OneShot>(), std::mem::align_of::<All>());
         assert!(std::mem::needs_drop::<WritevOpState>());

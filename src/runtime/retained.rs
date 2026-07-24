@@ -309,12 +309,12 @@ impl RetainedPayloadPool {
                 if let Some(result) = self.classes[class_index].alloc_block() {
                     #[cfg(any(debug_assertions, feature = "test-support"))]
                     {
-                        self.stats.pooled_allocs += 1;
+                        self.stats.pooled_allocs = self.stats.pooled_allocs.saturating_add(1);
                         if result.reused {
-                            self.stats.pooled_reuses += 1;
+                            self.stats.pooled_reuses = self.stats.pooled_reuses.saturating_add(1);
                         }
                         if result.new_slab {
-                            self.stats.slab_allocs += 1;
+                            self.stats.slab_allocs = self.stats.slab_allocs.saturating_add(1);
                         }
                     }
 
@@ -1231,6 +1231,72 @@ fn heap_vtable<T: 'static>() -> RetainedPayloadVtable {
     }
 }
 
+/// Statically selected release operation for one retained backing allocation.
+///
+/// Implementations contain no user code and must release the exact allocation
+/// represented by `ptr` without inspecting a consumed `T`.
+trait RetainedBackingCleanup {
+    /// # Safety
+    ///
+    /// `ptr` and `pool` must identify one live retained allocation matching
+    /// this cleanup implementation, with no initialized value remaining.
+    unsafe fn free(ptr: *mut (), pool: *mut RetainedPayloadPool);
+}
+
+struct PooledBacking<T, const CLASS: usize>(PhantomData<T>);
+
+impl<T, const CLASS: usize> RetainedBackingCleanup for PooledBacking<T, CLASS> {
+    #[inline(always)]
+    unsafe fn free(ptr: *mut (), pool: *mut RetainedPayloadPool) {
+        unsafe { pooled_free_storage::<T, CLASS>(ptr, pool) };
+    }
+}
+
+struct HeapBacking<T>(PhantomData<T>);
+
+impl<T> RetainedBackingCleanup for HeapBacking<T> {
+    #[inline(always)]
+    unsafe fn free(ptr: *mut (), pool: *mut RetainedPayloadPool) {
+        unsafe { heap_free_storage::<T>(ptr, pool) };
+    }
+}
+
+/// Returns retained backing on both normal return and destructor unwind.
+///
+/// The common path consumes this guard through [`Self::finish`], which keeps
+/// cleanup statically dispatched and inline. Its `Drop` exists only on the
+/// exceptional path.
+struct RetainedBackingGuard<C: RetainedBackingCleanup> {
+    ptr: *mut (),
+    pool: *mut RetainedPayloadPool,
+    _cleanup: PhantomData<C>,
+}
+
+impl<C: RetainedBackingCleanup> RetainedBackingGuard<C> {
+    #[inline(always)]
+    fn new(ptr: *mut (), pool: *mut RetainedPayloadPool) -> Self {
+        Self {
+            ptr,
+            pool,
+            _cleanup: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(self) {
+        let this = ManuallyDrop::new(self);
+        unsafe { C::free(this.ptr, this.pool) };
+    }
+}
+
+impl<C: RetainedBackingCleanup> Drop for RetainedBackingGuard<C> {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        unsafe { C::free(self.ptr, self.pool) };
+    }
+}
+
 /// Drops a pooled value and returns its block to the matching size class.
 ///
 /// # Safety
@@ -1241,10 +1307,9 @@ unsafe fn pooled_drop_and_free<T, const CLASS: usize>(
     ptr: *mut (),
     pool: *mut RetainedPayloadPool,
 ) {
-    unsafe {
-        std::ptr::drop_in_place(ptr as *mut T);
-        (*pool).free_pooled_block(CLASS, ptr as *mut u8);
-    }
+    let backing = RetainedBackingGuard::<PooledBacking<T, CLASS>>::new(ptr, pool);
+    unsafe { std::ptr::drop_in_place(ptr as *mut T) };
+    unsafe { backing.finish() };
 }
 
 /// Returns pooled backing after its `T` value has already been consumed.
@@ -1265,13 +1330,9 @@ unsafe fn pooled_free_storage<T, const CLASS: usize>(ptr: *mut (), pool: *mut Re
 /// `ptr` must come from `Box<T>` in this pool's heap fallback and must still
 /// contain an initialized `T`.
 unsafe fn heap_drop_and_free<T>(ptr: *mut (), pool: *mut RetainedPayloadPool) {
-    unsafe { drop(Box::from_raw(ptr as *mut T)) };
-    #[cfg(not(any(debug_assertions, feature = "test-support")))]
-    let _ = pool;
-    #[cfg(any(debug_assertions, feature = "test-support"))]
-    unsafe {
-        (*pool).stats.heap_frees += 1;
-    }
+    let backing = RetainedBackingGuard::<HeapBacking<T>>::new(ptr, pool);
+    unsafe { std::ptr::drop_in_place(ptr as *mut T) };
+    unsafe { backing.finish() };
 }
 
 /// Releases heap-fallback backing after its value has been consumed.
@@ -1396,6 +1457,108 @@ mod tests {
 
     #[repr(align(128))]
     struct HeapZst;
+
+    #[derive(Debug)]
+    struct RetainedPayloadDropPanic;
+
+    struct RetainedDropBomb {
+        drops: *const Cell<usize>,
+        armed: *const Cell<bool>,
+    }
+
+    impl RetainedDropBomb {
+        fn new(drops: &Cell<usize>, armed: &Cell<bool>) -> Self {
+            Self { drops, armed }
+        }
+    }
+
+    impl Drop for RetainedDropBomb {
+        fn drop(&mut self) {
+            // SAFETY: tests keep both stack-local cells live until every bomb
+            // using them has been consumed.
+            let drops = unsafe { &*self.drops };
+            drops.set(drops.get() + 1);
+            if unsafe { (*self.armed).get() } {
+                std::panic::panic_any(RetainedPayloadDropPanic);
+            }
+        }
+    }
+
+    #[repr(align(128))]
+    struct HeapRetainedDropBomb(RetainedDropBomb);
+
+    #[test]
+    fn pooled_retained_payload_drop_panic_recycles_backing_once() {
+        let drops = Cell::new(0);
+        let armed = Cell::new(true);
+        let replacement_drops = Cell::new(0);
+        let replacement_armed = Cell::new(false);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let payload = pool.alloc(RetainedDropBomb::new(&drops, &armed));
+        let payload_ptr = payload.as_ptr();
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            payload.drop_and_free(&mut pool);
+        }))
+        .expect_err("retained payload destructor did not panic");
+        assert!(
+            unwind.downcast_ref::<RetainedPayloadDropPanic>().is_some(),
+            "retained payload cleanup replaced the original panic"
+        );
+        assert_eq!(drops.get(), 1);
+        let after_unwind = pool.stats();
+        assert_eq!(after_unwind.pooled_allocs, 1);
+        assert_eq!(after_unwind.pooled_frees, 1);
+
+        let replacement = pool.alloc(RetainedDropBomb::new(
+            &replacement_drops,
+            &replacement_armed,
+        ));
+        assert_eq!(
+            replacement.as_ptr(),
+            payload_ptr,
+            "pooled retained backing was not returned for exact reuse"
+        );
+        let after_reuse = pool.stats();
+        assert_eq!(after_reuse.pooled_allocs, 2);
+        assert_eq!(after_reuse.pooled_reuses, 1);
+        unsafe { replacement.drop_and_free(&mut pool) };
+        assert_eq!(replacement_drops.get(), 1);
+        assert_eq!(pool.stats().pooled_frees, 2);
+    }
+
+    #[test]
+    fn heap_retained_payload_drop_panic_deallocates_backing_once() {
+        let drops = Cell::new(0);
+        let armed = Cell::new(true);
+        let replacement_drops = Cell::new(0);
+        let replacement_armed = Cell::new(false);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let payload = pool.alloc(HeapRetainedDropBomb(RetainedDropBomb::new(&drops, &armed)));
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            payload.drop_and_free(&mut pool);
+        }))
+        .expect_err("heap retained payload destructor did not panic");
+        assert!(
+            unwind.downcast_ref::<RetainedPayloadDropPanic>().is_some(),
+            "heap retained cleanup replaced the original panic"
+        );
+        assert_eq!(drops.get(), 1);
+        let after_unwind = pool.stats();
+        assert_eq!(after_unwind.heap_fallbacks, 1);
+        assert_eq!(after_unwind.heap_frees, 1);
+
+        let replacement = pool.alloc(HeapRetainedDropBomb(RetainedDropBomb::new(
+            &replacement_drops,
+            &replacement_armed,
+        )));
+        unsafe { replacement.drop_and_free(&mut pool) };
+        assert_eq!(replacement_drops.get(), 1);
+        let after_replacement = pool.stats();
+        assert_eq!(after_replacement.heap_fallbacks, 2);
+        assert_eq!(after_replacement.heap_frees, 2);
+    }
 
     #[test]
     fn raw_retained_slot_finishes_pooled_payload_exactly_once() {

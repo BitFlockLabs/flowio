@@ -771,6 +771,40 @@ fn runtime_tcp_async_empty_projected_validation_uses_no_submission_or_retained_s
 }
 
 #[test]
+fn runtime_tcp_empty_read_write_complete_without_submission() {
+    let (mut stream, _peer) = connected_try_tcp_stream();
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let returned_stream = Rc::new(Cell::new(None));
+    let return_slot = Rc::clone(&returned_stream);
+
+    executor
+        .run(async move {
+            common::assert_empty_stream_io_cases!(stream);
+            return_slot.set(Some(stream));
+        })
+        .expect("executor run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 0);
+        assert_eq!(stats.cqe_completions, 0);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(
+            stats.poll_context_extractions, 2,
+            "each local completion must still validate its FlowIO context"
+        );
+    }
+
+    drop(
+        returned_stream
+            .take()
+            .expect("empty stream I/O test did not return its TCP stream"),
+    );
+}
+
+#[test]
 fn runtime_tcp_async_projected_shape_mismatches_return_source() {
     let (mut stream, _peer) = connected_try_tcp_stream();
 

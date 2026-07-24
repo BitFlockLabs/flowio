@@ -788,7 +788,7 @@ impl TimerRuntime {
     }
 
     /// Samples and returns the current monotonic timer tick.
-    pub fn now_tick(&mut self) -> io::Result<u64> {
+    pub fn now_tick(&self) -> io::Result<u64> {
         now_tick()
     }
 
@@ -818,8 +818,8 @@ impl TimerRuntime {
         };
 
         unsafe {
-            (*entry).link = Link::new_unlinked();
-            (*entry).clear_waiter();
+            debug_assert!((*entry).link.is_unlinked());
+            debug_assert!((*entry).waiter.is_null());
             (*entry).owner = if self.owner.is_null() {
                 None
             } else {
@@ -841,7 +841,7 @@ impl TimerRuntime {
         // sleeps do not start from an old baseline and later timer processing
         // does not need to burn budget catching up empty ticks.
         if !self.has_pending() {
-            self.wheel.current_tick = tick;
+            self.wheel.current_tick = tick.max(self.wheel.current_tick);
         }
 
         Ok(nanos)
@@ -1010,7 +1010,7 @@ impl TimerRuntime {
             if self.wheel.current_tick == u64::MAX {
                 break;
             }
-            self.wheel.current_tick = self.wheel.current_tick.saturating_add(1);
+            self.wheel.current_tick += 1;
         }
         if self
             .wheel
@@ -1572,9 +1572,30 @@ mod tests {
     use super::*;
     #[cfg(not(miri))]
     use crate::runtime::executor::Executor;
+    use crate::runtime::task::TaskVTable;
     use std::cell::Cell;
     #[cfg(not(miri))]
     use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    thread_local! {
+        static TIMER_DRAIN_DESTROYS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Debug)]
+    struct TimerDrainWaiterPanic;
+
+    unsafe fn panic_timer_waiter_destroy(_: *mut TaskHeader) {
+        TIMER_DRAIN_DESTROYS.with(|destroys| destroys.set(destroys.get() + 1));
+        std::panic::panic_any(TimerDrainWaiterPanic);
+    }
+
+    static PANIC_TIMER_WAITER_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Ready(()),
+        finish: |_| {},
+        cancel: |_| {},
+        destroy: panic_timer_waiter_destroy,
+    };
 
     enum ScriptedMode {
         Ready(usize),
@@ -2022,6 +2043,23 @@ mod tests {
             deadline_tick_from_nanos(u64::MAX, Duration::from_secs(u64::MAX)),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn empty_timer_wheel_arm_never_moves_current_tick_backward() {
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        assert!(!runtime.has_pending());
+
+        runtime.wheel.current_tick = u64::MAX;
+        let sampled_tick =
+            runtime.sample_arm_nanos().expect("timer arm sample failed") / TIMER_TICK_NS;
+
+        assert!(
+            sampled_tick < u64::MAX,
+            "test requires a sampled tick below the saturated wheel tick"
+        );
+        assert_eq!(runtime.wheel.current_tick, u64::MAX);
     }
 
     #[test]
@@ -2698,7 +2736,7 @@ mod tests {
     }
 
     #[test]
-    fn timer_runtime_pool_provider_survives_arm_cancel_under_miri() {
+    fn timer_runtime_pool_provider_survives_arm_cancel_reuse_under_miri() {
         // Proxy Miri coverage for executor/reactor/timer holder ownership:
         // executor and reactor construction require real io_uring/socket
         // resources that Miri cannot run, while timer arm/cancel exercises the
@@ -2718,6 +2756,78 @@ mod tests {
         runtime
             .cancel_sleep(entry)
             .expect("canceling test timer failed");
+
+        let reused = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+            .expect("rearming test timer failed");
+        assert_eq!(reused, entry, "timer pool did not reuse the canceled slot");
+        assert!(
+            unsafe { (*reused).state == TimerState::Armed },
+            "reused timer entry must publish the armed state"
+        );
+        runtime
+            .cancel_sleep(reused)
+            .expect("canceling reused test timer failed");
+    }
+
+    #[test]
+    fn timer_shutdown_drain_preserves_later_entries_after_waiter_destroy_panics() {
+        TIMER_DRAIN_DESTROYS.with(|destroys| destroys.set(0));
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        let deadline = runtime.wheel.current_tick.saturating_add(10);
+        let mut first_waiter = TaskHeader::new();
+        first_waiter.vtable = &PANIC_TIMER_WAITER_VTABLE;
+        let first_waiter_ptr = &mut first_waiter as *mut TaskHeader;
+        let mut second_waiter = TaskHeader::new();
+        let second_waiter_ptr = &mut second_waiter as *mut TaskHeader;
+
+        let first_entry = runtime
+            .submit_sleep_at_tick(first_waiter_ptr, deadline)
+            .expect("first shutdown timer arm failed");
+        let second_entry = runtime
+            .submit_sleep_at_tick(second_waiter_ptr, deadline)
+            .expect("second shutdown timer arm failed");
+        unsafe { release_task(first_waiter_ptr) };
+        assert_eq!(second_waiter.refs.get(), 2);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| runtime.cancel_all_for_shutdown()))
+            .expect_err("final waiter release did not panic");
+        assert!(
+            unwind.downcast_ref::<TimerDrainWaiterPanic>().is_some(),
+            "timer shutdown replaced the waiter-destroy panic"
+        );
+        TIMER_DRAIN_DESTROYS.with(|destroys| assert_eq!(destroys.get(), 1));
+        assert!(unsafe { (*first_entry).link.is_unlinked() });
+        assert!(unsafe { (*first_entry).waiter.is_null() });
+        assert!(unsafe { (*first_entry).state == TimerState::Cancelled });
+        assert!(unsafe { (*second_entry).state == TimerState::Armed });
+        assert!(!unsafe { (*second_entry).link.is_unlinked() });
+        assert_eq!(second_waiter.refs.get(), 2);
+
+        runtime.cancel_all_for_shutdown();
+        assert!(unsafe { (*second_entry).link.is_unlinked() });
+        assert!(unsafe { (*second_entry).waiter.is_null() });
+        assert!(unsafe { (*second_entry).state == TimerState::Cancelled });
+        assert_eq!(second_waiter.refs.get(), 1);
+
+        runtime
+            .cancel_sleep(first_entry)
+            .expect("first detached timer reclaim failed");
+        runtime
+            .cancel_sleep(second_entry)
+            .expect("second detached timer reclaim failed");
+        let replacement = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+            .expect("replacement timer arm failed");
+        assert!(
+            replacement == first_entry || replacement == second_entry,
+            "shutdown recovery did not make a detached timer slot reusable"
+        );
+        runtime
+            .cancel_sleep(replacement)
+            .expect("replacement timer cancel failed");
+        unsafe { release_task(second_waiter_ptr) };
     }
 
     #[test]

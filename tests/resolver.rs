@@ -1,14 +1,69 @@
 use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
-use flowio::test_support::net::resolver::lookup_ipv4;
+use flowio::test_support::net::resolver::{
+    lookup_ipv4, read_resolv_conf, resolve_local_host_with_hosts_path,
+};
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
+use std::fs::{OpenOptions, remove_file};
 use std::io;
+use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const HOSTS_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
+static NEXT_TEMP_RESOLVER_FILE: AtomicUsize = AtomicUsize::new(0);
+
+struct TempResolverFile {
+    path: PathBuf,
+}
+
+impl TempResolverFile {
+    fn padded(label: &str, prefix: &[u8], len: usize) -> Self {
+        assert!(prefix.len() <= len, "fixture prefix must fit");
+        let sequence = NEXT_TEMP_RESOLVER_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "flowio-resolver-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("failed to create resolver fixture");
+        file.write_all(prefix)
+            .expect("failed to write resolver fixture prefix");
+
+        let padding = [b' '; 8192];
+        let mut remaining = len - prefix.len();
+        while remaining != 0 {
+            let chunk_len = remaining.min(padding.len());
+            file.write_all(&padding[..chunk_len])
+                .expect("failed to pad resolver fixture");
+            remaining -= chunk_len;
+        }
+
+        Self { path }
+    }
+
+    fn path(&self) -> &str {
+        self.path
+            .to_str()
+            .expect("temporary resolver path should be UTF-8")
+    }
+}
+
+impl Drop for TempResolverFile {
+    fn drop(&mut self) {
+        let _ = remove_file(&self.path);
+    }
+}
 
 /// Response shapes emitted by the mock DNS server.
 ///
@@ -42,6 +97,7 @@ enum TestAnswer {
     CnameRdataTrailingBytes,
     InvalidUtf8CnameTarget,
     LiteralDotCnameTarget,
+    RootCnameTarget,
     Empty,
     NxDomain,
     NegativeQuestionMismatch(QuestionMismatch, NegativeRcode),
@@ -228,6 +284,116 @@ fn resolve_host_rejects_invalid_query_names_without_sending_dns() {
 fn dns_resolver_requires_nameserver() {
     let err = DnsResolver::new(Vec::new()).expect_err("empty nameserver list should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(err.to_string(), "resolver requires at least one nameserver");
+}
+
+#[test]
+fn resolver_deduplicates_silent_nameserver_attempts() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver, nameserver, nameserver])
+                .expect("duplicate nameservers should be accepted");
+            resolver.set_query_timeout(Duration::from_millis(30));
+
+            let err = lookup_ipv4(&resolver, "dedup-attempt.flowio.invalid")
+                .await
+                .expect_err("silent nameserver should time out");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        })
+        .expect("executor run failed");
+
+    server
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("failed to set dns socket timeout");
+    let mut buffer = [0u8; 512];
+    server
+        .recv_from(&mut buffer)
+        .expect("unique nameserver did not receive the query");
+    server
+        .set_nonblocking(true)
+        .expect("failed to make dns socket nonblocking");
+    let err = server
+        .recv_from(&mut buffer)
+        .expect_err("duplicate nameservers must not cause duplicate attempts");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn resolver_hosts_file_accepts_four_mib_and_rejects_the_next_byte() {
+    let host = "hosts-boundary.flowio.invalid";
+    let prefix = format!("192.0.2.10 {host}\n");
+    let exact = TempResolverFile::padded("hosts-exact", prefix.as_bytes(), HOSTS_FILE_MAX_BYTES);
+    let addrs = resolve_local_host_with_hosts_path(exact.path(), host, 5432)
+        .expect("a four MiB hosts file should be accepted");
+    assert_eq!(
+        addrs,
+        [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 5432))]
+    );
+
+    let over = TempResolverFile::padded("hosts-over", prefix.as_bytes(), HOSTS_FILE_MAX_BYTES + 1);
+    let err = resolve_local_host_with_hosts_path(over.path(), host, 5432)
+        .expect_err("a hosts file above four MiB should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "/etc/hosts exceeds the 4 MiB resolver configuration limit"
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_accepts_64_kib_and_rejects_the_next_byte() {
+    let prefix = b"nameserver 192.0.2.53\n";
+    let exact = TempResolverFile::padded("resolv-conf-exact", prefix, RESOLV_CONF_MAX_BYTES);
+    let nameservers =
+        read_resolv_conf(exact.path()).expect("a 64 KiB resolv.conf should be accepted");
+    assert_eq!(
+        nameservers,
+        [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53))]
+    );
+
+    let over = TempResolverFile::padded("resolv-conf-over", prefix, RESOLV_CONF_MAX_BYTES + 1);
+    let err =
+        read_resolv_conf(over.path()).expect_err("a resolv.conf above 64 KiB should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "/etc/resolv.conf exceeds the 64 KiB resolver configuration limit"
+    );
+}
+
+#[test]
+fn resolver_hosts_result_accepts_64_unique_addresses_and_rejects_the_65th() {
+    let host = "address-boundary.flowio.invalid";
+    let mut contents = String::new();
+    for octet in 1..=64 {
+        contents.push_str(&format!("192.0.2.{octet} {host}\n"));
+    }
+    let exact =
+        TempResolverFile::padded("hosts-address-exact", contents.as_bytes(), contents.len());
+    let addrs = resolve_local_host_with_hosts_path(exact.path(), host, 5432)
+        .expect("64 unique hosts addresses should be accepted");
+    assert_eq!(addrs.len(), 64);
+    for (index, addr) in addrs.iter().enumerate() {
+        assert_eq!(
+            *addr,
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, index as u8 + 1), 5432))
+        );
+    }
+
+    contents.push_str(&format!("192.0.2.65 {host}\n"));
+    let over = TempResolverFile::padded("hosts-address-over", contents.as_bytes(), contents.len());
+    let err = resolve_local_host_with_hosts_path(over.path(), host, 5432)
+        .expect_err("a 65th unique hosts address should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "resolver result exceeds 64 unique addresses"
+    );
 }
 
 #[test]
@@ -757,6 +923,56 @@ fn resolve_host_falls_back_after_nxdomain_with_malformed_authority() {
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 5432))]
             );
+        })
+        .expect("executor run failed");
+
+    bad_thread.join().expect("bad dns thread panicked");
+    good_thread.join().expect("good dns thread panicked");
+}
+
+#[test]
+fn resolve_host_falls_back_after_root_cname_without_querying_root() {
+    let bad_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind root-CNAME dns socket");
+    let bad_nameserver = bad_server
+        .local_addr()
+        .expect("failed to read root-CNAME dns socket addr");
+    let bad_thread = thread::spawn(move || {
+        serve_dns_queries(bad_server, 2, |name, qtype| {
+            assert_eq!(name, "db.example.test");
+            assert!(matches!(qtype, 1 | 28));
+            TestAnswer::RootCnameTarget
+        })
+    });
+
+    let expected_ip = Ipv4Addr::new(192, 0, 2, 45);
+    let good_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind root-CNAME fallback dns socket");
+    let good_nameserver = good_server
+        .local_addr()
+        .expect("failed to read root-CNAME fallback dns socket addr");
+    let good_thread = thread::spawn(move || {
+        serve_dns_queries(good_server, 2, move |name, qtype| {
+            assert_eq!(name, "db.example.test");
+            match qtype {
+                1 => TestAnswer::A(expected_ip),
+                28 => TestAnswer::Empty,
+                _ => panic!("unexpected DNS query type {qtype}"),
+            }
+        })
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![bad_nameserver, good_nameserver])
+                .expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("root CNAME should be an upstream failover error");
+            assert_eq!(addrs, vec![SocketAddr::from((expected_ip, 5432))]);
         })
         .expect("executor run failed");
 
@@ -2426,7 +2642,8 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
         | TestAnswer::CnameRdataOverrun
         | TestAnswer::CnameRdataTrailingBytes
         | TestAnswer::InvalidUtf8CnameTarget
-        | TestAnswer::LiteralDotCnameTarget => 1u16,
+        | TestAnswer::LiteralDotCnameTarget
+        | TestAnswer::RootCnameTarget => 1u16,
         TestAnswer::QuestionTypeMismatch
         | TestAnswer::QuestionClassMismatch
         | TestAnswer::Empty
@@ -2554,6 +2771,14 @@ fn build_response(query: &[u8], answer: TestAnswer) -> Vec<u8> {
             push_u32_be(&mut response, 60);
             push_u16_be(&mut response, encoded.len() as u16);
             response.extend_from_slice(&encoded);
+        }
+        TestAnswer::RootCnameTarget => {
+            push_u16_be(&mut response, 0xC00C);
+            push_u16_be(&mut response, 5);
+            push_u16_be(&mut response, 1);
+            push_u32_be(&mut response, 60);
+            push_u16_be(&mut response, 1);
+            response.push(0);
         }
         TestAnswer::CnameWithA(target, ip) => {
             let mut encoded = Vec::new();

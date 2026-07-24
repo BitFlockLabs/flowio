@@ -24,14 +24,12 @@ thread_local! {
 
 /// Makes the next completion-state allocation on this thread fail.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn fail_next_op_alloc() {
     FAIL_OP_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
 
 /// Makes the next timer-entry allocation on this thread fail.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn fail_next_timer_alloc() {
     FAIL_TIMER_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
@@ -39,7 +37,6 @@ pub fn fail_next_timer_alloc() {
 /// Makes the next raw reactor SQE submission on this thread fail with
 /// `WouldBlock`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn fail_next_sqe_submit() {
     fail_next_raw_sqe_submit();
 }
@@ -47,7 +44,6 @@ pub fn fail_next_sqe_submit() {
 /// Makes the next raw reactor SQE submission on this thread fail with
 /// `WouldBlock`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub(crate) fn fail_next_raw_sqe_submit() {
     FAIL_RAW_SQE_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
@@ -55,7 +51,6 @@ pub(crate) fn fail_next_raw_sqe_submit() {
 /// Makes the next raw `io_uring_enter` submit call on this thread fail with a
 /// specific OS errno.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn fail_next_ring_submit_errno(errno: i32) {
     FAIL_RING_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
     FAIL_RING_SUBMIT_ERRNO.with(|stored| stored.set(errno));
@@ -64,7 +59,6 @@ pub fn fail_next_ring_submit_errno(errno: i32) {
 /// Makes the next `io_uring_enter` wait call on this thread fail with a
 /// specific OS errno.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn fail_next_ring_wait_errno(errno: i32) {
     FAIL_RING_WAITS.with(|fails| fails.set(fails.get().saturating_add(1)));
     FAIL_RING_WAIT_ERRNO.with(|stored| stored.set(errno));
@@ -72,7 +66,6 @@ pub fn fail_next_ring_wait_errno(errno: i32) {
 
 /// Makes the next `IoBuffPool` slab allocation on this thread fail.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub(crate) fn fail_next_iobuff_pool_slab_alloc() {
     FAIL_IOBUFF_POOL_SLAB_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
@@ -80,7 +73,6 @@ pub(crate) fn fail_next_iobuff_pool_slab_alloc() {
 /// Makes the next reactor feature validation report missing
 /// `IORING_ENTER_EXT_ARG` support.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub(crate) fn fail_next_reactor_ext_arg_probe() {
     FAIL_REACTOR_EXT_ARG_PROBES.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
@@ -88,7 +80,6 @@ pub(crate) fn fail_next_reactor_ext_arg_probe() {
 /// Makes the next reactor shutdown skip its ordinary bounded drain and enter
 /// the fallback path immediately.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn force_next_reactor_shutdown_fallback() {
     FORCE_REACTOR_SHUTDOWN_FALLBACKS.with(|forces| {
         forces.set(forces.get().saturating_add(1));
@@ -172,7 +163,6 @@ pub(crate) fn take_ring_wait_failure() -> Option<io::Error> {
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn ring_wait_failures_remaining() -> usize {
     FAIL_RING_WAITS.with(Cell::get)
 }
@@ -180,7 +170,6 @@ pub fn ring_wait_failures_remaining() -> usize {
 /// Returns the number of injected ring-submit failures not yet consumed on
 /// this thread.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn ring_submit_failures_remaining() -> usize {
     FAIL_RING_SUBMITS.with(Cell::get)
 }
@@ -227,7 +216,6 @@ pub(crate) fn take_reactor_shutdown_fallback() -> bool {
 /// Returns the number of forced reactor-shutdown fallbacks not yet consumed on
 /// this thread.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn reactor_shutdown_fallbacks_remaining() -> usize {
     FORCE_REACTOR_SHUTDOWN_FALLBACKS.with(Cell::get)
 }

@@ -682,6 +682,11 @@ impl SparseOversizedReadOnly {
     pub fn as_ptr_calls(&self) -> usize {
         self.as_ptr_calls.get()
     }
+
+    /// Returns the stable mapping identity without counting a data-pointer use.
+    pub fn mapping_base_addr(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
 }
 
 // SAFETY: successful anonymous mappings are zero-initialized and page-aligned.
@@ -1105,6 +1110,33 @@ macro_rules! assert_empty_projected_async_cases {
 }
 #[allow(unused_imports)]
 pub(crate) use assert_empty_projected_async_cases;
+
+/// Exercises the shared TCP/Unix one-shot empty read/write policy.
+#[allow(unused_macros)]
+macro_rules! assert_empty_stream_io_cases {
+    ($stream:ident) => {{
+        let mut read_buffer = Vec::with_capacity(8);
+        read_buffer.extend_from_slice(b"HEAD");
+        let read_ptr = read_buffer.as_ptr();
+        let read_capacity = read_buffer.capacity();
+        let (result, read_buffer) = $stream.read(read_buffer, 0).await;
+        assert_eq!(result.expect("empty stream read failed"), 0);
+        assert_eq!(read_buffer, b"HEAD");
+        assert_eq!(read_buffer.as_ptr(), read_ptr);
+        assert_eq!(read_buffer.capacity(), read_capacity);
+
+        let write_buffer = Vec::with_capacity(1);
+        let write_ptr = write_buffer.as_ptr();
+        let write_capacity = write_buffer.capacity();
+        let (result, write_buffer) = $stream.write(write_buffer).await;
+        assert_eq!(result.expect("empty stream write failed"), 0);
+        assert!(write_buffer.is_empty());
+        assert_eq!(write_buffer.as_ptr(), write_ptr);
+        assert_eq!(write_buffer.capacity(), write_capacity);
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_empty_stream_io_cases;
 
 /// Projection fixture whose reported byte count disagrees with its pieces.
 #[allow(dead_code)]

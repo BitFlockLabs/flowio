@@ -24,7 +24,9 @@ Alpha prereleases carry no compatibility guarantee.
 - `IoBuffReadWrite` now provides `initialized_writable_slice` for userspace
   producers that require `&mut [u8]`. Its default initializes exactly the
   requested writable prefix; `Vec`, `Box<[u8]>`, and `IoBuffMut` specialize the
-  operation to preserve bytes already known to be initialized.
+  operation to preserve bytes already known to be initialized. Its defensive
+  release clamp returns an empty slice without consulting a permitted null
+  pointer when no writable bytes remain.
 - `IoBuffReadWrite` now provides `write_base_len` for relative contiguous-read
   publication. Its default remains zero for overwrite-style flat/custom
   buffers; `IoBuffMut` reports its current payload length so reads append to
@@ -33,6 +35,19 @@ Alpha prereleases carry no compatibility guarantee.
   permit a null pointer only for an empty window. Every positive-length range
   must be non-null, suitably aligned, contained in one stable allocation, and
   satisfy the documented initialization and access requirements.
+- Projected write-all retries now rely consistently on the retained
+  carrier/completion-state invariant instead of preserving an unreachable
+  wake-less pending fallback.
+- Empty timer wheels now keep `current_tick` monotonic when refreshing a stale
+  arm-time baseline.
+- TCP and Unix one-shot stream reads and writes now complete zero-length
+  requests locally with `Ok(0)` after runtime-context validation, returning
+  the exact rental owner without allocating operation state or submitting an
+  SQE. A zero-length read result is request-scoped rather than peer EOF.
+- UDP `send_to` now applies the same io_uring 32-bit source-length validation
+  as connected `send`, returning an oversized owner before pointer access,
+  retained allocation, or submission. Legal zero-length datagrams continue to
+  use the normal kernel path.
 - **Breaking:** `IoBuffMut::payload_unwritten_mut` now exposes spare payload
   capacity as `MaybeUninit<u8>`. Callers initialize the intended prefix and
   publish it with unsafe `payload_set_len_initialized`; safe
@@ -57,6 +72,10 @@ Alpha prereleases carry no compatibility guarantee.
   changing whether the stream list is empty. Generic empty requests and any
   other intent/list mismatch now return `InvalidInput` before a socket-option
   syscall.
+- **Breaking:** SCTP `send`, `send_msg`, and `send_msg_vectored` now reject a
+  zero-length source with `InvalidInput` before kernel submission and return
+  the rental owner unchanged. Empty and zero-readable vectored chains no longer
+  complete with `Ok(0)`; legal zero-length UDP datagrams are unaffected.
 - Runtime dependencies have been refreshed while retaining the existing
   feature set and minimum supported Rust version.
 - Compatibility documentation now consistently states the binding Linux 5.11
@@ -64,19 +83,32 @@ Alpha prereleases carry no compatibility guarantee.
   `IORING_OP_CLOSE` and 14-byte `SCTP_EVENTS` requirements do not lower that
   floor or require a legacy SCTP subscription fallback.
 - Rich SCTP message operations now construct kernel-visible iovecs,
-  address/control storage, and self-referential message headers directly in
-  their retained completion payloads. Vectored receive and send futures no
-  longer stage iovec arrays, and scalar/vectored send moves the caller-owned
-  buffer only after every non-owning field is initialized; public API, wire
-  behavior, and completion-time ownership are unchanged.
-- Rich SCTP receive now decodes each caller-visible notification once and
-  reuses that result for discard recovery and returned metadata. FlowIO-only
-  forced notifications remain internal and parse-free; framing, visibility,
-  public API, and wire behavior are unchanged.
+  control storage, and self-referential message headers directly in their
+  retained completion payloads. Vectored receive and send futures no longer
+  stage iovec arrays, and scalar/vectored send moves the caller-owned buffer
+  only after every non-owning field is initialized; public API, wire behavior,
+  and completion-time ownership are unchanged.
+- SCTP completions now move only the returned rental owner and copy only the
+  receive metadata they consume from retained storage. Large vectored
+  completions no longer move unused iovecs, address storage, or pointer-bearing
+  message headers; allocation, ownership, API, and wire behavior are unchanged.
+- Connected rich SCTP receives no longer request or retain an unused
+  per-message peer address. Their `recvmsg` headers leave the address pointer
+  null and length zero while preserving metadata, notification, ownership, and
+  record-boundary behavior.
+- Rich SCTP receive decodes each notification at most once and reuses that
+  result for discard recovery and any returned metadata. FlowIO-only forced
+  notifications remain internal but are parsed for discard policy, so a
+  complete non-EOR abort retires both live and dropped receive state. Known
+  fields are bounded by the notification's declared length; public API and wire
+  behavior are unchanged.
 - DNS response parsing now validates Authority and Additional record owners
   and CNAME targets without materializing discarded strings. Answer-section
   name handling, structural validation, response-code precedence, and
   resolution behavior are unchanged.
+- DNS response parsing now uses the exact received datagram prefix carried with
+  a reusable response allocation, so stale tail bytes cannot complete a
+  truncated response.
 
 ### Fixed
 

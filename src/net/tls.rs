@@ -135,9 +135,9 @@ type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMark
 const DER_SEQUENCE_TAG: u8 = 0x30;
 const DER_BIT_STRING_TAG: u8 = 0x03;
 
-/// rustls deframer `MAX_WIRE_SIZE`; keep the reusable read scratch and each raw
-/// read to at most one TLS record so ciphertext and plaintext staging are both
-/// drained between feeds.
+/// rustls 0.23.42 deframer `MAX_WIRE_SIZE`; keep the reusable read scratch and
+/// each raw read to at most one TLS record so ciphertext and plaintext staging
+/// are both drained between feeds. Recheck this value when updating rustls.
 const TLS_MAX_WIRE_READ_SIZE: usize = 18_437;
 
 /// Marker type used when the shared stream futures are driving raw TLS record

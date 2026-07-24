@@ -243,9 +243,44 @@ unsafe fn free_op_fields(
 
     unsafe { pending_cancels.unlink(ptr) };
     unsafe { (*ptr).clear_waiter() };
+    let slot = OpSlotReturnGuard::new(op_pool, ptr);
     unsafe { (*ptr).drop_retained_payload(retained_pool) };
-    unsafe { op_pool.free(ptr) };
+    unsafe { slot.finish() };
     Ok(())
+}
+
+/// Returns one completion-state slot if retained-payload destruction unwinds.
+///
+/// Registry, cancel-queue, and waiter ownership are removed before this guard
+/// is installed. The checked-out slot itself remains unavailable to reentrant
+/// owner-thread work until payload destruction finishes or unwinds.
+struct OpSlotReturnGuard {
+    op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+    ptr: *mut CompletionState,
+}
+
+impl OpSlotReturnGuard {
+    #[inline(always)]
+    fn new(
+        op_pool: &mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+        ptr: *mut CompletionState,
+    ) -> Self {
+        Self { op_pool, ptr }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(self) {
+        let mut this = ManuallyDrop::new(self);
+        unsafe { (*this.op_pool).free(this.ptr) };
+    }
+}
+
+impl Drop for OpSlotReturnGuard {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        unsafe { (*self.op_pool).free(self.ptr) };
+    }
 }
 
 /// User-facing `io_uring` setup configuration embedded inside
@@ -843,6 +878,9 @@ impl Reactor {
                 let timespec = types::Timespec::from(timeout);
                 let args = types::SubmitArgs::new().timespec(&timespec);
                 match self.submit_with_args(1, &args) {
+                    // `flush_sqes` emptied the userspace SQ before this wait.
+                    // Keep this cheap check as defense if a future submit
+                    // wrapper can leave an unconsumed suffix.
                     Ok(_) if self.has_queued_sqes() => {
                         return Ok(ReactorSubmitStatus::Busy);
                     }
@@ -869,6 +907,8 @@ impl Reactor {
         } else {
             loop {
                 match self.submit_and_wait(1) {
+                    // As above, this is defensive after the preceding flush;
+                    // the ordinary wait path has no queued userspace SQEs.
                     Ok(_) if self.has_queued_sqes() => {
                         return Ok(ReactorSubmitStatus::Busy);
                     }
@@ -1188,6 +1228,31 @@ pub fn benchmark_cancel_submit_pressure(
 mod pending_cancel_tests {
     use super::*;
     use crate::runtime::task::TaskHeader;
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::rc::Rc;
+
+    #[derive(Debug)]
+    struct OpPayloadDropPanic(&'static str);
+
+    struct OpPayloadDropBomb {
+        drops: Rc<Cell<usize>>,
+        panic_tag: Option<&'static str>,
+    }
+
+    impl Drop for OpPayloadDropBomb {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if let Some(tag) = self.panic_tag {
+                std::panic::panic_any(OpPayloadDropPanic(tag));
+            }
+        }
+    }
+
+    #[repr(align(128))]
+    struct HeapOpPayloadDropBomb {
+        _bomb: OpPayloadDropBomb,
+    }
 
     fn queue_states(
         count: usize,
@@ -1328,6 +1393,139 @@ mod pending_cancel_tests {
     fn completion_state_remains_one_cache_line() {
         assert_eq!(std::mem::size_of::<CompletionState>(), 64);
         assert_eq!(std::mem::align_of::<CompletionState>(), 64);
+    }
+
+    #[test]
+    fn free_op_fields_retained_drop_panic_recycles_operation_slot_once() {
+        let pooled_drops = Rc::new(Cell::new(0));
+        let heap_drops = Rc::new(Cell::new(0));
+        let mut pending_cancels = PendingCancelQueue::new();
+        let mut retained_pool =
+            RetainedPayloadPool::new().expect("retained payload pool construction failed");
+        let mut op_pool: ProviderOwnedPool<CompletionState, BasicMemoryProvider> =
+            ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+                .expect("operation pool construction failed");
+        op_pool.init();
+        let mut live_registry = Vec::new();
+
+        let state = unsafe { op_pool.alloc(()) }.expect("operation allocation failed");
+        unsafe { (*state).bind_owner(None, 0) };
+        live_registry.push(state);
+        let pooled = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&pooled_drops),
+            panic_tag: Some("pooled"),
+        });
+        let pooled_ptr = pooled.as_ptr();
+        unsafe { (*state).attach_retained_payload(pooled) };
+
+        let pooled_unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                state,
+            )
+            .expect("pooled operation retirement failed before payload drop");
+        }))
+        .expect_err("pooled retained payload destructor did not panic");
+        let pooled_panic = pooled_unwind
+            .downcast_ref::<OpPayloadDropPanic>()
+            .expect("pooled cleanup replaced the original panic");
+        assert_eq!(pooled_panic.0, "pooled");
+        assert_eq!(pooled_drops.get(), 1);
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
+        assert_eq!(retained_pool.stats().pooled_frees, 1);
+
+        let pooled_replacement =
+            unsafe { op_pool.alloc(()) }.expect("pooled replacement operation allocation failed");
+        assert_eq!(
+            pooled_replacement, state,
+            "panicking payload stranded the operation slot"
+        );
+        unsafe { (*pooled_replacement).bind_owner(None, 0) };
+        live_registry.push(pooled_replacement);
+        let pooled_payload_replacement = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&pooled_drops),
+            panic_tag: None,
+        });
+        assert_eq!(
+            pooled_payload_replacement.as_ptr(),
+            pooled_ptr,
+            "panicking payload stranded its pooled backing"
+        );
+        unsafe {
+            (*pooled_replacement).attach_retained_payload(pooled_payload_replacement);
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                pooled_replacement,
+            )
+            .expect("pooled replacement operation retirement failed");
+        }
+        assert_eq!(pooled_drops.get(), 2);
+        assert_eq!(retained_pool.stats().pooled_reuses, 1);
+
+        let heap_state = unsafe { op_pool.alloc(()) }.expect("heap operation allocation failed");
+        assert_eq!(heap_state, state);
+        unsafe { (*heap_state).bind_owner(None, 0) };
+        live_registry.push(heap_state);
+        let heap = retained_pool.alloc(HeapOpPayloadDropBomb {
+            _bomb: OpPayloadDropBomb {
+                drops: Rc::clone(&heap_drops),
+                panic_tag: Some("heap"),
+            },
+        });
+        unsafe { (*heap_state).attach_retained_payload(heap) };
+
+        let heap_unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                heap_state,
+            )
+            .expect("heap operation retirement failed before payload drop");
+        }))
+        .expect_err("heap retained payload destructor did not panic");
+        let heap_panic = heap_unwind
+            .downcast_ref::<OpPayloadDropPanic>()
+            .expect("heap cleanup replaced the original panic");
+        assert_eq!(heap_panic.0, "heap");
+        assert_eq!(heap_drops.get(), 1);
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
+        assert_eq!(retained_pool.stats().heap_frees, 1);
+
+        let heap_replacement =
+            unsafe { op_pool.alloc(()) }.expect("heap replacement operation allocation failed");
+        assert_eq!(heap_replacement, state);
+        unsafe { (*heap_replacement).bind_owner(None, 0) };
+        live_registry.push(heap_replacement);
+        let heap_payload_replacement = retained_pool.alloc(HeapOpPayloadDropBomb {
+            _bomb: OpPayloadDropBomb {
+                drops: Rc::clone(&heap_drops),
+                panic_tag: None,
+            },
+        });
+        unsafe {
+            (*heap_replacement).attach_retained_payload(heap_payload_replacement);
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                heap_replacement,
+            )
+            .expect("heap replacement operation retirement failed");
+        }
+        assert_eq!(heap_drops.get(), 2);
+        assert_eq!(retained_pool.stats().heap_frees, 2);
+        assert!(live_registry.is_empty());
     }
 }
 

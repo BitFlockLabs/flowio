@@ -1,8 +1,13 @@
 #[path = "common/counting_allocator.rs"]
 mod counting_allocator;
+#[path = "common/dns_allocation.rs"]
+mod dns_allocation;
 
 use counting_allocator::{
     CountingAllocator, finish_counting_allocations_of_size, start_counting_allocations_of_size,
+};
+use dns_allocation::{
+    completed_cname_followup_script, expected_followup_socket, maximum_query_name, serve_script,
 };
 use flowio::net::resolver::DnsResolver;
 use flowio::net::udp::UdpSocket;
@@ -42,27 +47,36 @@ async fn serve_error_responses(mut server: UdpSocket, rcodes: &'static [u16]) ->
 
 #[test]
 fn completed_nameserver_failover_reuses_one_response_buffer() {
-    let server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("failed to bind FlowIO DNS server");
-    let nameserver = server.local_addr();
-    let resolver = DnsResolver::new(vec![nameserver, nameserver]).expect("resolver init failed");
+    let first_server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind first FlowIO DNS server");
+    let first_nameserver = first_server.local_addr();
+    let second_server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind second FlowIO DNS server");
+    let second_nameserver = second_server.local_addr();
+    let resolver =
+        DnsResolver::new(vec![first_nameserver, second_nameserver]).expect("resolver init failed");
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     start_counting_allocations_of_size(DNS_RESPONSE_BUFFER_SIZE);
     executor
         .run(async move {
-            let server_task = Executor::spawn(serve_error_responses(
-                server,
-                &[DNS_RCODE_SERVFAIL, DNS_RCODE_REFUSED],
-            ))
-            .expect("failed to spawn DNS responder");
+            let first_server_task =
+                Executor::spawn(serve_error_responses(first_server, &[DNS_RCODE_SERVFAIL]))
+                    .expect("failed to spawn first DNS responder");
+            let second_server_task =
+                Executor::spawn(serve_error_responses(second_server, &[DNS_RCODE_REFUSED]))
+                    .expect("failed to spawn second DNS responder");
             lookup_ipv4(&resolver, "completed-failover.flowio.invalid")
                 .await
                 .expect_err("two DNS error responses should fail lookup");
-            server_task
+            first_server_task
                 .await
-                .expect("DNS responder task was cancelled")
-                .expect("DNS responder failed");
+                .expect("first DNS responder task was cancelled")
+                .expect("first DNS responder failed");
+            second_server_task
+                .await
+                .expect("second DNS responder task was cancelled")
+                .expect("second DNS responder failed");
         })
         .expect("executor run failed");
     let response_allocations = finish_counting_allocations_of_size();
@@ -118,4 +132,39 @@ fn timed_out_receive_uses_a_distinct_response_buffer_for_failover() {
     silent_server
         .recv_from(&mut query)
         .expect("silent nameserver did not receive the first query");
+}
+
+#[test]
+fn one_completed_response_allocation_serves_families_and_cname_followup() {
+    let server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind FlowIO DNS server");
+    let nameserver = server.local_addr();
+    let resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+    let host = maximum_query_name();
+    let script = completed_cname_followup_script(&host);
+    let port = 4321;
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    start_counting_allocations_of_size(DNS_RESPONSE_BUFFER_SIZE);
+    executor
+        .run(async move {
+            let server_task = Executor::spawn(serve_script(server, script))
+                .expect("failed to spawn scripted DNS responder");
+            let addrs = resolver
+                .resolve_host(&host, port)
+                .await
+                .expect("CNAME follow-up should resolve");
+            assert_eq!(addrs, [expected_followup_socket(port)]);
+            server_task
+                .await
+                .expect("scripted DNS responder task was cancelled")
+                .expect("scripted DNS responder failed");
+        })
+        .expect("executor run failed");
+    let response_allocations = finish_counting_allocations_of_size();
+
+    assert_eq!(
+        response_allocations, 1,
+        "the complete A/AAAA plus CNAME follow-up should share one completed response allocation"
+    );
 }

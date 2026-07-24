@@ -384,6 +384,10 @@ impl CompletionState {
     #[inline(always)]
     pub fn reset_for_resubmit(&mut self) {
         debug_assert!(
+            self.is_completed(),
+            "retry completion state was not completed"
+        );
+        debug_assert!(
             !self.is_cancel_pending(),
             "cannot resubmit a completion state queued for cancel retry"
         );
@@ -447,6 +451,7 @@ mod tests {
         assert_eq!(first.refs.get(), 1, "clearing waiter did not release it");
 
         unsafe { state.register_waiter(first_ptr) };
+        state.set_completed();
         state.reset_for_resubmit();
         assert_eq!(first.refs.get(), 1, "resubmit reset leaked waiter");
     }

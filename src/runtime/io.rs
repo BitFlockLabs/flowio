@@ -21,7 +21,7 @@
 //! ```
 
 use crate::runtime::executor::{
-    completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    PollCtx, completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker,
     refresh_op_waiter_from_waker, submit_tracked_sqe,
 };
 use crate::runtime::op::CompletionState;
@@ -33,10 +33,7 @@ use std::task::{Context, Poll};
 
 /// Completes and frees a finished `NOP` submission if one is ready.
 #[inline(always)]
-fn complete_nop_op(
-    cx: &mut Context<'_>,
-    state_ptr: &mut *mut CompletionState,
-) -> Option<io::Result<i32>> {
+fn complete_nop_op(pctx: PollCtx, state_ptr: &mut *mut CompletionState) -> Option<io::Result<i32>> {
     if state_ptr.is_null() {
         return None;
     }
@@ -47,7 +44,7 @@ fn complete_nop_op(
     }
 
     let result = state.result;
-    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(Some(pctx), *state_ptr) };
     unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
 
@@ -79,7 +76,7 @@ fn poll_nop_op(
         return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
     }
 
-    if let Some(result) = complete_nop_op(cx, state_ptr) {
+    if let Some(result) = complete_nop_op(pctx, state_ptr) {
         return Poll::Ready(result);
     }
 
@@ -168,10 +165,6 @@ impl NopSlot {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
 
-        debug_assert!(
-            self.state_ptr.is_null() || unsafe { (*self.state_ptr).is_completed() },
-            "nop slot still in flight"
-        );
         debug_assert!(
             self.state_ptr.is_null(),
             "completed nop slot should have been reclaimed before reuse"
@@ -267,7 +260,185 @@ impl Drop for NopFuture<'_> {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use crate::runtime::executor::Executor;
+    use crate::runtime::executor::{Executor, ExecutorConfig, submit_retained_sqe};
+    use crate::runtime::reactor::ReactorConfig;
+    use std::cell::{Cell, RefCell};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::rc::Rc;
+
+    #[derive(Debug)]
+    struct RetainedNopDropPanic(&'static str);
+
+    struct RetainedNopDropBomb {
+        drops: Rc<Cell<usize>>,
+        panic_tag: Option<&'static str>,
+    }
+
+    impl Drop for RetainedNopDropBomb {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if let Some(tag) = self.panic_tag {
+                std::panic::panic_any(RetainedNopDropPanic(tag));
+            }
+        }
+    }
+
+    #[repr(align(128))]
+    struct HeapRetainedNopDropBomb {
+        _bomb: RetainedNopDropBomb,
+    }
+
+    struct StatePointerObserver {
+        source: *const *mut CompletionState,
+        observed: Rc<Cell<*mut CompletionState>>,
+    }
+
+    impl Drop for StatePointerObserver {
+        fn drop(&mut self) {
+            // SAFETY: the observer is a stack local in `RetainedNop::drop`;
+            // its source field remains live until that Drop invocation exits,
+            // including while unwinding from retained-payload destruction.
+            self.observed.set(unsafe { *self.source });
+        }
+    }
+
+    struct RetainedNop<T: 'static> {
+        state_ptr: *mut CompletionState,
+        payload: Option<Box<T>>,
+        state_address: Rc<Cell<*mut CompletionState>>,
+        payload_address: Rc<Cell<*mut T>>,
+        state_after_drop: Rc<Cell<*mut CompletionState>>,
+    }
+
+    impl<T: 'static> RetainedNop<T> {
+        fn new(
+            payload: T,
+            state_address: Rc<Cell<*mut CompletionState>>,
+            payload_address: Rc<Cell<*mut T>>,
+            state_after_drop: Rc<Cell<*mut CompletionState>>,
+        ) -> Self {
+            Self {
+                state_ptr: std::ptr::null_mut(),
+                payload: Some(Box::new(payload)),
+                state_address,
+                payload_address,
+                state_after_drop,
+            }
+        }
+    }
+
+    impl<T: 'static + Unpin> Future for RetainedNop<T> {
+        type Output = io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    unsafe { drop_op_ptr_unchecked(&mut this.state_ptr) };
+                    return Poll::Ready(Err(err));
+                }
+            };
+
+            if this.state_ptr.is_null() {
+                let state = unsafe { (*pctx.reactor()).alloc_op() };
+                if state.is_null() {
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+                }
+                unsafe { (*state).register_waiter(pctx.owner_task()) };
+                this.state_address.set(state);
+                let payload = *this.payload.take().expect("retained NOP payload missing");
+                let payload_address = Rc::clone(&this.payload_address);
+                let submit = unsafe {
+                    submit_retained_sqe(&pctx, state, payload, move |payload| {
+                        payload_address.set(payload as *mut T);
+                        Ok(opcode::Nop::new().build().user_data(state as u64))
+                    })
+                };
+                if let Err((err, payload)) = submit {
+                    unsafe { (*pctx.reactor()).free_op(state) };
+                    this.payload = Some(Box::new(payload));
+                    return Poll::Ready(Err(err));
+                }
+                assert!(
+                    !this.payload_address.get().is_null(),
+                    "retained NOP builder did not publish its payload address"
+                );
+                this.state_ptr = state;
+                return Poll::Pending;
+            }
+
+            if unsafe { (*this.state_ptr).is_completed() } {
+                return Poll::Ready(Ok(()));
+            }
+            unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+            Poll::Pending
+        }
+    }
+
+    impl<T: 'static> Drop for RetainedNop<T> {
+        fn drop(&mut self) {
+            let _observer = StatePointerObserver {
+                source: std::ptr::addr_of!(self.state_ptr),
+                observed: Rc::clone(&self.state_after_drop),
+            };
+            unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        }
+    }
+
+    struct StageCompletedRetainedNop<T: 'static> {
+        inner: Option<RetainedNop<T>>,
+        staged: Rc<RefCell<Option<RetainedNop<T>>>>,
+        submitted: bool,
+    }
+
+    impl<T: 'static + Unpin> Future for StageCompletedRetainedNop<T> {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if this.submitted {
+                *this.staged.borrow_mut() = this.inner.take();
+                return Poll::Ready(());
+            }
+
+            let inner = this.inner.as_mut().expect("staged retained NOP missing");
+            assert!(Pin::new(inner).poll(cx).is_pending());
+            this.submitted = true;
+            Poll::Pending
+        }
+    }
+
+    struct OrphanSubmittedRetainedNop<T: 'static> {
+        inner: Option<RetainedNop<T>>,
+    }
+
+    impl<T: 'static + Unpin> Future for OrphanSubmittedRetainedNop<T> {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let inner = this.inner.as_mut().expect("orphan retained NOP missing");
+            assert!(Pin::new(inner).poll(cx).is_pending());
+            drop(this.inner.take());
+            Poll::Ready(())
+        }
+    }
+
+    fn one_slot_executor() -> Executor {
+        Executor::new_with_config(ExecutorConfig {
+            reactor: ReactorConfig { ring_entries: 1 },
+            ..ExecutorConfig::default()
+        })
+        .expect("one-slot executor construction failed")
+    }
+
+    fn assert_panic_tag(unwind: Box<dyn std::any::Any + Send>, expected: &'static str) {
+        let panic = unwind
+            .downcast_ref::<RetainedNopDropPanic>()
+            .expect("retained NOP cleanup replaced the original panic");
+        assert_eq!(panic.0, expected);
+    }
 
     #[test]
     fn ring_abandoned_nop_reports_not_connected_and_clears_its_pointer() {
@@ -299,5 +470,153 @@ mod tests {
                 .await;
             })
             .expect("ring-abandoned NOP test run failed");
+    }
+
+    #[test]
+    fn completed_retained_nop_drop_panic_reclaims_origin_state() {
+        let mut executor = one_slot_executor();
+        let drops = Rc::new(Cell::new(0));
+        let state_address = Rc::new(Cell::new(std::ptr::null_mut()));
+        let payload_address = Rc::new(Cell::new(std::ptr::null_mut()));
+        let state_after_drop = Rc::new(Cell::new(std::ptr::null_mut()));
+        let staged = Rc::new(RefCell::new(None));
+
+        executor
+            .run(StageCompletedRetainedNop {
+                inner: Some(RetainedNop::new(
+                    RetainedNopDropBomb {
+                        drops: Rc::clone(&drops),
+                        panic_tag: Some("completed"),
+                    },
+                    Rc::clone(&state_address),
+                    Rc::clone(&payload_address),
+                    Rc::clone(&state_after_drop),
+                )),
+                staged: Rc::clone(&staged),
+                submitted: false,
+            })
+            .expect("completed retained NOP staging failed");
+        let completed = staged
+            .borrow_mut()
+            .take()
+            .expect("completed retained NOP did not escape");
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| drop(completed)))
+            .expect_err("completed retained NOP destructor did not panic");
+        assert_panic_tag(unwind, "completed");
+        assert_eq!(drops.get(), 1);
+        assert!(
+            state_after_drop.get().is_null(),
+            "completed future retained a dangling operation pointer"
+        );
+
+        let expected_state = state_address.get();
+        let expected_payload = payload_address.get();
+        let reuse_drops = Rc::clone(&drops);
+        executor
+            .run(std::future::poll_fn(move |cx| {
+                let pctx = poll_ctx_from_waker(cx).expect("FlowIO poll context missing");
+                let replacement_state = unsafe { (*pctx.reactor()).alloc_op() };
+                assert_eq!(
+                    replacement_state, expected_state,
+                    "completed future drop did not recycle its operation slot"
+                );
+                let replacement_payload = unsafe {
+                    (*pctx.reactor()).alloc_retained_payload(RetainedNopDropBomb {
+                        drops: Rc::clone(&reuse_drops),
+                        panic_tag: None,
+                    })
+                };
+                assert_eq!(
+                    replacement_payload.as_ptr(),
+                    expected_payload,
+                    "completed future drop did not recycle pooled payload backing"
+                );
+                unsafe {
+                    (*replacement_state).attach_retained_payload(replacement_payload);
+                    (*pctx.reactor()).free_op(replacement_state);
+                }
+                let stats = unsafe { (*pctx.reactor()).retained_payload_stats() };
+                assert_eq!(stats.pooled_frees, 2);
+                assert_eq!(stats.pooled_reuses, 1);
+                Poll::Ready(())
+            }))
+            .expect("completed retained NOP origin reactor was not reusable");
+        assert_eq!(drops.get(), 2);
+        executor
+            .run(async {
+                assert_eq!(Nop::new().await.expect("reuse NOP failed"), 0);
+            })
+            .expect("executor failed after completed retained NOP panic");
+    }
+
+    #[test]
+    fn orphaned_retained_nop_target_cqe_drop_panic_reclaims_origin_state() {
+        let mut executor = one_slot_executor();
+        let drops = Rc::new(Cell::new(0));
+        let state_address = Rc::new(Cell::new(std::ptr::null_mut()));
+        let payload_address = Rc::new(Cell::new(std::ptr::null_mut()));
+        let state_after_drop = Rc::new(Cell::new(std::ptr::null_mut()));
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            executor
+                .run(OrphanSubmittedRetainedNop {
+                    inner: Some(RetainedNop::new(
+                        HeapRetainedNopDropBomb {
+                            _bomb: RetainedNopDropBomb {
+                                drops: Rc::clone(&drops),
+                                panic_tag: Some("orphan"),
+                            },
+                        },
+                        Rc::clone(&state_address),
+                        Rc::clone(&payload_address),
+                        Rc::clone(&state_after_drop),
+                    )),
+                })
+                .expect("orphan retained NOP unexpectedly returned an executor error");
+        }))
+        .expect_err("orphan target CQE did not drop its retained payload");
+        assert_panic_tag(unwind, "orphan");
+        assert_eq!(drops.get(), 1);
+        assert!(
+            state_after_drop.get().is_null(),
+            "orphaning a future did not clear its operation pointer"
+        );
+        assert!(!payload_address.get().is_null());
+
+        let expected_state = state_address.get();
+        let reuse_drops = Rc::clone(&drops);
+        executor
+            .run(std::future::poll_fn(move |cx| {
+                let pctx = poll_ctx_from_waker(cx).expect("FlowIO poll context missing");
+                let replacement_state = unsafe { (*pctx.reactor()).alloc_op() };
+                assert_eq!(
+                    replacement_state, expected_state,
+                    "orphan target CQE did not recycle its operation slot"
+                );
+                let replacement_payload = unsafe {
+                    (*pctx.reactor()).alloc_retained_payload(HeapRetainedNopDropBomb {
+                        _bomb: RetainedNopDropBomb {
+                            drops: Rc::clone(&reuse_drops),
+                            panic_tag: None,
+                        },
+                    })
+                };
+                unsafe {
+                    (*replacement_state).attach_retained_payload(replacement_payload);
+                    (*pctx.reactor()).free_op(replacement_state);
+                }
+                let stats = unsafe { (*pctx.reactor()).retained_payload_stats() };
+                assert_eq!(stats.heap_fallbacks, 2);
+                assert_eq!(stats.heap_frees, 2);
+                Poll::Ready(())
+            }))
+            .expect("orphan retained NOP origin reactor was not reusable");
+        assert_eq!(drops.get(), 2);
+        executor
+            .run(async {
+                assert_eq!(Nop::new().await.expect("reuse NOP failed"), 0);
+            })
+            .expect("executor failed after orphan target-CQE panic");
     }
 }

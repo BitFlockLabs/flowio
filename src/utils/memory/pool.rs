@@ -65,6 +65,55 @@ pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider> {
     live_slots: usize,
 }
 
+/// Returns a destroyed object slot to its pool even if `T::drop` unwinds.
+///
+/// The guard borrows only the bookkeeping fields needed for recycling. A valid
+/// live slot cannot be allocated again until its destructor has completed
+/// normally or transferred control to unwinding.
+struct PoolFreeGuard<'pool, T> {
+    free_list: &'pool mut utils::list::intrusive::slist::SList<T>,
+    slot: *mut T,
+    #[cfg(debug_assertions)]
+    live_slots: &'pool mut usize,
+}
+
+impl<T> PoolFreeGuard<'_, T> {
+    /// Performs the bookkeeping shared by normal return and unwind cleanup.
+    #[inline(always)]
+    fn recycle_slot(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            // Pool::free validates the live count before user drop glue runs.
+            // Its exclusive borrow prevents a valid destructor from changing
+            // the count before this guard restores the accounting.
+            *self.live_slots -= 1;
+        }
+
+        let link_ptr = self.slot as *mut utils::list::intrusive::slist::Link;
+        // SAFETY: Pool::free creates this guard for one exclusively owned live
+        // slot. The value has completed destruction (normally or by unwind),
+        // and the slot has not yet been linked into any free list.
+        unsafe { self.free_list.push_front_unchecked(link_ptr) };
+    }
+
+    /// Recycles on the ordinary path without calling the cold unwind shim.
+    #[inline(always)]
+    fn finish(self) {
+        // Suppress Drop before recycling so an invalid corrupted-list panic
+        // cannot attempt a second recycle while unwinding.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        this.recycle_slot();
+    }
+}
+
+impl<T> Drop for PoolFreeGuard<'_, T> {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        self.recycle_slot();
+    }
+}
+
 impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     /// Creates an uninitialized pool.
     ///
@@ -180,26 +229,29 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     ///
     /// The caller must ensure that `obj` is a live object slot returned by this
     /// pool and has not already been freed.
+    #[inline(always)]
     pub unsafe fn free(&mut self, obj: *mut T) {
         if obj.is_null() {
             return;
         }
 
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.live_slots > 0,
+            "Pool freed more slots than it allocated"
+        );
+
+        let recycle = PoolFreeGuard {
+            free_list: &mut self.free_list,
+            slot: obj,
+            #[cfg(debug_assertions)]
+            live_slots: &mut self.live_slots,
+        };
+
         unsafe {
             std::ptr::drop_in_place(obj);
-
-            #[cfg(debug_assertions)]
-            {
-                debug_assert!(
-                    self.live_slots > 0,
-                    "Pool freed more slots than it allocated"
-                );
-                self.live_slots = self.live_slots.saturating_sub(1);
-            }
-
-            let link_ptr = obj as *mut utils::list::intrusive::slist::Link;
-            self.free_list.push_front_unchecked(link_ptr);
         }
+        recycle.finish();
     }
 }
 

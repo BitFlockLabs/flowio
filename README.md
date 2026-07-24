@@ -141,6 +141,15 @@ any progress does not publish a new length, so the buffer's existing logical
 contents remain unchanged. Exact reads publish any completed prefix before
 returning EOF or another terminal error.
 
+TCP and Unix one-shot `read`/`write` operations complete zero-length requests
+locally after validating the runtime context. They return `Ok(0)` with the
+exact owner and do not allocate operation state or submit kernel I/O. For a
+zero-length `read`, that result describes only the empty request and is not a
+peer-EOF observation. UDP `send` and `send_to` reject sources above the
+io_uring 32-bit byte-count limit before pointer access or submission, while
+still submitting legal zero-length datagrams. SCTP rejects zero-length sends
+and receive windows with `InvalidInput`.
+
 ## Fast-path guidance
 
 flowio's fast path is the steady-state per-task, per-message, or per-I/O path
@@ -154,7 +163,7 @@ workload is faster without measurement.
 | Task admission | `Executor::spawn`; use `try_spawn` when failure must return the future | `spawn` when the future owns a response or cleanup obligation | Tasks use fixed-size slots acquired in slabs. `try_spawn` preserves the unpolled future on allocation pressure; `spawn` maps the error and drops it. |
 | Fixed-shape buffers | Pre-acquired `IoBuffPool` slots | `IoBuffMut::new` per message | Pool reuse avoids per-buffer allocator traffic while warmed capacity is available. Use `new` for setup or genuinely variable shapes. |
 | Frozen buffers | `freeze`, `clone`, `slice`, or `try_mut` when ownership permits | `make_mut` on a shared buffer | Shared `make_mut` allocates and copies. Keep exclusive `IoBuffMut` ownership or use `try_mut` when copying is not acceptable. |
-| TCP/Unix stream I/O | `read` / `write` when the protocol tracks partial progress | `_exact` / `_all` for data that does not require complete-buffer semantics | Plain-stream partial APIs make one transport submission. Complete APIs may process a completion and resubmit. |
+| TCP/Unix stream I/O | `read` / `write` when the protocol tracks partial progress | `_exact` / `_all` for data that does not require complete-buffer semantics | Positive-length plain-stream partial APIs make one transport submission; zero-length requests complete locally. Complete APIs may process a completion and resubmit. |
 | TLS plaintext I/O | `TlsClientStream::read` / `write` when the protocol tracks partial plaintext | TLS `_exact` / `_all` when complete plaintext is not required | Partial TLS APIs avoid looping for the caller's complete plaintext buffer, but TLS record processing may still require multiple raw TCP operations. |
 | Payload shape | Contiguous APIs for one byte range; vectored/projected APIs for existing segmentation | Building a chain for one contiguous range or coalescing segmented data just to call `write` | Match the API to existing ownership; vectored paths construct bounded iovec metadata, while coalescing copies bytes. |
 | Immediate deadline edge | `try_read`, `try_write`, and `try_writev_projected` only after a deadline has already reached zero | Polling `try_*` as the normal async path | `try_*` makes one direct nonblocking syscall and returns `WouldBlock`; normal async methods register reactor work and wake the task. |
@@ -284,9 +293,10 @@ Message receives remain available when EOR or truncation must be checked, but
 a data-configured socket returns default ancillary fields. Enable receive
 metadata (or use the rich/signaling configuration) when stream, PPID, TSN,
 association metadata, notifications, or partial-delivery recovery matter. All
-SCTP receive APIs reject a zero-length caller receive window with `InvalidInput`,
-so a successful zero-byte result from the flag-less lean `recv` path denotes
-clean peer EOF.
+SCTP send and receive APIs reject a zero-length caller payload/window with
+`InvalidInput` before kernel submission and return the rental owner unchanged.
+This includes empty or zero-readable vectored sends. A successful zero-byte
+result from the flag-less lean `recv` path therefore denotes clean peer EOF.
 
 On sockets configured by FlowIO, enabling `recv_rcvinfo` also keeps the SCTP
 partial-delivery event subscribed even when the requested notification mask
@@ -340,7 +350,17 @@ SCTP send or receive paths.
 Keep DNS resolution in setup or control paths when the protocol permits.
 Resolve names once, retain the resulting addresses, and put timer deadlines
 around protocol phases rather than every individual message to reduce timer
-bookkeeping. Query normalization removes surrounding whitespace and at most
+bookkeeping. `DnsResolver::new` retains the first occurrence of each configured
+nameserver in retry order. An empty list or more than eight unique nameservers
+returns `InvalidInput`; over-limit input is rejected rather than truncated.
+System configuration reads are bounded to 4 MiB for `/etc/hosts` and 64 KiB
+for `/etc/resolv.conf`. An oversized file or a 65th unique resolved address
+returns `InvalidData`; address order remains first-seen and no result is
+silently truncated. One owned query allocation and one safely returned
+response allocation are reused across sequential A, AAAA, nameserver retry,
+and bounded CNAME-follow-up work; a timed-out kernel-visible response buffer
+is not reused before its target completion.
+Query normalization removes surrounding whitespace and at most
 one optional trailing root dot; a second trailing dot remains an empty label
 and returns `InvalidInput` before query allocation or DNS network I/O. Matching-ID
 responses must be marked as responses and retain the

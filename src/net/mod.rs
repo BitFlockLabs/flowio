@@ -75,10 +75,13 @@
 //! transport futures must be polled inside the FlowIO executor that submitted
 //! them. An unsubmitted rental operation returns the buffer immediately. Once
 //! submitted, it keeps the buffer retained until the original CQE and then
-//! returns the buffer with `NotConnected`. The exceptional bounded shutdown
-//! fallback cannot return ownership if it abandons a ring without observing
-//! that target CQE; the operation remains pending and its kernel-visible state
-//! and buffer are intentionally retained until process exit.
+//! returns the buffer with `NotConnected`. Bytes reported by a completion first
+//! observed from a rejected context are not published into the returned
+//! buffer; only progress published by earlier valid exact-read iterations
+//! remains visible. The exceptional bounded shutdown fallback cannot return
+//! ownership if it abandons a ring without observing that target CQE; the
+//! operation remains pending and its kernel-visible state and buffer are
+//! intentionally retained until process exit.
 //!
 //! # Fast-Path Guidance
 //!
@@ -171,8 +174,16 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use crate::runtime::buffer::IoBuffReadWrite;
+use crate::runtime::executor::{
+    completed_op_ctx, drop_op_ptr_unchecked, note_accept_readiness_rearm, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_retained_sqe,
+};
+use crate::runtime::fd::{LingerProvenance, RetainedListenerFd, RuntimeFd};
+use crate::runtime::op::CompletionState;
 
 pub mod resolver;
 pub mod sctp;
@@ -507,6 +518,151 @@ fn accept_readiness_allows_rearm(readiness: i32, accept_error: &io::Error) -> bo
     accept_error.kind() == io::ErrorKind::WouldBlock && readiness & TERMINAL_EVENTS == 0
 }
 
+/// Reusable one-shot readiness state shared by TCP and SCTP listeners.
+///
+/// The readiness CQE owns only a retained listener reference. A successful
+/// owner-thread `accept4` transfers the accepted descriptor to
+/// `finish_accepted`; all other completion, cancellation, and submission
+/// behavior is transport-independent.
+struct AcceptReadinessSlot {
+    /// Listener retained by every readiness submission until its CQE or
+    /// cancellation retires.
+    listener_fd: Rc<RuntimeFd>,
+    /// Completion state for the current or last readiness submission.
+    state_ptr: *mut CompletionState,
+    /// True while a transport accept future is borrowing this slot.
+    in_use: bool,
+}
+
+impl AcceptReadinessSlot {
+    fn new(listener_fd: Rc<RuntimeFd>) -> Self {
+        Self {
+            listener_fd,
+            state_ptr: std::ptr::null_mut(),
+            in_use: false,
+        }
+    }
+
+    fn prepare(&mut self) -> io::Result<()> {
+        if self.in_use || !self.state_ptr.is_null() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        self.in_use = true;
+        Ok(())
+    }
+
+    fn drop_future(&mut self) {
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+
+        self.in_use = false;
+    }
+
+    fn drop_cached_state(&mut self) {
+        // Normal safe use drops the accept future before its listener. This
+        // also handles safe `mem::forget` teardown, where the slot can still
+        // hold an in-flight or completed readiness state. A readiness CQE
+        // never owns an accepted descriptor.
+        self.drop_future();
+    }
+
+    fn poll_accept<T, F>(&mut self, cx: &mut Context<'_>, finish_accepted: F) -> Poll<io::Result<T>>
+    where
+        F: FnOnce(
+            OwnedFd,
+            LingerProvenance,
+            &libc::sockaddr_storage,
+            libc::socklen_t,
+        ) -> io::Result<T>,
+    {
+        if !self.state_ptr.is_null() {
+            let state = unsafe { &*self.state_ptr };
+            if state.is_completed() {
+                let result = state.result;
+                let op_ctx =
+                    unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), self.state_ptr) };
+                let poll_fd = unsafe {
+                    (*op_ctx.reactor()).take_retained_payload::<RetainedListenerFd>(self.state_ptr)
+                };
+                unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
+                self.state_ptr = std::ptr::null_mut();
+
+                if op_ctx.context_rejected() {
+                    self.in_use = false;
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+                }
+                if result < 0 {
+                    self.in_use = false;
+                    return Poll::Ready(Err(io::Error::from_raw_os_error(-result)));
+                }
+
+                let accepted_linger_provenance = self.listener_fd.linger_provenance();
+                match accept_nonblocking(
+                    poll_fd.raw_fd(),
+                    accepted_linger_provenance == LingerProvenance::Uncertain,
+                ) {
+                    Ok((accepted_fd, addr, addrlen)) => {
+                        self.in_use = false;
+                        return Poll::Ready(finish_accepted(
+                            accepted_fd,
+                            accepted_linger_provenance,
+                            &addr,
+                            addrlen,
+                        ));
+                    }
+                    Err(err) if accept_readiness_allows_rearm(result, &err) => {
+                        // Readiness is only a hint and can be stale. Rearm the
+                        // one-shot poll without consuming slot ownership.
+                        note_accept_readiness_rearm();
+                    }
+                    Err(err) => {
+                        self.in_use = false;
+                        return Poll::Ready(Err(err));
+                    }
+                }
+            }
+        }
+
+        if self.state_ptr.is_null() {
+            let pctx = match poll_ctx_from_waker(cx) {
+                Ok(pctx) => pctx,
+                Err(err) => {
+                    self.in_use = false;
+                    return Poll::Ready(Err(err));
+                }
+            };
+            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+            if state_ptr.is_null() {
+                self.in_use = false;
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
+            self.state_ptr = state_ptr;
+
+            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+
+            let poll_fd = RetainedListenerFd::new(&self.listener_fd);
+            unsafe {
+                if let Err((err, _poll_fd)) =
+                    submit_retained_sqe(&pctx, state_ptr, poll_fd, |poll_fd| {
+                        Ok(accept_readiness_sqe(poll_fd.raw_fd(), state_ptr as u64))
+                    })
+                {
+                    (*pctx.reactor()).free_op(state_ptr);
+                    self.state_ptr = std::ptr::null_mut();
+                    self.in_use = false;
+                    return Poll::Ready(Err(err));
+                }
+            }
+            return Poll::Pending;
+        }
+
+        if unsafe { refresh_op_waiter_from_waker(cx, self.state_ptr) } {
+            self.drop_future();
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+        }
+        Poll::Pending
+    }
+}
+
 /// Installs a completed readiness state without submitting an SQE.
 ///
 /// This deterministic test seam lets each transport exercise its real
@@ -684,6 +840,21 @@ fn new_nonblocking_socket(domain: libc::c_int, kind: libc::c_int) -> io::Result<
     }
 
     Ok(fd)
+}
+
+/// Applies the standard stream-shutdown mapping to one socket descriptor.
+#[inline(always)]
+fn shutdown_socket(fd: RawFd, how: std::net::Shutdown) -> io::Result<()> {
+    let how = match how {
+        std::net::Shutdown::Read => libc::SHUT_RD,
+        std::net::Shutdown::Write => libc::SHUT_WR,
+        std::net::Shutdown::Both => libc::SHUT_RDWR,
+    };
+    let rc = unsafe { libc::shutdown(fd, how) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -991,6 +1162,65 @@ mod tests {
         let err = connect_cqe_result(-libc::ECONNREFUSED)
             .expect_err("real connect failure should retain its errno");
         assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn shutdown_socket_maps_all_modes_and_preserves_errno() {
+        for how in [
+            std::net::Shutdown::Read,
+            std::net::Shutdown::Write,
+            std::net::Shutdown::Both,
+        ] {
+            let (stream, _peer) =
+                std::os::unix::net::UnixStream::pair().expect("socketpair failed");
+            shutdown_socket(std::os::fd::AsRawFd::as_raw_fd(&stream), how)
+                .expect("valid stream shutdown failed");
+        }
+
+        let err = shutdown_socket(-1, std::net::Shutdown::Both)
+            .expect_err("invalid descriptor shutdown should fail");
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn accept_readiness_slot_prepare_drop_and_reuse_match_transport_contracts() {
+        let raw = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("distinctive listener fd failed");
+        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(raw));
+        let mut slot = AcceptReadinessSlot::new(Rc::clone(&listener));
+
+        slot.prepare().expect("first prepare should claim the slot");
+        let err = slot
+            .prepare()
+            .expect_err("a borrowed accept slot should report pressure");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        slot.drop_future();
+        assert!(slot.state_ptr.is_null());
+        assert!(!slot.in_use);
+
+        slot.prepare().expect("dropped slot should be reusable");
+        let mut abandoned = CompletionState::empty();
+        abandoned.set_ring_abandoned();
+        slot.state_ptr = &mut abandoned;
+        slot.drop_cached_state();
+        assert!(slot.state_ptr.is_null());
+        assert!(!slot.in_use);
+        assert!(abandoned.is_ring_abandoned());
+
+        slot.prepare()
+            .expect("cached-state teardown should leave the slot reusable");
+        slot.drop_future();
+        drop(slot);
+        assert!(
+            !crate::runtime::fd::raw_fd_is_closed(raw),
+            "slot drop must preserve the listener's owning reference"
+        );
+        drop(listener);
+        assert!(
+            crate::runtime::fd::raw_fd_is_closed(raw),
+            "last listener owner must close the descriptor"
+        );
     }
 
     #[test]

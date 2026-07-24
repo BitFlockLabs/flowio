@@ -269,7 +269,10 @@ impl<T> DList<T> {
     /// uninitialized list sentinel is tolerated for defensive teardown, but a
     /// partially initialized sentinel is rejected in debug builds. Initialized
     /// non-empty lists must not move after `init`; moved-empty sentinels remain
-    /// tolerated for teardown.
+    /// tolerated for teardown. Unlike [`DList::drain_all_for_drop`], this
+    /// offset-free helper cannot re-anchor a moved non-empty sentinel without
+    /// dereferencing its stale boundary, so it deliberately retains the
+    /// non-move contract.
     pub(crate) fn unlink_all_for_drop(&mut self) {
         let next_null = self.head.next.is_null();
         let prev_null = self.head.prev.is_null();
@@ -311,8 +314,16 @@ impl<T> DList<T> {
     ///
     /// This is for drop paths that must return node storage to an owner before
     /// the list itself is discarded. It tolerates a sentinel that was moved
-    /// after initialization by treating the first node's `prev` pointer as the
-    /// original sentinel address.
+    /// after initialization by re-anchoring the first and last payload links
+    /// to the current sentinel before draining. This is intentionally stronger
+    /// than [`DList::unlink_all_for_drop`], whose offset-free teardown contract
+    /// requires a non-empty initialized list to remain in place.
+    ///
+    /// Each node is fully detached and responsibility for it transfers to `f`
+    /// before `f` runs. If `f` unwinds, this list neither reclaims nor relinks
+    /// that node: `f` must already have consumed it or the caller must retain a
+    /// separate recovery handle. Later nodes remain linked and can be drained
+    /// by a caller that catches the panic.
     ///
     /// # Safety
     ///
@@ -342,24 +353,24 @@ impl<T> DList<T> {
             return;
         }
 
-        let mut current = self.head.next;
-        if current == head_ptr {
+        let first = self.head.next;
+        if first == head_ptr {
+            self.set_empty(head_ptr);
             return;
         }
 
-        let original_head = unsafe { (*current).prev };
-        while !current.is_null() && current != head_ptr && current != original_head {
-            unsafe {
-                let next = (*current).next;
-                let container_ptr = (current as *mut u8).sub(offset) as *mut T;
-                (*current).next = ptr::null_mut();
-                (*current).prev = ptr::null_mut();
-                f(container_ptr);
-                current = next;
-            }
+        // A teardown caller may have moved the sentinel after initialization.
+        // The payload allocations did not move, so repair only their boundary
+        // links without dereferencing the stale sentinel address.
+        let last = self.head.prev;
+        unsafe {
+            (*first).prev = head_ptr;
+            (*last).next = head_ptr;
         }
 
-        self.set_empty(head_ptr);
+        while let Some(container_ptr) = unsafe { self.pop_front(offset) } {
+            f(container_ptr);
+        }
     }
 
     /// Removes a specific node from the list.
@@ -676,7 +687,10 @@ impl<'a, T> CursorBackMut<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::mem::offset_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::rc::Rc;
 
     #[repr(C)]
     struct Node {
@@ -684,9 +698,29 @@ mod tests {
         link: Link,
     }
 
+    #[repr(C)]
+    struct DropNode {
+        id: u32,
+        link: Link,
+        drops: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl Drop for DropNode {
+        fn drop(&mut self) {
+            self.drops.borrow_mut().push(self.id);
+        }
+    }
+
+    #[derive(Debug)]
+    struct DrainDropPanic;
+
     fn node_link_ptr(node: &mut Node) -> *mut Link {
         let base = node as *mut Node as *mut u8;
         unsafe { base.add(offset_of!(Node, link)) as *mut Link }
+    }
+
+    unsafe fn drop_node_link_ptr(node: *mut DropNode) -> *mut Link {
+        unsafe { std::ptr::addr_of_mut!((*node).link) }
     }
 
     #[derive(Clone, Copy)]
@@ -884,6 +918,106 @@ mod tests {
         }
 
         assert!(!drained, "empty moved list should not drain payloads");
+        assert!(moved.is_empty());
+    }
+
+    #[test]
+    fn drain_all_for_drop_preserves_remaining_list_after_callback_frees_and_panics() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let nodes = [1, 2, 3].map(|id| {
+            Box::into_raw(Box::new(DropNode {
+                id,
+                link: Link::new_unlinked(),
+                drops: Rc::clone(&drops),
+            }))
+        });
+        let mut list = DList::<DropNode>::new_uninit();
+        list.init();
+        unsafe {
+            for node in nodes {
+                list.push_back(drop_node_link_ptr(node));
+            }
+        }
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            list.drain_all_for_drop(offset_of!(DropNode, link), |node| {
+                let id = (*node).id;
+                drop(Box::from_raw(node));
+                if id == 1 {
+                    std::panic::panic_any(DrainDropPanic);
+                }
+            });
+        }))
+        .expect_err("first consuming drain callback did not panic");
+        assert!(
+            unwind.downcast_ref::<DrainDropPanic>().is_some(),
+            "drain cleanup replaced the original panic"
+        );
+        assert_eq!(*drops.borrow(), [1]);
+
+        let front = unsafe {
+            list.front(offset_of!(DropNode, link))
+                .expect("remaining list lost its second node")
+        };
+        assert_eq!(unsafe { (*front).id }, 2);
+
+        let mut remaining = Vec::new();
+        unsafe {
+            list.drain_all_for_drop(offset_of!(DropNode, link), |node| {
+                remaining.push((*node).id);
+                drop(Box::from_raw(node));
+            });
+        }
+        assert_eq!(remaining, [2, 3]);
+        assert_eq!(*drops.borrow(), [1, 2, 3]);
+        assert!(list.is_empty());
+
+        let replacement = Box::into_raw(Box::new(DropNode {
+            id: 4,
+            link: Link::new_unlinked(),
+            drops: Rc::clone(&drops),
+        }));
+        unsafe {
+            list.push_back(drop_node_link_ptr(replacement));
+            let popped = list
+                .pop_front(offset_of!(DropNode, link))
+                .expect("reused list did not return its replacement node");
+            assert_eq!(popped, replacement);
+            drop(Box::from_raw(popped));
+        }
+        assert!(list.is_empty());
+        assert_eq!(*drops.borrow(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn drain_all_for_drop_reanchors_moved_nonempty_sentinel() {
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let nodes = [1, 2, 3].map(|id| {
+            Box::into_raw(Box::new(DropNode {
+                id,
+                link: Link::new_unlinked(),
+                drops: Rc::clone(&drops),
+            }))
+        });
+        let mut list = DList::<DropNode>::new_uninit();
+        list.init();
+        unsafe {
+            for node in nodes {
+                list.push_back(drop_node_link_ptr(node));
+            }
+        }
+
+        let mut moved = list;
+        let mut drained = Vec::new();
+        unsafe {
+            moved.drain_all_for_drop(offset_of!(DropNode, link), |node| {
+                drained.push((*node).id);
+                drop(Box::from_raw(node));
+            });
+        }
+
+        assert_eq!(drained, [1, 2, 3]);
+        assert_eq!(*drops.borrow(), [1, 2, 3]);
         assert!(moved.is_empty());
     }
 

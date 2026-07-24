@@ -345,7 +345,7 @@ fn runtime_sctp_send_msg_submit_failure_returns_exact_buffer_and_reuses_state() 
     let test_drops = Rc::clone(&drops);
     executor
         .run(async move {
-            for (index, len) in [0, 16].into_iter().enumerate() {
+            for (index, len) in [8, 16].into_iter().enumerate() {
                 let identity = index + 1;
                 let bytes = vec![identity as u8; len];
                 let expected_ptr = bytes.as_ptr();
@@ -1920,6 +1920,104 @@ fn parse_unknown_notification_falls_back_to_other() {
 }
 
 #[test]
+fn known_notification_fields_never_extend_past_declared_length() {
+    let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
+    let mut peer_addr = notification_buffer(test_peer_addr_change_type(), 0, 8 + storage_len + 12);
+    let storage = localhost_sockaddr_storage(3868);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &storage as *const libc::sockaddr_storage as *const u8,
+            peer_addr.as_mut_ptr().add(8),
+            storage_len,
+        );
+    }
+
+    let info_offset = test_send_failed_info_offset();
+    let cases = [
+        (
+            "assoc change",
+            notification_buffer(test_assoc_change_type(), 0, 20),
+        ),
+        ("peer address change", peer_addr),
+        (
+            "legacy send failed",
+            notification_buffer(
+                test_send_failed_type(),
+                0,
+                info_offset + std::mem::size_of::<libc::sctp_sndrcvinfo>() + 4,
+            ),
+        ),
+        (
+            "remote error",
+            notification_buffer(test_remote_error_type(), 0, 16),
+        ),
+        (
+            "shutdown",
+            notification_buffer(test_shutdown_event_type(), 0, 12),
+        ),
+        (
+            "adaptation",
+            notification_buffer(test_adaptation_indication_type(), 0, 16),
+        ),
+        (
+            "partial delivery",
+            notification_buffer(test_partial_delivery_event_type(), 0, 24),
+        ),
+        (
+            "sender dry",
+            notification_buffer(test_sender_dry_event_type(), 0, 12),
+        ),
+        (
+            "stream reset",
+            notification_buffer(test_stream_reset_event_type(), 0, 12),
+        ),
+        (
+            "association reset",
+            notification_buffer(test_assoc_reset_event_type(), 0, 20),
+        ),
+        (
+            "stream change",
+            notification_buffer(test_stream_change_event_type(), 0, 16),
+        ),
+        (
+            "send failed event",
+            notification_buffer(
+                test_send_failed_event_type(),
+                0,
+                info_offset + std::mem::size_of::<libc::sctp_sndinfo>() + 4,
+            ),
+        ),
+    ];
+
+    for (name, mut buffer) in cases {
+        test_parse_notification(&buffer)
+            .unwrap_or_else(|err| panic!("{name} minimum fixture failed: {err}"));
+        let declared_len = buffer.len() - 1;
+        buffer
+            .write_u32_at(4, declared_len as u32)
+            .expect("declared notification length write should fit");
+        let err = match test_parse_notification(&buffer) {
+            Ok(parsed) => panic!("{name} borrowed fields beyond sn_length: {parsed:?}"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{name}");
+    }
+
+    let mut unknown = notification_buffer(0x9001, 0x0007, 12);
+    unknown
+        .write_u32_at(4, 8)
+        .expect("unknown declared length write should fit");
+    assert_eq!(
+        test_parse_notification(&unknown).expect("unknown notification should remain extensible"),
+        SctpRecvMeta::Notification(SctpNotification::Other {
+            kind: 0x9001,
+            flags: 0x0007,
+            length: 8,
+        })
+    );
+}
+
+#[test]
 fn notification_helpers() {
     let notification = SctpNotification::Shutdown { assoc_id: 7 };
     assert_eq!(notification.kind(), SctpNotificationKind::Shutdown);
@@ -3192,7 +3290,10 @@ fn runtime_sctp_vectored_empty_chain_semantics() {
             let (send_res, send_chain) = stream
                 .send_msg_vectored(empty_send, SctpSendInfo::default())
                 .await;
-            assert_eq!(send_res.expect("send_msg_vectored empty failed"), 0);
+            let err = send_res.expect_err("send_msg_vectored empty should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), "zero-length SCTP send request");
             assert!(send_chain.is_empty());
 
             let mut zero_readable = IoBuffVecMut::<2>::new();
@@ -3205,7 +3306,10 @@ fn runtime_sctp_vectored_empty_chain_semantics() {
             let (send_res, send_chain) = stream
                 .send_msg_vectored(zero_readable.freeze(), SctpSendInfo::default())
                 .await;
-            assert_eq!(send_res.expect("send_msg_vectored zero-readable failed"), 0);
+            let err = send_res.expect_err("send_msg_vectored zero-readable should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), "zero-length SCTP send request");
             assert_eq!(send_chain.segments(), 2);
             assert!(send_chain.is_empty());
 
@@ -3279,6 +3383,196 @@ fn runtime_sctp_default_peer_addr_params_rejects_specific_address() {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_zero_length_sends_outside_run_prefer_context_error() {
+    let (socket, _peer) =
+        std::os::unix::net::UnixStream::pair().expect("Unix socket pair creation failed");
+    socket
+        .set_nonblocking(true)
+        .expect("Unix test socket nonblocking setup failed");
+    let mut stream =
+        SctpStream::from_owned_fd(socket.into(), SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)));
+    let drops = Rc::new(Cell::new(0));
+    let mut cx = Context::from_waker(Waker::noop());
+
+    let bytes = Vec::with_capacity(1);
+    let expected_ptr = bytes.as_ptr();
+    let buffer = DropTrackedReadOnly::new(bytes, &drops);
+    let mut future = Box::pin(stream.send(buffer));
+    match Future::poll(future.as_mut(), &mut cx) {
+        Poll::Ready((Err(err), returned)) => {
+            assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+            assert_eq!(returned.bytes().as_ptr(), expected_ptr);
+            assert!(returned.bytes().is_empty());
+            drop(returned);
+        }
+        Poll::Ready((Ok(_), _)) => panic!("inactive zero-length SCTP data send succeeded"),
+        Poll::Pending => panic!("inactive zero-length SCTP data send remained pending"),
+    }
+    drop(future);
+
+    let bytes = Vec::with_capacity(1);
+    let expected_ptr = bytes.as_ptr();
+    let buffer = DropTrackedReadOnly::new(bytes, &drops);
+    let mut future = Box::pin(stream.send_msg(buffer, SctpSendInfo::default()));
+    match Future::poll(future.as_mut(), &mut cx) {
+        Poll::Ready((Err(err), returned)) => {
+            assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+            assert_eq!(returned.bytes().as_ptr(), expected_ptr);
+            assert!(returned.bytes().is_empty());
+            drop(returned);
+        }
+        Poll::Ready((Ok(_), _)) => panic!("inactive zero-length SCTP metadata send succeeded"),
+        Poll::Pending => panic!("inactive zero-length SCTP metadata send remained pending"),
+    }
+    drop(future);
+
+    let mut zero_readable = IoBuffVecMut::<1>::new();
+    zero_readable
+        .push(IoBuffMut::new(4, 0, 0))
+        .expect("zero-readable send chain push failed");
+    let zero_readable = zero_readable.freeze();
+    let expected_ptr = zero_readable
+        .get(0)
+        .expect("zero-readable segment missing")
+        .as_ptr();
+    let mut future = Box::pin(stream.send_msg_vectored(zero_readable, SctpSendInfo::default()));
+    match Future::poll(future.as_mut(), &mut cx) {
+        Poll::Ready((Err(err), returned)) => {
+            assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+            assert_eq!(returned.segments(), 1);
+            assert_eq!(
+                returned
+                    .get(0)
+                    .expect("returned zero-readable segment missing")
+                    .as_ptr(),
+                expected_ptr
+            );
+        }
+        Poll::Ready((Ok(_), _)) => panic!("inactive zero-readable SCTP send succeeded"),
+        Poll::Pending => panic!("inactive zero-readable SCTP send remained pending"),
+    }
+    drop(future);
+
+    assert_eq!(drops.get(), 2);
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_sctp_zero_length_sends_return_owners_without_submission() {
+    let (socket, _peer) =
+        std::os::unix::net::UnixStream::pair().expect("Unix socket pair creation failed");
+    socket
+        .set_nonblocking(true)
+        .expect("Unix test socket nonblocking setup failed");
+    let mut stream =
+        SctpStream::from_owned_fd(socket.into(), SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)));
+
+    let drops = Rc::new(Cell::new(0));
+    let returned_stream = Rc::new(Cell::new(None));
+    let test_drops = Rc::clone(&drops);
+    let stream_slot = Rc::clone(&returned_stream);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let bytes = Vec::with_capacity(1);
+            let expected_ptr = bytes.as_ptr();
+            let buffer = DropTrackedReadOnly::new(bytes, &test_drops);
+            let (result, returned) = stream.send(buffer).await;
+            let err = result.expect_err("zero-length SCTP data send should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), "zero-length SCTP send request");
+            assert_eq!(returned.bytes().as_ptr(), expected_ptr);
+            assert!(returned.bytes().is_empty());
+            assert_eq!(test_drops.get(), 0);
+            drop(returned);
+            assert_eq!(test_drops.get(), 1);
+
+            let bytes = Vec::with_capacity(1);
+            let expected_ptr = bytes.as_ptr();
+            let buffer = DropTrackedReadOnly::new(bytes, &test_drops);
+            let (result, returned) = stream.send_msg(buffer, SctpSendInfo::default()).await;
+            let err = result.expect_err("zero-length SCTP metadata send should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), "zero-length SCTP send request");
+            assert_eq!(returned.bytes().as_ptr(), expected_ptr);
+            assert!(returned.bytes().is_empty());
+            assert_eq!(test_drops.get(), 1);
+            drop(returned);
+            assert_eq!(test_drops.get(), 2);
+
+            let empty = IoBuffVecMut::<0>::new().freeze();
+            let (result, returned) = stream
+                .send_msg_vectored(empty, SctpSendInfo::default())
+                .await;
+            let err = result.expect_err("empty SCTP vectored send should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), "zero-length SCTP send request");
+            assert_eq!(returned.segments(), 0);
+
+            let mut zero_readable = IoBuffVecMut::<2>::new();
+            zero_readable
+                .push(IoBuffMut::new(4, 0, 0))
+                .expect("first zero-readable send chain push failed");
+            zero_readable
+                .push(IoBuffMut::new(4, 0, 0))
+                .expect("second zero-readable send chain push failed");
+            let zero_readable = zero_readable.freeze();
+            let first_ptr = zero_readable
+                .get(0)
+                .expect("first zero-readable segment missing")
+                .as_ptr();
+            let second_ptr = zero_readable
+                .get(1)
+                .expect("second zero-readable segment missing")
+                .as_ptr();
+            let (result, returned) = stream
+                .send_msg_vectored(zero_readable, SctpSendInfo::default())
+                .await;
+            let err = result.expect_err("zero-readable SCTP vectored send should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), "zero-length SCTP send request");
+            assert_eq!(returned.segments(), 2);
+            assert!(returned.is_empty());
+            assert_eq!(
+                returned
+                    .get(0)
+                    .expect("returned first zero-readable segment missing")
+                    .as_ptr(),
+                first_ptr
+            );
+            assert_eq!(
+                returned
+                    .get(1)
+                    .expect("returned second zero-readable segment missing")
+                    .as_ptr(),
+                second_ptr
+            );
+
+            stream_slot.set(Some(stream));
+        })
+        .expect("zero-length SCTP send validation run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 0);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+    }
+    assert_eq!(drops.get(), 2);
+    drop(
+        returned_stream
+            .take()
+            .expect("zero-length send validation did not return its stream"),
+    );
 }
 
 #[cfg(any(debug_assertions, feature = "test-support"))]

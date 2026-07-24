@@ -23,10 +23,11 @@
 //!   on the hot path.
 //! - Use [`DnsResolver`] when resolving repeatedly so nameserver selection and
 //!   timeout policy are constructed once and then reused. Reuse avoids
-//!   rebuilding that setup state, but each non-local DNS family lookup still
-//!   creates one owned query buffer, plus a UDP socket per nameserver attempt
-//!   and a response buffer reused after completed attempts. A timed-out receive
-//!   may remain kernel-visible and requires a replacement for a later attempt.
+//!   rebuilding that setup state, but each non-local resolution still creates
+//!   one owned query buffer, plus a UDP socket per nameserver attempt and a
+//!   response buffer reused across completed A, AAAA, and CNAME-follow-up
+//!   attempts. A timed-out receive may remain kernel-visible and requires a
+//!   replacement for a later attempt.
 //!
 //! Avoid on the fast path:
 //! - Avoid DNS lookup in the steady-state data path. Reuse the
@@ -57,7 +58,7 @@ use crate::runtime::buffer::bytes::{
 };
 use crate::runtime::timer::{TimeoutError, timeout};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -80,6 +81,10 @@ const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
 const DNS_MAX_NAME_WIRE_LEN: usize = 255;
 const DNS_MAX_QUERY_PACKET_LEN: usize = 12 + DNS_MAX_NAME_WIRE_LEN + 4;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const HOSTS_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
+const MAX_NAMESERVERS: usize = 8;
+const MAX_RESOLVED_ADDRESSES: usize = 64;
 const MAX_CNAME_HOPS_PER_RESPONSE: usize = 16;
 const MAX_CNAME_FOLLOWUP_QUERIES: usize = 1;
 const MAX_CNAME_TOTAL_HOPS: usize = 16;
@@ -111,10 +116,11 @@ impl QueryAttemptError {
 /// Use this on setup/control-plane paths when lookups repeat and the configured
 /// nameservers/timeouts should be reused. For one-off convenience resolution,
 /// use [`resolve_host`]. Reuse does not make lookup allocation-free: DNS
-/// family lookups create one owned query and reusable response buffer, attempts
-/// create UDP sockets, and non-literal names inspect `/etc/hosts` for each call.
-/// A receive that times out after submission retains its buffer until the
-/// target CQE, so a later attempt allocates a replacement.
+/// resolution creates one owned query and reusable response buffer shared by
+/// its sequential A, AAAA, and CNAME-follow-up work, attempts create UDP
+/// sockets, and non-literal names inspect `/etc/hosts` for each call. A receive
+/// that times out after submission retains its buffer until the target CQE, so
+/// a later attempt allocates a replacement.
 ///
 /// # Example
 /// ```
@@ -138,7 +144,14 @@ impl DnsResolver {
     /// Builds a resolver from `/etc/resolv.conf`.
     ///
     /// This performs a synchronous filesystem read. Call it during setup, then
-    /// store the resulting nameserver list for reuse across lookups.
+    /// store the resulting nameserver list for reuse across lookups. The file
+    /// read is limited to 64 KiB.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] when `/etc/resolv.conf` exceeds
+    /// 64 KiB. Other file and resolver-construction errors retain their
+    /// existing classifications.
     pub fn from_system() -> io::Result<Self> {
         let nameservers = read_resolv_conf(RESOLV_CONF_PATH)?;
         Self::new(nameservers)
@@ -147,14 +160,37 @@ impl DnsResolver {
     /// Builds a resolver from an explicit nameserver list.
     ///
     /// Use this when the application needs deterministic or test-specific DNS
-    /// behavior instead of system defaults.
-    pub fn new(nameservers: Vec<SocketAddr>) -> io::Result<Self> {
+    /// behavior instead of system defaults. Duplicate addresses are removed
+    /// while retaining the first occurrence and its retry order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when the list is empty or
+    /// contains more than eight unique nameservers.
+    pub fn new(mut nameservers: Vec<SocketAddr>) -> io::Result<Self> {
         if nameservers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "resolver requires at least one nameserver",
             ));
         }
+
+        let mut unique_len = 0;
+        for index in 0..nameservers.len() {
+            let nameserver = nameservers[index];
+            if nameservers[..unique_len].contains(&nameserver) {
+                continue;
+            }
+            if unique_len == MAX_NAMESERVERS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "resolver supports at most eight unique nameservers",
+                ));
+            }
+            nameservers[unique_len] = nameserver;
+            unique_len += 1;
+        }
+        nameservers.truncate(unique_len);
 
         Ok(Self {
             nameservers: nameservers.into_boxed_slice(),
@@ -175,20 +211,26 @@ impl DnsResolver {
     /// This first handles IP literals, `localhost`, and `/etc/hosts`, then
     /// falls back to UDP DNS queries if needed.
     ///
+    /// # Execution and failover
+    ///
     /// This is setup/control-plane work. Keep the returned addresses and pass
     /// them to transport connectors instead of resolving on the data path.
     /// Non-literal names synchronously inspect `/etc/hosts`; each upstream DNS
-    /// family lookup creates one owned query and reusable response buffer, and
-    /// each attempt creates a connected UDP socket. A true query expiry advances
-    /// to the next nameserver; a submitted timed-out receive retains its buffer
-    /// until target-CQE retirement, so a later attempt allocates a replacement.
-    /// Timer
-    /// `OutOfMemory` stops that family lookup without attempting another
-    /// server. A and AAAA remain sequential, in that order. Their outcomes are
+    /// resolution creates one owned query and reusable response buffer shared
+    /// across its sequential A, AAAA, and CNAME-follow-up work, and each
+    /// attempt creates a connected UDP socket. A true query expiry advances
+    /// to the next nameserver; a submitted timed-out receive retains its
+    /// buffer until target-CQE retirement, so a later attempt allocates a
+    /// replacement. Timer `OutOfMemory` stops that family lookup without
+    /// attempting another server.
+    ///
+    /// A and AAAA remain sequential, in that order. Their outcomes are
     /// combined as: any address, a terminal local/runtime error, an A-first
     /// CNAME, NXDOMAIN, an A-first recoverable error, then `NotFound` for two
     /// empty answers. An A-side terminal error stops before the AAAA query; a
     /// later AAAA-side terminal error does not discard an A address.
+    ///
+    /// # Input validation
     ///
     /// Surrounding whitespace and one optional trailing root dot are removed
     /// before lookup; root-only input and a second trailing dot are rejected.
@@ -196,18 +238,19 @@ impl DnsResolver {
     /// most 63 bytes, fit within 253 bytes in normalized dotted form, and
     /// encode to at most 255 bytes including label lengths and the terminal
     /// root. Invalid names return `InvalidInput` before a query packet is
-    /// allocated or sent. A CNAME response is
-    /// malformed unless its encoded (possibly compressed) name consumes its
-    /// declared RDATA length exactly; malformed responses participate in the
-    /// existing nameserver and address-family error selection.
+    /// allocated or sent.
+    ///
+    /// # Response validation
+    ///
     /// A matching-ID response must be marked as a response and use the QUERY
     /// opcode. The allocation-free UDP candidate gate drains other opcodes;
     /// full parsing rejects them with `InvalidData` before question,
-    /// response-code, or resource-record handling.
-    /// Every present echoed question is matched by name, type, and class before
-    /// its response code is applied. Questionless FORMERR, SERVFAIL, NOTIMP,
-    /// and REFUSED replies remain prompt nameserver-failover results, while a
-    /// questionless NXDOMAIN is drained as an unrelated datagram.
+    /// response-code, or resource-record handling. Every present echoed
+    /// question is matched by name, type, and class before its response code
+    /// is applied. Questionless FORMERR, SERVFAIL, NOTIMP, and REFUSED replies
+    /// remain prompt nameserver-failover results, while a questionless
+    /// NXDOMAIN is drained as an unrelated datagram.
+    ///
     /// Every literal label in a response name, including a compressed suffix,
     /// must be valid UTF-8 and contain no literal `.`; dots are inserted only
     /// between wire labels in the decoded presentation. The shared name walker
@@ -215,19 +258,36 @@ impl DnsResolver {
     /// invalid record owner or CNAME target with `InvalidData` before
     /// response-code or chain processing. Valid non-ASCII label text is
     /// preserved; name comparison folds ASCII case only.
+    ///
     /// Every declared Answer, Authority, and Additional record is structurally
     /// validated before NXDOMAIN or another response code is applied. Known A
     /// and AAAA records require their exact wire lengths, and CNAME RDATA must
     /// contain exactly one complete encoded name, regardless of section or
-    /// class. Only Internet-class Answer CNAME and address records contribute
-    /// to resolution; all other valid records are ignored. An Answer CNAME
-    /// without an Answer address follows one linear chain for at most 16 hops
-    /// in one response, 16 hops total, and one canonical-name follow-up query
-    /// round. Exceeding the total-hop budget is local resolver policy and stops
-    /// that family's remaining nameserver attempts; the sibling address family
-    /// remains eligible to supply an address. CNAME loops are rejected
-    /// explicitly. DNS name-compression recursion is bounded independently at
-    /// depth 8.
+    /// class. A CNAME is therefore malformed unless its encoded (possibly
+    /// compressed) name consumes its declared RDATA length exactly. Malformed
+    /// responses participate in the existing nameserver and address-family
+    /// error selection.
+    ///
+    /// Only Internet-class Answer CNAME and address records contribute to
+    /// resolution; all other valid records are ignored. A structurally valid
+    /// root name remains allowed in an ignored record, but a root target
+    /// reached while interpreting an Answer CNAME is upstream `InvalidData`
+    /// and advances nameserver failover.
+    ///
+    /// # Bounds
+    ///
+    /// An Answer CNAME without an Answer address follows one linear chain for
+    /// at most 16 hops in one response, 16 hops total, and one canonical-name
+    /// follow-up query round. Exceeding the total-hop budget is local resolver
+    /// policy and stops that family's remaining nameserver attempts; the
+    /// sibling address family remains eligible to supply an address. CNAME
+    /// loops are rejected explicitly. DNS name-compression recursion is
+    /// bounded independently at depth 8.
+    ///
+    /// The synchronous `/etc/hosts` read is limited to 4 MiB, and the final
+    /// first-seen unique result is limited to 64 socket addresses. Either
+    /// over-limit condition returns `InvalidData`; results are never
+    /// truncated.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
@@ -243,10 +303,17 @@ impl DnsResolver {
         let mut current = host.to_owned();
         let mut cname_followup_queries = 0usize;
         let mut total_cname_hops = 0usize;
+        let mut query_storage = DnsQueryStorage::new();
         loop {
             let remaining_cname_hops = MAX_CNAME_TOTAL_HOPS - total_cname_hops;
             match self
-                .gather_dns_addresses(&current, port, &mut addrs, remaining_cname_hops)
+                .gather_dns_addresses(
+                    &current,
+                    port,
+                    &mut addrs,
+                    remaining_cname_hops,
+                    &mut query_storage,
+                )
                 .await?
             {
                 ResolveHostStep::Resolved => return Ok(addrs),
@@ -270,20 +337,26 @@ impl DnsResolver {
         host: &str,
         qtype: u16,
         remaining_cname_hops: usize,
+        query_storage: &mut DnsQueryStorage,
     ) -> io::Result<LookupResult> {
         let query_id = next_query_id();
-        let mut packet = encode_query_packet(query_id, host, qtype)?;
-        let mut response_buffer = None;
+        patch_query_packet(&mut query_storage.packet, query_id, qtype)?;
         let mut last_err = None;
 
         for nameserver in self.nameservers.iter().copied() {
             match self
-                .query_nameserver(nameserver, &mut packet, &mut response_buffer, query_id)
+                .query_nameserver(
+                    nameserver,
+                    &mut query_storage.packet,
+                    &mut query_storage.response_buffer,
+                    query_id,
+                )
                 .await
             {
-                Ok(response) => {
-                    let parsed = parse_response_packet(&response, query_id, host, qtype);
-                    response_buffer = Some(response);
+                Ok((response, recv_len)) => {
+                    let parsed =
+                        parse_received_response_packet(&response, recv_len, query_id, host, qtype);
+                    query_storage.response_buffer = Some(response);
                     match parsed {
                         Ok(result) if result.cname_hops <= remaining_cname_hops => {
                             return Ok(result);
@@ -320,7 +393,7 @@ impl DnsResolver {
         packet: &mut Vec<u8>,
         response_buffer: &mut Option<Vec<u8>>,
         query_id: u16,
-    ) -> Result<Vec<u8>, QueryAttemptError> {
+    ) -> Result<(Vec<u8>, usize), QueryAttemptError> {
         let mut socket =
             UdpSocket::bind(unspecified_addr(nameserver)).map_err(QueryAttemptError::Io)?;
         socket.connect(nameserver).map_err(QueryAttemptError::Io)?;
@@ -360,8 +433,7 @@ impl DnsResolver {
                 }
                 let response = &recv[..recv_len];
                 if response_is_decodable_candidate(response, query_id) {
-                    debug_assert_eq!(recv.len(), recv_len);
-                    return Ok(recv);
+                    return Ok((recv, recv_len));
                 }
             }
         })
@@ -378,16 +450,18 @@ impl DnsResolver {
         port: u16,
         addrs: &mut Vec<SocketAddr>,
         remaining_cname_hops: usize,
+        query_storage: &mut DnsQueryStorage,
     ) -> io::Result<ResolveHostStep> {
+        encode_query_packet(&mut query_storage.packet, current)?;
         let a = match self
-            .lookup_name(current, DNS_TYPE_A, remaining_cname_hops)
+            .lookup_name(current, DNS_TYPE_A, remaining_cname_hops, query_storage)
             .await
         {
             Err(err) if is_terminal_family_lookup_error(&err) => return Err(err),
             outcome => outcome,
         };
         let aaaa = self
-            .lookup_name(current, DNS_TYPE_AAAA, remaining_cname_hops)
+            .lookup_name(current, DNS_TYPE_AAAA, remaining_cname_hops, query_storage)
             .await;
         finish_dns_family_lookups(current, port, addrs, a, aaaa)
     }
@@ -419,7 +493,7 @@ fn finish_dns_family_lookups(
         match outcome {
             Ok(result) => {
                 saw_nx_domain |= result.nx_domain;
-                extend_unique_socket_addrs(addrs, &result.addresses, port);
+                extend_unique_socket_addrs(addrs, &result.addresses, port)?;
                 if cname.is_none() {
                     cname = result.cname.map(|next| (next, result.cname_hops));
                 }
@@ -478,6 +552,24 @@ pub(crate) struct LookupResult {
     cname_hops: usize,
     /// True when the upstream resolver returned NXDOMAIN for this name.
     nx_domain: bool,
+}
+
+/// Owned DNS packet storage shared by one complete logical resolution.
+struct DnsQueryStorage {
+    /// Encoded query whose name is rebuilt only for a CNAME follow-up and whose
+    /// ID/type fields are patched for each family lookup.
+    packet: Vec<u8>,
+    /// Completed receive allocation available to the next nameserver or family.
+    response_buffer: Option<Vec<u8>>,
+}
+
+impl DnsQueryStorage {
+    fn new() -> Self {
+        Self {
+            packet: Vec::with_capacity(DNS_MAX_QUERY_PACKET_LEN),
+            response_buffer: None,
+        }
+    }
 }
 
 /// Next action after combining one name's A and AAAA lookup results.
@@ -619,28 +711,42 @@ fn normalize_host(host: &str) -> io::Result<&str> {
 }
 
 fn resolve_local_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    resolve_local_host_with_hosts_path(HOSTS_PATH, host, port)
+}
+
+fn resolve_local_host_with_hosts_path(
+    hosts_path: &str,
+    host: &str,
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::new();
 
     if host.eq_ignore_ascii_case("localhost") {
-        push_unique_socket_addr(&mut addrs, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-        push_unique_socket_addr(&mut addrs, SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+        push_unique_resolved_addr(&mut addrs, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
+        push_unique_resolved_addr(&mut addrs, SocketAddr::from((Ipv6Addr::LOCALHOST, port)))?;
     }
 
-    for addr in read_hosts_file(HOSTS_PATH, host, port)? {
-        push_unique_socket_addr(&mut addrs, addr);
-    }
+    read_hosts_file(hosts_path, host, port, &mut addrs)?;
 
     Ok(addrs)
 }
 
-fn read_hosts_file(path: &str, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    let contents = match fs::read_to_string(path) {
+fn read_hosts_file(
+    path: &str,
+    host: &str,
+    port: u16,
+    addrs: &mut Vec<SocketAddr>,
+) -> io::Result<()> {
+    let contents = match read_bounded_utf8_file(
+        path,
+        HOSTS_FILE_MAX_BYTES,
+        "/etc/hosts exceeds the 4 MiB resolver configuration limit",
+    ) {
         Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
 
-    let mut addrs = Vec::new();
     for line in contents.lines() {
         let line = strip_comment(line);
         if line.is_empty() {
@@ -657,15 +763,19 @@ fn read_hosts_file(path: &str, host: &str, port: u16) -> io::Result<Vec<SocketAd
 
         if parts.any(|name| name.eq_ignore_ascii_case(host)) {
             let socket = SocketAddr::new(ip, port);
-            push_unique_socket_addr(&mut addrs, socket);
+            push_unique_resolved_addr(addrs, socket)?;
         }
     }
 
-    Ok(addrs)
+    Ok(())
 }
 
 fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
-    let contents = fs::read_to_string(path)?;
+    let contents = read_bounded_utf8_file(
+        path,
+        RESOLV_CONF_MAX_BYTES,
+        "/etc/resolv.conf exceeds the 64 KiB resolver configuration limit",
+    )?;
     let mut nameservers = Vec::new();
 
     for line in contents.lines() {
@@ -698,6 +808,51 @@ fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
     }
 
     Ok(nameservers)
+}
+
+fn read_bounded_utf8_file(
+    path: &str,
+    max_bytes: usize,
+    over_limit_message: &'static str,
+) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let max_read = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resolver file limit cannot represent an over-limit sentinel",
+        )
+    })?;
+    let initial_capacity = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0)
+        .min(max_read);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0u8; 8192];
+
+    while bytes.len() < max_read {
+        let remaining = max_read - bytes.len();
+        let chunk_len = remaining.min(chunk.len());
+        let read = match file.read(&mut chunk[..chunk_len]) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            over_limit_message,
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -891,11 +1046,27 @@ fn dns_rcode_allows_questionless_failover(rcode: u8) -> bool {
     )
 }
 
-fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port: u16) {
+fn extend_unique_socket_addrs(
+    addrs: &mut Vec<SocketAddr>,
+    ips: &[IpAddr],
+    port: u16,
+) -> io::Result<()> {
     for ip in ips {
         let addr = SocketAddr::new(*ip, port);
-        push_unique_socket_addr(addrs, addr);
+        push_unique_resolved_addr(addrs, addr)?;
     }
+    Ok(())
+}
+
+fn push_unique_resolved_addr(addrs: &mut Vec<SocketAddr>, addr: SocketAddr) -> io::Result<()> {
+    if addrs.len() >= MAX_RESOLVED_ADDRESSES && !addrs.contains(&addr) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resolver result exceeds 64 unique addresses",
+        ));
+    }
+    push_unique_socket_addr(addrs, addr);
+    Ok(())
 }
 
 /// Order-preserving helper that filters duplicate socket addresses.
@@ -905,14 +1076,13 @@ fn push_unique_socket_addr(addrs: &mut Vec<SocketAddr>, addr: SocketAddr) {
     }
 }
 
-fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
-    validate_query_name(host)?;
-
-    let mut packet = Vec::with_capacity(DNS_MAX_QUERY_PACKET_LEN);
+fn encode_query_packet(packet: &mut Vec<u8>, host: &str) -> io::Result<()> {
+    debug_assert!(validate_query_name(host).is_ok());
+    packet.clear();
     let mut header = [0u8; 12];
     {
         let mut cursor = BufferCursorMut::new(&mut header);
-        cursor.put_u16_be(query_id).map_err(byte_range_eof)?;
+        cursor.put_u16_be(0).map_err(byte_range_eof)?;
         cursor.put_u16_be(0x0100).map_err(byte_range_eof)?;
         cursor.put_u16_be(1).map_err(byte_range_eof)?;
         cursor.put_u16_be(0).map_err(byte_range_eof)?;
@@ -929,9 +1099,18 @@ fn encode_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<
     packet.push(0);
     let start = packet.len();
     packet.resize(start + 4, 0);
-    write_u16_be_at(&mut packet, start, qtype).map_err(byte_range_eof)?;
-    write_u16_be_at(&mut packet, start + 2, DNS_CLASS_IN).map_err(byte_range_eof)?;
-    Ok(packet)
+    write_u16_be_at(packet, start + 2, DNS_CLASS_IN).map_err(byte_range_eof)
+}
+
+fn patch_query_packet(packet: &mut [u8], query_id: u16, qtype: u16) -> io::Result<()> {
+    let qtype_offset = packet.len().checked_sub(4).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS query packet was shorter than its fixed fields",
+        )
+    })?;
+    write_u16_be_at(packet, 0, query_id).map_err(byte_range_eof)?;
+    write_u16_be_at(packet, qtype_offset, qtype).map_err(byte_range_eof)
 }
 
 pub(crate) fn validate_query_name(host: &str) -> io::Result<()> {
@@ -1029,7 +1208,6 @@ pub(crate) fn parse_response_packet(
 
     let mut addresses = Vec::new();
     let mut active_owner = query_host;
-    let mut cname = None;
     let mut cname_hops = 0usize;
     let mut seen_owners = [""; MAX_CNAME_HOPS_PER_RESPONSE + 1];
     seen_owners[0] = query_host;
@@ -1058,6 +1236,12 @@ pub(crate) fn parse_response_packet(
             break;
         };
 
+        if target.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response CNAME target was the root name",
+            ));
+        }
         if seen_owners[..seen_owner_count]
             .iter()
             .any(|seen| dns_name_eq(seen, target))
@@ -1077,8 +1261,8 @@ pub(crate) fn parse_response_packet(
         seen_owner_count += 1;
         cname_hops += 1;
         active_owner = target;
-        cname = Some(target.clone());
     }
+    let cname = (cname_hops != 0).then(|| active_owner.to_owned());
 
     Ok(LookupResult {
         addresses,
@@ -1086,6 +1270,22 @@ pub(crate) fn parse_response_packet(
         cname_hops,
         nx_domain: false,
     })
+}
+
+fn parse_received_response_packet(
+    buffer: &[u8],
+    received_len: usize,
+    query_id: u16,
+    query_host: &str,
+    qtype: u16,
+) -> io::Result<LookupResult> {
+    let packet = buffer.get(..received_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS receive length exceeded response buffer",
+        )
+    })?;
+    parse_response_packet(packet, query_id, query_host, qtype)
 }
 
 /// Validates every declared resource record and retains only resolution data
@@ -1118,9 +1318,10 @@ fn parse_response_records(
         (DnsRecordSection::Authority, envelope.nscount),
         (DnsRecordSection::Additional, envelope.arcount),
     ] {
-        let materialize_names = retain_resolution_data && section == DnsRecordSection::Answer;
         for _ in 0..count {
-            let (owner, consumed) = decode_or_validate_name(packet, offset, materialize_names)?;
+            let owner_offset = offset;
+            let (consumed, owner_presentation_len) =
+                walk_dns_name(packet, owner_offset, 0).map_err(DnsNameWalkError::into_io_error)?;
             offset = checked_add(offset, consumed, packet.len())?;
             let rr = parse_rr_header(packet, offset)?;
             offset = rr.data_offset + rr.rdlength as usize;
@@ -1138,6 +1339,11 @@ fn parse_response_records(
                     }
                     if contributes {
                         let data = &packet[rr.data_offset..rr.data_offset + 4];
+                        let owner = materialize_walked_dns_name(
+                            packet,
+                            owner_offset,
+                            owner_presentation_len,
+                        )?;
                         records.push(DnsRecord::Address {
                             owner,
                             rr_type: rr.rr_type,
@@ -1155,6 +1361,11 @@ fn parse_response_records(
                     if contributes {
                         let mut octets = [0u8; 16];
                         octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
+                        let owner = materialize_walked_dns_name(
+                            packet,
+                            owner_offset,
+                            owner_presentation_len,
+                        )?;
                         records.push(DnsRecord::Address {
                             owner,
                             rr_type: rr.rr_type,
@@ -1163,15 +1374,26 @@ fn parse_response_records(
                     }
                 }
                 DNS_TYPE_CNAME => {
-                    let (target, consumed) =
-                        decode_or_validate_name(packet, rr.data_offset, materialize_names)?;
-                    if consumed != rr.rdlength as usize {
+                    let (target_consumed, target_presentation_len) =
+                        walk_dns_name(packet, rr.data_offset, 0)
+                            .map_err(DnsNameWalkError::into_io_error)?;
+                    if target_consumed != rr.rdlength as usize {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "DNS CNAME RDATA did not consume its declared length",
                         ));
                     }
                     if contributes {
+                        let owner = materialize_walked_dns_name(
+                            packet,
+                            owner_offset,
+                            owner_presentation_len,
+                        )?;
+                        let target = materialize_walked_dns_name(
+                            packet,
+                            rr.data_offset,
+                            target_presentation_len,
+                        )?;
                         records.push(DnsRecord::Cname { owner, target });
                     }
                 }
@@ -1181,22 +1403,6 @@ fn parse_response_records(
     }
 
     Ok(records)
-}
-
-/// Decodes a response name when an Answer may retain it, or validates it
-/// without allocating for negative responses and ignored record sections.
-fn decode_or_validate_name(
-    packet: &[u8],
-    offset: usize,
-    materialize: bool,
-) -> io::Result<(String, usize)> {
-    if materialize {
-        decode_name(packet, offset, 0)
-    } else {
-        let (consumed, _) =
-            walk_dns_name(packet, offset, 0).map_err(DnsNameWalkError::into_io_error)?;
-        Ok((String::new(), consumed))
-    }
 }
 
 /// The fixed-size resource-record header fields that follow the already-decoded
@@ -1244,13 +1450,33 @@ pub(crate) fn decode_name(
 ) -> io::Result<(String, usize)> {
     let (consumed, presentation_len) =
         walk_dns_name(packet, offset, depth).map_err(DnsNameWalkError::into_io_error)?;
+    let name = materialize_walked_dns_name_at_depth(packet, offset, depth, presentation_len)?;
+    Ok((name, consumed))
+}
+
+/// Materializes a name immediately after a successful structural walk.
+fn materialize_walked_dns_name(
+    packet: &[u8],
+    offset: usize,
+    presentation_len: usize,
+) -> io::Result<String> {
+    materialize_walked_dns_name_at_depth(packet, offset, 0, presentation_len)
+}
+
+fn materialize_walked_dns_name_at_depth(
+    packet: &[u8],
+    offset: usize,
+    depth: usize,
+    presentation_len: usize,
+) -> io::Result<String> {
     let mut name = String::with_capacity(presentation_len);
-    // SAFETY: the successful walk above validated this exact offset/depth path,
-    // including every label's UTF-8, in the same immutable packet.
+    // SAFETY: callers invoke this only after `walk_dns_name` validates this
+    // exact offset/depth path, including every label's UTF-8, in the same
+    // immutable packet.
     unsafe { materialize_validated_dns_name(packet, offset, depth, &mut name) }
         .map_err(DnsNameWalkError::into_io_error)?;
     debug_assert_eq!(name.len(), presentation_len);
-    Ok((name, consumed))
+    Ok(name)
 }
 
 /// Allocation-free failure status used by the shared DNS name walker.
@@ -1529,15 +1755,41 @@ pub(crate) mod test_support {
         resolver: &super::DnsResolver,
         host: &str,
     ) -> std::io::Result<Vec<IpAddr>> {
+        super::validate_query_name(host)?;
+        let mut query_storage = super::DnsQueryStorage::new();
+        super::encode_query_packet(&mut query_storage.packet, host)?;
         resolver
-            .lookup_name(host, super::DNS_TYPE_A, super::MAX_CNAME_TOTAL_HOPS)
+            .lookup_name(
+                host,
+                super::DNS_TYPE_A,
+                super::MAX_CNAME_TOTAL_HOPS,
+                &mut query_storage,
+            )
             .await
             .map(|result| result.addresses)
     }
 
     /// Repository-only seam for the resolver deduplication allocation fixture.
-    pub fn extend_unique_socket_addrs(addrs: &mut Vec<SocketAddr>, ips: &[IpAddr], port: u16) {
-        super::extend_unique_socket_addrs(addrs, ips, port);
+    pub fn extend_unique_socket_addrs(
+        addrs: &mut Vec<SocketAddr>,
+        ips: &[IpAddr],
+        port: u16,
+    ) -> std::io::Result<()> {
+        super::extend_unique_socket_addrs(addrs, ips, port)
+    }
+
+    /// Repository-only seam for bounded `/etc/hosts` fixtures.
+    pub fn resolve_local_host_with_hosts_path(
+        path: &str,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        super::resolve_local_host_with_hosts_path(path, host, port)
+    }
+
+    /// Repository-only seam for bounded `/etc/resolv.conf` fixtures.
+    pub fn read_resolv_conf(path: &str) -> std::io::Result<Vec<SocketAddr>> {
+        super::read_resolv_conf(path)
     }
 
     /// Repository-only seam for the DNS candidate allocation fixture.
@@ -1558,6 +1810,63 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+        validate_query_name(host)?;
+        let mut query_storage = DnsQueryStorage::new();
+        encode_query_packet(&mut query_storage.packet, host)?;
+        patch_query_packet(&mut query_storage.packet, query_id, qtype)?;
+        Ok(query_storage.packet)
+    }
+
+    #[test]
+    fn resolver_nameserver_bound_preserves_first_seen_unique_order() {
+        let first = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 5301));
+        let second = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 5302));
+        let third = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 5303));
+
+        let resolver = DnsResolver::new(vec![first, second, first, third, second])
+            .expect("duplicate nameservers within the bound should be accepted");
+        assert_eq!(&*resolver.nameservers, &[first, second, third]);
+    }
+
+    #[test]
+    fn resolver_nameserver_bound_accepts_eight_unique_entries() {
+        let nameservers = (0..MAX_NAMESERVERS)
+            .map(|index| {
+                SocketAddr::from((
+                    Ipv4Addr::new(192, 0, 2, index as u8 + 1),
+                    5300 + index as u16,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let resolver = DnsResolver::new(nameservers.clone())
+            .expect("the nameserver boundary should be accepted");
+        assert_eq!(&*resolver.nameservers, nameservers);
+    }
+
+    #[test]
+    fn resolver_nameserver_bound_rejects_ninth_unique_entry() {
+        let mut nameservers = (0..MAX_NAMESERVERS)
+            .map(|index| {
+                SocketAddr::from((
+                    Ipv4Addr::new(192, 0, 2, index as u8 + 1),
+                    5300 + index as u16,
+                ))
+            })
+            .collect::<Vec<_>>();
+        nameservers.insert(1, nameservers[0]);
+        nameservers.push(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 9), 5309)));
+
+        let err = DnsResolver::new(nameservers)
+            .expect_err("a ninth unique nameserver should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "resolver supports at most eight unique nameservers"
+        );
+    }
 
     #[test]
     fn fallback_query_id_mixer_is_not_sequential_counter() {
@@ -1580,7 +1889,7 @@ mod tests {
     #[test]
     fn encoded_query_packet_carries_selected_query_id() {
         let packet =
-            encode_query_packet(0xBEEF, "db.example.test", DNS_TYPE_A).expect("query encode");
+            test_query_packet(0xBEEF, "db.example.test", DNS_TYPE_A).expect("query encode");
         assert_eq!(
             read_u16_be_at(&packet, 0).expect("encoded query ID should fit"),
             0xBEEF
@@ -1592,7 +1901,7 @@ mod tests {
         let host = query_name_with_final_label(61);
         assert_eq!(host.len(), DNS_MAX_NAME_PRESENTATION_LEN);
 
-        let packet = encode_query_packet(0xBEEF, &host, DNS_TYPE_A)
+        let packet = test_query_packet(0xBEEF, &host, DNS_TYPE_A)
             .expect("maximum-length query name should encode");
         assert_eq!(packet.len(), DNS_MAX_QUERY_PACKET_LEN);
         assert_eq!(packet.capacity(), DNS_MAX_QUERY_PACKET_LEN);
@@ -1603,7 +1912,7 @@ mod tests {
         let host = query_name_with_final_label(62);
         assert_eq!(host.len(), DNS_MAX_NAME_PRESENTATION_LEN + 1);
 
-        let err = encode_query_packet(0xBEEF, &host, DNS_TYPE_A)
+        let err = test_query_packet(0xBEEF, &host, DNS_TYPE_A)
             .expect_err("overlong query name should fail before encoding");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
@@ -1611,15 +1920,15 @@ mod tests {
     #[test]
     fn query_name_limits_retain_the_63_byte_label_boundary() {
         let valid = "a".repeat(63);
-        encode_query_packet(0xBEEF, &valid, DNS_TYPE_A).expect("63-byte DNS label should encode");
+        test_query_packet(0xBEEF, &valid, DNS_TYPE_A).expect("63-byte DNS label should encode");
 
         let invalid = "a".repeat(64);
-        let err = encode_query_packet(0xBEEF, &invalid, DNS_TYPE_A)
+        let err = test_query_packet(0xBEEF, &invalid, DNS_TYPE_A)
             .expect_err("64-byte DNS label should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         for host in ["", ".example.test", "example..test", "example.test."] {
-            let err = encode_query_packet(0xBEEF, host, DNS_TYPE_A)
+            let err = test_query_packet(0xBEEF, host, DNS_TYPE_A)
                 .expect_err("empty DNS label should fail at the encoder boundary");
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
@@ -1657,7 +1966,7 @@ mod tests {
         let dotted = format!("{max_host}.");
         let normalized =
             normalize_host(&dotted).expect("maximum name plus root dot should normalize");
-        encode_query_packet(0xBEEF, normalized, DNS_TYPE_A)
+        test_query_packet(0xBEEF, normalized, DNS_TYPE_A)
             .expect("normalized maximum-length name should encode");
         let repeated_root = format!("{max_host}..");
         let err = normalize_host(&repeated_root)
@@ -2162,6 +2471,70 @@ mod tests {
     }
 
     #[test]
+    fn received_response_parser_excludes_stale_tail_bytes() {
+        let buffer = response_with_single_test_rr(
+            DnsRecordSection::Answer,
+            0,
+            true,
+            DNS_TYPE_A,
+            DNS_TYPE_A,
+            DNS_CLASS_IN,
+            &[192, 0, 2, 1],
+        );
+        let received_len = buffer.len() - 1;
+
+        assert!(
+            response_is_decodable_candidate(&buffer[..received_len], 0x1234),
+            "the truncated record should pass the header-and-question prefilter"
+        );
+        assert!(
+            parse_response_packet(&buffer, 0x1234, "db.example.test", DNS_TYPE_A).is_ok(),
+            "the physical tail should complete the otherwise truncated record"
+        );
+        let err = match parse_received_response_packet(
+            &buffer,
+            received_len,
+            0x1234,
+            "db.example.test",
+            DNS_TYPE_A,
+        ) {
+            Ok(_) => panic!("stale tail byte completed a truncated DNS response"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "DNS packet ended unexpectedly");
+    }
+
+    #[test]
+    fn received_response_parser_rejects_length_beyond_buffer() {
+        let buffer = response_with_single_test_rr(
+            DnsRecordSection::Answer,
+            0,
+            true,
+            DNS_TYPE_A,
+            DNS_TYPE_A,
+            DNS_CLASS_IN,
+            &[192, 0, 2, 1],
+        );
+
+        let err = match parse_received_response_packet(
+            &buffer,
+            buffer.len() + 1,
+            0x1234,
+            "db.example.test",
+            DNS_TYPE_A,
+        ) {
+            Ok(_) => panic!("out-of-bounds DNS receive length was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "DNS receive length exceeded response buffer"
+        );
+    }
+
+    #[test]
     fn ignored_section_name_validation_precedes_filtering_and_rcode() {
         let malformed_name = [1, 0xff, 0];
         let question_owner = 0xC00Cu16.to_be_bytes();
@@ -2248,18 +2621,33 @@ mod tests {
                             class,
                             shape.rdata,
                         );
-                        let result = parse_response_packet(
+                        let parsed = parse_response_packet(
                             &packet,
                             0x1234,
                             "db.example.test",
                             shape.query_type,
-                        )
-                        .unwrap_or_else(|err| panic!("{context} failed validation: {err}"));
-                        assert_eq!(result.nx_domain, rcode == DNS_RCODE_NXDOMAIN, "{context}");
+                        );
 
                         let contributes = rcode == 0
                             && section == DnsRecordSection::Answer
                             && class == DNS_CLASS_IN;
+                        if shape.rr_type == DNS_TYPE_CNAME && contributes {
+                            let err = match parsed {
+                                Ok(_) => panic!("{context} root CNAME entered follow-up selection"),
+                                Err(err) => err,
+                            };
+                            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{context}");
+                            assert_eq!(
+                                err.to_string(),
+                                "DNS response CNAME target was the root name",
+                                "{context}"
+                            );
+                            continue;
+                        }
+
+                        let result = parsed
+                            .unwrap_or_else(|err| panic!("{context} failed validation: {err}"));
+                        assert_eq!(result.nx_domain, rcode == DNS_RCODE_NXDOMAIN, "{context}");
                         match shape.rr_type {
                             DNS_TYPE_A | DNS_TYPE_AAAA => {
                                 assert_eq!(
@@ -2561,6 +2949,38 @@ mod tests {
     }
 
     #[test]
+    fn reachable_root_cname_target_is_upstream_invalid_data() {
+        let direct_root = [0];
+        // `db.example.test` starts at byte 12; its terminal root is byte 28.
+        let compressed_root = 0xC01Cu16.to_be_bytes();
+
+        for (encoding, target) in [
+            ("direct", direct_root.as_slice()),
+            ("compressed", compressed_root.as_slice()),
+        ] {
+            let packet = response_with_single_test_rr(
+                DnsRecordSection::Answer,
+                0,
+                true,
+                DNS_TYPE_A,
+                DNS_TYPE_CNAME,
+                DNS_CLASS_IN,
+                target,
+            );
+            let err = match parse_response_packet(&packet, 0x1234, "db.example.test", DNS_TYPE_A) {
+                Ok(_) => panic!("{encoding} root CNAME target entered follow-up selection"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{encoding}");
+            assert_eq!(
+                err.to_string(),
+                "DNS response CNAME target was the root name",
+                "{encoding}"
+            );
+        }
+    }
+
+    #[test]
     fn literal_dot_rr_owner_is_rejected_before_selection_or_rcode() {
         for rcode in [0, DNS_RCODE_NXDOMAIN] {
             let packet = response_with_literal_dot_rr_owner(rcode);
@@ -2784,7 +3204,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
         ];
 
-        extend_unique_socket_addrs(&mut addrs, &ips, port);
+        extend_unique_socket_addrs(&mut addrs, &ips, port)
+            .expect("four unique addresses should remain within the result bound");
 
         assert_eq!(
             addrs,
@@ -2794,6 +3215,74 @@ mod tests {
                 SocketAddr::from((Ipv4Addr::new(192, 0, 2, 11), port)),
                 SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 11), port)),
             ]
+        );
+    }
+
+    #[test]
+    fn dns_family_merge_accepts_64_unique_addresses_and_rejects_the_65th() {
+        let port = 5432;
+        let ipv4 = (1..=32)
+            .map(|octet| IpAddr::V4(Ipv4Addr::new(192, 0, 2, octet)))
+            .collect::<Vec<_>>();
+        let ipv6 = (1..=32)
+            .map(|suffix| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, suffix)))
+            .collect::<Vec<_>>();
+        let expected = ipv4
+            .iter()
+            .chain(&ipv6)
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect::<Vec<_>>();
+
+        let mut ipv4_with_duplicate = ipv4.clone();
+        ipv4_with_duplicate.push(ipv4[0]);
+        let mut addrs = Vec::new();
+        let step = finish_dns_family_lookups(
+            "db.example.test",
+            port,
+            &mut addrs,
+            Ok(LookupResult {
+                addresses: ipv4_with_duplicate,
+                cname: None,
+                cname_hops: 0,
+                nx_domain: false,
+            }),
+            Ok(LookupResult {
+                addresses: ipv6.clone(),
+                cname: None,
+                cname_hops: 0,
+                nx_domain: false,
+            }),
+        )
+        .expect("64 unique DNS addresses should be accepted");
+        assert!(matches!(step, ResolveHostStep::Resolved));
+        assert_eq!(addrs, expected);
+
+        let mut over_limit_ipv6 = ipv6;
+        over_limit_ipv6.push(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 33)));
+        let mut over_limit_addrs = Vec::new();
+        let err = finish_dns_family_lookups(
+            "db.example.test",
+            port,
+            &mut over_limit_addrs,
+            Ok(LookupResult {
+                addresses: ipv4,
+                cname: None,
+                cname_hops: 0,
+                nx_domain: false,
+            }),
+            Ok(LookupResult {
+                addresses: over_limit_ipv6,
+                cname: None,
+                cname_hops: 0,
+                nx_domain: false,
+            }),
+        )
+        .err()
+        .expect("a 65th unique DNS address should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "resolver result exceeds 64 unique addresses"
         );
     }
 

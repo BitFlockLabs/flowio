@@ -3,10 +3,10 @@ mod common;
 use common::{
     DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
     assert_poll_after_ready_parks, ipv6_loopback_capability_unavailable, poll_once_pending,
-    set_positive_linger, wait_for_drop_count,
+    run_test_output, set_positive_linger, wait_for_drop_count,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
+use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::{TimeoutError, timeout};
@@ -289,25 +289,106 @@ fn runtime_udp_ipv6_connected_bidirectional_ping_pong() {
 
 #[test]
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-fn runtime_udp_send_rejects_oversize_iobuff() {
-    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("failed to bind udp socket");
+fn runtime_udp_send_paths_reject_oversize_iobuff_before_submission() {
+    let (mut socket, _peer, peer_addr) = connected_udp_pair();
     let oversized =
         SparseOversizedReadOnly::new().expect("failed to reserve sparse oversized mapping");
+    let mapping_base_addr = oversized.mapping_base_addr();
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
-    let (_oversized, _socket) = run_test_output(&mut executor, async move {
+    let (oversized, mut socket) = run_test_output(&mut executor, async move {
         let (res, oversized) = socket.send(oversized).await;
         assert_oversized_send_rejected(res, &oversized);
+        assert_eq!(oversized.mapping_base_addr(), mapping_base_addr);
+
+        let (res, oversized) = socket.send_to(oversized, peer_addr).await;
+        assert_oversized_send_rejected(res, &oversized);
+        assert_eq!(oversized.mapping_base_addr(), mapping_base_addr);
+
         (oversized, socket)
     });
 
     #[cfg(debug_assertions)]
-    assert_eq!(
-        executor.last_stats().sqe_submits,
-        0,
-        "oversized UDP send should submit no SQE"
-    );
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 0, "oversized UDP sends submitted an SQE");
+        assert_eq!(
+            stats.cqe_completions, 0,
+            "oversized UDP sends observed a CQE"
+        );
+        assert_eq!(
+            stats.retained_pooled_allocs, 0,
+            "oversized UDP sends allocated retained payloads"
+        );
+        assert_eq!(
+            stats.retained_heap_fallbacks, 0,
+            "oversized UDP sends used retained heap fallback"
+        );
+        assert_eq!(
+            stats.poll_context_extractions, 2,
+            "each local validation must still inspect its FlowIO context"
+        );
+    }
+
+    let mut future = Box::pin(socket.send_to(oversized, peer_addr));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready((Err(error), oversized)) => {
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(oversized.mapping_base_addr(), mapping_base_addr);
+            assert_eq!(
+                oversized.as_ptr_calls(),
+                0,
+                "context rejection consulted the oversized buffer pointer"
+            );
+        }
+        Poll::Ready((Ok(_), _)) => panic!("oversized send_to unexpectedly succeeded outside run"),
+        Poll::Pending => panic!("oversized send_to remained pending outside run"),
+    }
+}
+
+#[test]
+fn runtime_udp_send_to_zero_datagram_submits_and_delivers() {
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime UDP socket");
+    let local_addr = socket.local_addr();
+    let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind peer UDP socket");
+    let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    peer.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("failed to bound peer receive");
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let empty = Vec::with_capacity(1);
+    let empty_ptr = empty.as_ptr();
+    let empty_capacity = empty.capacity();
+
+    let (empty, socket) = run_test_output(&mut executor, async move {
+        let (result, empty) = socket.send_to(empty, peer_addr).await;
+        assert_eq!(result.expect("zero-length send_to failed"), 0);
+        (empty, socket)
+    });
+
+    assert!(empty.is_empty());
+    assert_eq!(empty.as_ptr(), empty_ptr);
+    assert_eq!(empty.capacity(), empty_capacity);
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 1);
+        assert_eq!(stats.cqe_completions, 1);
+        assert_eq!(
+            stats.poll_context_extractions, 2,
+            "submission and completion must each validate the FlowIO context"
+        );
+    }
+
+    let mut received = [0u8; 1];
+    let (received_len, from) = peer
+        .recv_from(&mut received)
+        .expect("peer did not receive zero-length datagram");
+    assert_eq!(received_len, 0);
+    assert_eq!(from, local_addr);
+    drop(socket);
 }
 
 #[test]

@@ -92,8 +92,8 @@ use super::{
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    completed_op_ctx_from_waker, drop_op_ptr_unchecked, poll_ctx_from_waker,
-    refresh_op_waiter_from_waker, submit_retained_sqe, validate_local_io_result,
+    completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
+    submit_retained_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
@@ -390,17 +390,29 @@ impl UdpSocket {
     /// Starts one unconnected send to the provided destination.
     ///
     /// Use this instead of [`UdpSocket::send`] when the destination varies per
-    /// datagram.
+    /// datagram. A source longer than the io_uring 32-bit byte-count limit is
+    /// rejected before submission; an empty source remains a legal datagram
+    /// and is submitted to the kernel.
     pub fn send_to<B: IoBuffReadOnly>(
         &mut self,
         buffer: B,
         addr: SocketAddr,
     ) -> SendToFuture<'_, B> {
+        let mut input_error = None;
+        let len = match checked_send_len(buffer.len()) {
+            Ok(len) => len,
+            Err(err) => {
+                input_error = Some(err);
+                0
+            }
+        };
         SendToFuture {
             fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
+            len,
             addr,
+            input_error,
             _marker: PhantomData,
         }
     }
@@ -463,22 +475,113 @@ struct RetainedSendToPayload<B: IoBuffReadOnly> {
     msghdr: MaybeUninit<libc::msghdr>,
 }
 
+/// Initializes the pointer-bearing fields shared by retained UDP receives.
+///
+/// # Safety
+///
+/// `buffer`, `iovec`, `msghdr`, and non-null `name` storage must already
+/// occupy their final addresses and must not move until the target recvmsg CQE
+/// retires. `len` must be a checked snapshot no greater than
+/// `buffer.writable_len()`.
+#[inline(always)]
+unsafe fn initialize_retained_recv_fields<B: IoBuffReadWrite>(
+    buffer: &mut B,
+    iovec: &mut MaybeUninit<libc::iovec>,
+    msghdr: &mut MaybeUninit<libc::msghdr>,
+    name: *mut libc::c_void,
+    namelen: libc::socklen_t,
+    len: u32,
+) {
+    iovec.write(libc::iovec {
+        iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+        iov_len: len as usize,
+    });
+    write_msghdr(
+        msghdr,
+        MsgHdrInit {
+            name,
+            namelen,
+            iov: iovec.as_mut_ptr(),
+            iovlen: 1,
+            control: std::ptr::null_mut(),
+            controllen: 0,
+        },
+    );
+}
+
+/// Initializes a connected recvmsg payload at its retained address.
+///
+/// # Safety
+///
+/// `payload` must already occupy its final address and must not move until the
+/// target recvmsg CQE retires. `len` must be the checked receive length for
+/// `payload.buffer`.
+#[inline(always)]
+unsafe fn initialize_retained_recv_msg_payload<B: IoBuffReadWrite>(
+    payload: &mut RetainedRecvMsgPayload<B>,
+    len: u32,
+) {
+    unsafe {
+        initialize_retained_recv_fields(
+            &mut payload.buffer,
+            &mut payload.iovec,
+            &mut payload.msghdr,
+            std::ptr::null_mut(),
+            0,
+            len,
+        );
+    }
+}
+
+/// Initializes an explicit-source recvmsg payload at its retained address.
+///
+/// # Safety
+///
+/// `payload` must already occupy its final address and must not move until the
+/// target recvmsg CQE retires. `len` must be the checked receive length for
+/// `payload.buffer`.
+#[inline(always)]
+unsafe fn initialize_retained_recv_from_payload<B: IoBuffReadWrite>(
+    payload: &mut RetainedRecvFromPayload<B>,
+    len: u32,
+) {
+    let RetainedRecvFromPayload {
+        buffer,
+        addr,
+        addrlen,
+        iovec,
+        msghdr,
+    } = payload;
+    unsafe {
+        initialize_retained_recv_fields(
+            buffer,
+            iovec,
+            msghdr,
+            addr.as_mut_ptr() as *mut libc::c_void,
+            *addrlen,
+            len,
+        );
+    }
+}
+
 /// Initializes an explicit-destination send payload at its retained address.
 ///
 /// # Safety
 ///
 /// `payload` must already occupy its final address and must not move until the
 /// target sendmsg CQE retires because its message header points into itself.
+/// `len` must be the checked snapshot of `payload.buffer.len()`.
 #[inline(always)]
 unsafe fn initialize_retained_send_to_payload<B: IoBuffReadOnly>(
     payload: &mut RetainedSendToPayload<B>,
     destination: SocketAddr,
+    len: u32,
 ) {
     let (addr, addrlen) = socket_addr_to_c(destination);
     payload.addr.write(addr);
     payload.iovec.write(libc::iovec {
         iov_base: payload.buffer.as_ptr() as *mut libc::c_void,
-        iov_len: payload.buffer.len(),
+        iov_len: len as usize,
     });
     write_msghdr(
         &mut payload.msghdr,
@@ -513,7 +616,7 @@ unsafe fn take_completed_udp_payload<T: 'static>(
     }
 
     let result = unsafe { (**state_ptr).result };
-    let op_ctx = unsafe { completed_op_ctx_from_waker(cx, *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
     let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
     unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
@@ -718,22 +821,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let buffer_ptr = payload.buffer.as_mut_ptr();
-                        payload.iovec.write(libc::iovec {
-                            iov_base: buffer_ptr as *mut libc::c_void,
-                            iov_len: this.len as usize,
-                        });
-                        write_msghdr(
-                            &mut payload.msghdr,
-                            MsgHdrInit {
-                                name: std::ptr::null_mut(),
-                                namelen: 0,
-                                iov: payload.iovec.as_mut_ptr(),
-                                iovlen: 1,
-                                control: std::ptr::null_mut(),
-                                controllen: 0,
-                            },
-                        );
+                        initialize_retained_recv_msg_payload(payload, this.len);
 
                         Ok(
                             opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
@@ -958,22 +1046,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let buffer_ptr = payload.buffer.as_mut_ptr();
-                        payload.iovec.write(libc::iovec {
-                            iov_base: buffer_ptr as *mut libc::c_void,
-                            iov_len: this.len as usize,
-                        });
-                        write_msghdr(
-                            &mut payload.msghdr,
-                            MsgHdrInit {
-                                name: payload.addr.as_mut_ptr() as *mut libc::c_void,
-                                namelen: payload.addrlen,
-                                iov: payload.iovec.as_mut_ptr(),
-                                iovlen: 1,
-                                control: std::ptr::null_mut(),
-                                controllen: 0,
-                            },
-                        );
+                        initialize_retained_recv_from_payload(payload, this.len);
 
                         Ok(
                             opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
@@ -1015,8 +1088,12 @@ pub struct SendToFuture<'a, B: IoBuffReadOnly> {
     state_ptr: *mut CompletionState,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
+    /// Validated datagram byte count submitted through the retained iovec.
+    len: u32,
     /// Destination address prepared after the payload reaches retained storage.
     addr: SocketAddr,
+    /// Deferred validation error returned before any SQE submission.
+    input_error: Option<io::Error>,
     /// Borrows the parent socket for the future lifetime.
     _marker: PhantomData<&'a mut UdpSocket>,
 }
@@ -1027,6 +1104,13 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if this.state_ptr.is_null()
+            && let Some(err) = this.input_error.take()
+        {
+            let result = validate_local_io_result(cx, Err(err));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((result, buffer));
+        }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
@@ -1063,6 +1147,7 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
 
             let destination = this.addr;
             let fd = this.fd;
+            let len = this.len;
             let payload = RetainedSendToPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
                 addr: MaybeUninit::uninit(),
@@ -1072,7 +1157,7 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        initialize_retained_send_to_payload(payload, destination);
+                        initialize_retained_send_to_payload(payload, destination, len);
 
                         Ok(opcode::SendMsg::new(types::Fd(fd), payload.msghdr.as_ptr())
                             .build()
@@ -1109,6 +1194,68 @@ mod tests {
     }
 
     #[test]
+    fn retained_recv_msg_payload_uses_final_storage_pointers() {
+        let mut payload = RetainedRecvMsgPayload {
+            buffer: vec![0u8; 32],
+            iovec: MaybeUninit::uninit(),
+            msghdr: MaybeUninit::uninit(),
+        };
+        let len = checked_read_len(17, payload.buffer.writable_len())
+            .expect("fixture receive length should be valid");
+
+        unsafe { initialize_retained_recv_msg_payload(&mut payload, len) };
+
+        let buffer_ptr = payload.buffer.as_mut_ptr();
+        let iovec_ptr = payload.iovec.as_mut_ptr();
+        let iovec = unsafe { payload.iovec.assume_init_ref() };
+        let msghdr = unsafe { payload.msghdr.assume_init_ref() };
+        assert!(msghdr.msg_name.is_null());
+        assert_eq!(msghdr.msg_namelen, 0);
+        assert_eq!(msghdr.msg_iov, iovec_ptr);
+        assert_eq!(msghdr.msg_iovlen, 1);
+        assert_eq!(iovec.iov_base, buffer_ptr as *mut libc::c_void);
+        assert_eq!(iovec.iov_len, len as usize);
+        assert!(msghdr.msg_control.is_null());
+        assert_eq!(msghdr.msg_controllen, 0);
+        assert_eq!(msghdr.msg_flags, 0);
+    }
+
+    #[test]
+    fn retained_recv_from_payload_uses_final_storage_pointers() {
+        let mut payload = RetainedRecvFromPayload {
+            buffer: vec![0u8; 64],
+            addr: zeroed_sockaddr_storage(),
+            addrlen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+            iovec: MaybeUninit::uninit(),
+            msghdr: MaybeUninit::uninit(),
+        };
+        let len = checked_read_len(29, payload.buffer.writable_len())
+            .expect("fixture receive length should be valid");
+
+        unsafe { initialize_retained_recv_from_payload(&mut payload, len) };
+
+        let buffer_ptr = payload.buffer.as_mut_ptr();
+        let addr_ptr = payload.addr.as_mut_ptr();
+        let iovec_ptr = payload.iovec.as_mut_ptr();
+        let addr = unsafe { payload.addr.assume_init_ref() };
+        let iovec = unsafe { payload.iovec.assume_init_ref() };
+        let msghdr = unsafe { payload.msghdr.assume_init_ref() };
+        assert_eq!(
+            msghdr.msg_name,
+            addr_ptr as *mut libc::sockaddr_storage as *mut libc::c_void
+        );
+        assert_eq!(msghdr.msg_namelen, payload.addrlen);
+        assert_eq!(msghdr.msg_iov, iovec_ptr);
+        assert_eq!(msghdr.msg_iovlen, 1);
+        assert_eq!(iovec.iov_base, buffer_ptr as *mut libc::c_void);
+        assert_eq!(iovec.iov_len, len as usize);
+        assert_eq!(addr.ss_family, 0);
+        assert!(msghdr.msg_control.is_null());
+        assert_eq!(msghdr.msg_controllen, 0);
+        assert_eq!(msghdr.msg_flags, 0);
+    }
+
+    #[test]
     fn retained_send_to_payload_uses_final_storage_pointers() {
         let destination = SocketAddr::V6(std::net::SocketAddrV6::new(
             std::net::Ipv6Addr::LOCALHOST,
@@ -1122,8 +1269,10 @@ mod tests {
             iovec: MaybeUninit::uninit(),
             msghdr: MaybeUninit::uninit(),
         };
+        let len =
+            checked_send_len(payload.buffer.len()).expect("fixture send length should be valid");
 
-        unsafe { initialize_retained_send_to_payload(&mut payload, destination) };
+        unsafe { initialize_retained_send_to_payload(&mut payload, destination, len) };
 
         let addr = unsafe { payload.addr.assume_init_ref() };
         let iovec = unsafe { payload.iovec.assume_init_ref() };

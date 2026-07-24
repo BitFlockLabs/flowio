@@ -362,18 +362,30 @@ pub(crate) fn distinctive_closeable_test_fd() -> io::Result<RawFd> {
         return Err(io::Error::last_os_error());
     }
 
-    let min_fd = next_distinctive_test_fd_floor(fds[0]);
-    // SAFETY: `fds[0]` is an open descriptor from the successful socketpair,
-    // and `min_fd` is bounded to the process soft fd limit when available.
-    let test_fd = unsafe { libc::fcntl(fds[0], libc::F_DUPFD_CLOEXEC, min_fd) };
-    let test_fd = if test_fd >= 0 {
-        close_raw_fd(fds[0]);
-        test_fd
-    } else {
-        fds[0]
-    };
-    close_raw_fd(fds[1]);
-    Ok(test_fd)
+    // SAFETY: successful socketpair returned two distinct sole owners.
+    let endpoint = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    drop(peer);
+    Ok(into_distinctive_test_fd(endpoint).into_raw_fd())
+}
+
+/// Moves a test descriptor above the ordinary low-fd range when possible.
+///
+/// `F_DUPFD_CLOEXEC` preserves the underlying open file description. If the
+/// duplicate cannot be created, the original sole owner is returned.
+#[cfg(any(test, feature = "test-support"))]
+fn into_distinctive_test_fd(fd: OwnedFd) -> OwnedFd {
+    let min_fd = next_distinctive_test_fd_floor(fd.as_raw_fd());
+    // SAFETY: `fd` remains open for this call, and `min_fd` is bounded to the
+    // process soft fd limit when available.
+    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };
+    if duplicate < 0 {
+        return fd;
+    }
+
+    // SAFETY: successful F_DUPFD_CLOEXEC returned one new descriptor whose
+    // sole ownership transfers here. The original owner drops on return.
+    unsafe { OwnedFd::from_raw_fd(duplicate) }
 }
 
 #[doc(hidden)]
@@ -386,7 +398,7 @@ pub(crate) fn raw_fd_is_closed(fd: RawFd) -> bool {
 }
 
 #[inline(always)]
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(test, not(miri)))]
 fn close_raw_fd(fd: RawFd) {
     // SAFETY: test helpers call this only after taking sole ownership of `fd`.
     unsafe {
@@ -451,27 +463,6 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
-    }
-
-    fn get_linger(fd: RawFd) -> libc::linger {
-        let mut linger = libc::linger {
-            l_onoff: 0,
-            l_linger: 0,
-        };
-        let mut len = std::mem::size_of::<libc::linger>() as libc::socklen_t;
-        // SAFETY: linger and len provide writable storage for this option.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                std::ptr::addr_of_mut!(linger).cast(),
-                std::ptr::addr_of_mut!(len),
-            )
-        };
-        assert_eq!(rc, 0, "getsockopt(SO_LINGER) failed");
-        assert_eq!(len as usize, std::mem::size_of::<libc::linger>());
-        linger
     }
 
     #[test]
@@ -561,8 +552,8 @@ mod tests {
         let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         assert_eq!(rc, 0, "pipe2 failed");
         // SAFETY: successful pipe2 returned two distinct sole owners.
-        let endpoint = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let endpoint = into_distinctive_test_fd(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+        let peer = into_distinctive_test_fd(unsafe { OwnedFd::from_raw_fd(fds[1]) });
         let raw = endpoint.as_raw_fd();
         assert_eq!(classify_close_linger(raw), CloseRoute::Direct);
 
@@ -604,7 +595,7 @@ mod tests {
             classify_close_linger(endpoint.as_raw_fd()),
             CloseRoute::Ring
         );
-        let disabled = get_linger(endpoint.as_raw_fd());
+        let disabled = read_linger(endpoint.as_raw_fd()).expect("getsockopt(SO_LINGER) failed");
         assert_eq!(disabled.l_onoff, 0);
 
         set_linger(endpoint.as_raw_fd(), 1, 0);
@@ -612,7 +603,7 @@ mod tests {
             classify_close_linger(endpoint.as_raw_fd()),
             CloseRoute::Ring
         );
-        let abortive = get_linger(endpoint.as_raw_fd());
+        let abortive = read_linger(endpoint.as_raw_fd()).expect("getsockopt(SO_LINGER) failed");
         assert_ne!(abortive.l_onoff, 0);
         assert_eq!(abortive.l_linger, 0);
 
@@ -622,7 +613,7 @@ mod tests {
             CloseRoute::Worker
         );
         disable_linger_for_fallback(endpoint.as_raw_fd()).unwrap();
-        let waived = get_linger(endpoint.as_raw_fd());
+        let waived = read_linger(endpoint.as_raw_fd()).expect("getsockopt(SO_LINGER) failed");
         assert_eq!(waived.l_onoff, 0);
 
         drop(endpoint);
