@@ -158,6 +158,25 @@ fn raw_sctp_stream_or_skip(test_name: &str) -> Option<(SctpStream, std::os::fd::
     ))
 }
 
+fn enable_socket_timestampns(fd: std::os::fd::RawFd) {
+    let enabled: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            std::ptr::addr_of!(enabled).cast::<libc::c_void>(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "failed to enable SO_TIMESTAMPNS on SCTP receiver: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_sctp_recv_msg_alloc_failure_precedes_buffer_pointer_callback() {
@@ -1178,6 +1197,19 @@ fn test_send_info(stream_id: u16, ppid: u32) -> SctpSendInfo {
         ppid,
         context: 0,
         assoc_id: 0,
+    }
+}
+
+fn assert_data_rcvinfo(meta: SctpRecvMeta, stream_id: u16, ppid: u32) {
+    match meta {
+        SctpRecvMeta::Data(info) => {
+            assert_eq!(info.stream_id, stream_id);
+            assert_eq!(info.ppid, ppid);
+            assert!(info.end_of_record);
+        }
+        SctpRecvMeta::Notification(notification) => {
+            panic!("expected SCTP data metadata, got notification {notification:?}");
+        }
     }
 }
 
@@ -2465,6 +2497,78 @@ fn runtime_sctp_data_config_recv_msg_defaults_missing_rcvinfo() {
                     ..SctpRecvInfo::default()
                 })
             );
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_recv_msg_finds_rcvinfo_after_timestampns() {
+    const TEST_NAME: &str = "runtime_sctp_recv_msg_finds_rcvinfo_after_timestampns";
+    let mut config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    config.recv_rcvinfo = true;
+    let Some(listener) = bind_sctp_listener_or_skip(TEST_NAME, config) else {
+        return;
+    };
+
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            enable_socket_timestampns(server.as_raw_fd());
+
+            let (send_result, _payload) = client
+                .send_msg(b"scalar".to_vec(), test_send_info(3, 0x0102_0304))
+                .await;
+            assert_eq!(send_result.expect("timestamped scalar send failed"), 6);
+
+            let recv = IoBuffMut::new(0, 64, 0);
+            let (recv_result, recv) = timeout(Duration::from_secs(1), server.recv_msg(recv, 64))
+                .await
+                .expect("timestamped scalar SCTP receive timed out");
+            let (recv_len, meta) = recv_result.expect("timestamped scalar SCTP receive failed");
+            assert_eq!(recv_len, 6);
+            assert_eq!(recv.payload_bytes(), b"scalar");
+            assert_data_rcvinfo(meta, 3, 0x0102_0304);
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_recv_msg_vectored_finds_rcvinfo_after_timestampns() {
+    const TEST_NAME: &str = "runtime_sctp_recv_msg_vectored_finds_rcvinfo_after_timestampns";
+    let mut config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    config.recv_rcvinfo = true;
+    let Some(listener) = bind_sctp_listener_or_skip(TEST_NAME, config) else {
+        return;
+    };
+
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            enable_socket_timestampns(server.as_raw_fd());
+
+            let (send_result, _payload) = client
+                .send_msg(b"vector".to_vec(), test_send_info(4, 0x0506_0708))
+                .await;
+            assert_eq!(send_result.expect("timestamped vectored send failed"), 6);
+
+            let mut chain = IoBuffVecMut::<2>::new();
+            chain.push(IoBuffMut::new(0, 3, 0)).unwrap();
+            chain.push(IoBuffMut::new(0, 3, 0)).unwrap();
+            let (recv_result, chain) =
+                timeout(Duration::from_secs(1), server.recv_msg_vectored(chain))
+                    .await
+                    .expect("timestamped vectored SCTP receive timed out");
+            let (recv_len, meta) = recv_result.expect("timestamped vectored SCTP receive failed");
+            assert_eq!(recv_len, 6);
+            assert_eq!(chain.get(0).unwrap().payload_bytes(), b"vec");
+            assert_eq!(chain.get(1).unwrap().payload_bytes(), b"tor");
+            assert_data_rcvinfo(meta, 4, 0x0506_0708);
         })
         .expect("executor run failed");
 }

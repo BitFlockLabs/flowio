@@ -2590,10 +2590,17 @@ impl SctpRecvState {
 /// `Ok((0, SctpRecvMeta::Data(SctpRecvInfo::default())))`. Both methods reject
 /// zero-length caller destinations before submission, so such a request cannot
 /// masquerade as EOF. When `SCTP_RECVRCVINFO` is disabled, ordinary data with
-/// no control message succeeds with default ancillary fields and the kernel's
-/// end-of-record flag. `MSG_CTRUNC` without usable `SCTP_RCVINFO`, or
+/// no SCTP receive-info succeeds with default ancillary fields and the
+/// kernel's end-of-record flag, including when complete unrelated socket
+/// control records are present. Metadata receive uses fixed-capacity control
+/// storage sized for common Linux timestamp, timestamping packet-info,
+/// receive-queue-overflow, and RCVINFO records; it never allocates control
+/// storage per message. Additional externally enabled records such as
+/// `SCTP_NXTINFO`, socket mark/priority, or Wi-Fi status are skipped if they
+/// fit but are outside that guaranteed combination. `MSG_CTRUNC` without
+/// usable `SCTP_RCVINFO`, or
 /// present-but-malformed control, remains `InvalidData`; intact receive info
-/// remains usable when only extra control was truncated. Kernel receive errors
+/// remains usable when only later control was truncated. Kernel receive errors
 /// are returned as `io::Error` values from the completed operation.
 ///
 /// # In-flight drop ownership
@@ -3361,7 +3368,30 @@ struct RetainedDataSendPayload<B: IoBuffReadOnly> {
     buffer: B,
 }
 
+// Linux emits generic SOL_SOCKET receive metadata before SCTP_RCVINFO. Keep a
+// fixed, ABI-derived budget for the common observability combination FlowIO
+// supports without making per-message control storage dynamic:
+//
+// - one largest basic timestamp/time-NS value (two signed 64-bit fields);
+// - one largest three-value SCM_TIMESTAMPING payload;
+// - SCM_TIMESTAMPING_PKTINFO;
+// - SO_RXQ_OVFL; and
+// - SCTP_RCVINFO.
+//
+// Other well-formed records are skipped when they fit. Combinations involving
+// additional external descriptor policy such as SO_MARK, SO_PRIORITY,
+// SCM_WIFI_STATUS, or SCTP_NXTINFO can exhaust this bound and then fail closed
+// via MSG_CTRUNC.
+const SOCKET_TIMESTAMP_CONTROL_LEN: usize = cmsg_space(2 * std::mem::size_of::<i64>());
+const SOCKET_TIMESTAMPING_CONTROL_LEN: usize = cmsg_space(6 * std::mem::size_of::<i64>());
+const SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN: usize = cmsg_space(4 * std::mem::size_of::<u32>());
+const SOCKET_RXQ_OVFL_CONTROL_LEN: usize = cmsg_space(std::mem::size_of::<u32>());
 const SCTP_RCVINFO_CONTROL_LEN: usize = cmsg_space(std::mem::size_of::<libc::sctp_rcvinfo>());
+const SCTP_RECV_CONTROL_LEN: usize = SOCKET_TIMESTAMP_CONTROL_LEN
+    + SOCKET_TIMESTAMPING_CONTROL_LEN
+    + SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN
+    + SOCKET_RXQ_OVFL_CONTROL_LEN
+    + SCTP_RCVINFO_CONTROL_LEN;
 
 // These retained recvmsg/sendmsg payloads become self-referential after their
 // msghdr points at embedded iovec and control storage. Connected one-to-one
@@ -3375,7 +3405,7 @@ struct RetainedSctpRecvPayload<B: IoBuffReadWrite> {
     /// Single kernel-facing iovec pointing into `buffer`.
     iovec: MaybeUninit<libc::iovec>,
     /// Kernel-initialized control-message prefix for SCTP receive metadata.
-    control: [MaybeUninit<u8>; SCTP_RCVINFO_CONTROL_LEN],
+    control: [MaybeUninit<u8>; SCTP_RECV_CONTROL_LEN],
     /// Message header whose pointers target fields in this retained payload.
     msghdr: MaybeUninit<libc::msghdr>,
 }
@@ -3422,7 +3452,7 @@ unsafe fn emplace_retained_sctp_recv_payload<B: IoBuffReadWrite>(
                     control: std::ptr::addr_of_mut!((*dst).control)
                         .cast::<u8>()
                         .cast::<libc::c_void>(),
-                    controllen: SCTP_RCVINFO_CONTROL_LEN,
+                    controllen: SCTP_RECV_CONTROL_LEN,
                 },
             );
 
@@ -3534,7 +3564,7 @@ struct RetainedSctpRecvVectoredPayload<const N: usize> {
     /// Kernel-facing iovec array pointing into `buffer` segments.
     iovecs: [MaybeUninit<libc::iovec>; N],
     /// Kernel-initialized control-message prefix for SCTP receive metadata.
-    control: [MaybeUninit<u8>; SCTP_RCVINFO_CONTROL_LEN],
+    control: [MaybeUninit<u8>; SCTP_RECV_CONTROL_LEN],
     /// Message header whose pointers target fields in this retained payload.
     msghdr: MaybeUninit<libc::msghdr>,
 }
@@ -3585,7 +3615,7 @@ unsafe fn emplace_retained_sctp_recv_vectored_payload<const N: usize>(
                     control: std::ptr::addr_of_mut!((*dst).control)
                         .cast::<u8>()
                         .cast::<libc::c_void>(),
-                    controllen: SCTP_RCVINFO_CONTROL_LEN,
+                    controllen: SCTP_RECV_CONTROL_LEN,
                 },
             );
 
@@ -3674,18 +3704,29 @@ impl SctpRecvHeader {
 }
 
 struct SctpRecvCompletionFields {
-    /// Only the kernel-reported initialized control prefix is copied.
-    control: [MaybeUninit<u8>; SCTP_RCVINFO_CONTROL_LEN],
+    /// Only the kernel-reported control prefix is copied. CMSG alignment
+    /// padding may remain uninitialized and is skipped by the parser.
+    control: [MaybeUninit<u8>; SCTP_RECV_CONTROL_LEN],
     header: SctpRecvHeader,
 }
 
 impl SctpRecvCompletionFields {
     #[inline(always)]
-    fn control(&self) -> &[u8] {
+    fn control(&self) -> &[MaybeUninit<u8>] {
         let len = self.header.msg_controllen.min(self.control.len());
-        // SAFETY: the completion extractor copies exactly this bounded prefix
-        // from the kernel-initialized receive control storage.
-        unsafe { std::slice::from_raw_parts(self.control.as_ptr().cast::<u8>(), len) }
+        &self.control[..len]
+    }
+
+    #[cfg(test)]
+    /// Views a synthetic completion prefix as initialized test bytes.
+    ///
+    /// # Safety
+    ///
+    /// Every byte in the reported prefix must have been initialized by the
+    /// test before this method is called.
+    unsafe fn initialized_control_for_test(&self) -> &[u8] {
+        let control = self.control();
+        unsafe { std::slice::from_raw_parts(control.as_ptr().cast::<u8>(), control.len()) }
     }
 }
 
@@ -3734,18 +3775,19 @@ unsafe fn copy_sctp_recv_header(msghdr: *const MaybeUninit<libc::msghdr>) -> Sct
 ///
 /// `control` and `msghdr` must point to the initialized fields of one live,
 /// uniquely owned retained SCTP receive payload. The kernel-reported control
-/// prefix must be initialized.
+/// record headers and payload bytes within the kernel-reported prefix must be
+/// initialized. Alignment padding may remain uninitialized.
 unsafe fn copy_sctp_recv_completion_fields(
-    control: *const [MaybeUninit<u8>; SCTP_RCVINFO_CONTROL_LEN],
+    control: *const [MaybeUninit<u8>; SCTP_RECV_CONTROL_LEN],
     msghdr: *const MaybeUninit<libc::msghdr>,
 ) -> SctpRecvCompletionFields {
     let header = unsafe { copy_sctp_recv_header(msghdr) };
-    let mut copied_control = [MaybeUninit::uninit(); SCTP_RCVINFO_CONTROL_LEN];
-    let copied_len = header.msg_controllen.min(SCTP_RCVINFO_CONTROL_LEN);
+    let mut copied_control = [MaybeUninit::uninit(); SCTP_RECV_CONTROL_LEN];
+    let copied_len = header.msg_controllen.min(SCTP_RECV_CONTROL_LEN);
     unsafe {
         std::ptr::copy_nonoverlapping(
-            control.cast::<u8>(),
-            copied_control.as_mut_ptr().cast::<u8>(),
+            control.cast::<MaybeUninit<u8>>(),
+            copied_control.as_mut_ptr(),
             copied_len,
         );
     }
@@ -4495,13 +4537,18 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             }
 
             let partial_nonempty = sctp_msg_partial_nonempty(actual, header.msg_flags);
-            let meta = parse_recv_meta_with_notification(
-                completion.fields.control(),
-                header.msg_controllen,
-                header.msg_flags,
-                data_slice,
-                parsed_notification,
-            );
+            // SAFETY: completion extraction preserves the kernel-written CMSG
+            // headers/payloads while leaving only alignment padding
+            // potentially uninitialized.
+            let meta = unsafe {
+                parse_recv_meta_with_notification(
+                    completion.fields.control(),
+                    header.msg_controllen,
+                    header.msg_flags,
+                    data_slice,
+                    parsed_notification,
+                )
+            };
 
             if meta.is_err() && partial_nonempty {
                 this.recv_state.discarding_tail = true;
@@ -4762,13 +4809,18 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
             }
 
             let partial_nonempty = sctp_msg_partial_nonempty(actual, header.msg_flags);
-            let meta = parse_recv_meta_with_notification(
-                completion.fields.control(),
-                header.msg_controllen,
-                header.msg_flags,
-                data_slice,
-                parsed_notification,
-            );
+            // SAFETY: completion extraction preserves the kernel-written CMSG
+            // headers/payloads while leaving only alignment padding
+            // potentially uninitialized.
+            let meta = unsafe {
+                parse_recv_meta_with_notification(
+                    completion.fields.control(),
+                    header.msg_controllen,
+                    header.msg_flags,
+                    data_slice,
+                    parsed_notification,
+                )
+            };
 
             let mut buffer = completion.buffer;
             unsafe {
@@ -5612,6 +5664,11 @@ const fn cmsg_align(len: usize) -> usize {
     (len + align - 1) & !(align - 1)
 }
 
+fn checked_cmsg_align(len: usize) -> Option<usize> {
+    let align = std::mem::size_of::<usize>();
+    len.checked_add(align - 1).map(|len| len & !(align - 1))
+}
+
 const fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
@@ -5641,46 +5698,112 @@ fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
     }
 }
 
-fn parse_rcvinfo(
-    control: &[u8],
+/// Finds the first complete SCTP_RCVINFO in a bounded control-message chain.
+///
+/// # Safety
+///
+/// Within `min(controllen, control.len())`, every CMSG header and declared
+/// payload byte reached by the walk must be initialized. Alignment padding may
+/// remain uninitialized.
+unsafe fn parse_rcvinfo(
+    control: &[MaybeUninit<u8>],
     controllen: usize,
     end_of_record: bool,
-) -> io::Result<SctpRecvInfo> {
+) -> io::Result<Option<SctpRecvInfo>> {
     let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+    let min_cmsg_len = cmsg_align(hdr_len);
+    let rcvinfo_len = std::mem::size_of::<libc::sctp_rcvinfo>();
+    let rcvinfo_cmsg_len = min_cmsg_len + rcvinfo_len;
     let available = controllen.min(control.len());
-    if available < hdr_len {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    let mut offset = 0usize;
+
+    while offset < available {
+        let remaining = available - offset;
+        if remaining < hdr_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SCTP recvmsg control message header was malformed",
+            ));
+        }
+
+        // SAFETY: the caller supplies the kernel-reported prefix. A complete
+        // cmsghdr fits in `remaining`; CMSG alignment padding is never read.
+        let hdr = unsafe {
+            std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
+        };
+        let cmsg_len = hdr.cmsg_len as usize;
+        if cmsg_len < min_cmsg_len || cmsg_len > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SCTP recvmsg control message length was malformed",
+            ));
+        }
+
+        if hdr.cmsg_level == libc::IPPROTO_SCTP && hdr.cmsg_type == libc::SCTP_RCVINFO {
+            if cmsg_len < rcvinfo_cmsg_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SCTP_RCVINFO control message was truncated",
+                ));
+            }
+            let data_offset = offset.checked_add(min_cmsg_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SCTP_RCVINFO control offset overflowed",
+                )
+            })?;
+            let data_end = data_offset.checked_add(rcvinfo_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SCTP_RCVINFO control length overflowed",
+                )
+            })?;
+            if data_end > available || data_end > offset + cmsg_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SCTP_RCVINFO control message was truncated",
+                ));
+            }
+
+            // SAFETY: the complete RCVINFO payload is bounded by both this
+            // record and the kernel-reported backing prefix. The ABI permits
+            // an unaligned control buffer, so use an unaligned read.
+            let info = unsafe {
+                std::ptr::read_unaligned(
+                    control
+                        .as_ptr()
+                        .add(data_offset)
+                        .cast::<libc::sctp_rcvinfo>(),
+                )
+            };
+            return Ok(Some(SctpRecvInfo {
+                stream_id: info.rcv_sid,
+                ssn: info.rcv_ssn,
+                flags: info.rcv_flags,
+                ppid: u32::from_be(info.rcv_ppid),
+                tsn: info.rcv_tsn,
+                cumtsn: info.rcv_cumtsn,
+                context: info.rcv_context,
+                assoc_id: info.rcv_assoc_id,
+                end_of_record,
+            }));
+        }
+
+        let aligned_len = checked_cmsg_align(cmsg_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SCTP recvmsg control message alignment overflowed",
+            )
+        })?;
+        if aligned_len > remaining {
+            // A final complete cmsg need not include all trailing CMSG_SPACE
+            // padding. No next header can begin in this suffix.
+            break;
+        }
+        offset += aligned_len;
     }
 
-    let hdr = unsafe { std::ptr::read_unaligned(control.as_ptr() as *const libc::cmsghdr) };
-    if hdr.cmsg_level != libc::IPPROTO_SCTP || hdr.cmsg_type != libc::SCTP_RCVINFO {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
-
-    let data_len = std::mem::size_of::<libc::sctp_rcvinfo>();
-    let cmsg_len = hdr.cmsg_len;
-    if cmsg_len < hdr_len + data_len || cmsg_len > available {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
-
-    let needed = cmsg_align(hdr_len) + data_len;
-    if available < needed {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
-
-    let data_ptr = unsafe { control.as_ptr().add(cmsg_align(hdr_len)) };
-    let info = unsafe { std::ptr::read_unaligned(data_ptr as *const libc::sctp_rcvinfo) };
-    Ok(SctpRecvInfo {
-        stream_id: info.rcv_sid,
-        ssn: info.rcv_ssn,
-        flags: info.rcv_flags,
-        ppid: u32::from_be(info.rcv_ppid),
-        tsn: info.rcv_tsn,
-        cumtsn: info.rcv_cumtsn,
-        context: info.rcv_context,
-        assoc_id: info.rcv_assoc_id,
-        end_of_record,
-    })
+    Ok(None)
 }
 
 #[cfg(any(feature = "fuzzing", feature = "test-support"))]
@@ -5690,11 +5813,23 @@ pub(crate) fn parse_recv_meta(
     msg_flags: libc::c_int,
     data_slice: &[u8],
 ) -> io::Result<SctpRecvMeta> {
-    parse_recv_meta_with_notification(control, controllen, msg_flags, data_slice, None)
+    // SAFETY: initialized bytes may always be viewed as MaybeUninit bytes.
+    let control = unsafe {
+        std::slice::from_raw_parts(control.as_ptr().cast::<MaybeUninit<u8>>(), control.len())
+    };
+    // SAFETY: the public test/fuzz facade accepted an initialized byte slice.
+    unsafe { parse_recv_meta_with_notification(control, controllen, msg_flags, data_slice, None) }
 }
 
-fn parse_recv_meta_with_notification(
-    control: &[u8],
+/// Interprets one completed SCTP metadata receive.
+///
+/// # Safety
+///
+/// Within `min(controllen, control.len())`, every CMSG header and declared
+/// payload byte reached by ancillary parsing must be initialized. Alignment
+/// padding may remain uninitialized.
+unsafe fn parse_recv_meta_with_notification(
+    control: &[MaybeUninit<u8>],
     controllen: usize,
     msg_flags: libc::c_int,
     data_slice: &[u8],
@@ -5729,18 +5864,37 @@ fn parse_recv_meta_with_notification(
         }));
     }
 
-    match parse_rcvinfo(control, controllen, end_of_record) {
-        Ok(info) => {
+    let rcvinfo = unsafe { parse_rcvinfo(control, controllen, end_of_record) };
+    match rcvinfo {
+        Ok(Some(info)) => {
             // The subscribed SCTP_RCVINFO cmsg was intact. Linux may still set
-            // MSG_CTRUNC for extra control records beyond the single metadata
-            // record this API consumes, so keep the data path successful.
+            // MSG_CTRUNC for later control records this API does not consume,
+            // so keep the data path successful.
             Ok(SctpRecvMeta::Data(info))
         }
-        Err(_err) if (msg_flags & libc::MSG_CTRUNC) != 0 => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SCTP recvmsg control data was truncated",
-        )),
-        Err(err) => Err(err),
+        Ok(None) => {
+            if (msg_flags & libc::MSG_CTRUNC) != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SCTP recvmsg control data was truncated",
+                ))
+            } else {
+                Ok(SctpRecvMeta::Data(SctpRecvInfo {
+                    end_of_record,
+                    ..SctpRecvInfo::default()
+                }))
+            }
+        }
+        Err(err) => {
+            if (msg_flags & libc::MSG_CTRUNC) != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SCTP recvmsg control data was truncated",
+                ))
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -6577,16 +6731,323 @@ mod tests {
         assert_eq!(sctp_cqe_result(9).expect("positive CQE should succeed"), 9);
     }
 
+    fn initialized_control(bytes: &[u8]) -> &[MaybeUninit<u8>] {
+        // SAFETY: initialized bytes may always be viewed as MaybeUninit bytes.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<MaybeUninit<u8>>(), bytes.len()) }
+    }
+
+    fn parse_recv_meta_with_notification_for_test(
+        control: &[u8],
+        controllen: usize,
+        msg_flags: libc::c_int,
+        data_slice: &[u8],
+        parsed_notification: Option<io::Result<SctpRecvMeta>>,
+    ) -> io::Result<SctpRecvMeta> {
+        // SAFETY: this test facade accepts fully initialized control bytes.
+        unsafe {
+            parse_recv_meta_with_notification(
+                initialized_control(control),
+                controllen,
+                msg_flags,
+                data_slice,
+                parsed_notification,
+            )
+        }
+    }
+
+    fn append_test_cmsg(
+        control: &mut Vec<u8>,
+        level: libc::c_int,
+        cmsg_type: libc::c_int,
+        payload_len: usize,
+    ) -> usize {
+        let offset = control.len();
+        let data_offset = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let cmsg_len = data_offset + payload_len;
+        control.resize(offset + cmsg_space(payload_len), 0);
+
+        let len_offset = offset + std::mem::offset_of!(libc::cmsghdr, cmsg_len);
+        control[len_offset..len_offset + std::mem::size_of::<usize>()]
+            .copy_from_slice(&cmsg_len.to_ne_bytes());
+        let level_offset = offset + std::mem::offset_of!(libc::cmsghdr, cmsg_level);
+        control[level_offset..level_offset + std::mem::size_of::<libc::c_int>()]
+            .copy_from_slice(&level.to_ne_bytes());
+        let type_offset = offset + std::mem::offset_of!(libc::cmsghdr, cmsg_type);
+        control[type_offset..type_offset + std::mem::size_of::<libc::c_int>()]
+            .copy_from_slice(&cmsg_type.to_ne_bytes());
+
+        offset + data_offset
+    }
+
+    fn append_test_rcvinfo(control: &mut Vec<u8>) {
+        let data_offset = append_test_cmsg(
+            control,
+            libc::IPPROTO_SCTP,
+            libc::SCTP_RCVINFO,
+            std::mem::size_of::<libc::sctp_rcvinfo>(),
+        );
+
+        let info = libc::sctp_rcvinfo {
+            rcv_sid: 3,
+            rcv_ssn: 4,
+            rcv_flags: 5,
+            rcv_ppid: 0x0607_0809_u32.to_be(),
+            rcv_tsn: 10,
+            rcv_cumtsn: 11,
+            rcv_context: 12,
+            rcv_assoc_id: 13,
+        };
+        macro_rules! write_info_field {
+            ($field:ident) => {{
+                let value = info.$field;
+                let offset = data_offset + std::mem::offset_of!(libc::sctp_rcvinfo, $field);
+                let bytes = value.to_ne_bytes();
+                control[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            }};
+        }
+        write_info_field!(rcv_sid);
+        write_info_field!(rcv_ssn);
+        write_info_field!(rcv_flags);
+        write_info_field!(rcv_ppid);
+        write_info_field!(rcv_tsn);
+        write_info_field!(rcv_cumtsn);
+        write_info_field!(rcv_context);
+        write_info_field!(rcv_assoc_id);
+    }
+
+    fn write_uninit_test_cmsg(
+        control: &mut [MaybeUninit<u8>],
+        offset: usize,
+        level: libc::c_int,
+        cmsg_type: libc::c_int,
+        payload_len: usize,
+    ) -> usize {
+        let data_offset = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let cmsg_len = data_offset + payload_len;
+        let mut write_bytes = |field_offset: usize, bytes: &[u8]| {
+            for (slot, byte) in control[field_offset..field_offset + bytes.len()]
+                .iter_mut()
+                .zip(bytes)
+            {
+                slot.write(*byte);
+            }
+        };
+        write_bytes(
+            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+            &cmsg_len.to_ne_bytes(),
+        );
+        write_bytes(
+            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_level),
+            &level.to_ne_bytes(),
+        );
+        write_bytes(
+            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+            &cmsg_type.to_ne_bytes(),
+        );
+        offset + data_offset
+    }
+
     #[test]
-    fn connected_sctp_recv_payloads_fit_without_peer_address_storage() {
-        assert!(
-            std::mem::size_of::<RetainedSctpRecvPayload<IoBuffMut>>() <= 256,
-            "scalar rich receive no longer fits its reduced retained size class"
+    fn parse_rcvinfo_scans_bounded_observability_prelude() {
+        let mut control = Vec::new();
+        append_test_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            2 * std::mem::size_of::<i64>(),
         );
-        assert!(
-            std::mem::size_of::<RetainedSctpRecvVectoredPayload<16>>() <= 1024,
-            "N=16 rich receive no longer fits its reduced retained size class"
+        append_test_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SCM_TIMESTAMPING_PKTINFO,
+            4 * std::mem::size_of::<u32>(),
         );
+        append_test_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPING,
+            6 * std::mem::size_of::<i64>(),
+        );
+        append_test_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            std::mem::size_of::<u32>(),
+        );
+        append_test_rcvinfo(&mut control);
+
+        assert_eq!(control.len(), SCTP_RECV_CONTROL_LEN);
+        let info = unsafe { parse_rcvinfo(initialized_control(&control), control.len(), true) }
+            .expect("bounded control chain should be well formed")
+            .expect("RCVINFO after generic control should be found");
+        assert_eq!(
+            info,
+            SctpRecvInfo {
+                stream_id: 3,
+                ssn: 4,
+                flags: 5,
+                ppid: 0x0607_0809,
+                tsn: 10,
+                cumtsn: 11,
+                context: 12,
+                assoc_id: 13,
+                end_of_record: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rcvinfo_defaults_complete_unrelated_control() {
+        let mut control = Vec::new();
+        append_test_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            2 * std::mem::size_of::<i64>(),
+        );
+
+        let parsed = parse_recv_meta_with_notification_for_test(
+            &control,
+            control.len(),
+            libc::MSG_EOR,
+            b"payload",
+            None,
+        )
+        .expect("complete unrelated control should default SCTP metadata");
+        assert_eq!(
+            parsed,
+            SctpRecvMeta::Data(SctpRecvInfo {
+                end_of_record: true,
+                ..SctpRecvInfo::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rcvinfo_rejects_malformed_preceding_records_without_overrun() {
+        let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+        let len_offset = std::mem::offset_of!(libc::cmsghdr, cmsg_len);
+
+        let short_header = vec![0u8; hdr_len - 1];
+        assert!(
+            unsafe { parse_rcvinfo(initialized_control(&short_header), short_header.len(), true) }
+                .is_err()
+        );
+
+        for malformed_len in [0, cmsg_align(hdr_len) - 1, hdr_len + 1] {
+            let mut control = vec![0u8; hdr_len];
+            control[len_offset..len_offset + std::mem::size_of::<usize>()]
+                .copy_from_slice(&malformed_len.to_ne_bytes());
+            assert!(
+                unsafe { parse_rcvinfo(initialized_control(&control), control.len(), true) }
+                    .is_err(),
+                "malformed cmsg_len {malformed_len} was accepted"
+            );
+        }
+
+        let mut overlong = vec![0u8; hdr_len];
+        overlong[len_offset..len_offset + std::mem::size_of::<usize>()]
+            .copy_from_slice(&usize::MAX.to_ne_bytes());
+        assert!(
+            unsafe { parse_rcvinfo(initialized_control(&overlong), usize::MAX, true) }.is_err(),
+            "an overlong reported record must not read beyond backing storage"
+        );
+        assert!(checked_cmsg_align(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn parse_rcvinfo_keeps_intact_target_when_later_control_is_truncated() {
+        let mut control = Vec::new();
+        append_test_rcvinfo(&mut control);
+        control.push(0xA5);
+
+        let parsed = parse_recv_meta_with_notification_for_test(
+            &control,
+            control.len(),
+            libc::MSG_EOR | libc::MSG_CTRUNC,
+            b"x",
+            None,
+        )
+        .expect("intact RCVINFO should precede irrelevant truncated control");
+        assert!(matches!(
+            parsed,
+            SctpRecvMeta::Data(SctpRecvInfo {
+                stream_id: 3,
+                ppid: 0x0607_0809,
+                end_of_record: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_rcvinfo_skips_uninitialized_alignment_padding() {
+        const CONTROL_LEN: usize = SOCKET_RXQ_OVFL_CONTROL_LEN + SCTP_RCVINFO_CONTROL_LEN;
+        let mut control = [MaybeUninit::uninit(); CONTROL_LEN];
+
+        let overflow_data = write_uninit_test_cmsg(
+            &mut control,
+            0,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            std::mem::size_of::<u32>(),
+        );
+        for (slot, byte) in control[overflow_data..overflow_data + 4]
+            .iter_mut()
+            .zip(7_u32.to_ne_bytes())
+        {
+            slot.write(byte);
+        }
+
+        let rcvinfo_offset = SOCKET_RXQ_OVFL_CONTROL_LEN;
+        let rcvinfo_data = write_uninit_test_cmsg(
+            &mut control,
+            rcvinfo_offset,
+            libc::IPPROTO_SCTP,
+            libc::SCTP_RCVINFO,
+            std::mem::size_of::<libc::sctp_rcvinfo>(),
+        );
+        for slot in
+            &mut control[rcvinfo_data..rcvinfo_data + std::mem::size_of::<libc::sctp_rcvinfo>()]
+        {
+            slot.write(0);
+        }
+
+        let info = unsafe { parse_rcvinfo(&control, control.len(), true) }
+            .expect("uninitialized CMSG alignment padding must not be inspected")
+            .expect("RCVINFO after the uninitialized padding should be found");
+        assert!(info.end_of_record);
+    }
+
+    #[test]
+    fn connected_sctp_recv_payload_footprints_pin_bounded_ancillary_cost() {
+        assert_eq!(
+            SCTP_RECV_CONTROL_LEN,
+            SOCKET_TIMESTAMP_CONTROL_LEN
+                + SOCKET_TIMESTAMPING_CONTROL_LEN
+                + SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN
+                + SOCKET_RXQ_OVFL_CONTROL_LEN
+                + SCTP_RCVINFO_CONTROL_LEN
+        );
+
+        #[cfg(all(target_pointer_width = "64", target_arch = "x86_64"))]
+        {
+            assert_eq!(SCTP_RCVINFO_CONTROL_LEN, 48);
+            assert_eq!(SCTP_RECV_CONTROL_LEN, 200);
+            assert_eq!(
+                std::mem::size_of::<RetainedSctpRecvPayload<IoBuffMut>>(),
+                312
+            );
+            assert_eq!(
+                std::mem::size_of::<RetainedSctpRecvVectoredPayload<2>>(),
+                376
+            );
+            assert_eq!(
+                std::mem::size_of::<RetainedSctpRecvVectoredPayload<16>>(),
+                1160
+            );
+            assert_eq!(std::mem::size_of::<SctpRecvCompletionFields>(), 216);
+        }
     }
 
     #[test]
@@ -6723,7 +7184,10 @@ mod tests {
             completion.fields.header.msg_flags,
             libc::MSG_EOR | libc::MSG_CTRUNC
         );
-        assert_eq!(completion.fields.control(), expected_control);
+        assert_eq!(
+            unsafe { completion.fields.initialized_control_for_test() },
+            expected_control
+        );
         assert_eq!(pool.stats().pooled_frees, 1);
 
         let retry_pointer_calls = Rc::new(Cell::new(0));
@@ -6745,7 +7209,7 @@ mod tests {
         let reused_control = unsafe {
             std::slice::from_raw_parts(
                 retry.as_ref().control.as_ptr().cast::<u8>(),
-                SCTP_RCVINFO_CONTROL_LEN,
+                SCTP_RECV_CONTROL_LEN,
             )
         };
         assert_eq!(
@@ -6997,7 +7461,10 @@ mod tests {
             unsafe { sctp_first_iov_slice(Some(first_iovec), 4) },
             b"note"
         );
-        assert_eq!(completion.fields.control(), expected_control);
+        assert_eq!(
+            unsafe { completion.fields.initialized_control_for_test() },
+            expected_control
+        );
         assert_eq!(
             completion.fields.header.msg_flags,
             libc::MSG_NOTIFICATION | libc::MSG_EOR
@@ -7037,7 +7504,7 @@ mod tests {
         let reused_control = unsafe {
             std::slice::from_raw_parts(
                 retry.as_ref().control.as_ptr().cast::<u8>(),
-                SCTP_RCVINFO_CONTROL_LEN,
+                SCTP_RECV_CONTROL_LEN,
             )
         };
         assert_eq!(
@@ -7471,7 +7938,7 @@ mod tests {
         // consumes the already-parsed value instead of decoding the bytes a
         // second time.
         assert!(matches!(
-            parse_recv_meta_with_notification(
+            parse_recv_meta_with_notification_for_test(
                 &[],
                 0,
                 msg.msg_flags,
@@ -7492,7 +7959,7 @@ mod tests {
             Some(&parsed_notification)
         ));
         assert_eq!(
-            parse_recv_meta_with_notification(
+            parse_recv_meta_with_notification_for_test(
                 &[],
                 0,
                 msg.msg_flags,
@@ -7520,7 +7987,7 @@ mod tests {
             Some(&parsed_notification),
         ));
         assert_eq!(
-            parse_recv_meta_with_notification(
+            parse_recv_meta_with_notification_for_test(
                 &[],
                 0,
                 truncated.msg_flags,
@@ -7542,7 +8009,7 @@ mod tests {
             Some(&parsed_notification)
         ));
         assert_eq!(
-            parse_recv_meta_with_notification(
+            parse_recv_meta_with_notification_for_test(
                 &[],
                 0,
                 partial.msg_flags,
@@ -7604,7 +8071,7 @@ mod tests {
         ));
         assert!(!explicit.discarding_tail);
         assert_eq!(
-            parse_recv_meta_with_notification(
+            parse_recv_meta_with_notification_for_test(
                 &[],
                 0,
                 abort_truncated.msg_flags,
@@ -7658,7 +8125,7 @@ mod tests {
             Some(&parsed_notification)
         ));
         assert!(matches!(
-            parse_recv_meta_with_notification(
+            parse_recv_meta_with_notification_for_test(
                 &[],
                 0,
                 msg.msg_flags,

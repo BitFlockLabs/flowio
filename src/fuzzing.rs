@@ -199,24 +199,45 @@ mod tests {
         (len + align - 1) & !(align - 1)
     }
 
+    fn cmsg_space(data_len: usize) -> usize {
+        cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
+    }
+
     fn write_ne<const N: usize>(buffer: &mut [u8], offset: usize, bytes: [u8; N]) {
         buffer[offset..offset + N].copy_from_slice(&bytes);
     }
 
-    fn rcvinfo_input(info: libc::sctp_rcvinfo, payload: &[u8]) -> Vec<u8> {
+    fn append_cmsg(
+        control: &mut Vec<u8>,
+        level: libc::c_int,
+        cmsg_type: libc::c_int,
+        payload_len: usize,
+    ) -> usize {
         let hdr_len = std::mem::size_of::<libc::cmsghdr>();
         let data_offset = cmsg_align(hdr_len);
-        let data_len = std::mem::size_of::<libc::sctp_rcvinfo>();
-        let control_len = data_offset + data_len;
-        let control_len_u8 =
-            u8::try_from(control_len).expect("RCVINFO cmsg should fit in one byte");
+        let cmsg_len = data_offset + payload_len;
+        let offset = control.len();
+        control.resize(offset + cmsg_space(payload_len), 0);
+        write_ne(
+            control,
+            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+            cmsg_len.to_ne_bytes(),
+        );
+        write_ne(
+            control,
+            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_level),
+            level.to_ne_bytes(),
+        );
+        write_ne(
+            control,
+            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_type),
+            cmsg_type.to_ne_bytes(),
+        );
+        offset + data_offset
+    }
 
-        let mut input = Vec::with_capacity(3 + control_len + payload.len());
-        input.extend_from_slice(&[0x08, control_len_u8, control_len_u8]);
-        input.resize(3 + control_len, 0);
-
-        let control = &mut input[3..3 + control_len];
-        // Write fields rather than whole C structs so their zeroed padding is
+    fn write_rcvinfo_fields(control: &mut [u8], data_offset: usize, info: libc::sctp_rcvinfo) {
+        // Write fields rather than whole C structs so zeroed padding stays
         // deterministic in optimized tests and checked corpus comparisons.
         macro_rules! write_field {
             ($base:expr, $ty:ty, $field:ident, $value:expr) => {
@@ -227,9 +248,6 @@ mod tests {
                 );
             };
         }
-        write_field!(0, libc::cmsghdr, cmsg_len, hdr_len + data_len);
-        write_field!(0, libc::cmsghdr, cmsg_level, libc::IPPROTO_SCTP);
-        write_field!(0, libc::cmsghdr, cmsg_type, libc::SCTP_RCVINFO);
         write_field!(data_offset, libc::sctp_rcvinfo, rcv_sid, info.rcv_sid);
         write_field!(data_offset, libc::sctp_rcvinfo, rcv_ssn, info.rcv_ssn);
         write_field!(data_offset, libc::sctp_rcvinfo, rcv_flags, info.rcv_flags);
@@ -248,7 +266,70 @@ mod tests {
             rcv_assoc_id,
             info.rcv_assoc_id
         );
+    }
+
+    fn recv_meta_input(flag_byte: u8, control: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+        let control_len =
+            u8::try_from(control.len()).expect("test control chain should fit in one byte");
+        let mut input = Vec::with_capacity(3 + control.len() + payload.len());
+        input.extend_from_slice(&[flag_byte, control_len, control_len]);
+        input.extend_from_slice(&control);
         input.extend_from_slice(payload);
+        input
+    }
+
+    fn rcvinfo_input(info: libc::sctp_rcvinfo, payload: &[u8]) -> Vec<u8> {
+        let mut control = Vec::new();
+        let data_offset = append_cmsg(
+            &mut control,
+            libc::IPPROTO_SCTP,
+            libc::SCTP_RCVINFO,
+            std::mem::size_of::<libc::sctp_rcvinfo>(),
+        );
+        // Preserve the historical exact CMSG_LEN-sized fixture rather than
+        // adding optional final alignment padding.
+        control.truncate(data_offset + std::mem::size_of::<libc::sctp_rcvinfo>());
+        write_rcvinfo_fields(&mut control, data_offset, info);
+        recv_meta_input(0x08, control, payload)
+    }
+
+    fn timestampns_before_rcvinfo_input(payload: &[u8]) -> Vec<u8> {
+        let mut control = Vec::new();
+        append_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            2 * std::mem::size_of::<i64>(),
+        );
+        let data_offset = append_cmsg(
+            &mut control,
+            libc::IPPROTO_SCTP,
+            libc::SCTP_RCVINFO,
+            std::mem::size_of::<libc::sctp_rcvinfo>(),
+        );
+        write_rcvinfo_fields(&mut control, data_offset, sample_rcvinfo());
+        recv_meta_input(0x08, control, payload)
+    }
+
+    fn timestampns_before_truncated_rcvinfo_input(payload: &[u8]) -> Vec<u8> {
+        let mut control = Vec::new();
+        append_cmsg(
+            &mut control,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            2 * std::mem::size_of::<i64>(),
+        );
+        append_cmsg(&mut control, libc::IPPROTO_SCTP, libc::SCTP_RCVINFO, 0);
+        recv_meta_input(0x0C, control, payload)
+    }
+
+    fn malformed_preceding_cmsg_len_input(payload: &[u8]) -> Vec<u8> {
+        let mut input = timestampns_before_rcvinfo_input(payload);
+        write_ne(
+            &mut input[3..],
+            std::mem::offset_of!(libc::cmsghdr, cmsg_len),
+            (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) - 1).to_ne_bytes(),
+        );
         input
     }
 
@@ -377,6 +458,42 @@ mod tests {
     }
 
     #[test]
+    fn sctp_recv_meta_wrapper_reaches_ancillary_chain_results() {
+        let valid = checked_native_seed(
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/timestampns_before_rcvinfo"),
+            timestampns_before_rcvinfo_input(b"ping"),
+        );
+        assert_eq!(
+            observe_sctp_parse_recv_meta(&valid)
+                .expect("RCVINFO after timestamp control should parse"),
+            sample_recv_meta()
+        );
+
+        let truncated = checked_native_seed(
+            include_bytes!(
+                "../fixtures/fuzzing/sctp_parse_recv_meta/timestampns_before_truncated_rcvinfo"
+            ),
+            timestampns_before_truncated_rcvinfo_input(b"ping"),
+        );
+        let truncated_error = observe_sctp_parse_recv_meta(&truncated)
+            .expect_err("a timestamp followed by truncated RCVINFO must fail");
+        assert_eq!(truncated_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(truncated_error.to_string().contains("control"));
+
+        let malformed = checked_native_seed(
+            include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/malformed_preceding_cmsg_len"),
+            malformed_preceding_cmsg_len_input(b"ping"),
+        );
+        let malformed_error = observe_sctp_parse_recv_meta(&malformed)
+            .expect_err("a malformed cmsg before RCVINFO must fail");
+        assert_eq!(malformed_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            malformed_error.to_string().contains("length")
+                || malformed_error.to_string().contains("malformed")
+        );
+    }
+
+    #[test]
     fn sctp_recv_meta_wrapper_pins_zero_controllen_decision_seam() {
         let no_rcvinfo = checked_native_seed(
             include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/data_without_rcvinfo"),
@@ -474,9 +591,11 @@ mod tests {
         );
         assert_eq!(
             observe_sctp_parse_recv_meta(&wrong_type)
-                .expect_err("wrong cmsg type must reject")
-                .kind(),
-            std::io::ErrorKind::InvalidData
+                .expect("complete unrelated control should default SCTP metadata"),
+            SctpRecvMeta::Data(SctpRecvInfo {
+                end_of_record: true,
+                ..SctpRecvInfo::default()
+            })
         );
 
         let mut short_cmsg = valid;
