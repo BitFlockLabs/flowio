@@ -668,7 +668,7 @@ impl AcceptReadinessSlot {
 /// This deterministic test seam lets each transport exercise its real
 /// completion branch against an empty nonblocking listener. Because no SQE is
 /// submitted, retiring the synthetic state cannot race a later kernel CQE.
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 fn completed_accept_readiness_for_test(
     cx: &std::task::Context<'_>,
     listener_fd: &std::rc::Rc<crate::runtime::fd::RuntimeFd>,
