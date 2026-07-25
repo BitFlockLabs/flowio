@@ -10,6 +10,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** `UdpSocket::local_addr` now returns
+  `io::Result<SocketAddr>` and queries the live descriptor on each call. It
+  reports kernel-assigned wildcard ports and address selection after connect or
+  reconnect instead of returning stale bind-time state.
 - **Breaking:** `JoinHandle<T>` now resolves to `Result<T, JoinError>`.
   Executor shutdown reports unfinished work as `JoinError::Cancelled` instead
   of returning an uninitialized task result.

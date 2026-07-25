@@ -36,7 +36,7 @@
 //! let mut executor = Executor::new()?;
 //! executor.run(async {
 //!     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-//!     let peer = socket.local_addr();
+//!     let peer = socket.local_addr().unwrap();
 //!     socket.connect(peer).unwrap();
 //!
 //!     let (res, _buf) = socket.send(b"ping".to_vec()).await;
@@ -67,7 +67,7 @@
 //! let mut executor = Executor::new()?;
 //! executor.run(async move {
 //!     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-//!     let peer = socket.local_addr();
+//!     let peer = socket.local_addr().unwrap();
 //!     socket.connect(peer).unwrap();
 //!
 //!     let mut send = pool.alloc().unwrap();
@@ -133,8 +133,6 @@ use std::task::{Context, Poll};
 pub struct UdpSocket {
     /// Owned datagram socket descriptor.
     fd: RuntimeFd,
-    /// Cached local address assigned after bind.
-    local_addr: SocketAddr,
     /// Connected default peer used by `send`/`recv`, if any.
     peer_addr: Option<SocketAddr>,
 }
@@ -166,27 +164,27 @@ impl UdpSocket {
             return Err(err);
         }
 
-        let local_addr = match current_local_addr(fd) {
-            Ok(addr) => addr,
-            Err(err) => {
-                close_fd(fd);
-                return Err(err);
-            }
-        };
-
         Ok(Self {
             fd: RuntimeFd::from_fresh_raw_fd(fd),
-            local_addr,
             peer_addr: None,
         })
     }
 
     /// Returns the local address currently assigned to the socket.
     ///
+    /// Each call queries the live descriptor with `getsockname(2)`; no local
+    /// address is cached.
+    ///
     /// This is socket status/control-plane lookup, not the per-datagram data
     /// fast path.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error from `getsockname(2)`, or
+    /// [`io::ErrorKind::InvalidData`] if the kernel returns an unsupported or
+    /// malformed socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        current_local_addr(self.fd.raw_fd())
     }
 
     /// Returns the connected peer address, or `None` if not connected.

@@ -49,10 +49,14 @@ async fn serve_error_responses(mut server: UdpSocket, rcodes: &'static [u16]) ->
 fn completed_nameserver_failover_reuses_one_response_buffer() {
     let first_server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind first FlowIO DNS server");
-    let first_nameserver = first_server.local_addr();
+    let first_nameserver = first_server
+        .local_addr()
+        .expect("failed to read first FlowIO DNS server address");
     let second_server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind second FlowIO DNS server");
-    let second_nameserver = second_server.local_addr();
+    let second_nameserver = second_server
+        .local_addr()
+        .expect("failed to read second FlowIO DNS server address");
     let resolver =
         DnsResolver::new(vec![first_nameserver, second_nameserver]).expect("resolver init failed");
     let mut executor = Executor::new().expect("failed to construct runtime executor");
@@ -96,7 +100,9 @@ fn timed_out_receive_uses_a_distinct_response_buffer_for_failover() {
         .expect("failed to read silent DNS server address");
     let responding_server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind responding FlowIO DNS server");
-    let responding_nameserver = responding_server.local_addr();
+    let responding_nameserver = responding_server
+        .local_addr()
+        .expect("failed to read responding FlowIO DNS server address");
     let mut resolver = DnsResolver::new(vec![silent_nameserver, responding_nameserver])
         .expect("resolver init failed");
     resolver.set_query_timeout(Duration::from_millis(20));
@@ -138,7 +144,9 @@ fn timed_out_receive_uses_a_distinct_response_buffer_for_failover() {
 fn one_completed_response_allocation_serves_families_and_cname_followup() {
     let server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind FlowIO DNS server");
-    let nameserver = server.local_addr();
+    let nameserver = server
+        .local_addr()
+        .expect("failed to read FlowIO DNS server address");
     let resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
     let host = maximum_query_name();
     let script = completed_cname_followup_script(&host);

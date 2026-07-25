@@ -78,7 +78,9 @@ fn dns_query_buffer_moves_across_nameserver_retries_without_cloning() {
 fn one_query_allocation_serves_both_families_and_cname_followup() {
     let server = FlowIoUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind FlowIO DNS server");
-    let nameserver = server.local_addr();
+    let nameserver = server
+        .local_addr()
+        .expect("failed to read FlowIO DNS server address");
     let resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
     let host = maximum_query_name();
     let script = completed_cname_followup_script(&host);

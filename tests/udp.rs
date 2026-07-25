@@ -13,10 +13,11 @@ use flowio::runtime::timer::{TimeoutError, timeout};
 #[cfg(any(debug_assertions, feature = "test-support"))]
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
+use std::fs::File;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
@@ -34,7 +35,7 @@ fn prefilled_udp_buffer(writable: usize) -> flowio::runtime::buffer::IoBuffMut {
 fn connected_udp_pair() -> (UdpSocket, StdUdpSocket, SocketAddr) {
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
@@ -80,6 +81,134 @@ fn raw_fd_is_closed(fd: RawFd) -> bool {
     // memory; EBADF is the expected closed-descriptor result.
     let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+}
+
+fn raw_udp_local_addr(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: `fd` is a live socket descriptor for the duration of this
+    // helper. F_DUPFD_CLOEXEC creates a distinct descriptor whose sole owner
+    // is transferred immediately to `StdUdpSocket`.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `duplicate` was created successfully above and ownership has
+    // not been transferred elsewhere.
+    let socket = unsafe { StdUdpSocket::from_raw_fd(duplicate) };
+    socket.local_addr()
+}
+
+#[test]
+fn runtime_udp_wildcard_ipv4_local_addr_reports_kernel_assigned_port() {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+        .expect("wildcard IPv4 UDP bind failed");
+
+    let local_addr = socket
+        .local_addr()
+        .expect("wildcard IPv4 UDP local_addr failed");
+
+    assert_eq!(local_addr.ip(), Ipv4Addr::UNSPECIFIED);
+    assert_ne!(local_addr.port(), 0);
+    assert_eq!(
+        local_addr,
+        raw_udp_local_addr(socket.as_raw_fd()).expect("raw IPv4 getsockname failed")
+    );
+}
+
+#[test]
+fn runtime_udp_local_addr_tracks_connect_and_reconnect() {
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+        .expect("wildcard IPv4 UDP bind failed");
+    let first_peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("first UDP peer bind failed");
+    let second_peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("second UDP peer bind failed");
+
+    let first_peer_addr = first_peer
+        .local_addr()
+        .expect("first peer local_addr failed");
+    socket
+        .connect(first_peer_addr)
+        .expect("first UDP connect failed");
+    let first_local = socket
+        .local_addr()
+        .expect("local_addr after first UDP connect failed");
+    assert_eq!(
+        first_local,
+        raw_udp_local_addr(socket.as_raw_fd())
+            .expect("raw getsockname after first UDP connect failed")
+    );
+    assert_eq!(socket.peer_addr(), Some(first_peer_addr));
+
+    let second_peer_addr = second_peer
+        .local_addr()
+        .expect("second peer local_addr failed");
+    socket
+        .connect(second_peer_addr)
+        .expect("second UDP connect failed");
+    let second_local = socket
+        .local_addr()
+        .expect("local_addr after UDP reconnect failed");
+    assert_eq!(
+        second_local,
+        raw_udp_local_addr(socket.as_raw_fd()).expect("raw getsockname after UDP reconnect failed")
+    );
+    assert_eq!(socket.peer_addr(), Some(second_peer_addr));
+}
+
+#[test]
+fn runtime_udp_ipv6_local_addr_matches_raw_getsockname() {
+    const TEST_NAME: &str = "runtime_udp_ipv6_local_addr_matches_raw_getsockname";
+
+    let peer = match StdUdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        Ok(peer) => peer,
+        Err(err) if ipv6_loopback_capability_unavailable(&err) => {
+            eprintln!("skipping {TEST_NAME}: IPv6 loopback unavailable ({err})");
+            return;
+        }
+        Err(err) => panic!("IPv6 UDP capability probe failed for {TEST_NAME}: {err}"),
+    };
+
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))
+        .expect("FlowIO IPv6 wildcard bind failed after capability probe");
+    let bound_addr = socket
+        .local_addr()
+        .expect("FlowIO IPv6 wildcard local_addr failed");
+    assert_eq!(bound_addr.ip(), Ipv6Addr::UNSPECIFIED);
+    assert_ne!(bound_addr.port(), 0);
+    assert_eq!(
+        bound_addr,
+        raw_udp_local_addr(socket.as_raw_fd()).expect("raw IPv6 wildcard getsockname failed")
+    );
+
+    let peer_addr = peer.local_addr().expect("IPv6 peer local_addr failed");
+    socket
+        .connect(peer_addr)
+        .expect("FlowIO IPv6 connect failed after capability probe");
+    assert_eq!(
+        socket
+            .local_addr()
+            .expect("FlowIO IPv6 connected local_addr failed"),
+        raw_udp_local_addr(socket.as_raw_fd()).expect("raw connected IPv6 getsockname failed")
+    );
+}
+
+#[test]
+fn runtime_udp_local_addr_propagates_getsockname_error() {
+    let socket =
+        UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("UDP bind failed");
+    let raw = socket.as_raw_fd();
+    let replacement = File::open("/dev/null").expect("failed to open descriptor replacement");
+
+    // SAFETY: both descriptors are live. dup2 atomically replaces `raw` while
+    // preserving FlowIO's sole ownership of that descriptor number.
+    let replaced = unsafe { libc::dup2(replacement.as_raw_fd(), raw) };
+    assert_eq!(replaced, raw, "failed to replace UDP descriptor");
+
+    let err = socket
+        .local_addr()
+        .expect_err("getsockname on a non-socket descriptor should fail");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTSOCK));
 }
 
 #[test]
@@ -169,7 +298,7 @@ fn runtime_udp_ping_pong() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -224,8 +353,8 @@ fn runtime_udp_ipv6_connected_bidirectional_ping_pong() {
         .expect("left FlowIO IPv6 UDP bind failed after the capability probe succeeded");
     let mut right = UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
         .expect("right FlowIO IPv6 UDP bind failed after the capability probe succeeded");
-    let left_addr = left.local_addr();
-    let right_addr = right.local_addr();
+    let left_addr = left.local_addr().expect("left FlowIO local_addr failed");
+    let right_addr = right.local_addr().expect("right FlowIO local_addr failed");
 
     assert_ne!(left_addr.port(), 0);
     assert_ne!(right_addr.port(), 0);
@@ -351,7 +480,7 @@ fn runtime_udp_send_paths_reject_oversize_iobuff_before_submission() {
 fn runtime_udp_send_to_zero_datagram_submits_and_delivers() {
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime UDP socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind peer UDP socket");
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
@@ -397,7 +526,7 @@ fn runtime_udp_send_to_recv_from_ping_pong() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -458,7 +587,7 @@ fn runtime_udp_recv_from_rejects_truncated_datagram() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -482,7 +611,7 @@ fn runtime_udp_recv_msg_ping_pong() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -507,7 +636,7 @@ fn runtime_udp_recv_msg_rejects_truncated_datagram() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -560,7 +689,7 @@ fn runtime_udp_cancelled_recv_retains_buffer_until_cqe() {
         .expect("failed to bind runtime udp socket");
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
     socket
         .connect(peer.local_addr().expect("peer local_addr failed"))
         .expect("runtime connect failed");
@@ -598,7 +727,7 @@ fn runtime_udp_cancelled_recv_from_retains_buffer_until_cqe() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
 
@@ -637,7 +766,7 @@ fn runtime_udp_cancelled_recv_msg_retains_buffer_until_cqe() {
         .expect("failed to bind runtime udp socket");
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
     socket
         .connect(peer.local_addr().expect("peer local_addr failed"))
         .expect("runtime connect failed");
@@ -829,7 +958,7 @@ fn runtime_udp_ping_pong_iobuff() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -873,7 +1002,7 @@ fn runtime_udp_send_to_recv_from_iobuff() {
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
-    let local_addr = socket.local_addr();
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");

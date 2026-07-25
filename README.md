@@ -286,6 +286,10 @@ helpers are appropriate for isolated attempts.
 For fixed-peer UDP, call `connect` once and use `send` and `recv`. Use
 `send_to` and `recv_from` when the peer changes per datagram. Use `recv_msg`
 when connected UDP must detect datagram truncation.
+`UdpSocket::local_addr` performs a live, fallible socket-status lookup, so it
+reports the kernel-assigned port after a wildcard bind and reflects address
+selection after connect or reconnect. Keep it on setup/control paths rather
+than calling it per datagram.
 
 For data-only SCTP associations, configure the socket with
 `SctpSocketConfig::data()` and use `SctpStream::send` and `SctpStream::recv`.
