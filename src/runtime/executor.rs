@@ -2913,6 +2913,38 @@ fn record_runtime_stat(update: impl FnOnce(&mut RuntimeStats)) {
     });
 }
 
+/// Returns the scheduling state for the currently active executor.
+///
+/// This checked form exists for safe dev-only entry points that may be called
+/// outside [`Executor::run`]. Internal executor-driven paths use
+/// [`schedule_ctx_unchecked`] after establishing the stronger context
+/// invariant themselves.
+#[cfg(any(test, feature = "test-support"))]
+#[inline(always)]
+pub(crate) fn schedule_ctx_from_active_executor() -> io::Result<ScheduleCtx> {
+    EXECUTOR_CTX.with(|ctx_cell| {
+        let owner = ctx_cell.get();
+        if owner.is_null() {
+            return Err(inactive_poll_context_error());
+        }
+        Ok(unsafe { schedule_ctx_from_owner_unchecked(owner) })
+    })
+}
+
+/// Builds scheduling state from one validated executor owner.
+///
+/// # Safety
+///
+/// `owner` must identify a live executor owner on the current thread.
+#[inline(always)]
+unsafe fn schedule_ctx_from_owner_unchecked(owner: *const ExecutorOwner) -> ScheduleCtx {
+    let state = unsafe { (*owner).state_ptr() };
+    ScheduleCtx {
+        ready_queue: unsafe { std::ptr::addr_of_mut!((*state).ready_queue) },
+        runtime_state: unsafe { std::ptr::addr_of_mut!((*state).runtime_state) },
+    }
+}
+
 /// # Safety
 ///
 /// Must be called from within `Executor::run` on the executor thread. The
@@ -2926,11 +2958,7 @@ pub(crate) unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
             !owner.is_null(),
             "runtime schedule_ctx_unchecked requested outside executor context"
         );
-        let state = unsafe { (*owner).state_ptr() };
-        ScheduleCtx {
-            ready_queue: unsafe { std::ptr::addr_of_mut!((*state).ready_queue) },
-            runtime_state: unsafe { std::ptr::addr_of_mut!((*state).runtime_state) },
-        }
+        unsafe { schedule_ctx_from_owner_unchecked(owner) }
     })
 }
 

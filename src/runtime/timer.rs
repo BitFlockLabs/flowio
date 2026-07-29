@@ -42,6 +42,8 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::runtime::executor::schedule_ctx_from_active_executor;
 use crate::runtime::executor::{
     ExecutorOwner, PollCtx, ScheduleCtx, note_timer_expired, note_timer_now_tick_call,
     note_waiter_wake, notify_task_into_list_unchecked, poll_ctx_from_waker, retain_first_panic,
@@ -925,10 +927,13 @@ impl TimerRuntime {
     /// Expires timers up to `now`, respecting the provided per-pass budget.
     ///
     /// Returns `true` when timer work remains pending for a later pass.
+    /// When advancing the timer wheel, returns
+    /// [`io::ErrorKind::NotConnected`] if no
+    /// [`crate::runtime::executor::Executor::run`] context is active.
     #[cfg(any(test, feature = "test-support"))]
     pub fn process_at_with_budget(&mut self, now: u64, budget: usize) -> io::Result<bool> {
         if now >= self.wheel.current_tick {
-            let schedule_ctx = unsafe { schedule_ctx_unchecked() };
+            let schedule_ctx = schedule_ctx_from_active_executor()?;
             return Ok(unsafe { Self::collect_expired_unchecked(self, now, budget, schedule_ctx) });
         }
         Ok(false)
