@@ -168,7 +168,7 @@ workload is faster without measurement.
 | Payload shape | Contiguous APIs for one byte range; vectored/projected APIs for existing segmentation | Building a chain for one contiguous range or coalescing segmented data just to call `write` | Match the API to existing ownership; vectored paths construct bounded iovec metadata, while coalescing copies bytes. |
 | Immediate deadline edge | `try_read`, `try_write`, and `try_writev_projected` only after a deadline has already reached zero | Polling `try_*` as the normal async path | `try_*` makes one direct nonblocking syscall and returns `WouldBlock`; normal async methods register reactor work and wake the task. |
 | UDP peer selection | Connected `send` / `recv` for a stable peer; `recv_msg` when truncation must be detected | `send_to` / `recv_from` for a fixed peer | Connected calls avoid per-datagram address handling. Use address-bearing methods when the peer actually varies. |
-| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. A data-configured `recv_msg` reports EOR/truncation with default ancillary fields; enable receive metadata when stream, PPID, TSN, association data, notifications, or partial-delivery recovery matter. |
+| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. A data-configured `recv_msg` reports EOR/truncation with default ancillary fields. A FlowIO-configured socket that requested receive info rejects ordinary data that omits it; enable receive metadata when stream, PPID, TSN, association data, notifications, or partial-delivery recovery matter. |
 | Timers | One `timeout_at` or `timeout` around a protocol phase when a deadline is required | A separate timeout around every tiny I/O step | Each armed deadline consumes timer-wheel state and expiry/cancellation work. Preserve finer timers when protocol semantics require them. |
 | DNS/TLS setup | Reuse `DnsResolver`, resolved addresses, connectors, and established TLS streams | Resolving names or handshaking in a per-message loop | Resolver setup/query construction and TLS handshakes may allocate and perform setup I/O. |
 
@@ -181,6 +181,16 @@ them alongside its new root future.
 Only one `Executor::run` may be active on a thread. Poll runtime I/O and timer
 futures only through the executor that submitted or armed them. Polling without
 an active FlowIO run or through another executor returns `NotConnected`.
+An accept future that reports an occupied reusable slot has not claimed that
+slot; later polls park, and dropping it cannot cancel the earlier accept.
+TCP/SCTP accept rearms a nonterminal stale readiness hint. If owner-thread
+`accept4` finds no queued peer after `POLLERR`, `POLLHUP`, or `POLLNVAL`, the
+listener instead latches `ConnectionAborted`; this and later accepts report
+that non-retryable kind without another readiness submission. A queued peer
+still wins a mixed readiness mask because `accept4` runs first. A positive
+`POLLNVAL` confirmed by `EBADF` preserves that first errno while latching the
+same later state; other non-`WouldBlock` accept errors propagate without
+latching.
 Unsubmitted rental I/O returns its buffer immediately; submitted I/O retains
 the buffer until the original completion and then returns it with that error.
 If the exceptional bounded shutdown fallback abandons an `io_uring` without
@@ -294,10 +304,14 @@ than calling it per datagram.
 For data-only SCTP associations, configure the socket with
 `SctpSocketConfig::data()` and use `SctpStream::send` and `SctpStream::recv`.
 Message receives remain available when EOR or truncation must be checked, but
-a data-configured socket returns default ancillary fields. Enable receive
+a data-configured socket returns default ancillary fields. Externally adopted
+sockets also default fields when receive information is absent because FlowIO
+did not configure that option. When FlowIO configured a socket to request
+receive information, ordinary data that omits `SCTP_RCVINFO` instead returns
+`InvalidData`; notifications and clean EOF are unaffected. Enable receive
 metadata (or use the rich/signaling configuration) when stream, PPID, TSN,
-association metadata, notifications, or partial-delivery recovery matter. All
-SCTP send and receive APIs reject a zero-length caller payload/window with
+association metadata, notifications, or partial-delivery recovery matter.
+All SCTP send and receive APIs reject a zero-length caller payload/window with
 `InvalidInput` before kernel submission and return the rental owner unchanged.
 This includes empty or zero-readable vectored sends. A successful zero-byte
 result from the flag-less lean `recv` path therefore denotes clean peer EOF.
@@ -366,8 +380,11 @@ and bounded CNAME-follow-up work; a timed-out kernel-visible response buffer
 is not reused before its target completion.
 Query normalization removes surrounding whitespace and at most
 one optional trailing root dot; a second trailing dot remains an empty label
-and returns `InvalidInput` before query allocation or DNS network I/O. Matching-ID
-responses must be marked as responses and retain the
+and returns `InvalidInput` before query allocation or DNS network I/O.
+`localhost` and `/etc/hosts` aliases compare case-insensitively and treat a
+trailing root dot as equivalent, so a local fully qualified entry is returned
+before any upstream query. Matching-ID responses must be marked as responses
+and retain the
 QUERY opcode; other opcodes are drained before question or record handling.
 The resolver validates every declared response record before using NXDOMAIN or
 another response code; malformed records in ignored sections/classes or
@@ -403,17 +420,19 @@ fn main() -> io::Result<()> {
 }
 ```
 
-`TlsClientOptions::transport_read_buffer_size` is validated as a nonzero
-setup option, then capped at 18,437 bytes for the effective per-connection read
-scratch: one maximum TLS wire record. Smaller values retain their requested
-size. `transport_write_buffer_size` independently sets a hard upper bound for
-each FlowIO ciphertext chunk drained from rustls; output beyond that bound is
-sent in later chunks, so a smaller bound can require more raw TCP writes.
-Ordinary TLS I/O reuses both setup allocations without growing the wrapper
-scratch. `rustls_buffer_limit: None` remains a separate choice that permits
-unbounded rustls-internal buffering and does not relax the FlowIO write-chunk
-bound. Raising the read option above its cap therefore does not increase the
-raw read size or reserve additional wrapper read scratch.
+`TlsClientOptions::transport_read_buffer_size` is validated as a nonzero setup
+option, then capped at 18,437 bytes for the effective per-connection raw-read
+bound and scratch reservation request: the maximum TLS wire-record byte bound.
+Smaller values retain their requested bound. The allocator may provide more
+`Vec` capacity than requested, but each raw read remains capped by the stored
+effective bound. `transport_write_buffer_size` independently sets a hard upper
+bound for each FlowIO ciphertext chunk drained from rustls; output beyond that
+bound is sent in later chunks, so a smaller bound can require more raw TCP
+writes. Ordinary TLS I/O reuses both setup allocations without growing the
+wrapper scratch. `rustls_buffer_limit: None` remains a separate choice that
+permits unbounded rustls-internal buffering and does not relax the FlowIO
+write-chunk bound. Raising the read option above its cap therefore does not
+increase the raw read size or reservation request.
 
 SCTP has separate socket and association configuration types. Basic
 one-to-one SCTP works through `SctpListener`, `SctpConnector`, and

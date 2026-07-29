@@ -728,6 +728,17 @@ impl Drop for SparseOversizedReadOnly {
 
 /// Verifies the common oversize-send result without touching mapped bytes.
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn assert_oversized_send_owner_uninspected(buffer: &SparseOversizedReadOnly) {
+    assert_eq!(IoBuffReadOnly::len(buffer), SPARSE_OVERSIZED_READ_ONLY_LEN);
+    assert_eq!(
+        buffer.as_ptr_calls(),
+        0,
+        "oversized send consulted the buffer pointer before rejecting its length"
+    );
+}
+
+/// Verifies the detailed asynchronous oversize-send result.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 #[allow(dead_code)]
 pub fn assert_oversized_send_rejected(result: io::Result<usize>, buffer: &SparseOversizedReadOnly) {
     let err = result.expect_err("oversized send should fail");
@@ -736,12 +747,19 @@ pub fn assert_oversized_send_rejected(result: io::Result<usize>, buffer: &Sparse
         err.to_string(),
         "length exceeds io_uring u32 byte-count limit"
     );
-    assert_eq!(IoBuffReadOnly::len(buffer), SPARSE_OVERSIZED_READ_ONLY_LEN);
-    assert_eq!(
-        buffer.as_ptr_calls(),
-        0,
-        "oversized send consulted the buffer pointer before rejecting its length"
-    );
+    assert_oversized_send_owner_uninspected(buffer);
+}
+
+/// Verifies the message-free immediate oversize-send result.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+pub fn assert_oversized_try_send_rejected(
+    result: io::Result<usize>,
+    buffer: &SparseOversizedReadOnly,
+) {
+    let err = result.expect_err("oversized try send should fail");
+    assert_message_free_invalid_input(err);
+    assert_oversized_send_owner_uninspected(buffer);
 }
 
 /// Drop-tracking read-only buffer used by retained-payload tests.
@@ -1138,6 +1156,101 @@ macro_rules! assert_empty_stream_io_cases {
 #[allow(unused_imports)]
 pub(crate) use assert_empty_stream_io_cases;
 
+/// Projection fixture whose reported shape is internally inconsistent.
+#[allow(dead_code)]
+pub struct MalformedReportedProjected {
+    shape: (usize, usize),
+    projection_calls: Cell<usize>,
+}
+
+impl MalformedReportedProjected {
+    #[allow(dead_code)]
+    pub fn bytes_without_pieces() -> Self {
+        Self::new((0, 1))
+    }
+
+    #[allow(dead_code)]
+    pub fn pieces_without_bytes() -> Self {
+        Self::new((1, 0))
+    }
+
+    fn new(shape: (usize, usize)) -> Self {
+        Self {
+            shape,
+            projection_calls: Cell::new(0),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn reported_shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    #[allow(dead_code)]
+    pub fn projection_calls(&self) -> usize {
+        self.projection_calls.get()
+    }
+}
+
+impl WritevProjection for MalformedReportedProjected {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    fn project_writev<'a>(&'a self, _pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        self.projection_calls
+            .set(self.projection_calls.get().saturating_add(1));
+        Ok(())
+    }
+}
+
+/// Exercises malformed reported-shape validation on the immediate API.
+#[allow(unused_macros)]
+macro_rules! assert_reported_projected_try_cases {
+    ($stream:ident) => {{
+        for source in [
+            $crate::common::MalformedReportedProjected::bytes_without_pieces(),
+            $crate::common::MalformedReportedProjected::pieces_without_bytes(),
+        ] {
+            let expected_shape = source.reported_shape();
+            let (result, source) = $stream.try_writev_projected(source);
+            let error = result.expect_err("malformed reported shape should fail");
+            $crate::common::assert_message_free_invalid_input(error);
+            assert_eq!(source.reported_shape(), expected_shape);
+            assert_eq!(source.projection_calls(), 0);
+        }
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_reported_projected_try_cases;
+
+/// Exercises malformed reported-shape validation on one asynchronous API.
+#[allow(unused_macros)]
+macro_rules! assert_reported_projected_async_cases {
+    ($stream:ident, $method:ident) => {{
+        for (source, expected_message) in [
+            (
+                $crate::common::MalformedReportedProjected::bytes_without_pieces(),
+                "projected writev reported bytes but no active pieces",
+            ),
+            (
+                $crate::common::MalformedReportedProjected::pieces_without_bytes(),
+                "projected writev reported active pieces but no bytes",
+            ),
+        ] {
+            let expected_shape = source.reported_shape();
+            let (result, source) = $stream.$method(source).await;
+            let error = result.expect_err("malformed reported shape should fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), expected_message);
+            assert_eq!(source.reported_shape(), expected_shape);
+            assert_eq!(source.projection_calls(), 0);
+        }
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_reported_projected_async_cases;
+
 /// Projection fixture whose reported byte count disagrees with its pieces.
 #[allow(dead_code)]
 pub struct TryMismatchedProjected;
@@ -1166,6 +1279,16 @@ impl WritevProjection for TryCountMismatchedProjected {
     }
 }
 
+/// Verifies an `InvalidInput` result that carries no custom diagnostic.
+#[allow(dead_code)]
+pub fn assert_message_free_invalid_input(err: io::Error) {
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.get_ref().is_none(),
+        "error unexpectedly carried a custom diagnostic: {err}"
+    );
+}
+
 /// Exercises piece-count and byte-total mismatch validation on one async API.
 #[allow(unused_macros)]
 macro_rules! assert_projected_async_mismatches {
@@ -1173,22 +1296,22 @@ macro_rules! assert_projected_async_mismatches {
         let (result, source) = $stream
             .$method($crate::common::TryCountMismatchedProjected)
             .await;
+        let error = result.expect_err("projected piece-count mismatch should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
-            result
-                .expect_err("projected piece-count mismatch should fail")
-                .kind(),
-            std::io::ErrorKind::InvalidInput
+            error.to_string(),
+            "projected writev piece count did not match counted pieces"
         );
         let _source = source;
 
         let (result, source) = $stream
             .$method($crate::common::TryMismatchedProjected)
             .await;
+        let error = result.expect_err("projected byte-total mismatch should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
-            result
-                .expect_err("projected byte-total mismatch should fail")
-                .kind(),
-            std::io::ErrorKind::InvalidInput
+            error.to_string(),
+            "projected writev byte length did not match counted length"
         );
         let _source = source;
     }};

@@ -70,7 +70,16 @@
 //! ```
 
 use super::{IoBuff, IoBuffError, IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
+use std::io;
 use std::mem::MaybeUninit;
+
+pub(crate) const READ_IOVEC_SHAPE_CHANGED: &str =
+    "read buffer chain shape changed before submission";
+
+#[inline(always)]
+pub(crate) fn invalid_read_iovec_shape() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, READ_IOVEC_SHAPE_CHANGED)
+}
 
 /// Error returned when a fixed-capacity vectored chain cannot accept a value.
 ///
@@ -410,32 +419,35 @@ impl<const N: usize> IoBuffVecMut<N> {
     /// Fills caller-provided `iovec` scratch for `readv`/`recvmsg`.
     ///
     /// Zero-length destinations are skipped. Returns
-    /// `(iov_count, total_writable)` for the initialized prefix.
+    /// `(iov_count, total_writable)` for the initialized prefix. Returns
+    /// `InvalidInput` if the scratch is too short or the materialized writable
+    /// total cannot be represented by `usize`.
     pub(crate) fn fill_read_iovecs_and_writable_len(
         &mut self,
         dst: &mut [MaybeUninit<libc::iovec>],
-    ) -> (usize, usize) {
-        debug_assert!(
-            dst.len() >= self.read_iovec_count_and_writable_len().0,
-            "readv scratch has fewer entries than non-empty segments"
-        );
+    ) -> io::Result<(usize, usize)> {
         let mut iov_count = 0;
-        let mut total = 0;
+        let mut total = 0usize;
         for i in 0..self.count {
             let buf = unsafe { self.buffers[i].assume_init_mut() };
             let len = buf.writable_len();
+            total = total
+                .checked_add(len)
+                .ok_or_else(invalid_read_iovec_shape)?;
             if len == 0 {
                 continue;
             }
-            dst[iov_count].write(libc::iovec {
+            let iovec = dst
+                .get_mut(iov_count)
+                .ok_or_else(invalid_read_iovec_shape)?;
+            iovec.write(libc::iovec {
                 iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                 iov_len: len,
             });
             iov_count += 1;
-            total += len;
         }
         debug_assert_eq!((iov_count, total), self.read_iovec_count_and_writable_len());
-        (iov_count, total)
+        Ok((iov_count, total))
     }
 
     #[cfg(feature = "test-support")]
@@ -582,37 +594,6 @@ impl<const N: usize> IoBuffVec<N> {
     /// Returns an iterator over the frozen buffer segments.
     pub fn iter(&self) -> impl Iterator<Item = &IoBuff> {
         iter_inline(&self.buffers, self.count)
-    }
-
-    /// Fills a caller-provided `iovec` scratch array for `writev`/`sendmsg`.
-    ///
-    /// Returns `(iov_count, total_len)` for the initialized entries. Empty
-    /// segments contribute to `total_len` but do not produce iovec entries, so
-    /// `iov_count` can be smaller than the segment count.
-    pub(crate) fn fill_write_iovecs_and_len(
-        &self,
-        dst: &mut [MaybeUninit<libc::iovec>; N],
-    ) -> (usize, usize) {
-        debug_assert!(
-            self.checked_len().is_some(),
-            "overflowed IoBuffVec reached iovec materialization"
-        );
-        let mut total = 0;
-        let mut iov_count = 0;
-        for i in 0..self.count {
-            let buf = unsafe { self.buffers[i].assume_init_ref() };
-            let len = buf.len();
-            total += len;
-            if len == 0 {
-                continue;
-            }
-            dst[iov_count].write(libc::iovec {
-                iov_base: buf.as_ptr() as *mut libc::c_void,
-                iov_len: len,
-            });
-            iov_count += 1;
-        }
-        (iov_count, total)
     }
 
     /// Attempts to convert the frozen chain back to a mutable chain.
@@ -907,7 +888,9 @@ mod tests {
         };
         let mut scratch: [MaybeUninit<libc::iovec>; 4] =
             std::array::from_fn(|_| MaybeUninit::new(poison));
-        let (iov_count, writable_len) = chain.fill_read_iovecs_and_writable_len(&mut scratch);
+        let (iov_count, writable_len) = chain
+            .fill_read_iovecs_and_writable_len(&mut scratch[..2])
+            .expect("read iovec materialization failed");
 
         assert_eq!((iov_count, writable_len), (2, 12));
         let first = unsafe { scratch[0].assume_init_ref() };
@@ -933,5 +916,29 @@ mod tests {
                 .payload_bytes(),
             b"ok"
         );
+    }
+
+    #[test]
+    fn read_iovec_fill_rejects_short_scratch_without_panicking() {
+        let mut first = IoBuffMut::new(0, 8, 0).expect("first segment allocation failed");
+        let second = IoBuffMut::new(0, 8, 0).expect("second segment allocation failed");
+        let first_ptr = first.as_mut_ptr();
+        let mut chain = IoBuffVecMut::from_array([first, second]);
+        let poison = libc::iovec {
+            iov_base: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            iov_len: usize::MAX,
+        };
+        let mut scratch = [MaybeUninit::new(poison)];
+
+        let err = chain
+            .fill_read_iovecs_and_writable_len(&mut scratch)
+            .expect_err("short read iovec scratch must be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), READ_IOVEC_SHAPE_CHANGED);
+        let initialized = unsafe { scratch[0].assume_init_ref() };
+        assert_eq!(initialized.iov_base, first_ptr.cast());
+        assert_eq!(initialized.iov_len, 8);
+        assert_eq!(chain.read_iovec_count_and_writable_len(), (2, 16));
     }
 }

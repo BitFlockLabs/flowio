@@ -48,10 +48,6 @@ pub struct TaskHeader {
     /// Packed scheduler state bits such as notified/running/queued/completed.
     /// Kept in one word so wake/poll transitions stay cheap.
     pub flags: Cell<u64>,
-    /// Last timer wake epoch observed for this task. Timer expiry uses a
-    /// per-pass epoch to collapse repeated wakes before they re-enter the
-    /// general scheduler path.
-    pub last_wake_epoch: Cell<u64>,
     /// Cached `Waker` built around this task's raw-waker implementation.
     pub cached_waker: MaybeUninit<Waker>,
     /// Type-erased hooks for polling, finishing, and destroying the concrete task.
@@ -78,7 +74,6 @@ impl TaskHeader {
             all_link: dlist::Link::new_unlinked(),
             refs: Cell::new(1),
             flags: Cell::new(0),
-            last_wake_epoch: Cell::new(0),
             cached_waker: MaybeUninit::uninit(),
             vtable: &DUMMY_VTABLE,
             owner: None,

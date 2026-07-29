@@ -705,15 +705,16 @@ fn runtime_tcp_try_writev_projected_invalid_projection_returns_source() {
     let (mut stream, mut peer) = connected_try_tcp_stream();
 
     common::assert_empty_projected_try_cases!(stream);
+    common::assert_reported_projected_try_cases!(stream);
 
     let (res, source) = stream.try_writev_projected(TryMismatchedProjected);
     let err = res.expect_err("mismatched projection should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    common::assert_message_free_invalid_input(err);
     let _source = source;
 
     let (res, source) = stream.try_writev_projected(TryCountMismatchedProjected);
     let err = res.expect_err("piece-count mismatch should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    common::assert_message_free_invalid_input(err);
     let _source = source;
 
     let (res, source) = stream.try_writev_projected(TryOversizedProjected);
@@ -741,6 +742,8 @@ fn runtime_tcp_async_empty_projected_validation_uses_no_submission_or_retained_s
         .run(async move {
             common::assert_empty_projected_async_cases!(stream, writev_projected);
             common::assert_empty_projected_async_cases!(stream, writev_all_projected);
+            common::assert_reported_projected_async_cases!(stream, writev_projected);
+            common::assert_reported_projected_async_cases!(stream, writev_all_projected);
 
             return_slot.set(Some(stream));
         })
@@ -836,6 +839,32 @@ fn runtime_tcp_empty_projected_rejects_outside_run_before_projection() {
             assert_eq!(source.projection_calls(), 0);
         }
         _ => panic!("empty all projection should reject an inactive poll context"),
+    }
+    drop(future);
+
+    let mut future = Box::pin(
+        stream.writev_projected(common::MalformedReportedProjected::bytes_without_pieces()),
+    );
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), source)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(source.reported_shape(), (0, 1));
+            assert_eq!(source.projection_calls(), 0);
+        }
+        _ => panic!("malformed partial projection should prefer an inactive poll context"),
+    }
+    drop(future);
+
+    let mut future = Box::pin(
+        stream.writev_all_projected(common::MalformedReportedProjected::pieces_without_bytes()),
+    );
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready((Err(err), source)) => {
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(source.reported_shape(), (1, 0));
+            assert_eq!(source.projection_calls(), 0);
+        }
+        _ => panic!("malformed all projection should prefer an inactive poll context"),
     }
 }
 

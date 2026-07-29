@@ -62,24 +62,35 @@ pub fn dns_decode_name(data: &[u8]) {
     let _ = crate::net::resolver::decode_name(data, offset, 0);
 }
 
-/// Fuzz entry: parse a DNS response packet with metadata derived from input.
-pub fn dns_parse_response_packet(data: &[u8]) {
-    let data = maybe_decode_hex_seed(data);
-    let data = data.as_ref();
-    let query_id = u16::from_be_bytes([
+const DNS_QUERY_ID_MISMATCH_CONTROL: u8 = 0x80;
+
+struct DnsResponseCase<'a> {
+    length_hint: u16,
+    query_id: u16,
+    qtype: u16,
+    host: &'a str,
+    packet: &'a [u8],
+}
+
+/// Decode `[length/id hint, control, host length, host, packet]`.
+///
+/// Normal cases derive the expected ID from the response packet so packet
+/// mutations continue past the ID gate. Control bit 7 deliberately mismatches
+/// it, preserving coverage of that rejection path. The two-byte hint remains a
+/// fallback for packets shorter than an ID and drives the received-length
+/// target below.
+fn dns_response_case(data: &[u8]) -> DnsResponseCase<'_> {
+    let length_hint = u16::from_be_bytes([
         data.first().copied().unwrap_or_default(),
         data.get(1).copied().unwrap_or_default(),
     ]);
-    let qtype = if data.get(2).copied().unwrap_or_default() & 1 == 0 {
-        1
-    } else {
-        28
-    };
+    let control = data.get(2).copied().unwrap_or_default();
+    let qtype = if control & 1 == 0 { 1 } else { 28 };
 
     let available = data.len().saturating_sub(4);
     let host_len = data
         .get(3)
-        .map(|len| (*len as usize).min(available).min(63))
+        .map(|len| (*len as usize).min(available))
         .unwrap_or_default();
     let host_bytes = &data.get(4..4 + host_len).unwrap_or_default();
     let host = std::str::from_utf8(host_bytes)
@@ -87,8 +98,76 @@ pub fn dns_parse_response_packet(data: &[u8]) {
         .filter(|host| !host.is_empty())
         .unwrap_or("example.com");
     let packet = data.get(4 + host_len..).unwrap_or_default();
+    let packet_id = u16::from_be_bytes([
+        packet.first().copied().unwrap_or_default(),
+        packet.get(1).copied().unwrap_or_default(),
+    ]);
+    let mut query_id = if packet.len() >= 2 {
+        packet_id
+    } else {
+        length_hint
+    };
+    if control & DNS_QUERY_ID_MISMATCH_CONTROL != 0 {
+        query_id ^= 0x5555;
+    }
 
-    let _ = crate::net::resolver::parse_response_packet(packet, query_id, host, qtype);
+    DnsResponseCase {
+        length_hint,
+        query_id,
+        qtype,
+        host,
+        packet,
+    }
+}
+
+fn observe_dns_parse_response_packet(data: &[u8]) -> std::io::Result<()> {
+    let data = maybe_decode_hex_seed(data);
+    let case = dns_response_case(data.as_ref());
+    crate::net::resolver::parse_response_packet(case.packet, case.query_id, case.host, case.qtype)
+        .map(drop)
+}
+
+#[cfg(test)]
+fn dns_response_case_reaches_records(data: &[u8]) -> bool {
+    let data = maybe_decode_hex_seed(data);
+    let case = dns_response_case(data.as_ref());
+    crate::net::resolver::response_reaches_record_parser(
+        case.packet,
+        case.query_id,
+        case.host,
+        case.qtype,
+    )
+}
+
+/// Fuzz entry: parse a DNS response packet with metadata derived from input.
+pub fn dns_parse_response_packet(data: &[u8]) {
+    let _ = std::hint::black_box(observe_dns_parse_response_packet(data));
+}
+
+fn observe_dns_parse_received_response_packet(data: &[u8]) -> std::io::Result<()> {
+    let data = maybe_decode_hex_seed(data);
+    let case = dns_response_case(data.as_ref());
+    let packet_len = case
+        .packet
+        .len()
+        .min(crate::net::resolver::DNS_UDP_RESPONSE_BUFFER_SIZE);
+    let buffer = &case.packet[..packet_len];
+    // The live buffer bound makes `packet_len + 2` infallible. Modulo selects
+    // every in-bounds prefix plus the single `len + 1` rejection case.
+    let received_len = usize::from(case.length_hint) % (packet_len + 2);
+    crate::net::resolver::parse_received_response_packet(
+        buffer,
+        received_len,
+        case.query_id,
+        case.host,
+        case.qtype,
+    )
+    .map(drop)
+}
+
+/// Fuzz entry: parse only the kernel-reported prefix of a DNS receive buffer.
+pub fn dns_parse_received_response_packet(data: &[u8]) {
+    let _ = std::hint::black_box(observe_dns_parse_received_response_packet(data));
 }
 
 /// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
@@ -116,17 +195,25 @@ fn observe_sctp_parse_recv_meta(data: &[u8]) -> std::io::Result<crate::net::sctp
     if flag_byte & 0x08 != 0 {
         msg_flags |= libc::MSG_EOR;
     }
+    let recv_rcvinfo_requested = flag_byte & 0x10 != 0;
 
     // Keep the kernel-reported length independent from the backing-storage
     // length so all cmsg parser branches remain reachable. Both are full-byte
     // values and are bounded before any slice is formed:
-    // [flags, control storage length, reported controllen, control..., data...].
+    // [flags plus receive-info policy, control storage length, reported
+    // controllen, control..., data...].
     let body = data.get(3..).unwrap_or_default();
     let control_len = (data.get(1).copied().unwrap_or_default() as usize).min(body.len());
     let (control, data_slice) = body.split_at(control_len);
     let controllen = (data.get(2).copied().unwrap_or_default() as usize).min(control.len());
 
-    crate::net::sctp::parse_recv_meta(control, controllen, msg_flags, data_slice)
+    crate::net::sctp::parse_recv_meta(
+        control,
+        controllen,
+        msg_flags,
+        data_slice,
+        recv_rcvinfo_requested,
+    )
 }
 
 /// Fuzz entry: parse SCTP recvmsg metadata with independently bounded lengths.
@@ -159,7 +246,7 @@ fn sctp_assoc_addrs_case(data: &[u8]) -> (usize, &[u8]) {
 /// covers the early-return path. Property: candidate and full-envelope
 /// structural acceptance stay identical, pointer recursion stays bounded, and
 /// arbitrary input cannot panic or read OOB.
-pub fn dns_response_prefilter(data: &[u8]) {
+fn observe_dns_response_prefilter(data: &[u8]) -> bool {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
     let query_id = u16::from_be_bytes([
@@ -173,6 +260,11 @@ pub fn dns_response_prefilter(data: &[u8]) {
         "DNS candidate prefilter and full envelope parser diverged"
     );
     let _ = crate::net::resolver::response_is_decodable_candidate(data, query_id ^ 0x5555);
+    candidate
+}
+
+pub fn dns_response_prefilter(data: &[u8]) {
+    let _ = std::hint::black_box(observe_dns_response_prefilter(data));
 }
 
 fn observe_tls_server_end_point(data: &[u8]) -> Option<Vec<u8>> {
@@ -192,48 +284,17 @@ pub fn tls_server_end_point(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::sctp::{SctpNotification, SctpRecvInfo, SctpRecvMeta};
+    use crate::net::sctp::{
+        SctpNotification, SctpRecvInfo, SctpRecvMeta, append_initialized_test_cmsg,
+    };
 
     fn cmsg_align(len: usize) -> usize {
         let align = std::mem::size_of::<usize>();
         (len + align - 1) & !(align - 1)
     }
 
-    fn cmsg_space(data_len: usize) -> usize {
-        cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
-    }
-
     fn write_ne<const N: usize>(buffer: &mut [u8], offset: usize, bytes: [u8; N]) {
         buffer[offset..offset + N].copy_from_slice(&bytes);
-    }
-
-    fn append_cmsg(
-        control: &mut Vec<u8>,
-        level: libc::c_int,
-        cmsg_type: libc::c_int,
-        payload_len: usize,
-    ) -> usize {
-        let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-        let data_offset = cmsg_align(hdr_len);
-        let cmsg_len = data_offset + payload_len;
-        let offset = control.len();
-        control.resize(offset + cmsg_space(payload_len), 0);
-        write_ne(
-            control,
-            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_len),
-            cmsg_len.to_ne_bytes(),
-        );
-        write_ne(
-            control,
-            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_level),
-            level.to_ne_bytes(),
-        );
-        write_ne(
-            control,
-            offset + std::mem::offset_of!(libc::cmsghdr, cmsg_type),
-            cmsg_type.to_ne_bytes(),
-        );
-        offset + data_offset
     }
 
     fn write_rcvinfo_fields(control: &mut [u8], data_offset: usize, info: libc::sctp_rcvinfo) {
@@ -280,7 +341,7 @@ mod tests {
 
     fn rcvinfo_input(info: libc::sctp_rcvinfo, payload: &[u8]) -> Vec<u8> {
         let mut control = Vec::new();
-        let data_offset = append_cmsg(
+        let data_offset = append_initialized_test_cmsg(
             &mut control,
             libc::IPPROTO_SCTP,
             libc::SCTP_RCVINFO,
@@ -295,13 +356,13 @@ mod tests {
 
     fn timestampns_before_rcvinfo_input(payload: &[u8]) -> Vec<u8> {
         let mut control = Vec::new();
-        append_cmsg(
+        append_initialized_test_cmsg(
             &mut control,
             libc::SOL_SOCKET,
             libc::SO_TIMESTAMPNS,
             2 * std::mem::size_of::<i64>(),
         );
-        let data_offset = append_cmsg(
+        let data_offset = append_initialized_test_cmsg(
             &mut control,
             libc::IPPROTO_SCTP,
             libc::SCTP_RCVINFO,
@@ -313,13 +374,13 @@ mod tests {
 
     fn timestampns_before_truncated_rcvinfo_input(payload: &[u8]) -> Vec<u8> {
         let mut control = Vec::new();
-        append_cmsg(
+        append_initialized_test_cmsg(
             &mut control,
             libc::SOL_SOCKET,
             libc::SO_TIMESTAMPNS,
             2 * std::mem::size_of::<i64>(),
         );
-        append_cmsg(&mut control, libc::IPPROTO_SCTP, libc::SCTP_RCVINFO, 0);
+        append_initialized_test_cmsg(&mut control, libc::IPPROTO_SCTP, libc::SCTP_RCVINFO, 0);
         recv_meta_input(0x0C, control, payload)
     }
 
@@ -411,6 +472,186 @@ mod tests {
         assert!(matches!(decoded, Cow::Borrowed(data) if data == seed));
     }
 
+    fn dns_parser_fixtures() -> [&'static [u8]; 11] {
+        [
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/valid_a"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/valid_aaaa"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/malformed_a_short"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_compressed_exact"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_trailing_byte"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_cycle"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_hops_16"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_hops_17"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/root_cname_target"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/question_pointer_loop"),
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/maximum_question_name"),
+        ]
+    }
+
+    fn dns_parse_error(fixture: &[u8]) -> std::io::Error {
+        observe_dns_parse_response_packet(fixture)
+            .expect_err("the DNS parser fixture should be rejected")
+    }
+
+    #[test]
+    fn dns_parser_corpus_reaches_record_parsing_for_at_least_two_thirds() {
+        let fixtures = dns_parser_fixtures();
+        let reached = fixtures
+            .iter()
+            .filter(|fixture| dns_response_case_reaches_records(fixture))
+            .count();
+
+        assert!(
+            reached * 3 >= fixtures.len() * 2,
+            "{reached}/{} canonical DNS parser fixtures reached record parsing; \
+             at least two thirds must do so",
+            fixtures.len()
+        );
+        assert_eq!(
+            reached, 10,
+            "the named semantic corpus changed record-parser reachability"
+        );
+    }
+
+    #[test]
+    fn dns_parser_corpus_pins_deep_record_and_chain_outcomes() {
+        assert!(
+            observe_dns_parse_response_packet(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/valid_a"
+            ))
+            .is_ok()
+        );
+        assert!(
+            observe_dns_parse_response_packet(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/valid_aaaa"
+            ))
+            .is_ok()
+        );
+
+        assert_eq!(
+            dns_parse_error(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/malformed_a_short"
+            ))
+            .to_string(),
+            "DNS A RDATA length was not 4 bytes"
+        );
+        assert!(
+            observe_dns_parse_response_packet(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/cname_compressed_exact"
+            ))
+            .is_ok(),
+            "an exactly consumed compressed CNAME must remain valid"
+        );
+        assert_eq!(
+            dns_parse_error(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/cname_trailing_byte"
+            ))
+            .to_string(),
+            "DNS CNAME RDATA did not consume its declared length"
+        );
+        assert_eq!(
+            dns_parse_error(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/cname_cycle"
+            ))
+            .to_string(),
+            "DNS response CNAME chain contained a loop"
+        );
+        assert!(
+            observe_dns_parse_response_packet(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/cname_hops_16"
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            dns_parse_error(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/cname_hops_17"
+            ))
+            .to_string(),
+            "DNS response CNAME chain exceeded maximum per-response hop count"
+        );
+        assert_eq!(
+            dns_parse_error(include_bytes!(
+                "../fixtures/fuzzing/dns_parse_response_packet/root_cname_target"
+            ))
+            .to_string(),
+            "DNS response CNAME target was the root name"
+        );
+    }
+
+    #[test]
+    fn dns_parser_case_preserves_maximum_host_and_explicit_id_mismatch() {
+        let maximum =
+            include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/maximum_question_name");
+        let decoded = maybe_decode_hex_seed(maximum);
+        let case = dns_response_case(decoded.as_ref());
+        assert_eq!(case.host.len(), 253);
+        assert_eq!(
+            case.host,
+            [
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(61)
+            ]
+            .join(".")
+        );
+        assert!(dns_response_case_reaches_records(maximum));
+        assert!(observe_dns_parse_response_packet(maximum).is_ok());
+
+        let valid = include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/valid_a");
+        let mut packet_coupled = maybe_decode_hex_seed(valid).into_owned();
+        packet_coupled[..2].copy_from_slice(&0u16.to_be_bytes());
+        assert!(
+            observe_dns_parse_response_packet(&packet_coupled).is_ok(),
+            "the normal path must derive its query ID from the packet"
+        );
+
+        packet_coupled[2] |= DNS_QUERY_ID_MISMATCH_CONTROL;
+        let mismatch = dns_parse_error(&packet_coupled);
+        assert_eq!(mismatch.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            mismatch.to_string(),
+            "DNS response ID did not match query ID"
+        );
+    }
+
+    #[test]
+    fn dns_prefilter_corpus_exercises_both_differential_outcomes() {
+        let accepted =
+            include_bytes!("../fixtures/fuzzing/dns_response_prefilter/accepted_question");
+        let rejected =
+            include_bytes!("../fixtures/fuzzing/dns_response_prefilter/rejected_pointer_loop");
+
+        assert!(observe_dns_response_prefilter(accepted));
+        assert!(!observe_dns_response_prefilter(rejected));
+    }
+
+    #[test]
+    fn dns_received_length_corpus_pins_full_truncated_and_oversized_inputs() {
+        let full =
+            include_bytes!("../fixtures/fuzzing/dns_parse_received_response_packet/full_response");
+        assert!(observe_dns_parse_received_response_packet(full).is_ok());
+
+        let truncated = include_bytes!(
+            "../fixtures/fuzzing/dns_parse_received_response_packet/truncated_response"
+        );
+        let truncated_error = observe_dns_parse_received_response_packet(truncated)
+            .expect_err("the reported prefix must exclude the stale tail");
+        assert_eq!(truncated_error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(truncated_error.to_string(), "DNS packet ended unexpectedly");
+
+        let oversized = include_bytes!(
+            "../fixtures/fuzzing/dns_parse_received_response_packet/oversized_length"
+        );
+        let oversized_error = observe_dns_parse_received_response_packet(oversized)
+            .expect_err("a reported length beyond the backing buffer must reject");
+        assert_eq!(oversized_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            oversized_error.to_string(),
+            "DNS receive length exceeded response buffer"
+        );
+    }
+
     #[test]
     fn sctp_assoc_addrs_case_uses_full_count_byte_and_reserved_offset() {
         let input = [u8::MAX, 0xA5, 0x11, 0x22, 0x33];
@@ -478,7 +719,10 @@ mod tests {
         let truncated_error = observe_sctp_parse_recv_meta(&truncated)
             .expect_err("a timestamp followed by truncated RCVINFO must fail");
         assert_eq!(truncated_error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(truncated_error.to_string().contains("control"));
+        assert_eq!(
+            truncated_error.to_string(),
+            "SCTP_RCVINFO control message was truncated"
+        );
 
         let malformed = checked_native_seed(
             include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/malformed_preceding_cmsg_len"),
@@ -508,6 +752,17 @@ mod tests {
             })
         );
 
+        let requested_no_rcvinfo = checked_native_seed(
+            include_bytes!(
+                "../fixtures/fuzzing/sctp_parse_recv_meta/data_without_requested_rcvinfo"
+            ),
+            zero_reported_control_input(0x18, 0, b"payload"),
+        );
+        let error = observe_sctp_parse_recv_meta(&requested_no_rcvinfo)
+            .expect_err("requested RCVINFO must not silently default");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("SCTP_RCVINFO"));
+
         let missing_eor = checked_native_seed(
             include_bytes!(
                 "../fixtures/fuzzing/sctp_parse_recv_meta/data_without_rcvinfo_missing_eor"
@@ -526,7 +781,10 @@ mod tests {
         let error = observe_sctp_parse_recv_meta(&control_truncated)
             .expect_err("MSG_CTRUNC without RCVINFO should still reject");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("control"));
+        assert_eq!(
+            error.to_string(),
+            "SCTP recvmsg fixed control buffer capacity was exhausted"
+        );
 
         let malformed_control = checked_native_seed(
             include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/malformed_present_control"),
@@ -581,7 +839,10 @@ mod tests {
         control_truncated[2] = 0;
         let control_error = observe_sctp_parse_recv_meta(&control_truncated)
             .expect_err("MSG_CTRUNC with missing RCVINFO must reject control");
-        assert!(control_error.to_string().contains("control"));
+        assert_eq!(
+            control_error.to_string(),
+            "SCTP recvmsg fixed control buffer capacity was exhausted"
+        );
 
         let mut wrong_type = valid.clone();
         write_ne(
@@ -623,7 +884,10 @@ mod tests {
         );
         let header_error = observe_sctp_parse_recv_meta(&short_header)
             .expect_err("truncated cmsg header must reject");
-        assert!(header_error.to_string().contains("control"));
+        assert_eq!(
+            header_error.to_string(),
+            "SCTP recvmsg control message header was malformed"
+        );
 
         let short_rcvinfo = checked_native_seed(
             include_bytes!("../fixtures/fuzzing/sctp_parse_recv_meta/truncated_rcvinfo_payload"),

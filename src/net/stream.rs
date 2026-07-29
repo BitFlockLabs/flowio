@@ -30,7 +30,9 @@
 
 use crate::net::complete_read_with_progress;
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
-use crate::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
+use crate::runtime::buffer::iobuffvec::{
+    IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut, invalid_read_iovec_shape,
+};
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
     PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker,
@@ -327,7 +329,12 @@ macro_rules! impl_stream_rw {
         /// [`Self::read`] to avoid iovec materialization.
         ///
         /// # Errors
-        /// Returns `InvalidInput` if the chain has no writable segments.
+        ///
+        /// Returns [`io::ErrorKind::InvalidInput`] if the chain has no
+        /// writable segments, iovec materialization overflows, or its writable
+        /// segment count or byte total changes before submission.
+        /// Materialization and shape failures return the exact chain without
+        /// submitting kernel I/O.
         pub fn readv<const N: usize>(
             &mut self,
             buffer: IoBuffVecMut<N>,
@@ -431,6 +438,16 @@ macro_rules! impl_stream_rw {
         /// This complete-buffer vectored API may resubmit after partial reads.
         /// Avoid that retry bookkeeping when the caller handles partial
         /// progress; use [`Self::readv`] instead.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds the
+        /// chain's writable capacity or the `io_uring` 32-bit byte-count
+        /// limit, iovec materialization overflows, or the chain's writable
+        /// segment count or byte total changes before submission.
+        /// Materialization and shape failures return the exact chain without
+        /// submitting kernel I/O. A zero `len` remains valid even when the
+        /// chain has no writable segments.
         pub fn readv_exact<const N: usize>(
             &mut self,
             buffer: IoBuffVecMut<N>,
@@ -466,8 +483,8 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
 
     let result = state.result;
     let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
-    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
-    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(*state_ptr) };
+    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
     Some((result, payload, op_ctx.context_rejected()))
 }
@@ -497,9 +514,8 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
 
     let result = state.result;
     let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
-    let value =
-        unsafe { (*op_ctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
-    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    let value = unsafe { op_ctx.take_retained_payload_with_unchecked::<T, R>(*state_ptr, extract) };
+    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
     Some((result, value, op_ctx.context_rejected()))
 }
@@ -520,8 +536,8 @@ unsafe fn retry_poll_ctx_or_rejected_payload<T: 'static>(
         return Ok(pctx);
     }
 
-    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
-    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(*state_ptr) };
+    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
     Err(payload)
 }
@@ -543,9 +559,8 @@ unsafe fn retry_poll_ctx_or_rejected_payload_with<T: 'static, R>(
         return Ok(pctx);
     }
 
-    let value =
-        unsafe { (*op_ctx.reactor()).take_retained_payload_with::<T, R>(*state_ptr, extract) };
-    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    let value = unsafe { op_ctx.take_retained_payload_with_unchecked::<T, R>(*state_ptr, extract) };
+    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
     Err(value)
 }
@@ -824,6 +839,14 @@ where
     Ok((iov_count, total))
 }
 
+#[inline(always)]
+pub(super) fn fill_iobuffvec_write_iovecs<const N: usize>(
+    buffer: &IoBuffVec<N>,
+    dst: &mut [MaybeUninit<libc::iovec>],
+) -> io::Result<(usize, usize)> {
+    fill_write_iovecs(buffer.iter(), dst)
+}
+
 impl<const N: usize> write_buffer_chain_sealed::Sealed<N> for IoBuffVec<N> {
     #[inline(always)]
     fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
@@ -835,7 +858,7 @@ impl<const N: usize> write_buffer_chain_sealed::Sealed<N> for IoBuffVec<N> {
         &self,
         dst: &mut [MaybeUninit<libc::iovec>],
     ) -> io::Result<(usize, usize)> {
-        fill_write_iovecs(self.iter(), dst)
+        fill_iobuffvec_write_iovecs(self, dst)
     }
 }
 
@@ -1229,9 +1252,28 @@ fn retained_iovecs(scratch: &RetainedIovecScratch) -> &[MaybeUninit<libc::iovec>
     scratch.as_uninit_slice()
 }
 
+/// Borrows the proven-initialized prefix of retained iovec scratch.
+///
+/// # Safety
+///
+/// `initialized_count` must not exceed `scratch.len()`, and every entry before
+/// that count must contain an initialized `libc::iovec`.
 #[inline(always)]
-fn retained_iovecs_mut(scratch: &mut RetainedIovecScratch) -> &mut [libc::iovec] {
-    unsafe { iovec_slice_mut_from_uninit(scratch.as_uninit_slice_mut()) }
+unsafe fn retained_iovecs_mut(
+    scratch: &mut RetainedIovecScratch,
+    initialized_count: usize,
+) -> &mut [libc::iovec] {
+    debug_assert!(
+        initialized_count <= scratch.len(),
+        "initialized iovec count exceeds retained scratch"
+    );
+    let initialized = unsafe {
+        slice::from_raw_parts_mut(
+            scratch.as_uninit_slice_mut().as_mut_ptr(),
+            initialized_count,
+        )
+    };
+    unsafe { iovec_slice_mut_from_uninit(initialized) }
 }
 
 #[inline(always)]
@@ -1239,30 +1281,109 @@ fn remaining_iovec_count(scratch: &RetainedIovecScratch, skip: usize) -> usize {
     scratch.len() - skip
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectedWritevShapeError {
+    ReportedBytesWithoutPieces,
+    ReportedPiecesWithoutBytes,
+    PieceCountMismatch,
+    ByteLengthMismatch,
+}
+
+impl ProjectedWritevShapeError {
+    #[inline(always)]
+    fn message(self) -> &'static str {
+        match self {
+            Self::ReportedBytesWithoutPieces => {
+                "projected writev reported bytes but no active pieces"
+            }
+            Self::ReportedPiecesWithoutBytes => {
+                "projected writev reported active pieces but no bytes"
+            }
+            Self::PieceCountMismatch => "projected writev piece count did not match counted pieces",
+            Self::ByteLengthMismatch => "projected writev byte length did not match counted length",
+        }
+    }
+}
+
+#[inline(always)]
+fn projected_report_shape_error(
+    iov_count: usize,
+    total: usize,
+) -> Option<ProjectedWritevShapeError> {
+    if iov_count == 0 && total != 0 {
+        return Some(ProjectedWritevShapeError::ReportedBytesWithoutPieces);
+    }
+    if iov_count != 0 && total == 0 {
+        return Some(ProjectedWritevShapeError::ReportedPiecesWithoutBytes);
+    }
+    None
+}
+
+#[inline(always)]
+fn projected_materialized_shape_error(
+    projected_count: usize,
+    projected_total: usize,
+    expected_count: usize,
+    expected_total: usize,
+) -> Option<ProjectedWritevShapeError> {
+    if projected_count != expected_count {
+        return Some(ProjectedWritevShapeError::PieceCountMismatch);
+    }
+    if projected_total != expected_total {
+        return Some(ProjectedWritevShapeError::ByteLengthMismatch);
+    }
+    None
+}
+
 #[inline(always)]
 fn validate_projected_count_and_len(iov_count: usize, total: usize) -> io::Result<()> {
-    if iov_count == 0 && total == 0 {
-        return Ok(());
-    }
-    if iov_count == 0 {
-        return Err(invalid_input(
-            "projected writev reported bytes but no active pieces",
-        ));
-    }
-    if total == 0 {
-        return Err(invalid_input(
-            "projected writev reported active pieces but no bytes",
-        ));
+    if let Some(error) = projected_report_shape_error(iov_count, total) {
+        return Err(invalid_input(error.message()));
     }
     Ok(())
 }
 
 #[inline(always)]
 fn validate_try_projected_count_and_len(iov_count: usize, total: usize) -> io::Result<()> {
-    if iov_count == 0 && total == 0 {
-        return Ok(());
+    if projected_report_shape_error(iov_count, total).is_some() {
+        return Err(invalid_input_kind());
     }
-    if iov_count == 0 || total == 0 {
+    Ok(())
+}
+
+#[inline(always)]
+fn validate_projected_materialized_shape(
+    projected_count: usize,
+    projected_total: usize,
+    expected_count: usize,
+    expected_total: usize,
+) -> io::Result<()> {
+    if let Some(error) = projected_materialized_shape_error(
+        projected_count,
+        projected_total,
+        expected_count,
+        expected_total,
+    ) {
+        return Err(invalid_input(error.message()));
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn validate_try_projected_materialized_shape(
+    projected_count: usize,
+    projected_total: usize,
+    expected_count: usize,
+    expected_total: usize,
+) -> io::Result<()> {
+    if projected_materialized_shape_error(
+        projected_count,
+        projected_total,
+        expected_count,
+        expected_total,
+    )
+    .is_some()
+    {
         return Err(invalid_input_kind());
     }
     Ok(())
@@ -1294,18 +1415,12 @@ fn project_retained_writev_payload<T: WritevProjection>(
         (pieces.count(), pieces.total())
     };
 
-    if projected_count != expected_count {
-        return Err(invalid_input(
-            "projected writev piece count did not match counted pieces",
-        ));
-    }
-    if projected_total != expected_total {
-        return Err(invalid_input(
-            "projected writev byte length did not match counted length",
-        ));
-    }
-
-    Ok(())
+    validate_projected_materialized_shape(
+        projected_count,
+        projected_total,
+        expected_count,
+        expected_total,
+    )
 }
 
 #[inline(always)]
@@ -1314,14 +1429,6 @@ fn one_shot_syscall_result(result: libc::ssize_t) -> io::Result<usize> {
         return Err(io::Error::last_os_error());
     }
     Ok(result as usize)
-}
-
-#[inline(always)]
-fn checked_try_write_len(len: usize) -> io::Result<usize> {
-    if len > u32::MAX as usize {
-        return Err(invalid_input_kind());
-    }
-    Ok(len)
 }
 
 /// Attempts one nonblocking read syscall into the caller-owned buffer.
@@ -1363,9 +1470,9 @@ pub(crate) fn try_read_append_once(
 /// Attempts one nonblocking write syscall from the caller-owned buffer.
 #[inline]
 pub(crate) fn try_write_once<B: IoBuffReadOnly>(fd: RawFd, buffer: B) -> (io::Result<usize>, B) {
-    let len = match checked_try_write_len(buffer.len()) {
-        Ok(len) => len,
-        Err(err) => return (Err(err), buffer),
+    let len = match super::send_len_u32(buffer.len()) {
+        Some(len) => len as usize,
+        None => return (Err(invalid_input_kind()), buffer),
     };
 
     if len == 0 {
@@ -1411,8 +1518,13 @@ fn try_writev_projected_with_scratch<T: WritevProjection>(
         Err(err) => return (Err(err), source),
     };
 
-    if projected_count != expected_count || projected_total != expected_total {
-        return (Err(invalid_input_kind()), source);
+    if let Err(err) = validate_try_projected_materialized_shape(
+        projected_count,
+        projected_total,
+        expected_count,
+        expected_total,
+    ) {
+        return (Err(err), source);
     }
 
     let iovecs = unsafe { iovec_slice_mut_from_uninit(&mut scratch[..expected_count]) };
@@ -2435,17 +2547,17 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_initialized_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let (iov_count, writable) =
-                            payload.buffer.fill_read_iovecs_and_writable_len(
-                                payload.scratch.as_uninit_slice_mut(),
-                            );
-                        debug_assert_eq!(iov_count, this.iov_count);
-                        debug_assert_eq!(writable, this.writable);
+                        let actual_shape = payload.buffer.fill_read_iovecs_and_writable_len(
+                            payload.scratch.as_uninit_slice_mut(),
+                        )?;
+                        if actual_shape != (this.iov_count, this.writable) {
+                            return Err(invalid_read_iovec_shape());
+                        }
                         Ok(build_read_vectored_entry(
                             this.fd,
                             retained_iovecs(&payload.scratch),
                             0,
-                            iov_count,
+                            actual_shape.0,
                             state_ptr as u64,
                         ))
                     })
@@ -2472,31 +2584,10 @@ impl<const N: usize, S> Drop for ReadvFuture<'_, N, S> {
 // WritevFuture
 // ---------------------------------------------------------------------------
 
-/// Drop guard kept before the caller buffer so operation-state drop and
-/// cancellation run before any still-local owner drops.
-#[repr(transparent)]
-struct WritevOpState {
-    state_ptr: *mut CompletionState,
-}
-
-impl WritevOpState {
-    const fn new() -> Self {
-        Self {
-            state_ptr: std::ptr::null_mut(),
-        }
-    }
-}
-
-impl Drop for WritevOpState {
-    fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
-    }
-}
-
 /// Gather-write from an owned vectored buffer chain (rental pattern).
 pub struct WritevFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state for the submitted writev/write SQE, if any.
-    op: WritevOpState,
+    state_ptr: *mut CompletionState,
     /// Caller-owned read-only segment chain returned on completion.
     buffer: Option<C>,
     /// Number of non-empty source segments to materialize into iovec scratch.
@@ -2524,7 +2615,7 @@ impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevFuture<'a, C, N, S> {
             None => (0, 0, true),
         };
         Self {
-            op: WritevOpState::new(),
+            state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             iov_count,
             total,
@@ -2544,7 +2635,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
         if let Some((result, completion, context_rejected)) = unsafe {
             take_completed_result_and_payload_with::<RetainedWritevPayload<C>, _>(
                 cx,
-                &mut this.op.state_ptr,
+                &mut this.state_ptr,
                 |payload| take_writev_completion_from_retained(payload),
             )
         } {
@@ -2557,11 +2648,11 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
             }
             return Poll::Ready((Ok(result as usize), buffer));
         }
-        if this.op.state_ptr.is_null() && this.buffer.is_none() {
+        if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if this.op.state_ptr.is_null() && this.invalid_aggregate {
+        if this.state_ptr.is_null() && this.invalid_aggregate {
             let result = validate_local_io_result(cx, Err(invalid_writev_aggregate()));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
@@ -2572,7 +2663,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
             return complete_empty_stream_io(cx, buffer);
         }
 
-        if this.op.state_ptr.is_null() {
+        if this.state_ptr.is_null() {
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -2632,12 +2723,18 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
-            this.op.state_ptr = guard.into_state_ptr();
+            this.state_ptr = guard.into_state_ptr();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.op.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
         Poll::Pending
+    }
+}
+
+impl<C: WriteBufferChain<N>, const N: usize, S> Drop for WritevFuture<'_, C, N, S> {
+    fn drop(&mut self) {
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
@@ -2648,7 +2745,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
 /// Gather-write an entire owned vectored chain, handling partial writes.
 pub struct WritevAllFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state reused across sequential retry submissions.
-    op: WritevOpState,
+    state_ptr: *mut CompletionState,
     /// Caller-owned read-only segment chain returned when the operation finishes.
     buffer: Option<C>,
     /// Number of non-empty source segments to materialize into iovec scratch.
@@ -2676,7 +2773,7 @@ impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevAllFuture<'a, C, N, S>
             None => (0, 0, true),
         };
         Self {
-            op: WritevOpState::new(),
+            state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             iov_count,
             fd,
@@ -2693,26 +2790,26 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.op.state_ptr.is_null() && this.buffer.is_none() {
+        if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if this.op.state_ptr.is_null() && this.invalid_aggregate {
+        if this.state_ptr.is_null() && this.invalid_aggregate {
             let result = validate_local_io_result(cx, Err(invalid_writev_aggregate()));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
 
-        if unsafe { retry_state_is_in_flight(cx, this.op.state_ptr) } {
+        if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
             return Poll::Pending;
         }
 
-        if this.op.state_ptr.is_null() && this.total == 0 {
+        if this.state_ptr.is_null() && this.total == 0 {
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return complete_empty_stream_io(cx, buffer);
         }
 
-        let pctx = if this.op.state_ptr.is_null() {
+        let pctx = if this.state_ptr.is_null() {
             match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -2724,7 +2821,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             match unsafe {
                 retry_poll_ctx_or_rejected_payload_with::<RetainedWritevPayload<C>, _>(
                     cx,
-                    &mut this.op.state_ptr,
+                    &mut this.state_ptr,
                     |payload| take_writev_completion_from_retained(payload),
                 )
             } {
@@ -2738,13 +2835,13 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             }
         };
 
-        if !this.op.state_ptr.is_null() {
-            match classify_retry_cqe_result(unsafe { (*this.op.state_ptr).result }) {
+        if !this.state_ptr.is_null() {
+            match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
                 RetryCqeResult::KernelError(errno) => {
                     let completion = unsafe {
                         take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
                             &pctx,
-                            &mut this.op.state_ptr,
+                            &mut this.state_ptr,
                             |payload| take_writev_completion_from_retained(payload),
                         )
                     };
@@ -2757,7 +2854,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                     let completion = unsafe {
                         take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
                             &pctx,
-                            &mut this.op.state_ptr,
+                            &mut this.state_ptr,
                             |payload| take_writev_completion_from_retained(payload),
                         )
                     };
@@ -2769,7 +2866,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                 RetryCqeResult::Bytes(n) => {
                     let completed = unsafe {
                         let payload =
-                            (*this.op.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
+                            (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
                         debug_assert!(n <= this.total - payload.written);
                         payload.written += n;
                         payload.written >= this.total
@@ -2778,7 +2875,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                         let completion = unsafe {
                             take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
                                 &pctx,
-                                &mut this.op.state_ptr,
+                                &mut this.state_ptr,
                                 |payload| take_writev_completion_from_retained(payload),
                             )
                         };
@@ -2787,10 +2884,10 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
 
                     unsafe {
                         let payload =
-                            (*this.op.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
+                            (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
                         let mut skip = payload.skip;
                         advance_iovecs_in_place(
-                            retained_iovecs_mut(&mut payload.scratch),
+                            retained_iovecs_mut(&mut payload.scratch, this.iov_count),
                             &mut skip,
                             n,
                         );
@@ -2805,7 +2902,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
         }
         if this.buffer.is_some() {
             debug_assert!(
-                this.op.state_ptr.is_null(),
+                this.state_ptr.is_null(),
                 "initial writev_all state was published"
             );
             let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
@@ -2859,17 +2956,17 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
-            this.op.state_ptr = guard.into_state_ptr();
+            this.state_ptr = guard.into_state_ptr();
 
             return Poll::Pending;
         }
 
         unsafe {
-            reset_existing_retry_state(&mut *this.op.state_ptr, pctx.owner_task());
+            reset_existing_retry_state(&mut *this.state_ptr, pctx.owner_task());
         }
 
         let payload =
-            unsafe { (*this.op.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>() };
+            unsafe { (*this.state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>() };
         let remaining_iovs = remaining_iovec_count(&payload.scratch, payload.skip);
         let sqe = build_write_vectored_entry(
             this.fd,
@@ -2877,20 +2974,26 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             payload.skip,
             remaining_iovs,
             &mut payload.msg,
-            this.op.state_ptr as u64,
+            this.state_ptr as u64,
         );
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
                 let payload = take_retained_payload_and_free_state::<RetainedWritevPayload<C>>(
                     &pctx,
-                    &mut this.op.state_ptr,
+                    &mut this.state_ptr,
                 );
                 return Poll::Ready((Err(e), payload.buffer));
             }
         }
 
         Poll::Pending
+    }
+}
+
+impl<C: WriteBufferChain<N>, const N: usize, S> Drop for WritevAllFuture<'_, C, N, S> {
+    fn drop(&mut self) {
+        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
     }
 }
 
@@ -3142,7 +3245,7 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
                             .retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
                         let mut skip = payload.skip;
                         advance_iovecs_in_place(
-                            retained_iovecs_mut(&mut payload.scratch),
+                            retained_iovecs_mut(&mut payload.scratch, this.iov_count),
                             &mut skip,
                             n,
                         );
@@ -3374,7 +3477,7 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
                         let payload =
                             (*this.state_ptr).retained_payload_mut::<RetainedReadvPayload<N>>();
                         advance_iovecs_in_place(
-                            retained_iovecs_mut(&mut payload.scratch),
+                            retained_iovecs_mut(&mut payload.scratch, this.iov_count),
                             &mut this.skip,
                             n,
                         );
@@ -3414,15 +3517,15 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
             unsafe {
                 if let Err((e, payload)) =
                     submit_initialized_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let (iov_count, writable) =
-                            payload.buffer.fill_read_iovecs_and_writable_len(
-                                payload.scratch.as_uninit_slice_mut(),
-                            );
-                        debug_assert_eq!(iov_count, this.iov_count);
-                        debug_assert_eq!(writable, this.writable);
+                        let actual_shape = payload.buffer.fill_read_iovecs_and_writable_len(
+                            payload.scratch.as_uninit_slice_mut(),
+                        )?;
+                        if actual_shape != (this.iov_count, this.writable) {
+                            return Err(invalid_read_iovec_shape());
+                        }
                         let remaining = this.target - this.filled;
                         this.window_iov_count = clamp_iovecs_to_read_limit(
-                            retained_iovecs_mut(&mut payload.scratch),
+                            retained_iovecs_mut(&mut payload.scratch, this.iov_count),
                             this.skip,
                             remaining,
                         );
@@ -3485,6 +3588,7 @@ impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
 mod tests {
     use super::*;
     use crate::net::send_sqe::test_support::sqe_prefix;
+    use crate::runtime::executor::with_ringless_poll_context_for_test;
     #[cfg(not(miri))]
     use crate::runtime::executor::{Executor, ExecutorConfig};
     #[cfg(not(miri))]
@@ -3497,6 +3601,73 @@ mod tests {
             iov_base: base as *mut libc::c_void,
             iov_len: len,
         })
+    }
+
+    fn assert_message_free_invalid_input(result: io::Result<()>) {
+        let err = result.expect_err("shape should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.get_ref().is_none(),
+            "try-path shape errors must remain message-free"
+        );
+    }
+
+    #[test]
+    fn projected_shape_validators_preserve_async_and_try_error_contracts() {
+        for shape in [(0, 0), (1, 1), (usize::MAX, usize::MAX)] {
+            validate_projected_count_and_len(shape.0, shape.1)
+                .expect("valid async reported shape should pass");
+            validate_try_projected_count_and_len(shape.0, shape.1)
+                .expect("valid try reported shape should pass");
+        }
+
+        let reported_bytes =
+            validate_projected_count_and_len(0, 1).expect_err("bytes without pieces should fail");
+        assert_eq!(reported_bytes.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            reported_bytes.to_string(),
+            "projected writev reported bytes but no active pieces"
+        );
+        assert_message_free_invalid_input(validate_try_projected_count_and_len(0, 1));
+
+        let reported_pieces =
+            validate_projected_count_and_len(1, 0).expect_err("pieces without bytes should fail");
+        assert_eq!(reported_pieces.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            reported_pieces.to_string(),
+            "projected writev reported active pieces but no bytes"
+        );
+        assert_message_free_invalid_input(validate_try_projected_count_and_len(1, 0));
+
+        validate_projected_materialized_shape(2, 3, 2, 3)
+            .expect("matching materialized shape should pass");
+        validate_try_projected_materialized_shape(2, 3, 2, 3)
+            .expect("matching try materialized shape should pass");
+
+        let count_mismatch = validate_projected_materialized_shape(1, 3, 2, 3)
+            .expect_err("piece-count mismatch should fail");
+        assert_eq!(
+            count_mismatch.to_string(),
+            "projected writev piece count did not match counted pieces"
+        );
+        assert_message_free_invalid_input(validate_try_projected_materialized_shape(1, 3, 2, 3));
+
+        let length_mismatch = validate_projected_materialized_shape(2, 2, 2, 3)
+            .expect_err("byte-length mismatch should fail");
+        assert_eq!(
+            length_mismatch.to_string(),
+            "projected writev byte length did not match counted length"
+        );
+        assert_message_free_invalid_input(validate_try_projected_materialized_shape(2, 2, 2, 3));
+
+        let both_mismatch = validate_projected_materialized_shape(1, 2, 2, 3)
+            .expect_err("combined shape mismatch should fail");
+        assert_eq!(
+            both_mismatch.to_string(),
+            "projected writev piece count did not match counted pieces",
+            "piece-count mismatch must retain precedence"
+        );
+        assert_message_free_invalid_input(validate_try_projected_materialized_shape(1, 2, 2, 3));
     }
 
     fn compacted_readv_test_chain() -> IoBuffVecMut<4> {
@@ -3621,6 +3792,76 @@ mod tests {
             checked_write_iovec_count_and_len(compacted.iter()),
             Some((1, 7))
         );
+    }
+
+    #[test]
+    fn write_iovec_fill_checks_bounds_overflow_and_compaction() {
+        let half = isize::MAX as usize;
+        let exact = [
+            AggregateLengthItem(half),
+            AggregateLengthItem(half),
+            AggregateLengthItem(1),
+        ];
+        let mut exact_scratch: [MaybeUninit<libc::iovec>; 3] =
+            std::array::from_fn(|_| MaybeUninit::uninit());
+        assert_eq!(
+            fill_write_iovecs(exact.iter(), &mut exact_scratch)
+                .expect("exact usize maximum should materialize"),
+            (3, usize::MAX)
+        );
+
+        let overflow = [
+            AggregateLengthItem(half),
+            AggregateLengthItem(half),
+            AggregateLengthItem(2),
+        ];
+        let mut overflow_scratch: [MaybeUninit<libc::iovec>; 3] =
+            std::array::from_fn(|_| MaybeUninit::uninit());
+        let overflow_err = fill_write_iovecs(overflow.iter(), &mut overflow_scratch)
+            .expect_err("overflowing aggregate should fail");
+        assert_eq!(overflow_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(overflow_err.to_string(), WRITEV_SHAPE_CHANGED);
+
+        let short = [AggregateLengthItem(1), AggregateLengthItem(1)];
+        let mut short_scratch = [MaybeUninit::uninit()];
+        let short_err = fill_write_iovecs(short.iter(), &mut short_scratch)
+            .expect_err("short iovec scratch should fail");
+        assert_eq!(short_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(short_err.to_string(), WRITEV_SHAPE_CHANGED);
+
+        let mut first = IoBuffMut::new(0, 3, 0).expect("first segment allocation failed");
+        first
+            .payload_append(b"abc")
+            .expect("first segment initialization failed");
+        let empty = IoBuffMut::new(0, 5, 0).expect("empty segment allocation failed");
+        let mut second = IoBuffMut::new(0, 5, 0).expect("second segment allocation failed");
+        second
+            .payload_append(b"defgh")
+            .expect("second segment initialization failed");
+        let chain = IoBuffVec::from_array([first.freeze(), empty.freeze(), second.freeze()]);
+        let first_ptr = chain.get(0).expect("first segment missing").as_ptr();
+        let second_ptr = chain.get(2).expect("second segment missing").as_ptr();
+        let mut compacted_scratch: [MaybeUninit<libc::iovec>; 3] = std::array::from_fn(|_| {
+            MaybeUninit::new(libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 77,
+            })
+        });
+
+        assert_eq!(
+            fill_iobuffvec_write_iovecs(&chain, &mut compacted_scratch)
+                .expect("compacted chain should materialize"),
+            (2, 8)
+        );
+        let first_iovec = unsafe { compacted_scratch[0].assume_init_ref() };
+        let second_iovec = unsafe { compacted_scratch[1].assume_init_ref() };
+        let untouched_tail = unsafe { compacted_scratch[2].assume_init_ref() };
+        assert_eq!(first_iovec.iov_base, first_ptr.cast_mut().cast());
+        assert_eq!(first_iovec.iov_len, 3);
+        assert_eq!(second_iovec.iov_base, second_ptr.cast_mut().cast());
+        assert_eq!(second_iovec.iov_len, 5);
+        assert!(untouched_tail.iov_base.is_null());
+        assert_eq!(untouched_tail.iov_len, 77);
     }
 
     fn assert_overflow_context_rejection<F>(
@@ -4035,6 +4276,166 @@ mod tests {
         );
     }
 
+    fn assert_retained_iovec_initialized_prefix<const N: usize>() {
+        let mut pool = RetainedPayloadPool::new().expect("retained pool creation failed");
+        let segments: [IoBuffMut; N] = std::array::from_fn(|_| {
+            IoBuffMut::new(0, 1, 0).expect("readv prefix segment allocation failed")
+        });
+        let mut buffer = Some(IoBuffVecMut::from_array(segments));
+        let scratch_init = pool
+            .alloc_iovec_scratch_init(N)
+            .expect("readv prefix scratch allocation failed");
+        let pool_ptr = NonNull::from(&mut pool);
+        let mut payload =
+            unsafe { emplace_retained_readv_payload(pool_ptr, &mut buffer, scratch_init) };
+        assert!(buffer.is_none(), "readv prefix constructor lost ownership");
+
+        unsafe {
+            let retained = payload.as_mut();
+            let first_ptr = retained
+                .buffer
+                .get_mut(0)
+                .expect("first readv prefix segment missing")
+                .as_mut_ptr();
+            retained.scratch.as_uninit_slice_mut()[0].write(libc::iovec {
+                iov_base: first_ptr.cast(),
+                iov_len: 1,
+            });
+            let initialized = retained_iovecs_mut(&mut retained.scratch, 1);
+            assert_eq!(initialized.len(), 1);
+            assert_eq!(initialized[0].iov_base, first_ptr.cast());
+            assert_eq!(initialized[0].iov_len, 1);
+        }
+
+        let returned = unsafe { payload.take(&mut pool) };
+        assert_eq!(returned.buffer.segments(), N);
+        drop(returned);
+        let stats = pool.stats();
+        assert_eq!(stats.pooled_allocs, 1);
+        assert_eq!(stats.pooled_frees, 1);
+        if N > RETAINED_IOVEC_INLINE_COUNT {
+            assert_eq!(stats.writev_scratch_pooled_allocs, 1);
+            assert_eq!(stats.writev_scratch_pooled_frees, 1);
+        }
+    }
+
+    #[test]
+    fn retained_iovecs_mut_exposes_only_initialized_prefix() {
+        assert_retained_iovec_initialized_prefix::<2>();
+        assert_retained_iovec_initialized_prefix::<{ RETAINED_IOVEC_INLINE_COUNT + 1 }>();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadvShapeDrift {
+        Growth,
+        Shrink,
+        Total,
+    }
+
+    fn readv_shape_drift_chain(drift: ReadvShapeDrift) -> IoBuffVecMut<2> {
+        match drift {
+            ReadvShapeDrift::Growth => {
+                let mut full =
+                    IoBuffMut::new(0, 4, 0).expect("full readv segment allocation failed");
+                full.payload_append(b"full")
+                    .expect("full readv segment initialization failed");
+                let writable =
+                    IoBuffMut::new(0, 4, 0).expect("writable readv segment allocation failed");
+                IoBuffVecMut::from_array([full, writable])
+            }
+            ReadvShapeDrift::Shrink | ReadvShapeDrift::Total => {
+                let first = IoBuffMut::new(0, 4, 0).expect("first readv segment allocation failed");
+                let second =
+                    IoBuffMut::new(0, 4, 0).expect("second readv segment allocation failed");
+                IoBuffVecMut::from_array([first, second])
+            }
+        }
+    }
+
+    fn mutate_readv_shape(chain: &mut IoBuffVecMut<2>, drift: ReadvShapeDrift) {
+        let first = chain
+            .get_mut(0)
+            .expect("first readv shape-drift segment missing");
+        match drift {
+            ReadvShapeDrift::Growth => first.reset(),
+            ReadvShapeDrift::Shrink => first
+                .payload_append(b"full")
+                .expect("readv shrink mutation failed"),
+            ReadvShapeDrift::Total => first
+                .payload_append(b"x")
+                .expect("readv total mutation failed"),
+        }
+    }
+
+    fn readv_chain_ptrs(chain: &mut IoBuffVecMut<2>) -> [usize; 2] {
+        std::array::from_fn(|index| {
+            chain
+                .get_mut(index)
+                .expect("readv shape-drift segment missing")
+                .as_mut_ptr() as usize
+        })
+    }
+
+    fn assert_readv_shape_rejection<F>(
+        future: F,
+        expected_ptrs: [usize; 2],
+        cx: &mut Context<'_>,
+        reactor: *mut Reactor,
+        owner: &crate::runtime::executor::ExecutorOwner,
+    ) where
+        F: Future<Output = (io::Result<usize>, IoBuffVecMut<2>)>,
+    {
+        let mut future = Box::pin(future);
+        let Poll::Ready((result, mut returned)) = future.as_mut().poll(cx) else {
+            panic!("readv shape drift remained pending");
+        };
+        let err = result.expect_err("readv shape drift unexpectedly succeeded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            crate::runtime::buffer::iobuffvec::READ_IOVEC_SHAPE_CHANGED
+        );
+        assert_eq!(readv_chain_ptrs(&mut returned), expected_ptrs);
+        assert!(
+            future.as_mut().poll(cx).is_pending(),
+            "completed readv shape-drift future did not fuse"
+        );
+        assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+        assert_eq!(owner.inflight_op_count_for_test(), 0);
+        drop(returned);
+    }
+
+    #[test]
+    fn readv_shape_drift_futures_reject_before_submission_and_return_chain() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+
+            for drift in [
+                ReadvShapeDrift::Growth,
+                ReadvShapeDrift::Shrink,
+                ReadvShapeDrift::Total,
+            ] {
+                let mut future = ReadvFuture::<2, ()>::new(-1, readv_shape_drift_chain(drift));
+                let chain = future.buffer.as_mut().expect("readv chain missing");
+                mutate_readv_shape(chain, drift);
+                let expected_ptrs = readv_chain_ptrs(chain);
+                assert_readv_shape_rejection(future, expected_ptrs, cx, reactor, owner);
+
+                let mut future =
+                    ReadvExactFuture::<2, ()>::new(-1, readv_shape_drift_chain(drift), 1);
+                let chain = future.buffer.as_mut().expect("readv_exact chain missing");
+                mutate_readv_shape(chain, drift);
+                let expected_ptrs = readv_chain_ptrs(chain);
+                assert_readv_shape_rejection(future, expected_ptrs, cx, reactor, owner);
+            }
+
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 6);
+            assert_eq!(stats.pooled_frees, 6);
+            assert_eq!(stats.writev_scratch_inline_allocs, 6);
+        });
+    }
+
     struct RetainedWritevConstructorChain {
         bytes: Box<[u8; 32]>,
         reenter_pool: Option<NonNull<RetainedPayloadPool>>,
@@ -4281,19 +4682,11 @@ mod tests {
     }
 
     #[test]
-    fn flattened_writev_futures_keep_pointer_sized_drop_state() {
+    fn flattened_writev_futures_keep_raw_state_layout_and_drop() {
         type Chain = IoBuffVec<2>;
         type OneShot = WritevFuture<'static, Chain, 2, ()>;
         type All = WritevAllFuture<'static, Chain, 2, ()>;
 
-        assert_eq!(
-            std::mem::size_of::<WritevOpState>(),
-            std::mem::size_of::<*mut CompletionState>()
-        );
-        assert_eq!(
-            std::mem::align_of::<WritevOpState>(),
-            std::mem::align_of::<*mut CompletionState>()
-        );
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(std::mem::size_of::<OneShot>(), 112);
@@ -4301,7 +4694,6 @@ mod tests {
         }
         assert_eq!(std::mem::size_of::<OneShot>(), std::mem::size_of::<All>());
         assert_eq!(std::mem::align_of::<OneShot>(), std::mem::align_of::<All>());
-        assert!(std::mem::needs_drop::<WritevOpState>());
         assert!(std::mem::needs_drop::<OneShot>());
         assert!(std::mem::needs_drop::<All>());
     }

@@ -181,10 +181,10 @@
 
 use super::stream;
 use super::{
-    AcceptReadinessSlot as AcceptSlot, WriteBufferChain, WritevProjection, close_fd,
-    close_if_valid, connect_cqe_result, current_local_addr, current_peer_addr, get_sock_opt,
-    new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
-    socket_addr_to_c, socket_domain,
+    AcceptReadinessSlot as AcceptSlot, RetainedConnectAddr, WriteBufferChain, WritevProjection,
+    close_fd, close_if_valid, connect_cqe_result, current_local_addr, current_peer_addr,
+    get_sock_opt, map_connect_timeout, new_nonblocking_socket, set_reuse_addr, set_reuse_port,
+    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
@@ -194,7 +194,7 @@ use crate::runtime::executor::{
 };
 use crate::runtime::fd::{LingerProvenance, RuntimeFd};
 use crate::runtime::op::CompletionState;
-use crate::runtime::timer::{Timeout, TimeoutError, timeout};
+use crate::runtime::timer::{Timeout, timeout};
 use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
@@ -310,7 +310,7 @@ impl ConnectSlot {
                 let result = state.result;
                 let op_ctx =
                     unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), self.state_ptr) };
-                unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
+                unsafe { op_ctx.free_op_unchecked(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
@@ -384,25 +384,6 @@ impl ConnectSlot {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
         }
         Poll::Pending
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RetainedConnectAddr {
-    /// Prepared peer address retained until connect completion.
-    addr: libc::sockaddr_storage,
-    /// Length of the prepared peer address.
-    addrlen: libc::socklen_t,
-}
-
-impl RetainedConnectAddr {
-    fn from_socket_addr(addr: SocketAddr) -> Self {
-        let (addr, addrlen) = socket_addr_to_c(addr);
-        Self { addr, addrlen }
-    }
-
-    fn addr_ptr(&self) -> *const libc::sockaddr {
-        &self.addr as *const libc::sockaddr_storage as *const libc::sockaddr
     }
 }
 
@@ -507,10 +488,17 @@ impl TcpStream {
         Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    /// Returns the local address of this socket.
+    /// Returns the local address currently assigned to this socket.
     ///
-    /// This is socket status/control-plane lookup, not the per-message data
-    /// fast path.
+    /// Each call queries the live descriptor with `getsockname(2)`; no local
+    /// address is cached. This is socket status/control-plane lookup, not the
+    /// per-message data fast path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error from `getsockname(2)`, or
+    /// [`io::ErrorKind::InvalidData`] if the kernel returns an unsupported or
+    /// malformed socket address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         current_local_addr(self.fd.raw_fd())
     }
@@ -536,10 +524,17 @@ impl TcpStream {
         finish_split_clone(&self.fd, duplicate).map(|fd| Self { fd })
     }
 
-    /// Returns the peer address of this socket.
+    /// Returns the peer address currently assigned to this socket.
     ///
-    /// This is socket status/control-plane lookup, not the per-message data
-    /// fast path.
+    /// Each call queries the live descriptor with `getpeername(2)`; no peer
+    /// address is cached. This is socket status/control-plane lookup, not the
+    /// per-message data fast path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error from `getpeername(2)`, or
+    /// [`io::ErrorKind::InvalidData`] if the kernel returns an unsupported or
+    /// malformed socket address.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         current_peer_addr(self.fd.raw_fd())
     }
@@ -865,14 +860,21 @@ impl TcpListener {
     ///
     /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
     /// listener's reusable accept slot is still occupied by a previous future
-    /// or if runtime operation capacity cannot accept the submission. It also
-    /// preserves the kernel's `WouldBlock` if a terminal readiness condition
-    /// has no queued connection, ending this accept attempt without rearming.
+    /// or if runtime operation capacity cannot accept the submission. A
+    /// terminal readiness condition with no queued connection latches the
+    /// listener and returns [`io::ErrorKind::ConnectionAborted`]. Later accepts
+    /// return the same non-retryable kind without another readiness submission.
+    /// A positive `POLLNVAL` confirmed as `EBADF` preserves that raw errno for
+    /// the current future while latching the same later fail-fast state.
+    /// A future that reports the occupied-slot error never claims that slot;
+    /// later polls park without replacing the previous accept's waiter.
     ///
-    /// Dropping a pending accept cancels only its readiness wait; it does not
-    /// consume a connection already queued in the listener backlog. If the
-    /// listener's raw fd is exposed, the caller must not concurrently accept
-    /// from it or race changes to its file-status flags.
+    /// Dropping a prepared pending accept cancels only its readiness wait; it
+    /// does not consume a connection already queued in the listener backlog.
+    /// An unprepared future owns no wait, so dropping it leaves the earlier
+    /// accept untouched. If the listener's raw fd is exposed, the caller must
+    /// not concurrently accept from it or race changes to its file-status
+    /// flags.
     pub fn accept(&mut self) -> AcceptFuture<'_> {
         let input_error = self.accept_slot.prepare().err();
         let prepared = input_error.is_none();
@@ -907,8 +909,9 @@ impl Drop for TcpListener {
 ///
 /// It resolves to the connected [`TcpStream`] and its peer address. The
 /// future borrows the listener's reusable accept slot, so a listener can have
-/// at most one live accept future. Dropping a pending future cancels its
-/// readiness wait without consuming a connection from the listener backlog.
+/// at most one live accept future. Dropping a prepared pending future cancels
+/// its readiness wait without consuming a connection from the listener
+/// backlog; dropping an unprepared future cannot affect the earlier owner.
 ///
 /// # Example
 /// ```no_run
@@ -936,7 +939,7 @@ impl Future for AcceptFuture<'_> {
             return Poll::Ready(validate_local_io_result(cx, Err(err)));
         }
         this.slot
-            .poll_accept(cx, finish_accepted_stream_with_provenance)
+            .poll_accept(this.prepared, cx, finish_accepted_stream_with_provenance)
     }
 }
 
@@ -1021,16 +1024,6 @@ impl Future for ConnectFuture<'_> {
 impl Drop for ConnectFuture<'_> {
     fn drop(&mut self) {
         self.slot.drop_future();
-    }
-}
-
-fn map_connect_timeout(
-    result: Result<io::Result<TcpStream>, TimeoutError>,
-) -> io::Result<TcpStream> {
-    match result {
-        Ok(result) => result,
-        Err(TimeoutError::Elapsed) => Err(io::Error::from(io::ErrorKind::TimedOut)),
-        Err(TimeoutError::Runtime(err)) => Err(err),
     }
 }
 
@@ -1139,7 +1132,7 @@ impl Future for OwnedConnectFuture {
                 let result = state.result;
                 let op_ctx =
                     unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), this.state_ptr) };
-                unsafe { (*op_ctx.reactor()).free_op(this.state_ptr) };
+                unsafe { op_ctx.free_op_unchecked(this.state_ptr) };
                 this.state_ptr = std::ptr::null_mut();
 
                 if op_ctx.context_rejected() {
@@ -1303,10 +1296,9 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
-    fn tcp_terminal_accept_readiness_would_block_is_not_rearmed() {
+    fn tcp_terminal_accept_readiness_latches_and_later_accepts_fail_fast() {
         crate::net::test_terminal_accept_readiness(
             "TCP",
-            AcceptSlot::new,
             |slot, cx, state_ptr| {
                 slot.state_ptr = state_ptr;
                 slot.in_use = true;
@@ -1319,8 +1311,34 @@ mod tests {
                 drop(accept);
                 outcome
             },
-            |slot| slot.state_ptr.is_null() && !slot.in_use,
+            |slot, cx| {
+                let input_error = slot.prepare().err();
+                let prepared = input_error.is_none();
+                let mut accept = AcceptFuture {
+                    slot,
+                    input_error,
+                    prepared,
+                };
+                let outcome = Future::poll(Pin::new(&mut accept), cx);
+                drop(accept);
+                outcome
+            },
         );
+    }
+
+    #[test]
+    fn tcp_unprepared_accept_future_parks_without_touching_slot() {
+        crate::net::test_unprepared_accept_future_parks("TCP", |slot, cx, input_error| {
+            let mut accept = AcceptFuture {
+                slot,
+                input_error: Some(input_error),
+                prepared: false,
+            };
+            let first = Future::poll(Pin::new(&mut accept), cx);
+            let second = Future::poll(Pin::new(&mut accept), cx);
+            drop(accept);
+            (first, second)
+        });
     }
 
     #[test]

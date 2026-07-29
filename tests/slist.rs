@@ -156,6 +156,22 @@ mod debug_only {
     }
 
     #[test]
+    #[should_panic(expected = "slist double insert")]
+    fn test_singleton_double_insert_panics() {
+        let mut list: utils::list::intrusive::slist::SList<Node> =
+            utils::list::intrusive::slist::SList::new();
+        let mut node = Node {
+            link: utils::list::intrusive::slist::Link::new_unlinked(),
+            value: 1,
+        };
+
+        unsafe {
+            list.push_front(node_link_ptr(&mut node));
+            list.push_front(node_link_ptr(&mut node));
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "attempted to push head onto itself")]
     fn test_push_head_onto_itself_panics() {
         let mut list: utils::list::intrusive::slist::SList<Node> =

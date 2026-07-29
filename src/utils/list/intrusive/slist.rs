@@ -114,6 +114,7 @@ impl<T> SList<T> {
     pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
         debug_assert!(!node_link.is_null());
+        debug_assert!(node_link != self.head, "slist double insert");
         debug_assert!(unsafe { (*node_link).is_unlinked() }, "slist double insert");
 
         unsafe {

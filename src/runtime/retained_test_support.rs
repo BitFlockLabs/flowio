@@ -182,6 +182,8 @@ impl<T: 'static> RetainedPayload<T> {
     /// `pool` must be the same retained pool that created this handle.
     /// `extract` must move or drop every initialized field that requires
     /// destruction before returning.
+    /// If `extract` unwinds, the backing allocation is intentionally leaked
+    /// because its remaining initialized fields cannot be determined safely.
     pub unsafe fn take_with<R>(
         self,
         pool: &mut RetainedPayloadPool,

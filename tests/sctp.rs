@@ -1624,9 +1624,10 @@ fn parse_recv_meta_rejects_truncated_payload_and_control() {
     let control_err = test_parse_recv_meta(&[], 0, libc::MSG_CTRUNC | libc::MSG_EOR, &[])
         .expect_err("MSG_CTRUNC should reject missing SCTP control data");
     assert_eq!(control_err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(
-        control_err.to_string().contains("control"),
-        "control truncation error should name control truncation: {control_err}"
+    assert_eq!(
+        control_err.to_string(),
+        "SCTP recvmsg fixed control buffer capacity was exhausted",
+        "control truncation error should identify fixed-capacity exhaustion"
     );
 }
 

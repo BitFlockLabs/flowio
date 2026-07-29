@@ -304,9 +304,11 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     /// Creates an uninitialized slab allocator from a raw provider pointer.
     ///
     /// # Safety
-    /// `provider` must be non-null, valid for unique mutable access for `'a`,
-    /// and must outlive the returned allocator. The caller must ensure no
-    /// other mutable access aliases the provider while this allocator is used.
+    /// `provider` must be non-null and outlive the returned allocator. It must
+    /// be valid for exclusive mutable access during every allocator operation.
+    /// If multiple allocators retain the same raw pointer, the caller must
+    /// serialize all provider operations and exclude every other access while
+    /// one such operation is active.
     pub(crate) unsafe fn new_uninit_from_raw(
         provider: *mut P,
         obj_size: usize,
@@ -425,6 +427,11 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn get_slab_alignment(&self) -> usize {
         self.slab_align
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_ptr(&self) -> *mut P {
+        self.provider.as_ptr()
     }
 
     /// Returns a slab to the backing memory provider.

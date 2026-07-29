@@ -99,9 +99,7 @@ impl<T> PoolFreeGuard<'_, T> {
     /// Recycles on the ordinary path without calling the cold unwind shim.
     #[inline(always)]
     fn finish(self) {
-        // Suppress Drop before recycling so an invalid corrupted-list panic
-        // cannot attempt a second recycle while unwinding.
-        let mut this = std::mem::ManuallyDrop::new(self);
+        let mut this = utils::disarm_unwind_guard(self);
         this.recycle_slot();
     }
 }
@@ -212,10 +210,7 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
 
         #[cfg(debug_assertions)]
         {
-            self.live_slots = self
-                .live_slots
-                .checked_add(1)
-                .expect("Pool live-slot count overflowed");
+            self.live_slots += 1;
         }
 
         Some(raw_ptr)
@@ -228,7 +223,9 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     /// # Safety
     ///
     /// The caller must ensure that `obj` is a live object slot returned by this
-    /// pool and has not already been freed.
+    /// pool and has not already been freed. While `T::drop` runs, it must not
+    /// re-enter this pool through any alias, for example to allocate or free
+    /// another slot.
     #[inline(always)]
     pub unsafe fn free(&mut self, obj: *mut T) {
         if obj.is_null() {

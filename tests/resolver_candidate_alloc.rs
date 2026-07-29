@@ -46,7 +46,10 @@ fn overlong_question() -> Vec<u8> {
 
 #[test]
 fn malformed_dns_candidates_are_allocation_free() {
-    const ROUNDS: usize = 16_384;
+    // The stable gate retains the full allocation-stress load. Under Miri the
+    // same nine malformed parser shapes run enough times for provenance and
+    // undefined-behaviour checking without spending minutes in repetition.
+    const ROUNDS: usize = if cfg!(miri) { 16 } else { 16_384 };
     let overlong_question = overlong_question();
     let malformed: [&[u8]; 9] = [
         TRUNCATED_POINTER,

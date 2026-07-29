@@ -4,7 +4,9 @@ mod counting_allocator;
 mod dns_allocation;
 
 use counting_allocator::{
-    CountingAllocator, finish_counting_allocations_of_size, start_counting_allocations_of_size,
+    CountingAllocator, finish_counting_allocations_of_size,
+    finish_counting_zeroed_allocations_of_size, start_counting_allocations_of_size,
+    start_counting_zeroed_allocations_of_size,
 };
 use dns_allocation::{
     completed_cname_followup_script, expected_followup_socket, maximum_query_name, serve_script,
@@ -62,6 +64,7 @@ fn completed_nameserver_failover_reuses_one_response_buffer() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     start_counting_allocations_of_size(DNS_RESPONSE_BUFFER_SIZE);
+    start_counting_zeroed_allocations_of_size(DNS_RESPONSE_BUFFER_SIZE);
     executor
         .run(async move {
             let first_server_task =
@@ -84,10 +87,15 @@ fn completed_nameserver_failover_reuses_one_response_buffer() {
         })
         .expect("executor run failed");
     let response_allocations = finish_counting_allocations_of_size();
+    let zeroed_response_allocations = finish_counting_zeroed_allocations_of_size();
 
     assert_eq!(
         response_allocations, 1,
         "completed nameserver failover should reuse one response allocation"
+    );
+    assert_eq!(
+        zeroed_response_allocations, 0,
+        "a fresh DNS response allocation must not initialize bytes before recv"
     );
 }
 

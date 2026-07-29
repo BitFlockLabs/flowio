@@ -79,6 +79,10 @@ impl CompletionState {
     /// Reactor teardown abandoned this submission without observing its target
     /// CQE. The state and any retained payload must never be reclaimed.
     pub const FLAG_RING_ABANDONED: u32 = 1 << 6;
+    /// User-controlled SQE construction unwound before the operation was
+    /// submitted. No target CQE exists, so the future's destructor may reclaim
+    /// the state directly instead of issuing cancellation.
+    pub const FLAG_BUILD_ABORTED: u32 = 1 << 7;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -122,6 +126,11 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn is_ring_abandoned(&self) -> bool {
         self.state_flags & Self::FLAG_RING_ABANDONED != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_build_aborted(&self) -> bool {
+        self.state_flags & Self::FLAG_BUILD_ABORTED != 0
     }
 
     #[inline(always)]
@@ -196,6 +205,11 @@ impl CompletionState {
     }
 
     #[inline(always)]
+    pub(crate) fn set_build_aborted(&mut self) {
+        self.state_flags |= Self::FLAG_BUILD_ABORTED;
+    }
+
+    #[inline(always)]
     pub(crate) fn is_context_rejected(&self) -> bool {
         self.state_flags & Self::FLAG_CONTEXT_REJECTED != 0
     }
@@ -249,10 +263,12 @@ impl CompletionState {
         unsafe { clear_task_ref(&mut self.waiter) };
     }
 
-    /// Attaches a retained payload to this in-flight operation.
+    /// Attaches a retained payload while preparing this operation.
     ///
-    /// The payload is owned by the completion state until a live future takes
-    /// it back or the reactor drops it while retiring an orphaned original CQE.
+    /// After submission, the payload is owned by the completion state until a
+    /// live future takes it back or the reactor drops it while retiring an
+    /// orphaned original CQE. If SQE construction aborts first, the submission
+    /// guard detaches it before the state becomes reclaimable.
     #[inline(always)]
     pub(crate) fn attach_retained_payload<T: 'static>(&mut self, payload: RetainedPayload<T>) {
         debug_assert!(
@@ -357,17 +373,22 @@ impl CompletionState {
     /// `pool` must be the pool that allocated the attached payload, and the
     /// associated kernel submission must no longer be able to reference it.
     #[inline(always)]
-    pub(crate) unsafe fn drop_retained_payload(&mut self, pool: &mut RetainedPayloadPool) {
-        if self.retained_payload.is_null() {
+    pub(crate) unsafe fn drop_retained_payload_unchecked(
+        state: *mut Self,
+        pool: *mut RetainedPayloadPool,
+    ) {
+        if unsafe { (*state).retained_payload.is_null() } {
             return;
         }
-        let ptr = self.retained_payload;
+        let ptr = unsafe { (*state).retained_payload };
         debug_assert!(
-            self.retained_payload_vtable.is_some(),
+            unsafe { (*state).retained_payload_vtable.is_some() },
             "retained payload missing vtable"
         );
-        let vtable = unsafe { self.retained_payload_vtable.take().unwrap_unchecked() };
-        self.retained_payload = std::ptr::null_mut();
+        let vtable = unsafe { (*state).retained_payload_vtable.take().unwrap_unchecked() };
+        unsafe {
+            (*state).retained_payload = std::ptr::null_mut();
+        }
         unsafe { (vtable.drop_and_free)(ptr, pool) };
     }
 

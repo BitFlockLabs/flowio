@@ -40,6 +40,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dns_parse_received_response_packet"
+path = "fuzz_targets/dns_parse_received_response_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sctp_parse_recv_meta"
 path = "fuzz_targets/sctp_parse_recv_meta.rs"
 test = false

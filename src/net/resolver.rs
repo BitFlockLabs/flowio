@@ -2,7 +2,8 @@
 //!
 //! The resolver keeps the public surface deliberately small:
 //! - IP literals resolve directly without DNS traffic
-//! - `localhost` and `/etc/hosts` entries are honored first
+//! - `localhost` and `/etc/hosts` entries are honored first with
+//!   case-insensitive, single-root-dot-equivalent name matching
 //! - all other names are resolved through UDP DNS queries using FlowIO's own
 //!   transport and timer APIs
 //!
@@ -58,7 +59,7 @@ use crate::runtime::buffer::bytes::{
 };
 use crate::runtime::timer::{TimeoutError, timeout};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,7 +80,12 @@ const DNS_RCODE_NOTIMP: u8 = 4;
 const DNS_RCODE_REFUSED: u8 = 5;
 const DNS_MAX_NAME_PRESENTATION_LEN: usize = 253;
 const DNS_MAX_NAME_WIRE_LEN: usize = 255;
-const DNS_MAX_QUERY_PACKET_LEN: usize = 12 + DNS_MAX_NAME_WIRE_LEN + 4;
+const DNS_HEADER_LEN: usize = 12;
+const DNS_QUESTION_FIXED_FIELDS_LEN: usize = 4;
+const DNS_RR_FIXED_FIELDS_LEN: usize = 10;
+const DNS_MIN_RR_LEN: usize = 1 + DNS_RR_FIXED_FIELDS_LEN;
+const DNS_MAX_QUERY_PACKET_LEN: usize =
+    DNS_HEADER_LEN + DNS_MAX_NAME_WIRE_LEN + DNS_QUESTION_FIXED_FIELDS_LEN;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const HOSTS_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
@@ -89,7 +95,7 @@ const MAX_CNAME_HOPS_PER_RESPONSE: usize = 16;
 const MAX_CNAME_FOLLOWUP_QUERIES: usize = 1;
 const MAX_CNAME_TOTAL_HOPS: usize = 16;
 const MAX_NAME_COMPRESSION_DEPTH: usize = 8;
-const DNS_UDP_RESPONSE_BUFFER_SIZE: usize = 2048;
+pub(crate) const DNS_UDP_RESPONSE_BUFFER_SIZE: usize = 2048;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const HOSTS_PATH: &str = "/etc/hosts";
 
@@ -209,7 +215,8 @@ impl DnsResolver {
     /// Resolves a host name into socket addresses for the requested port.
     ///
     /// This first handles IP literals, `localhost`, and `/etc/hosts`, then
-    /// falls back to UDP DNS queries if needed.
+    /// falls back to UDP DNS queries if needed. Local aliases compare
+    /// case-insensitively and treat a trailing root dot as equivalent.
     ///
     /// # Execution and failover
     ///
@@ -289,13 +296,23 @@ impl DnsResolver {
     /// over-limit condition returns `InvalidData`; results are never
     /// truncated.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        self.resolve_host_with_hosts_path(HOSTS_PATH, host, port)
+            .await
+    }
+
+    async fn resolve_host_with_hosts_path(
+        &self,
+        hosts_path: &str,
+        host: &str,
+        port: u16,
+    ) -> io::Result<Vec<SocketAddr>> {
         let host = normalize_host(host)?;
 
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
 
-        let mut addrs = resolve_local_host(host, port)?;
+        let mut addrs = resolve_local_host_with_hosts_path(hosts_path, host, port)?;
         if !addrs.is_empty() {
             return Ok(addrs);
         }
@@ -407,7 +424,7 @@ impl DnsResolver {
         match timeout(self.query_timeout, async {
             let mut recv = response_buffer
                 .take()
-                .unwrap_or_else(|| vec![0u8; DNS_UDP_RESPONSE_BUFFER_SIZE]);
+                .unwrap_or_else(new_dns_response_buffer);
             loop {
                 let (recv_result, returned) = socket.recv(recv, DNS_UDP_RESPONSE_BUFFER_SIZE).await;
                 recv = returned;
@@ -697,6 +714,10 @@ fn query_id_from_state(state: u64) -> u16 {
     (state as u16) ^ ((state >> 16) as u16) ^ ((state >> 32) as u16) ^ ((state >> 48) as u16)
 }
 
+fn new_dns_response_buffer() -> Vec<u8> {
+    Vec::with_capacity(DNS_UDP_RESPONSE_BUFFER_SIZE)
+}
+
 fn normalize_host(host: &str) -> io::Result<&str> {
     let host = host.trim();
     let host = host.strip_suffix('.').unwrap_or(host);
@@ -710,10 +731,6 @@ fn normalize_host(host: &str) -> io::Result<&str> {
     Ok(host)
 }
 
-fn resolve_local_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    resolve_local_host_with_hosts_path(HOSTS_PATH, host, port)
-}
-
 fn resolve_local_host_with_hosts_path(
     hosts_path: &str,
     host: &str,
@@ -721,7 +738,7 @@ fn resolve_local_host_with_hosts_path(
 ) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::new();
 
-    if host.eq_ignore_ascii_case("localhost") {
+    if dns_name_eq(host, "localhost") {
         push_unique_resolved_addr(&mut addrs, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
         push_unique_resolved_addr(&mut addrs, SocketAddr::from((Ipv6Addr::LOCALHOST, port)))?;
     }
@@ -737,17 +754,54 @@ fn read_hosts_file(
     port: u16,
     addrs: &mut Vec<SocketAddr>,
 ) -> io::Result<()> {
-    let contents = match read_bounded_utf8_file(
-        path,
-        HOSTS_FILE_MAX_BYTES,
-        "/etc/hosts exceeds the 4 MiB resolver configuration limit",
-    ) {
-        Ok(contents) => contents,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
+    let max_read = max_read_with_over_limit_sentinel(HOSTS_FILE_MAX_BYTES)?;
+    let mut reader = BufReader::new(file.take(max_read as u64));
+    let mut line_bytes = Vec::with_capacity(256);
+    let mut total_bytes = 0usize;
+    let mut utf8_error = None;
+    let mut result_error = None;
 
-    for line in contents.lines() {
+    loop {
+        line_bytes.clear();
+        let reached_eof = loop {
+            match reader.read_until(b'\n', &mut line_bytes) {
+                Ok(0) => break true,
+                Ok(_) => break false,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        };
+        if reached_eof && line_bytes.is_empty() {
+            break;
+        }
+
+        // `reader` is capped at the configured maximum plus one sentinel byte,
+        // so the accumulated count cannot overflow.
+        total_bytes += line_bytes.len();
+        if total_bytes > HOSTS_FILE_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "/etc/hosts exceeds the 4 MiB resolver configuration limit",
+            ));
+        }
+
+        let line = match std::str::from_utf8(&line_bytes) {
+            Ok(line) => line,
+            Err(err) => {
+                if utf8_error.is_none() {
+                    utf8_error = Some(io::Error::new(io::ErrorKind::InvalidData, err));
+                }
+                continue;
+            }
+        };
+        if utf8_error.is_some() || result_error.is_some() {
+            continue;
+        }
         let line = strip_comment(line);
         if line.is_empty() {
             continue;
@@ -761,12 +815,23 @@ fn read_hosts_file(
             continue;
         };
 
-        if parts.any(|name| name.eq_ignore_ascii_case(host)) {
+        if parts.any(|name| dns_name_eq(name, host)) {
             let socket = SocketAddr::new(ip, port);
-            push_unique_resolved_addr(addrs, socket)?;
+            if let Err(err) = push_unique_resolved_addr(addrs, socket) {
+                result_error = Some(err);
+            }
+        }
+        if reached_eof {
+            break;
         }
     }
 
+    if let Some(err) = utf8_error {
+        return Err(err);
+    }
+    if let Some(err) = result_error {
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -816,12 +881,7 @@ fn read_bounded_utf8_file(
     over_limit_message: &'static str,
 ) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
-    let max_read = max_bytes.checked_add(1).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "resolver file limit cannot represent an over-limit sentinel",
-        )
-    })?;
+    let max_read = max_read_with_over_limit_sentinel(max_bytes)?;
     let initial_capacity = file
         .metadata()
         .ok()
@@ -855,6 +915,15 @@ fn read_bounded_utf8_file(
     String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
+fn max_read_with_over_limit_sentinel(max_bytes: usize) -> io::Result<usize> {
+    max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resolver file limit cannot represent an over-limit sentinel",
+        )
+    })
+}
+
 fn strip_comment(line: &str) -> &str {
     line.split_once(['#', ';'])
         .map(|(head, _)| head.trim())
@@ -883,7 +952,7 @@ fn byte_range_eof(err: BufferRangeError) -> io::Error {
 /// question structure to decide whether full parsing is useful; it does not
 /// authenticate or fully validate the response packet.
 pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
-    if packet.len() < 12 {
+    if packet.len() < DNS_HEADER_LEN {
         return false;
     }
 
@@ -910,13 +979,15 @@ pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> b
     match qdcount {
         0 => dns_rcode_allows_questionless_failover(dns_rcode(flags)),
         1 => {
-            let Some((consumed, _)) = skip_dns_name(packet, 12, 0) else {
+            let Some((consumed, _)) = skip_dns_name(packet, DNS_HEADER_LEN, 0) else {
                 return false;
             };
-            let Some(question_end) = checked_add_candidate(12, consumed, packet.len()) else {
+            let Some(question_end) = checked_add_candidate(DNS_HEADER_LEN, consumed, packet.len())
+            else {
                 return false;
             };
-            checked_add_candidate(question_end, 4, packet.len()).is_some()
+            checked_add_candidate(question_end, DNS_QUESTION_FIXED_FIELDS_LEN, packet.len())
+                .is_some()
         }
         _ => false,
     }
@@ -949,7 +1020,7 @@ struct DnsResponseQuestion {
 }
 
 fn parse_response_envelope(packet: &[u8], query_id: u16) -> io::Result<DnsResponseEnvelope> {
-    if packet.len() < 12 {
+    if packet.len() < DNS_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "DNS response shorter than header",
@@ -992,13 +1063,13 @@ fn parse_response_envelope(packet: &[u8], query_id: u16) -> io::Result<DnsRespon
             ));
         }
         1 => {
-            let mut offset = 12usize;
+            let mut offset = DNS_HEADER_LEN;
             let (name, consumed) = decode_name(packet, offset, 0)?;
             offset = checked_add(offset, consumed, packet.len())?;
             let qtype = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
             let qclass_offset = checked_add(offset, 2, packet.len())?;
             let qclass = read_u16_be_at(packet, qclass_offset).map_err(byte_range_eof)?;
-            let end_offset = checked_add(offset, 4, packet.len())?;
+            let end_offset = checked_add(offset, DNS_QUESTION_FIXED_FIELDS_LEN, packet.len())?;
             Some(DnsResponseQuestion {
                 name,
                 qtype,
@@ -1079,7 +1150,7 @@ fn push_unique_socket_addr(addrs: &mut Vec<SocketAddr>, addr: SocketAddr) {
 fn encode_query_packet(packet: &mut Vec<u8>, host: &str) -> io::Result<()> {
     debug_assert!(validate_query_name(host).is_ok());
     packet.clear();
-    let mut header = [0u8; 12];
+    let mut header = [0u8; DNS_HEADER_LEN];
     {
         let mut cursor = BufferCursorMut::new(&mut header);
         cursor.put_u16_be(0).map_err(byte_range_eof)?;
@@ -1098,17 +1169,20 @@ fn encode_query_packet(packet: &mut Vec<u8>, host: &str) -> io::Result<()> {
 
     packet.push(0);
     let start = packet.len();
-    packet.resize(start + 4, 0);
+    packet.resize(start + DNS_QUESTION_FIXED_FIELDS_LEN, 0);
     write_u16_be_at(packet, start + 2, DNS_CLASS_IN).map_err(byte_range_eof)
 }
 
 fn patch_query_packet(packet: &mut [u8], query_id: u16, qtype: u16) -> io::Result<()> {
-    let qtype_offset = packet.len().checked_sub(4).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS query packet was shorter than its fixed fields",
-        )
-    })?;
+    let qtype_offset = packet
+        .len()
+        .checked_sub(DNS_QUESTION_FIXED_FIELDS_LEN)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS query packet was shorter than its fixed fields",
+            )
+        })?;
     write_u16_be_at(packet, 0, query_id).map_err(byte_range_eof)?;
     write_u16_be_at(packet, qtype_offset, qtype).map_err(byte_range_eof)
 }
@@ -1159,29 +1233,8 @@ pub(crate) fn parse_response_packet(
     query_host: &str,
     qtype: u16,
 ) -> io::Result<LookupResult> {
-    let envelope = parse_response_envelope(packet, query_id)?;
+    let envelope = parse_response_query_envelope(packet, query_id, query_host, qtype)?;
     let flags = envelope.flags;
-    if flags & DNS_FLAG_TC != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response was truncated; TCP fallback is not implemented",
-        ));
-    }
-
-    if let Some(question) = envelope.question.as_ref() {
-        if !dns_name_eq(&question.name, query_host) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "DNS response question name did not match query",
-            ));
-        }
-        if question.qtype != qtype || question.qclass != DNS_CLASS_IN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "DNS response question type/class did not match query",
-            ));
-        }
-    }
 
     let rcode = dns_rcode(flags);
     let records = parse_response_records(packet, &envelope, rcode == 0)?;
@@ -1272,7 +1325,49 @@ pub(crate) fn parse_response_packet(
     })
 }
 
-fn parse_received_response_packet(
+fn parse_response_query_envelope(
+    packet: &[u8],
+    query_id: u16,
+    query_host: &str,
+    qtype: u16,
+) -> io::Result<DnsResponseEnvelope> {
+    let envelope = parse_response_envelope(packet, query_id)?;
+    if envelope.flags & DNS_FLAG_TC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response was truncated; TCP fallback is not implemented",
+        ));
+    }
+
+    if let Some(question) = envelope.question.as_ref() {
+        if !dns_name_eq(&question.name, query_host) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response question name did not match query",
+            ));
+        }
+        if question.qtype != qtype || question.qclass != DNS_CLASS_IN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS response question type/class did not match query",
+            ));
+        }
+    }
+
+    Ok(envelope)
+}
+
+#[cfg(all(feature = "fuzzing", test))]
+pub(crate) fn response_reaches_record_parser(
+    packet: &[u8],
+    query_id: u16,
+    query_host: &str,
+    qtype: u16,
+) -> bool {
+    parse_response_query_envelope(packet, query_id, query_host, qtype).is_ok()
+}
+
+pub(crate) fn parse_received_response_packet(
     buffer: &[u8],
     received_len: usize,
     query_id: u16,
@@ -1302,9 +1397,9 @@ fn parse_response_records(
     let mut offset = envelope
         .question
         .as_ref()
-        .map_or(12, |question| question.end_offset);
+        .map_or(DNS_HEADER_LEN, |question| question.end_offset);
     let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;
-    let max_rrs_by_packet = packet.len().saturating_sub(offset) / 11;
+    let max_rrs_by_packet = packet.len().saturating_sub(offset) / DNS_MIN_RR_LEN;
     // Bound the eager allocation by the packet's minimum possible RR density;
     // forged header counts cannot reserve independently of packet size.
     let mut records = if retain_resolution_data {
@@ -1419,7 +1514,7 @@ struct RrHeader {
 }
 
 fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
-    let end = checked_add(offset, 10, packet.len())?;
+    let end = checked_add(offset, DNS_RR_FIXED_FIELDS_LEN, packet.len())?;
     let rr_type = read_u16_be_at(packet, offset).map_err(byte_range_eof)?;
     let class_offset = checked_add(offset, 2, packet.len())?;
     let rdlength_offset = checked_add(offset, 8, packet.len())?;
@@ -1708,8 +1803,9 @@ fn checked_add_name_offset(
 }
 
 fn dns_name_eq(left: &str, right: &str) -> bool {
-    left.trim_end_matches('.')
-        .eq_ignore_ascii_case(right.trim_end_matches('.'))
+    let left = left.strip_suffix('.').unwrap_or(left);
+    let right = right.strip_suffix('.').unwrap_or(right);
+    left.eq_ignore_ascii_case(right)
 }
 
 fn checked_add(base: usize, add: usize, limit: usize) -> io::Result<usize> {
@@ -1787,6 +1883,18 @@ pub(crate) mod test_support {
         super::resolve_local_host_with_hosts_path(path, host, port)
     }
 
+    /// Repository-only seam for full resolver lookup with a hosts fixture.
+    pub async fn resolve_host_with_hosts_path(
+        resolver: &super::DnsResolver,
+        path: &str,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        resolver
+            .resolve_host_with_hosts_path(path, host, port)
+            .await
+    }
+
     /// Repository-only seam for bounded `/etc/resolv.conf` fixtures.
     pub fn read_resolv_conf(path: &str) -> std::io::Result<Vec<SocketAddr>> {
         super::read_resolv_conf(path)
@@ -1810,6 +1918,13 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_dns_response_buffer_exposes_capacity_without_initializing_bytes() {
+        let response = new_dns_response_buffer();
+        assert_eq!(response.len(), 0);
+        assert_eq!(response.capacity(), DNS_UDP_RESPONSE_BUFFER_SIZE);
+    }
 
     fn test_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
         validate_query_name(host)?;

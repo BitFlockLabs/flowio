@@ -140,6 +140,9 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// Binds a UDP socket to the requested local address.
     ///
+    /// This enables `SO_REUSEADDR` before binding. A socket-option failure is
+    /// returned before `bind(2)` is attempted.
+    ///
     /// This is socket setup work. Keep the bound socket alive for steady-state
     /// datagram I/O rather than rebinding per message.
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
@@ -187,10 +190,13 @@ impl UdpSocket {
         current_local_addr(self.fd.raw_fd())
     }
 
-    /// Returns the connected peer address, or `None` if not connected.
+    /// Returns the peer from the last successful FlowIO [`Self::connect`].
     ///
-    /// This is socket status/control-plane lookup, not the per-datagram data
-    /// fast path.
+    /// This is an infallible cache lookup, not a live `getpeername(2)` query.
+    /// A failed connect leaves the previous value unchanged, and raw-descriptor
+    /// changes can make live kernel state disagree with this cache. This is
+    /// socket status/control-plane lookup, not the per-datagram data fast path.
+    /// Returns `None` until the first successful connect.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer_addr
     }
@@ -615,8 +621,8 @@ unsafe fn take_completed_udp_payload<T: 'static>(
 
     let result = unsafe { (**state_ptr).result };
     let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
-    let payload = unsafe { (*op_ctx.reactor()).take_retained_payload::<T>(*state_ptr) };
-    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(*state_ptr) };
+    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
     Some((result, payload, op_ctx.context_rejected()))
 }

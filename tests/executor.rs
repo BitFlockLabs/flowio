@@ -3146,6 +3146,8 @@ fn runtime_sleep_ordering_across_cascade_boundary() {
 
 #[test]
 fn runtime_sleep_uses_fresh_tick_after_idle_gap() {
+    const SLEEP_TARGET: Duration = Duration::from_millis(5);
+
     let mut executor = new_executor();
     let observed = Rc::new(Cell::new(Duration::ZERO));
     let observed_flag = observed.clone();
@@ -3154,13 +3156,13 @@ fn runtime_sleep_uses_fresh_tick_after_idle_gap() {
         .run(async move {
             std::thread::sleep(Duration::from_millis(20));
             let start = Instant::now();
-            sleep(Duration::from_millis(5)).await.expect("sleep failed");
+            sleep(SLEEP_TARGET).await.expect("sleep failed");
             observed_flag.set(start.elapsed());
         })
         .expect("executor run failed");
 
     assert!(
-        observed.get() >= Duration::from_millis(4),
+        observed.get() >= SLEEP_TARGET,
         "sleep completed too early after idle gap: {:?}",
         observed.get()
     );
@@ -3218,6 +3220,8 @@ fn runtime_relative_sleep_samples_after_same_pass_cpu_delay() {
 
 #[test]
 fn runtime_sleep_until_uses_fresh_tick_after_idle_gap() {
+    const SLEEP_TARGET: Duration = Duration::from_millis(5);
+
     let mut executor = new_executor();
     let observed = Rc::new(Cell::new(Duration::ZERO));
     let observed_flag = observed.clone();
@@ -3226,14 +3230,14 @@ fn runtime_sleep_until_uses_fresh_tick_after_idle_gap() {
         .run(async move {
             std::thread::sleep(Duration::from_millis(20));
             let start = Instant::now();
-            let deadline = start + Duration::from_millis(5);
+            let deadline = start + SLEEP_TARGET;
             sleep_until(deadline).await.expect("sleep_until failed");
             observed_flag.set(start.elapsed());
         })
         .expect("executor run failed");
 
     assert!(
-        observed.get() >= Duration::from_millis(4),
+        observed.get() >= SLEEP_TARGET,
         "sleep_until completed too early after idle gap: {:?}",
         observed.get()
     );

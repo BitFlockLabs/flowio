@@ -46,6 +46,7 @@ use crate::runtime::task::{
     task_ptr_from_waker,
 };
 use crate::runtime::timer::TimerRuntime;
+use crate::utils::disarm_unwind_guard;
 use crate::utils::list::intrusive::dlist::DList;
 use crate::utils::memory::provider::MemoryProvider;
 use crate::utils::memory::provider_owned_pool::{ProviderOwnedPool, ProviderOwnedPoolControl};
@@ -430,8 +431,6 @@ pub(crate) struct RuntimeState {
     pub(crate) live_tasks: usize,
     /// Number of submitted operations that have not retired yet.
     pub(crate) inflight_ops: usize,
-    /// Monotonic wake epoch used to coalesce repeated timer wakes in one pass.
-    pub(crate) wake_epoch: u64,
     #[cfg(debug_assertions)]
     /// Debug-only scheduler and allocation counters.
     pub(crate) stats: RuntimeStats,
@@ -442,7 +441,6 @@ impl RuntimeState {
         Self {
             live_tasks: 0,
             inflight_ops: 0,
-            wake_epoch: 1,
             #[cfg(debug_assertions)]
             stats: RuntimeStats::default(),
         }
@@ -543,7 +541,7 @@ impl Drop for CloseWorkerShutdownGuard {
     }
 }
 
-type TaskPanic = Box<dyn Any + Send + 'static>;
+pub(super) type PanicPayload = Box<dyn Any + Send + 'static>;
 
 /// Owns the executor's reference while a task completes or is cancelled.
 ///
@@ -668,29 +666,101 @@ struct ExecutorState {
     shutdown_complete: bool,
 }
 
-/// Completes timer cancellation and reactor retirement after task shutdown.
-///
-/// The guard preserves the required tasks -> timers -> reactor ordering even
-/// if task cancellation or task-reference release unwinds unexpectedly.
-struct RuntimeShutdownGuard {
+/// Cancels timers after task shutdown.
+struct TimerShutdownPhase {
     state: *mut ExecutorState,
 }
 
+impl Drop for TimerShutdownPhase {
+    fn drop(&mut self) {
+        let state = self.state;
+        run_cleanup_preserving_panic(|| {
+            // SAFETY: shutdown_owner creates this phase from its heap-stable
+            // ExecutorState and keeps that state alive until after phase drop.
+            unsafe {
+                TimerRuntime::cancel_all_for_shutdown_unchecked(std::ptr::addr_of_mut!(
+                    (*state).timers
+                ));
+            }
+        });
+    }
+}
+
+/// Retires reactor work after timer cancellation.
+struct ReactorShutdownPhase {
+    state: *mut ExecutorState,
+}
+
+impl Drop for ReactorShutdownPhase {
+    fn drop(&mut self) {
+        let state = self.state;
+        run_cleanup_preserving_panic(|| {
+            // SAFETY: shutdown_owner creates this phase from its heap-stable
+            // ExecutorState and keeps that state alive until after phase drop.
+            unsafe {
+                let runtime_state = std::ptr::addr_of_mut!((*state).runtime_state);
+                let ready_queue = std::ptr::addr_of_mut!((*state).ready_queue);
+                Reactor::shutdown_unchecked(
+                    std::ptr::addr_of_mut!((*state).reactor),
+                    runtime_state,
+                    ready_queue,
+                );
+            }
+        });
+    }
+}
+
+/// Completes timer cancellation and reactor retirement after task shutdown.
+///
+/// Rust drops struct fields in declaration order. Keeping the timer phase
+/// before the reactor phase ensures reactor retirement still runs if timer
+/// waiter destruction unwinds.
+struct RuntimeShutdownGuard {
+    _timer: TimerShutdownPhase,
+    _reactor: ReactorShutdownPhase,
+}
+
 impl RuntimeShutdownGuard {
+    fn new(state: *mut ExecutorState) -> Self {
+        Self {
+            _timer: TimerShutdownPhase { state },
+            _reactor: ReactorShutdownPhase { state },
+        }
+    }
+}
+
+/// Latches one completed shutdown even when an earlier teardown phase unwinds.
+struct ShutdownCompleteGuard {
+    state: *mut ExecutorState,
+}
+
+impl ShutdownCompleteGuard {
     fn new(state: *mut ExecutorState) -> Self {
         Self { state }
     }
 }
 
-impl Drop for RuntimeShutdownGuard {
+impl Drop for ShutdownCompleteGuard {
     fn drop(&mut self) {
-        // SAFETY: shutdown_owner creates this guard from its heap-stable
-        // ExecutorState and keeps the state alive until after guard drop.
+        // SAFETY: shutdown_owner creates this guard from its heap-stable state
+        // and keeps that state alive until after guard drop.
         unsafe {
-            (*self.state).timers.cancel_all_for_shutdown();
-            let runtime_state = std::ptr::addr_of_mut!((*self.state).runtime_state);
-            let ready_queue = std::ptr::addr_of_mut!((*self.state).ready_queue);
-            (*self.state).reactor.shutdown(runtime_state, ready_queue);
+            (*self.state).shutdown_complete = true;
+        }
+    }
+}
+
+/// Runs one cleanup action without allowing a secondary panic to abort an
+/// already-unwinding thread.
+fn run_cleanup_preserving_panic(cleanup: impl FnOnce()) {
+    let already_panicking = std::thread::panicking();
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(cleanup)) {
+        if already_panicking {
+            // Dropping this payload may itself panic, so intentionally retain
+            // it for process lifetime while the original unwind continues.
+            std::mem::forget(payload);
+        } else {
+            resume_unwind(payload);
         }
     }
 }
@@ -741,6 +811,11 @@ impl ExecutorOwner {
         unsafe { std::ptr::addr_of_mut!((*self.state_ptr()).timers) }
     }
 
+    #[cfg(test)]
+    pub(crate) fn inflight_op_count_for_test(&self) -> usize {
+        unsafe { (*self.state_ptr()).runtime_state.inflight_ops }
+    }
+
     /// Clones the `Rc` represented by a live owner pointer.
     ///
     /// # Safety
@@ -757,8 +832,126 @@ impl ExecutorOwner {
     }
 }
 
+#[cfg(test)]
+fn ringless_owner_for_test(max_live_ops: usize) -> Rc<ExecutorOwner> {
+    let task_pool = ProviderOwnedPool::new(ExecutorTaskMemProvider::new(), TASKS_PER_SLAB)
+        .expect("task pool construction failed");
+    let reactor =
+        Reactor::new_ringless_for_test(max_live_ops).expect("ringless reactor construction failed");
+    let timers = TimerRuntime::new().expect("timer runtime construction failed");
+    let owner = Rc::new(ExecutorOwner {
+        state: UnsafeCell::new(ExecutorState {
+            reactor,
+            close_worker: CloseWorker {
+                sender: None,
+                worker: None,
+            },
+            task_pool,
+            ready_queue: DList::new_uninit(),
+            all_tasks: DList::new_uninit(),
+            timers,
+            runtime_state: RuntimeState::new(),
+            initialized: false,
+            shutting_down: false,
+            shutdown_complete: false,
+        }),
+        #[cfg(debug_assertions)]
+        owner_thread: std::thread::current().id(),
+    });
+
+    let owner_ptr = Rc::as_ptr(&owner);
+    let state = owner.state_ptr();
+    unsafe {
+        (*state).task_pool.init();
+        (*state).ready_queue.init();
+        (*state).all_tasks.init();
+        (*state)
+            .timers
+            .init()
+            .expect("timer runtime initialization failed");
+        (*state).timers.bind_owner(owner_ptr);
+        (*state).reactor.bind_owner(owner_ptr);
+        (*state).initialized = true;
+    }
+    owner
+}
+
+/// Runs a test closure with a genuine FlowIO task waker over a ringless owner.
+///
+/// The closure must retire every operation waiter it registers before
+/// returning so the stack-resident task header can be released safely.
+#[cfg(test)]
+pub(crate) fn with_ringless_poll_context_for_test<R>(
+    max_live_ops: usize,
+    test: impl FnOnce(&Rc<ExecutorOwner>, &mut Context<'_>) -> R,
+) -> R {
+    let owner = ringless_owner_for_test(max_live_ops);
+    let _active = ExecutorCtxGuard::install(Rc::as_ptr(&owner))
+        .expect("ringless test owner context installation failed");
+    let mut task = TaskHeader::new();
+    task.owner = Some(Rc::clone(&owner));
+    let task_ptr = std::ptr::addr_of_mut!(task);
+    unsafe { init_cached_waker(task_ptr) };
+
+    let result = {
+        let waker = unsafe { cached_waker_ref(task_ptr) };
+        let mut cx = Context::from_waker(waker);
+        test(&owner, &mut cx)
+    };
+
+    assert_eq!(
+        task.refs.get(),
+        1,
+        "ringless test closure leaked a task waiter reference"
+    );
+    // The cached Waker owns the task's base reference, but its MaybeUninit
+    // storage has no automatic destructor. Release the same reference directly
+    // after the final borrow, matching its raw-waker Drop action without
+    // creating a field-wide mutable borrow that aliases the callback's header
+    // access under Miri.
+    unsafe { release_task(task_ptr) };
+    assert_eq!(
+        task.refs.get(),
+        0,
+        "ringless test task did not release its base reference"
+    );
+    result
+}
+
 thread_local! {
     static EXECUTOR_CTX: Cell<*const ExecutorOwner> = const { Cell::new(std::ptr::null()) };
+    static COMPLETION_DRAIN_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the thread while any reactor completion view has its ring mutably
+/// borrowed.
+///
+/// Descriptor destruction can run from retained-payload or task destructors
+/// during completion reclamation. The nestable flag conservatively keeps all
+/// destructor-driven owner-thread work off every ring until all active
+/// completion views have been released.
+pub(crate) struct CompletionDrainGuard {
+    previous: bool,
+}
+
+impl CompletionDrainGuard {
+    #[inline(always)]
+    pub(crate) fn enter() -> Self {
+        let previous = COMPLETION_DRAIN_ACTIVE.with(|active| active.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for CompletionDrainGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        COMPLETION_DRAIN_ACTIVE.with(|active| active.set(self.previous));
+    }
+}
+
+#[inline(always)]
+pub(crate) fn completion_drain_active() -> bool {
+    COMPLETION_DRAIN_ACTIVE.with(Cell::get)
 }
 
 struct ExecutorCtxGuard {
@@ -858,7 +1051,8 @@ pub(crate) fn poll_ctx_from_waker(cx: &std::task::Context<'_>) -> io::Result<Pol
     let task = task_ptr_from_waker(cx.waker()).ok_or_else(inactive_poll_context_error)?;
     let owner = unsafe { (*task).owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr) };
     let active_owner = EXECUTOR_CTX.with(Cell::get);
-    if owner.is_null() || active_owner != owner {
+    let shutting_down = !owner.is_null() && unsafe { (*(*owner).state_ptr()).shutting_down };
+    if owner.is_null() || active_owner != owner || shutting_down || completion_drain_active() {
         return Err(inactive_poll_context_error());
     }
 
@@ -885,6 +1079,7 @@ pub(crate) fn validate_local_io_result<T>(
 /// its current poll context is invalid.
 pub(crate) struct CompletedOpCtx {
     origin: PollCtx,
+    _origin_keepalive: Option<Rc<ExecutorOwner>>,
     current: Option<PollCtx>,
     context_rejected: bool,
 }
@@ -893,11 +1088,6 @@ impl CompletedOpCtx {
     #[inline(always)]
     pub(crate) fn reactor(&self) -> *mut Reactor {
         self.origin.reactor()
-    }
-
-    #[inline(always)]
-    pub(crate) fn origin_poll_ctx(&self) -> &PollCtx {
-        &self.origin
     }
 
     #[inline(always)]
@@ -912,6 +1102,48 @@ impl CompletedOpCtx {
         } else {
             self.current
         }
+    }
+
+    /// Retires a completed state without creating a whole-reactor mutable
+    /// reference, including while its completion view is live.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the live completed state represented by this origin
+    /// context and must no longer be kernel-visible.
+    #[inline(always)]
+    pub(crate) unsafe fn free_op_unchecked(&self, ptr: *mut CompletionState) {
+        unsafe { Reactor::free_op_unchecked(self.reactor(), ptr) };
+    }
+
+    /// Takes the retained payload from a completed state without creating a
+    /// whole-reactor mutable reference.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must satisfy [`Self::free_op_unchecked`] and retain exactly `T`.
+    #[inline(always)]
+    pub(crate) unsafe fn take_retained_payload_unchecked<T: 'static>(
+        &self,
+        ptr: *mut CompletionState,
+    ) -> T {
+        unsafe { Reactor::take_retained_payload_unchecked(self.reactor(), ptr) }
+    }
+
+    /// Extracts the retained payload from a completed state without creating
+    /// a whole-reactor mutable reference.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must satisfy [`Self::take_retained_payload_unchecked`], and
+    /// `extract` must fully handle every initialized field requiring drop.
+    #[inline(always)]
+    pub(crate) unsafe fn take_retained_payload_with_unchecked<T: 'static, R>(
+        &self,
+        ptr: *mut CompletionState,
+        extract: impl FnOnce(*mut T) -> R,
+    ) -> R {
+        unsafe { Reactor::take_retained_payload_with_unchecked(self.reactor(), ptr, extract) }
     }
 }
 
@@ -939,12 +1171,20 @@ pub(crate) unsafe fn completed_op_ctx(
     if !current_matches {
         state.set_context_rejected();
     }
+    let origin_keepalive = if current_matches {
+        None
+    } else {
+        let owner = state.clone_owner();
+        debug_assert!(owner.is_some(), "completed operation lost its origin owner");
+        owner
+    };
 
     CompletedOpCtx {
         origin: PollCtx {
             owner,
             task: std::ptr::null_mut(),
         },
+        _origin_keepalive: origin_keepalive,
         current,
         context_rejected: state.is_context_rejected(),
     }
@@ -1012,6 +1252,24 @@ struct JoinTask<F: Future> {
     join_waker: Option<Waker>,
 }
 
+/// Initializes one join payload directly in its final fixed task slot.
+///
+/// # Safety
+///
+/// `dst` must be aligned, writable storage for one uninitialized
+/// `JoinTask<F>`. It must be initialized exactly once and must not become
+/// visible to polling or destruction until this function returns.
+#[inline(always)]
+unsafe fn init_join_task_at<F: Future>(dst: *mut JoinTask<F>, future: F) {
+    // Publish non-owning empty state first and move the user future into its
+    // final address last. None of these writes allocates or invokes user code.
+    unsafe {
+        std::ptr::addr_of_mut!((*dst).result).write(None);
+        std::ptr::addr_of_mut!((*dst).join_waker).write(None);
+        std::ptr::addr_of_mut!((*dst).future).write(Some(future));
+    }
+}
+
 /// Reclaims one zero-reference task after its join payload is destroyed.
 trait TaskDestroyCleanup {
     /// # Safety
@@ -1066,9 +1324,7 @@ impl<'cleanup, C: TaskDestroyCleanup + ?Sized> TaskDestroyGuard<'cleanup, C> {
     /// Runs ordinary task cleanup inline without entering the cold drop shim.
     #[inline(always)]
     fn finish(self) {
-        // Suppress Drop before invoking cleanup so a cleanup panic cannot
-        // attempt a second unlink or slot return while unwinding.
-        let this = std::mem::ManuallyDrop::new(self);
+        let this = disarm_unwind_guard(self);
         this.cleanup();
     }
 }
@@ -1164,7 +1420,7 @@ impl std::error::Error for JoinError {}
 /// Error returned by [`Executor::try_spawn`].
 ///
 /// Each variant contains the original future so callers that own external
-/// state, such as an active RPC answer, can retry, reject, or clean up without
+/// state, such as an active request, can retry, reject, or clean up without
 /// losing task ownership when the executor cannot accept new work.
 ///
 /// # Example
@@ -1572,14 +1828,11 @@ impl Executor {
                     }
                 };
 
-                let join_task = JoinTask {
-                    future: Some(future),
-                    result: None,
-                    join_waker: None,
-                };
                 let data_ptr = (*slot_ptr).data.as_mut_ptr() as *mut JoinTask<F>;
-                std::ptr::write(data_ptr, join_task);
-
+                // Initialize the join payload directly in its fixed task slot.
+                // Building a by-value JoinTask first would move a future as
+                // large as the slot through a second stack temporary.
+                init_join_task_at(data_ptr, future);
                 let result_ptr = std::ptr::addr_of_mut!((*data_ptr).result);
                 let waker_ptr = std::ptr::addr_of_mut!((*data_ptr).join_waker);
 
@@ -1594,7 +1847,6 @@ impl Executor {
                     .header
                     .flags
                     .set(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED);
-                (*slot_ptr).header.last_wake_epoch.set(0);
                 init_cached_waker(&mut (*slot_ptr).header as *mut _);
                 (*slot_ptr).header.vtable = join_task_vtable_for::<F>();
 
@@ -1624,15 +1876,24 @@ impl Executor {
         let state_ptr = self.owner.state_ptr();
         let runtime_state = unsafe { std::ptr::addr_of_mut!((*state_ptr).runtime_state) };
         let ready_queue = unsafe { std::ptr::addr_of_mut!((*state_ptr).ready_queue) };
-        let _ = unsafe { &mut (*state_ptr).reactor }.poll_io(
-            self.process_quota,
-            runtime_state,
-            ready_queue,
-        )?;
-        let timers = unsafe { &mut (*state_ptr).timers };
-        if timers.has_pending() {
-            let now_tick = timers.now_tick()?;
-            let _ = timers.process_at_with_budget(now_tick, self.process_quota)?;
+        let _ = unsafe {
+            Reactor::poll_io_unchecked(
+                std::ptr::addr_of_mut!((*state_ptr).reactor),
+                self.process_quota,
+                runtime_state,
+                ready_queue,
+            )
+        }?;
+        let timers = unsafe { std::ptr::addr_of_mut!((*state_ptr).timers) };
+        if unsafe { (*timers).has_pending() } {
+            let now_tick = unsafe { (*timers).now_tick()? };
+            let _ = unsafe {
+                TimerRuntime::process_at_with_budget_unchecked(
+                    timers,
+                    now_tick,
+                    self.process_quota,
+                )?
+            };
         }
         Ok(())
     }
@@ -1758,13 +2019,13 @@ impl Executor {
                     let task_ref = ExecutorTaskRefGuard::new(header_ptr);
                     let finish = header.vtable.finish;
                     let mut first_panic = None;
-                    retain_first_task_panic(
+                    retain_first_panic(
                         &mut first_panic,
                         catch_unwind(AssertUnwindSafe(|| unsafe {
                             finish(header_ptr);
                         })),
                     );
-                    retain_first_task_panic(
+                    retain_first_panic(
                         &mut first_panic,
                         catch_unwind(AssertUnwindSafe(|| {
                             task_ref.release();
@@ -1794,20 +2055,25 @@ impl Executor {
                 self.poll_io_and_process_timers()?;
                 continue;
             }
-            let completed = unsafe { &mut (*state_ptr).reactor }.poll_io(
-                self.process_quota,
-                unsafe { std::ptr::addr_of_mut!((*state_ptr).runtime_state) },
-                unsafe { std::ptr::addr_of_mut!((*state_ptr).ready_queue) },
-            )?;
+            let completed = unsafe {
+                Reactor::poll_io_unchecked(
+                    std::ptr::addr_of_mut!((*state_ptr).reactor),
+                    self.process_quota,
+                    std::ptr::addr_of_mut!((*state_ptr).runtime_state),
+                    std::ptr::addr_of_mut!((*state_ptr).ready_queue),
+                )
+            }?;
             let timers_pending = unsafe { (*state_ptr).timers.has_pending() };
             let mut now_tick = None;
             let timer_budget_exhausted = if timers_pending {
                 let tick = unsafe { (*state_ptr).timers.now_tick()? };
                 now_tick = Some(tick);
                 unsafe {
-                    (*state_ptr)
-                        .timers
-                        .process_at_with_budget(tick, self.process_quota)?
+                    TimerRuntime::process_at_with_budget_unchecked(
+                        std::ptr::addr_of_mut!((*state_ptr).timers),
+                        tick,
+                        self.process_quota,
+                    )?
                 }
             } else {
                 false
@@ -1851,13 +2117,16 @@ impl Executor {
                 // above. Keep this cheap defensive branch so a clock/tick
                 // boundary is processed locally instead of entering a
                 // nominally timed kernel wait.
-                let _ = unsafe { &mut (*state_ptr).timers }
-                    // SAFETY: now_tick is Some when timer_wait is Some (set in the
-                    // has_pending() branch above).
-                    .process_at_with_budget(
-                        unsafe { now_tick.unwrap_unchecked() },
+                // SAFETY: now_tick is Some when timer_wait is Some (set in the
+                // has_pending() branch above), and the raw timer pointer remains
+                // owner-thread confined for this call.
+                let _ = unsafe {
+                    TimerRuntime::process_at_with_budget_unchecked(
+                        std::ptr::addr_of_mut!((*state_ptr).timers),
+                        now_tick.unwrap_unchecked(),
                         self.process_quota,
-                    )?;
+                    )?
+                };
                 continue;
             }
 
@@ -1916,7 +2185,7 @@ impl Executor {
     /// Cancels every unfinished task while leaving completed slots available
     /// to escaped join handles. The first cancellation panic is retained while
     /// the remaining tasks are drained.
-    fn shutdown_tasks(&mut self) -> Option<TaskPanic> {
+    fn shutdown_tasks(&mut self) -> Option<PanicPayload> {
         let state_ptr = self.owner.state_ptr();
         unsafe {
             (*state_ptr).shutting_down = true;
@@ -1980,18 +2249,18 @@ impl Executor {
         }
 
         let owner_ptr = Rc::as_ptr(&self.owner);
-        let first_panic = {
+        let mut first_panic = None;
+        let teardown_result = catch_unwind(AssertUnwindSafe(|| {
             let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
+            let _shutdown_complete_guard = ShutdownCompleteGuard::new(state_ptr);
             let _close_worker_guard = CloseWorkerShutdownGuard::new(unsafe {
                 std::ptr::addr_of_mut!((*state_ptr).close_worker)
             });
             let _runtime_shutdown_guard = RuntimeShutdownGuard::new(state_ptr);
-            self.shutdown_tasks()
-        };
+            first_panic = self.shutdown_tasks();
+        }));
+        retain_first_panic(&mut first_panic, teardown_result);
 
-        unsafe {
-            (*state_ptr).shutdown_complete = true;
-        }
         if let Some(payload) = first_panic {
             if std::thread::panicking() {
                 // Executor::drop may run while another panic is already
@@ -2007,7 +2276,10 @@ impl Executor {
 }
 
 #[inline(always)]
-fn retain_first_task_panic(first_panic: &mut Option<TaskPanic>, result: Result<(), TaskPanic>) {
+pub(super) fn retain_first_panic(
+    first_panic: &mut Option<PanicPayload>,
+    result: Result<(), PanicPayload>,
+) {
     let Err(payload) = result else {
         return;
     };
@@ -2036,7 +2308,7 @@ fn retain_first_task_panic(first_panic: &mut Option<TaskPanic>, result: Result<(
 unsafe fn cancel_task_and_release_executor_ref(
     task: *mut TaskHeader,
     runtime_state: *mut RuntimeState,
-) -> Option<TaskPanic> {
+) -> Option<PanicPayload> {
     let flags = unsafe { (*task).flags.get() };
     let live_tasks = unsafe { (*runtime_state).live_tasks };
     #[cfg(debug_assertions)]
@@ -2063,13 +2335,13 @@ unsafe fn cancel_task_and_release_executor_ref(
     let cancel = unsafe { (*task).vtable.cancel };
     let task_ref = ExecutorTaskRefGuard::new(task);
     let mut first_panic = None;
-    retain_first_task_panic(
+    retain_first_panic(
         &mut first_panic,
         catch_unwind(AssertUnwindSafe(|| unsafe {
             cancel(task);
         })),
     );
-    retain_first_task_panic(
+    retain_first_panic(
         &mut first_panic,
         catch_unwind(AssertUnwindSafe(|| {
             task_ref.release();
@@ -2138,27 +2410,41 @@ unsafe fn cancel_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
     let Some(owner) = (unsafe { (*ptr).clone_owner() }) else {
         return;
     };
-    unsafe { (*owner.reactor_ptr()).cancel_op(ptr) };
+    let reactor = owner.reactor_ptr();
+    if completion_drain_active() {
+        unsafe { Reactor::defer_cancel_during_completion_drain(reactor, ptr) };
+    } else {
+        unsafe { Reactor::cancel_op_unchecked(reactor, ptr) };
+    }
 }
 
-/// Free a completed `CompletionState` from a future's `Drop` impl when the
-/// CQE has already been consumed but the future is dropped before polling the
-/// result. Reclamation uses the state owner and therefore remains valid after a
-/// run boundary or public `Executor` teardown.
+/// Free a reclaimable `CompletionState` from a future's `Drop` impl.
+///
+/// This covers completed operations whose CQE has already been consumed and
+/// operations whose SQE construction aborted before submission. Reclamation
+/// uses the state owner and therefore remains valid after a run boundary or
+/// public `Executor` teardown.
 ///
 /// # Safety
 ///
-/// `ptr` must point to a completed state, and its result must already have been
-/// consumed or otherwise made safe to drop.
+/// `ptr` must point to a completed state whose result has been consumed or
+/// otherwise made safe to drop, or to a build-aborted state that was never
+/// submitted.
 unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
     let Some(owner) = (unsafe { (*ptr).clone_owner() }) else {
         return;
     };
-    unsafe { (*owner.reactor_ptr()).free_op(ptr) };
+    let reactor = owner.reactor_ptr();
+    if completion_drain_active() {
+        unsafe { Reactor::free_op_unchecked(reactor, ptr) };
+    } else {
+        unsafe { (*reactor).free_op(ptr) };
+    }
 }
 
 /// Release a future-owned `CompletionState` pointer from `Drop`.
-/// Completed ops are freed immediately; pending ops are orphaned and cancelled.
+/// Completed and pre-submission-aborted ops are freed immediately; pending
+/// submitted ops are orphaned and cancelled.
 /// Ring-abandoned ops remain leaked because no target CQE proved that their
 /// kernel-visible storage may be reclaimed. The caller's pointer is always
 /// cleared.
@@ -2179,8 +2465,16 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
         if (*state_ptr).is_ring_abandoned() {
             // Ring-abandoned state and payload storage are deliberately leaked:
             // no target CQE proved that the kernel released its references.
-        } else if (*state_ptr).is_completed() {
+        } else if (*state_ptr).is_completed() || (*state_ptr).is_build_aborted() {
             free_op_unchecked(state_ptr);
+        } else if (*state_ptr).is_runtime_shutdown() {
+            // Shutdown already owns cancellation and final retirement. A task
+            // destructor may reach this path after the reactor has detached
+            // its waiter; submitting or queueing a second cancel would corrupt
+            // the pending-cancel ownership links. Mark the now-unowned state so
+            // its target CQE retires the slot instead of preserving it for an
+            // escaped future.
+            (*state_ptr).set_orphaned();
         } else {
             cancel_op_unchecked(state_ptr);
         }
@@ -2236,6 +2530,73 @@ impl Drop for UnsubmittedOpGuard {
     #[inline(always)]
     fn drop(&mut self) {
         unsafe { self.reactor.as_mut().free_op(self.state.as_ptr()) };
+    }
+}
+
+/// Owns an attached retained payload while user-controlled SQE construction
+/// runs.
+///
+/// Successful construction consumes this guard before the SQE can enter the
+/// submission queue. If construction unwinds, the guard marks the operation as
+/// never submitted, detaches and destroys the payload in place, and leaves a
+/// published state safe for its future's destructor to reclaim directly.
+struct AttachedRetainedPayloadGuard<T: 'static> {
+    /// Attached completion state.
+    state: NonNull<CompletionState>,
+    /// Origin pool that owns the retained backing.
+    retained_pool: NonNull<crate::runtime::retained::RetainedPayloadPool>,
+    /// Exact attached payload type used by the returned-error path.
+    _payload: std::marker::PhantomData<T>,
+}
+
+impl<T: 'static> AttachedRetainedPayloadGuard<T> {
+    /// # Safety
+    ///
+    /// `state` must be a live, unsubmitted completion state with one attached
+    /// retained payload of exactly type `T`, and `retained_pool` must own that
+    /// payload's backing.
+    #[inline(always)]
+    unsafe fn new(
+        state: *mut CompletionState,
+        retained_pool: NonNull<crate::runtime::retained::RetainedPayloadPool>,
+    ) -> Self {
+        debug_assert!(!state.is_null(), "attached payload state must be non-null");
+        Self {
+            state: unsafe { NonNull::new_unchecked(state) },
+            retained_pool,
+            _payload: std::marker::PhantomData,
+        }
+    }
+
+    /// Detaches the typed payload for an ordinary returned construction error.
+    #[inline(always)]
+    unsafe fn take(self) -> T {
+        let this = std::mem::ManuallyDrop::new(self);
+        unsafe {
+            (&mut *this.state.as_ptr())
+                .take_retained_payload::<T>(&mut *this.retained_pool.as_ptr())
+        }
+    }
+
+    /// Leaves the payload attached after successful SQE construction.
+    #[inline(always)]
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<T: 'static> Drop for AttachedRetainedPayloadGuard<T> {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        unsafe {
+            self.state.as_mut().set_build_aborted();
+        }
+        let state = self.state.as_ptr();
+        let retained_pool = self.retained_pool.as_ptr();
+        run_cleanup_preserving_panic(|| unsafe {
+            CompletionState::drop_retained_payload_unchecked(state, retained_pool);
+        });
     }
 }
 
@@ -2316,11 +2677,16 @@ where
 {
     let reactor = pctx.reactor();
     unsafe { (*state_ptr).attach_retained_payload(payload) };
+    let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+    let payload_guard = unsafe { AttachedRetainedPayloadGuard::<T>::new(state_ptr, retained_pool) };
 
     let sqe = match build(unsafe { (*state_ptr).retained_payload_mut::<T>() }) {
-        Ok(sqe) => sqe,
+        Ok(sqe) => {
+            payload_guard.disarm();
+            sqe
+        }
         Err(err) => {
-            let payload = unsafe { (*reactor).take_retained_payload::<T>(state_ptr) };
+            let payload = unsafe { payload_guard.take() };
             return Err((err, payload));
         }
     };
@@ -2427,6 +2793,17 @@ pub(crate) fn try_admit_close(fd: OwnedFd) -> CloseAdmission {
 pub(crate) fn try_submit_close(fd: OwnedFd) -> CloseSubmission {
     EXECUTOR_CTX.with(|ctx_cell| {
         let owner = ctx_cell.get();
+        if completion_drain_active() {
+            #[cfg(debug_assertions)]
+            if !owner.is_null() {
+                unsafe {
+                    (*owner).debug_assert_owner_thread();
+                    let state_ptr = (*owner).state_ptr();
+                    (*state_ptr).runtime_state.stats.close_ring_fallbacks += 1;
+                }
+            }
+            return CloseSubmission::Rejected(fd);
+        }
         if owner.is_null() {
             return CloseSubmission::OutsideExecutor(fd);
         }
@@ -2557,47 +2934,6 @@ pub(crate) unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
     })
 }
 
-#[inline(always)]
-/// Schedules a timer-expired task at most once for `wake_epoch`.
-///
-/// # Safety
-///
-/// All three pointers must be live and owned by the same active executor.
-/// `task_ptr` must remain allocated while its intrusive link may be queued.
-pub(crate) unsafe fn schedule_timer_woken_task_unchecked(
-    task_ptr: *mut TaskHeader,
-    ready_list: *mut DList<TaskHeader>,
-    runtime_state: *mut RuntimeState,
-    wake_epoch: u64,
-) {
-    let header = unsafe { &mut *task_ptr };
-    if header.last_wake_epoch.get() == wake_epoch {
-        return;
-    }
-    header.last_wake_epoch.set(wake_epoch);
-    unsafe {
-        notify_task_into_list_unchecked(task_ptr, ready_list, runtime_state);
-    }
-}
-
-/// # Safety
-///
-/// `schedule_ctx` must be a context obtained from `schedule_ctx_unchecked()`
-/// during the currently active `Executor::run`; its `runtime_state` pointer is
-/// dereferenced for read and write.
-#[inline(always)]
-pub(crate) unsafe fn next_timer_wake_epoch_unchecked(schedule_ctx: ScheduleCtx) -> u64 {
-    let current = unsafe { (*schedule_ctx.runtime_state).wake_epoch };
-    let mut next = current.wrapping_add(1);
-    if next == 0 {
-        next = 1;
-    }
-    unsafe {
-        (*schedule_ctx.runtime_state).wake_epoch = next;
-    }
-    next
-}
-
 fn join_task_vtable_for<F>() -> &'static TaskVTable
 where
     F: Future + 'static,
@@ -2651,14 +2987,14 @@ where
                     jt.result = Some(Err(JoinError::Cancelled));
                 }
                 let mut first_panic = None;
-                retain_first_task_panic(
+                retain_first_panic(
                     &mut first_panic,
                     catch_unwind(AssertUnwindSafe(|| {
                         drop_join_future_in_place(std::ptr::addr_of_mut!(jt.future));
                     })),
                 );
                 if let Some(join_waker) = jt.join_waker.take() {
-                    retain_first_task_panic(
+                    retain_first_panic(
                         &mut first_panic,
                         catch_unwind(AssertUnwindSafe(|| join_waker.wake())),
                     );
@@ -2895,6 +3231,8 @@ mod tests {
     use crate::runtime::buffer::IoBuffReadWrite;
     #[cfg(not(miri))]
     use crate::runtime::fd::{RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed};
+    #[cfg(not(miri))]
+    use crate::runtime::io::Nop;
     #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
     use crate::runtime::test_hooks;
     #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
@@ -2909,6 +3247,185 @@ mod tests {
     use std::task::{RawWaker, RawWakerVTable};
     #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
     use std::time::Duration;
+
+    #[cfg(not(miri))]
+    struct ReturnPendingNop {
+        nop: Option<Nop>,
+    }
+
+    thread_local! {
+        static RUNTIME_SHUTDOWN_DROP_STATE: Cell<*mut CompletionState> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static RUNTIME_SHUTDOWN_DROP_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    unsafe fn runtime_shutdown_output_destroy(_: *mut TaskHeader) {
+        RUNTIME_SHUTDOWN_DROP_COUNT.with(|count| count.set(count.get() + 1));
+        let mut state = RUNTIME_SHUTDOWN_DROP_STATE.with(Cell::get);
+        assert!(!state.is_null(), "runtime-shutdown state is missing");
+        unsafe {
+            drop_op_ptr_unchecked(&mut state);
+        }
+        assert!(
+            state.is_null(),
+            "future Drop did not clear its state pointer"
+        );
+    }
+
+    static RUNTIME_SHUTDOWN_OUTPUT_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Ready(()),
+        finish: |_| {},
+        cancel: |_| {},
+        destroy: runtime_shutdown_output_destroy,
+    };
+
+    #[cfg(not(miri))]
+    impl Future for ReturnPendingNop {
+        type Output = Nop;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let nop = this.nop.as_mut().expect("pending NOP was already returned");
+            assert!(
+                Pin::new(nop).poll(cx).is_pending(),
+                "first NOP poll did not submit an operation"
+            );
+            Poll::Ready(this.nop.take().expect("pending NOP disappeared"))
+        }
+    }
+
+    #[test]
+    fn rejected_completed_cleanup_keeps_origin_alive_through_pool_return() {
+        let owner = ringless_owner_for_test(4);
+        let reactor = owner.reactor_ptr();
+        let state = unsafe { (&mut *reactor).alloc_op() };
+        assert!(!state.is_null(), "operation allocation failed");
+        unsafe {
+            (*state).set_completed();
+        }
+        assert_eq!(Rc::strong_count(&owner), 2);
+        drop(owner);
+
+        let op_ctx = unsafe { completed_op_ctx(None, state) };
+        assert!(op_ctx.context_rejected());
+        unsafe {
+            op_ctx.free_op_unchecked(state);
+        }
+        drop(op_ctx);
+    }
+
+    #[test]
+    fn runtime_shutdown_task_output_drop_retires_target_state() {
+        RUNTIME_SHUTDOWN_DROP_COUNT.with(|count| count.set(0));
+        let owner = ringless_owner_for_test(4);
+        let owner_ptr = Rc::as_ptr(&owner);
+        let state_ptr = owner.state_ptr();
+        let reactor = owner.reactor_ptr();
+        let state = unsafe { (&mut *reactor).alloc_op() };
+        assert!(!state.is_null(), "operation allocation failed");
+
+        let mut waiter = TaskHeader::new();
+        waiter.vtable = &RUNTIME_SHUTDOWN_OUTPUT_VTABLE;
+        let waiter_ptr = std::ptr::addr_of_mut!(waiter);
+        unsafe {
+            (*state).register_waiter(waiter_ptr);
+            release_task(waiter_ptr);
+            (*state_ptr).runtime_state.inflight_ops = 1;
+        }
+        RUNTIME_SHUTDOWN_DROP_STATE.with(|stored| stored.set(state));
+
+        let mut first_panic = None;
+        unsafe {
+            Reactor::prepare_shutdown_unchecked(reactor, &mut first_panic);
+        }
+        assert!(first_panic.is_none());
+        RUNTIME_SHUTDOWN_DROP_STATE.with(|stored| stored.set(std::ptr::null_mut()));
+        RUNTIME_SHUTDOWN_DROP_COUNT.with(|count| assert_eq!(count.get(), 1));
+        unsafe {
+            assert!((*state).is_runtime_shutdown());
+            assert!((*state).is_orphaned());
+            assert!(!(*state).is_completed());
+            Reactor::retire_completion_unchecked(
+                reactor,
+                owner_ptr,
+                state,
+                0,
+                std::ptr::addr_of_mut!((*state_ptr).runtime_state),
+                std::ptr::addr_of_mut!((*state_ptr).ready_queue),
+            )
+            .expect("runtime-shutdown completion retirement failed");
+        }
+
+        assert_eq!(unsafe { (*state_ptr).runtime_state.inflight_ops }, 0);
+        assert_eq!(unsafe { (*state_ptr).reactor.live_op_count() }, 0);
+        drop(owner);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn completion_drain_rejects_nested_same_thread_future_poll() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run(async {
+                let mut nop = Nop::new();
+                std::future::poll_fn(|cx| {
+                    let outer = CompletionDrainGuard::enter();
+                    assert!(completion_drain_active());
+                    let inner = CompletionDrainGuard::enter();
+                    let result = match Pin::new(&mut nop).poll(cx) {
+                        Poll::Ready(result) => {
+                            result.expect_err("completion drain admitted a fresh NOP")
+                        }
+                        Poll::Pending => panic!("completion drain submitted a fresh NOP"),
+                    };
+                    assert_eq!(result.kind(), ErrorKind::NotConnected);
+                    drop(inner);
+                    assert!(
+                        completion_drain_active(),
+                        "nested guard ended the outer completion drain"
+                    );
+                    drop(outer);
+                    assert!(!completion_drain_active());
+                    Poll::Ready(())
+                })
+                .await;
+            })
+            .expect("executor run failed");
+
+        let state = executor.owner.state_ptr();
+        assert_eq!(unsafe { (*state).runtime_state.inflight_ops }, 0);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn completion_drain_reclaims_completed_operation_from_task_output_drop() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run(async {
+                let handle = Executor::spawn(ReturnPendingNop {
+                    nop: Some(Nop::new()),
+                })
+                .expect("pending-NOP task spawn failed");
+                drop(handle);
+            })
+            .expect("executor failed to drain detached pending-NOP task");
+
+        let state = executor.owner.state_ptr();
+        assert_eq!(unsafe { (*state).runtime_state.inflight_ops }, 0);
+        assert_eq!(
+            unsafe { (*state).reactor.live_op_count() },
+            0,
+            "task-output NOP drop stranded its completed operation"
+        );
+
+        executor
+            .run(async {
+                Nop::new().await.expect("replacement NOP failed");
+            })
+            .expect("executor failed after reentrant operation reclamation");
+        assert_eq!(unsafe { (*state).runtime_state.inflight_ops }, 0);
+        assert_eq!(unsafe { (*state).reactor.live_op_count() }, 0);
+    }
 
     #[test]
     fn ring_abandoned_waiter_refresh_reports_without_registering_waiter() {
@@ -4077,6 +4594,146 @@ mod tests {
 
     #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
     #[test]
+    fn timer_waiter_panic_still_abandons_reactor_and_completes_shutdown() {
+        struct FirstShutdownPanic;
+
+        struct PendingDropPanic {
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for PendingDropPanic {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for PendingDropPanic {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                std::panic::panic_any(FirstShutdownPanic);
+            }
+        }
+
+        struct StageArmedSleepOutput {
+            sleep: Option<crate::runtime::timer::Sleep>,
+            staged: Rc<RefCell<Option<crate::runtime::timer::Sleep>>>,
+            output_drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for StageArmedSleepOutput {
+            type Output = PanickingTaskOutput;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                let sleep = this.sleep.as_mut().expect("shutdown sleep missing");
+                assert!(Pin::new(sleep).poll(cx).is_pending());
+                *this.staged.borrow_mut() = this.sleep.take();
+                Poll::Ready(PanickingTaskOutput {
+                    drops: Rc::clone(&this.output_drops),
+                })
+            }
+        }
+
+        let mut executor = Executor::new().expect("executor construction failed");
+        let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+        let first_panic_drops = Rc::new(Cell::new(0));
+        let timer_output_drops = Rc::new(Cell::new(0));
+        let staged_sleep = Rc::new(RefCell::new(None));
+
+        let err = executor
+            .run({
+                let first_panic_drops = Rc::clone(&first_panic_drops);
+                let timer_output_drops = Rc::clone(&timer_output_drops);
+                let staged_sleep = Rc::clone(&staged_sleep);
+                async move {
+                    let first_panic = Executor::spawn(PendingDropPanic {
+                        drops: first_panic_drops,
+                    })
+                    .expect("first panic task spawn failed");
+                    drop(first_panic);
+
+                    let read = Executor::spawn(async move {
+                        let _ = reader.read(vec![0u8; 1], 1).await;
+                    })
+                    .expect("pending read task spawn failed");
+                    drop(read);
+
+                    let timer_output = Executor::spawn(StageArmedSleepOutput {
+                        sleep: Some(sleep(Duration::from_secs(3_600))),
+                        staged: staged_sleep,
+                        output_drops: timer_output_drops,
+                    })
+                    .expect("timer output task spawn failed");
+                    drop(timer_output);
+
+                    test_hooks::fail_next_ring_wait_errno(libc::EIO);
+                }
+            })
+            .expect_err("injected ring wait error should stop the run");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(test_hooks::ring_wait_failures_remaining(), 0);
+        assert_eq!(first_panic_drops.get(), 0);
+        assert_eq!(timer_output_drops.get(), 0);
+        assert!(staged_sleep.borrow().is_some(), "sleep was not staged");
+
+        let state_ptr = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 2);
+            assert_eq!((*state_ptr).runtime_state.inflight_ops, 1);
+            assert!((*state_ptr).timers.has_pending());
+            assert!(!(*state_ptr).shutdown_complete);
+        }
+
+        test_hooks::force_next_reactor_shutdown_fallback();
+        let unwind = catch_unwind(AssertUnwindSafe(|| executor.shutdown_owner()))
+            .expect_err("first task destructor should unwind shutdown");
+        assert!(
+            unwind.is::<FirstShutdownPanic>(),
+            "timer waiter panic replaced the first task panic"
+        );
+
+        assert_eq!(first_panic_drops.get(), 1);
+        assert_eq!(timer_output_drops.get(), 1);
+        assert_eq!(
+            test_hooks::reactor_shutdown_fallbacks_remaining(),
+            0,
+            "timer unwind skipped the forced reactor fallback"
+        );
+        unsafe {
+            assert_eq!((*state_ptr).runtime_state.live_tasks, 0);
+            assert_eq!((*state_ptr).runtime_state.inflight_ops, 0);
+            assert!((*state_ptr).reactor.test_storage_abandoned());
+            assert!((*state_ptr).all_tasks.is_empty());
+            assert!((*state_ptr).ready_queue.is_empty());
+            assert!((*state_ptr).close_worker.sender.is_none());
+            assert!((*state_ptr).close_worker.worker.is_none());
+            assert!((*state_ptr).shutdown_complete);
+        }
+
+        drop(
+            staged_sleep
+                .borrow_mut()
+                .take()
+                .expect("staged sleep disappeared"),
+        );
+        executor.shutdown_owner();
+        assert_eq!(first_panic_drops.get(), 1, "shutdown ran twice");
+        assert_eq!(timer_output_drops.get(), 1, "timer output dropped twice");
+
+        drop(writer);
+        drop(executor);
+        assert_eq!(first_panic_drops.get(), 1, "executor drop reran shutdown");
+        assert_eq!(
+            timer_output_drops.get(),
+            1,
+            "executor drop reran timer output destruction"
+        );
+    }
+
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    #[test]
     fn shutdown_drains_io_timer_and_worker_before_resuming_task_destructor_panic() {
         struct DropTrackedBuffer {
             bytes: Vec<u8>,
@@ -4805,6 +5462,25 @@ mod tests {
     #[repr(align(128))]
     struct Align128Payload;
 
+    struct NearSlotSpawnFuture {
+        bytes: [u8; 4000],
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Future for NearSlotSpawnFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for NearSlotSpawnFuture {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
     struct AlignedSpawnFuture<A> {
         id: usize,
         drops: Rc<Cell<usize>>,
@@ -4907,6 +5583,41 @@ mod tests {
             0,
             "placed task payload does not honor the advertised alignment"
         );
+    }
+
+    #[test]
+    fn join_task_initializer_writes_near_capacity_future_in_final_slot() {
+        let drops = Rc::new(Cell::new(0));
+        assert!(size_of::<JoinTask<NearSlotSpawnFuture>>() <= TASK_POOL_SIZE);
+        assert!(
+            size_of::<JoinTask<NearSlotSpawnFuture>>() > TASK_POOL_SIZE - 128,
+            "regression future no longer exercises a near-capacity join payload"
+        );
+
+        let mut slot = std::mem::MaybeUninit::<Task<TASK_POOL_SIZE>>::uninit();
+        let data_ptr = unsafe { std::ptr::addr_of_mut!((*slot.as_mut_ptr()).data) };
+        let join_ptr = data_ptr.cast::<JoinTask<NearSlotSpawnFuture>>();
+        let future = NearSlotSpawnFuture {
+            bytes: [0xA5; 4000],
+            drops: Rc::clone(&drops),
+        };
+
+        unsafe { init_join_task_at(join_ptr, future) };
+        let join_task = unsafe { &*join_ptr };
+        assert_eq!(
+            join_task
+                .future
+                .as_ref()
+                .expect("future was not initialized")
+                .bytes[3999],
+            0xA5
+        );
+        assert!(join_task.result.is_none());
+        assert!(join_task.join_waker.is_none());
+        assert_eq!(drops.get(), 0);
+
+        unsafe { std::ptr::drop_in_place(join_ptr) };
+        assert_eq!(drops.get(), 1);
     }
 
     #[cfg(not(miri))]

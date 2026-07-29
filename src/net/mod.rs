@@ -66,10 +66,15 @@
 //! forgotten future. The first three cases may become available after the
 //! executor makes progress; a busy reusable slot becomes available only when
 //! the previous future completes or is dropped, or when the owning
-//! listener/connector is dropped. TCP/SCTP accept also surfaces the kernel's
-//! `WouldBlock` when a terminal `POLLERR`/`POLLHUP` readiness mask
-//! has no queued connection; the current accept future completes instead of
-//! rearming that continuously ready condition.
+//! listener/connector is dropped. An accept future that reports this busy-slot
+//! error never owns the slot: later polls park, and dropping it does not cancel
+//! or replace the earlier owner's readiness waiter. TCP/SCTP accept latches
+//! [`io::ErrorKind::ConnectionAborted`] when `POLLERR`, `POLLHUP`, or `POLLNVAL`
+//! remains after owner-thread `accept4` finds no queued connection. That
+//! listener is no longer retryable; later accepts fail without another
+//! readiness submission. A positive `POLLNVAL` confirmed by `accept4` as
+//! `EBADF` preserves that raw errno for the current future while latching the
+//! same later fail-fast state. Other `accept4` errors propagate unchanged.
 //!
 //! [`io::ErrorKind::NotConnected`] also reports an invalid runtime poll context:
 //! transport futures must be polled inside the FlowIO executor that submitted
@@ -184,6 +189,7 @@ use crate::runtime::executor::{
 };
 use crate::runtime::fd::{LingerProvenance, RetainedListenerFd, RuntimeFd};
 use crate::runtime::op::CompletionState;
+use crate::runtime::timer::TimeoutError;
 
 pub mod resolver;
 pub mod sctp;
@@ -473,11 +479,29 @@ pub(crate) unsafe fn complete_read_with_progress<B: IoBuffReadWrite, T>(
 /// Validates a contiguous send length against io_uring opcodes that accept a
 /// 32-bit byte count.
 pub(crate) fn checked_send_len(requested: usize) -> io::Result<u32> {
-    if requested > u32::MAX as usize {
-        return Err(invalid_input(LEN_EXCEEDS_U32));
+    match send_len_u32(requested) {
+        Some(len) => Ok(len),
+        None => Err(invalid_input(LEN_EXCEEDS_U32)),
     }
+}
 
-    Ok(requested as u32)
+/// Classifies a send length without constructing an error.
+#[inline(always)]
+fn send_len_u32(requested: usize) -> Option<u32> {
+    if requested > u32::MAX as usize {
+        return None;
+    }
+    Some(requested as u32)
+}
+
+/// Maps the shared runtime timeout result onto a transport connect result.
+#[inline(always)]
+fn map_connect_timeout<T>(result: Result<io::Result<T>, TimeoutError>) -> io::Result<T> {
+    match result {
+        Ok(result) => result,
+        Err(TimeoutError::Elapsed) => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        Err(TimeoutError::Runtime(err)) => Err(err),
+    }
 }
 
 /// Interpret a connect CQE result code. `io_uring` may re-issue an async
@@ -502,20 +526,53 @@ fn accept_readiness_sqe(fd: RawFd, user_data: u64) -> io_uring::squeue::Entry {
         .user_data(user_data)
 }
 
-/// Returns whether a failed owner-thread accept attempt may rearm its one-shot
-/// readiness poll.
-///
-/// `POLLERR` and `POLLHUP` are terminal poll conditions that can remain
-/// continuously ready. If `accept4` found no queued connection, rearming one of
-/// those masks would create a reactor-paced loop. The caller still attempts
-/// `accept4` before consulting this predicate so a queued connection wins when
-/// `POLLIN` and a terminal condition arrive together.
-#[inline(always)]
-fn accept_readiness_allows_rearm(readiness: i32, accept_error: &io::Error) -> bool {
-    debug_assert!(readiness >= 0, "accept readiness mask must be nonnegative");
-    const TERMINAL_EVENTS: i32 = libc::POLLERR as i32 | libc::POLLHUP as i32;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptFailureDisposition {
+    Rearm,
+    LatchTerminal,
+    LatchAndPropagate,
+    Propagate,
+}
 
-    accept_error.kind() == io::ErrorKind::WouldBlock && readiness & TERMINAL_EVENTS == 0
+/// Classifies a failed owner-thread accept attempt after a positive readiness
+/// CQE.
+///
+/// `POLLERR`, `POLLHUP`, and `POLLNVAL` are terminal poll conditions that can
+/// remain continuously ready. If `accept4` found no queued connection, rearming
+/// one of those masks would create a reactor-paced loop. The caller still
+/// attempts `accept4` before consulting this predicate so a queued connection
+/// wins when `POLLIN` and a terminal condition arrive together.
+#[inline(always)]
+fn accept_failure_disposition(
+    readiness: i32,
+    accept_error: &io::Error,
+) -> AcceptFailureDisposition {
+    debug_assert!(readiness >= 0, "accept readiness mask must be nonnegative");
+
+    if accept_error.kind() == io::ErrorKind::WouldBlock {
+        if accept_readiness_is_terminal(readiness) {
+            return AcceptFailureDisposition::LatchTerminal;
+        }
+        return AcceptFailureDisposition::Rearm;
+    }
+    if readiness & libc::POLLNVAL as i32 != 0 && accept_error.raw_os_error() == Some(libc::EBADF) {
+        return AcceptFailureDisposition::LatchAndPropagate;
+    }
+    AcceptFailureDisposition::Propagate
+}
+
+#[inline(always)]
+fn accept_readiness_is_terminal(readiness: i32) -> bool {
+    debug_assert!(readiness >= 0, "accept readiness mask must be nonnegative");
+    const TERMINAL_EVENTS: i32 =
+        libc::POLLERR as i32 | libc::POLLHUP as i32 | libc::POLLNVAL as i32;
+
+    readiness & TERMINAL_EVENTS != 0
+}
+
+#[inline(always)]
+fn terminal_accept_error() -> io::Error {
+    io::Error::from(io::ErrorKind::ConnectionAborted)
 }
 
 /// Reusable one-shot readiness state shared by TCP and SCTP listeners.
@@ -532,6 +589,8 @@ struct AcceptReadinessSlot {
     state_ptr: *mut CompletionState,
     /// True while a transport accept future is borrowing this slot.
     in_use: bool,
+    /// Permanently latched after terminal readiness finds no queued peer.
+    terminal: bool,
 }
 
 impl AcceptReadinessSlot {
@@ -540,10 +599,14 @@ impl AcceptReadinessSlot {
             listener_fd,
             state_ptr: std::ptr::null_mut(),
             in_use: false,
+            terminal: false,
         }
     }
 
     fn prepare(&mut self) -> io::Result<()> {
+        if self.terminal {
+            return Err(terminal_accept_error());
+        }
         if self.in_use || !self.state_ptr.is_null() {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
@@ -565,7 +628,12 @@ impl AcceptReadinessSlot {
         self.drop_future();
     }
 
-    fn poll_accept<T, F>(&mut self, cx: &mut Context<'_>, finish_accepted: F) -> Poll<io::Result<T>>
+    fn poll_accept<T, F>(
+        &mut self,
+        slot_owned: bool,
+        cx: &mut Context<'_>,
+        finish_accepted: F,
+    ) -> Poll<io::Result<T>>
     where
         F: FnOnce(
             OwnedFd,
@@ -574,6 +642,13 @@ impl AcceptReadinessSlot {
             libc::socklen_t,
         ) -> io::Result<T>,
     {
+        if !slot_owned {
+            return Poll::Pending;
+        }
+        if self.terminal {
+            return Poll::Ready(Err(terminal_accept_error()));
+        }
+
         if !self.state_ptr.is_null() {
             let state = unsafe { &*self.state_ptr };
             if state.is_completed() {
@@ -581,9 +656,9 @@ impl AcceptReadinessSlot {
                 let op_ctx =
                     unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), self.state_ptr) };
                 let poll_fd = unsafe {
-                    (*op_ctx.reactor()).take_retained_payload::<RetainedListenerFd>(self.state_ptr)
+                    op_ctx.take_retained_payload_unchecked::<RetainedListenerFd>(self.state_ptr)
                 };
-                unsafe { (*op_ctx.reactor()).free_op(self.state_ptr) };
+                unsafe { op_ctx.free_op_unchecked(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
 
                 if op_ctx.context_rejected() {
@@ -609,15 +684,28 @@ impl AcceptReadinessSlot {
                             addrlen,
                         ));
                     }
-                    Err(err) if accept_readiness_allows_rearm(result, &err) => {
-                        // Readiness is only a hint and can be stale. Rearm the
-                        // one-shot poll without consuming slot ownership.
-                        note_accept_readiness_rearm();
-                    }
-                    Err(err) => {
-                        self.in_use = false;
-                        return Poll::Ready(Err(err));
-                    }
+                    Err(err) => match accept_failure_disposition(result, &err) {
+                        AcceptFailureDisposition::Rearm => {
+                            // Readiness is only a hint and can be stale. Rearm
+                            // the one-shot poll without consuming slot
+                            // ownership.
+                            note_accept_readiness_rearm();
+                        }
+                        AcceptFailureDisposition::LatchTerminal => {
+                            self.in_use = false;
+                            self.terminal = true;
+                            return Poll::Ready(Err(terminal_accept_error()));
+                        }
+                        AcceptFailureDisposition::LatchAndPropagate => {
+                            self.in_use = false;
+                            self.terminal = true;
+                            return Poll::Ready(Err(err));
+                        }
+                        AcceptFailureDisposition::Propagate => {
+                            self.in_use = false;
+                            return Poll::Ready(Err(err));
+                        }
+                    },
                 }
             }
         }
@@ -663,6 +751,136 @@ impl AcceptReadinessSlot {
     }
 }
 
+/// Runs the failed-preparation regression through one transport's real accept
+/// future without requiring a live io_uring or transport-specific kernel
+/// support.
+#[cfg(test)]
+fn test_unprepared_accept_future_parks<T, P>(transport: &'static str, mut poll_accept: P)
+where
+    P: for<'cx> FnMut(
+        &mut AcceptReadinessSlot,
+        &mut std::task::Context<'cx>,
+        io::Error,
+    ) -> (
+        std::task::Poll<io::Result<T>>,
+        std::task::Poll<io::Result<T>>,
+    ),
+{
+    fn assert_outcomes<T>(
+        transport: &str,
+        first: std::task::Poll<io::Result<T>>,
+        second: std::task::Poll<io::Result<T>>,
+    ) {
+        match first {
+            std::task::Poll::Ready(Err(err)) => {
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock,
+                    "{transport} failed preparation lost its pressure error"
+                );
+            }
+            std::task::Poll::Ready(Ok(_)) => {
+                panic!("{transport} failed preparation unexpectedly accepted a peer");
+            }
+            std::task::Poll::Pending => {
+                panic!("{transport} failed preparation did not return its error");
+            }
+        }
+        assert!(
+            matches!(second, std::task::Poll::Pending),
+            "{transport} unprepared accept future did not park after completion"
+        );
+    }
+
+    crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
+        let reactor = owner.reactor_ptr();
+        let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(-1));
+        let mut slot = AcceptReadinessSlot::new(listener_fd);
+        slot.in_use = true;
+        let input_error = slot
+            .prepare()
+            .expect_err("occupied accept slot should reject preparation");
+
+        let (first, second) = poll_accept(&mut slot, cx, input_error);
+        assert_outcomes(transport, first, second);
+        assert!(
+            slot.state_ptr.is_null(),
+            "{transport} unprepared accept future created a readiness operation"
+        );
+        assert!(
+            slot.in_use,
+            "{transport} unprepared accept future cleared the prior owner's marker"
+        );
+        assert_eq!(
+            unsafe { (&*reactor).live_op_count() },
+            0,
+            "{transport} unprepared accept future retained a reactor operation"
+        );
+
+        slot.drop_cached_state();
+        assert!(slot.state_ptr.is_null());
+        assert!(
+            !slot.in_use,
+            "{transport} listener teardown retained its accept marker"
+        );
+
+        let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(-1));
+        let mut slot = AcceptReadinessSlot::new(listener_fd);
+        let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+        assert!(
+            !state_ptr.is_null(),
+            "{transport} prior accept state allocation failed"
+        );
+        let mut prior_waiter = crate::runtime::task::TaskHeader::new();
+        let prior_waiter_ptr = std::ptr::addr_of_mut!(prior_waiter);
+        unsafe { (*state_ptr).register_waiter(prior_waiter_ptr) };
+        let prior_flags = unsafe { (*state_ptr).state_flags };
+        slot.state_ptr = state_ptr;
+        slot.in_use = true;
+        let input_error = slot
+            .prepare()
+            .expect_err("state-bearing accept slot should reject preparation");
+
+        let (first, second) = poll_accept(&mut slot, cx, input_error);
+        assert_outcomes(transport, first, second);
+        assert_eq!(
+            slot.state_ptr, state_ptr,
+            "{transport} unprepared accept future replaced the prior state"
+        );
+        assert_eq!(
+            unsafe { (*state_ptr).state_flags },
+            prior_flags,
+            "{transport} unprepared accept future changed the prior state flags"
+        );
+        assert_eq!(
+            unsafe { (*state_ptr).waiter },
+            prior_waiter_ptr,
+            "{transport} unprepared accept future replaced the prior waiter"
+        );
+        assert_eq!(
+            prior_waiter.refs.get(),
+            2,
+            "{transport} unprepared accept future changed the prior waiter refcount"
+        );
+        assert!(
+            slot.in_use,
+            "{transport} unprepared accept future cleared the state owner's marker"
+        );
+        assert_eq!(
+            unsafe { (&*reactor).live_op_count() },
+            1,
+            "{transport} unprepared accept future changed live operation ownership"
+        );
+
+        slot.state_ptr = std::ptr::null_mut();
+        unsafe { (&mut *reactor).free_op(state_ptr) };
+        assert_eq!(prior_waiter.refs.get(), 1);
+        assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+        slot.drop_cached_state();
+        assert!(!slot.in_use);
+    });
+}
+
 /// Installs a completed readiness state without submitting an SQE.
 ///
 /// This deterministic test seam lets each transport exercise its real
@@ -704,22 +922,23 @@ fn completed_accept_readiness_for_test(
 /// Runs the shared terminal-readiness regression through one transport's real
 /// accept future.
 #[cfg(all(test, not(miri)))]
-fn test_terminal_accept_readiness<A, T, M, P, R>(
+fn test_terminal_accept_readiness<T, P, N>(
     transport: &'static str,
-    make_adapter: M,
     mut poll_accept: P,
-    state_released: R,
+    mut poll_new_accept: N,
 ) where
-    A: 'static,
     T: 'static,
-    M: FnOnce(std::rc::Rc<crate::runtime::fd::RuntimeFd>) -> A,
     P: for<'cx> FnMut(
-            &mut A,
+            &mut AcceptReadinessSlot,
             &mut std::task::Context<'cx>,
             *mut crate::runtime::op::CompletionState,
         ) -> std::task::Poll<io::Result<T>>
         + 'static,
-    R: Fn(&A) -> bool + 'static,
+    N: for<'cx> FnMut(
+            &mut AcceptReadinessSlot,
+            &mut std::task::Context<'cx>,
+        ) -> std::task::Poll<io::Result<T>>
+        + 'static,
 {
     // The terminal-mask branch runs before transport-specific accepted-fd
     // setup, so an empty TCP listener deterministically supplies EAGAIN for
@@ -732,13 +951,16 @@ fn test_terminal_accept_readiness<A, T, M, P, R>(
     let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_owned(
         std::os::fd::OwnedFd::from(listener),
     ));
-    let mut adapter = make_adapter(std::rc::Rc::clone(&listener_fd));
+    let listener_keepalive = std::rc::Rc::clone(&listener_fd);
     let terminal_masks = [
         libc::POLLERR as i32,
         libc::POLLHUP as i32,
+        libc::POLLNVAL as i32,
         (libc::POLLERR | libc::POLLHUP) as i32,
         (libc::POLLIN | libc::POLLERR) as i32,
         (libc::POLLIN | libc::POLLHUP) as i32,
+        (libc::POLLIN | libc::POLLNVAL) as i32,
+        (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i32,
     ];
     let mut executor = crate::runtime::executor::Executor::new()
         .unwrap_or_else(|err| panic!("{transport} accept readiness executor failed: {err}"));
@@ -746,6 +968,7 @@ fn test_terminal_accept_readiness<A, T, M, P, R>(
     executor
         .run(async move {
             for readiness in terminal_masks {
+                let mut adapter = AcceptReadinessSlot::new(std::rc::Rc::clone(&listener_fd));
                 let state_ptr = std::future::poll_fn(|cx| {
                     std::task::Poll::Ready(completed_accept_readiness_for_test(
                         cx,
@@ -768,18 +991,43 @@ fn test_terminal_accept_readiness<A, T, M, P, R>(
                         panic!("terminal {transport} readiness was rearmed")
                     }
                 };
-                assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-                assert_eq!(err.raw_os_error(), Some(libc::EAGAIN));
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+                assert_eq!(err.raw_os_error(), None);
                 assert!(
-                    state_released(&adapter),
-                    "terminal {transport} readiness retained its reusable slot"
+                    adapter.state_ptr.is_null() && !adapter.in_use && adapter.terminal,
+                    "terminal {transport} readiness did not latch a reusable empty slot"
                 );
+
+                for _ in 0..8 {
+                    let outcome = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(poll_new_accept(&mut adapter, cx))
+                    })
+                    .await;
+                    assert!(
+                        matches!(
+                            outcome,
+                            std::task::Poll::Ready(Err(ref err))
+                                if err.kind() == io::ErrorKind::ConnectionAborted
+                                    && err.raw_os_error().is_none()
+                        ),
+                        "latched {transport} listener did not fail a later accept"
+                    );
+                    assert!(
+                        adapter.state_ptr.is_null() && !adapter.in_use && adapter.terminal,
+                        "latched {transport} listener changed state on a later accept"
+                    );
+                }
             }
         })
         .unwrap_or_else(|err| panic!("{transport} accept readiness run failed: {err}"));
 
     #[cfg(debug_assertions)]
-    assert_eq!(executor.last_stats().accept_readiness_rearms, 0);
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.accept_readiness_rearms, 0);
+        assert_eq!(stats.sqe_submits, 0);
+    }
+    drop(listener_keepalive);
 }
 
 /// Accepts one ready connection without allowing the owner thread to block.
@@ -900,6 +1148,27 @@ fn socket_addr_to_c(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
     }
 
     (storage, len)
+}
+
+/// Kernel-visible connect address storage retained until the connect CQE
+/// retires.
+#[derive(Clone, Copy)]
+struct RetainedConnectAddr {
+    /// Prepared peer address retained until connect completion.
+    addr: libc::sockaddr_storage,
+    /// Length of the prepared peer address.
+    addrlen: libc::socklen_t,
+}
+
+impl RetainedConnectAddr {
+    fn from_socket_addr(addr: SocketAddr) -> Self {
+        let (addr, addrlen) = socket_addr_to_c(addr);
+        Self { addr, addrlen }
+    }
+
+    fn addr_ptr(&self) -> *const libc::sockaddr {
+        &self.addr as *const libc::sockaddr_storage as *const libc::sockaddr
+    }
 }
 
 fn socket_addr_from_c(
@@ -1164,6 +1433,123 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
     }
 
+    #[test]
+    fn connect_timeout_mapping_preserves_each_result_class() {
+        assert_eq!(
+            map_connect_timeout::<u8>(Ok(Ok(7))).expect("successful connect should pass through"),
+            7
+        );
+
+        let connect_error =
+            map_connect_timeout::<u8>(Ok(Err(io::Error::from_raw_os_error(libc::ECONNREFUSED))))
+                .expect_err("connect error should pass through");
+        assert_eq!(connect_error.raw_os_error(), Some(libc::ECONNREFUSED));
+
+        let elapsed = map_connect_timeout::<u8>(Err(TimeoutError::Elapsed))
+            .expect_err("elapsed timeout should fail");
+        assert_eq!(elapsed.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed.get_ref().is_none(),
+            "elapsed timeout should retain the message-free error contract"
+        );
+
+        let runtime_error = map_connect_timeout::<u8>(Err(TimeoutError::Runtime(
+            io::Error::from_raw_os_error(libc::ENOMEM),
+        )))
+        .expect_err("timer runtime error should pass through");
+        assert_eq!(runtime_error.raw_os_error(), Some(libc::ENOMEM));
+    }
+
+    #[test]
+    fn accept_readiness_classifier_includes_every_terminal_poll_bit() {
+        assert_eq!(
+            std::mem::size_of::<AcceptReadinessSlot>(),
+            3 * std::mem::size_of::<usize>(),
+            "the terminal latch must remain inside the slot's existing padding"
+        );
+
+        let would_block = io::Error::from(io::ErrorKind::WouldBlock);
+        assert_eq!(
+            accept_failure_disposition(libc::POLLIN as i32, &would_block),
+            AcceptFailureDisposition::Rearm
+        );
+
+        for readiness in [
+            libc::POLLERR as i32,
+            libc::POLLHUP as i32,
+            libc::POLLNVAL as i32,
+            (libc::POLLIN | libc::POLLERR) as i32,
+            (libc::POLLIN | libc::POLLHUP) as i32,
+            (libc::POLLIN | libc::POLLNVAL) as i32,
+            (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i32,
+        ] {
+            assert!(accept_readiness_is_terminal(readiness));
+            assert_eq!(
+                accept_failure_disposition(readiness, &would_block),
+                AcceptFailureDisposition::LatchTerminal
+            );
+        }
+
+        let bad_fd = io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(
+            accept_failure_disposition(libc::POLLNVAL as i32, &bad_fd),
+            AcceptFailureDisposition::LatchAndPropagate
+        );
+        assert_eq!(bad_fd.raw_os_error(), Some(libc::EBADF));
+
+        for raw_error in [libc::ECONNABORTED, libc::ENETDOWN] {
+            let transient = io::Error::from_raw_os_error(raw_error);
+            assert_eq!(
+                accept_failure_disposition(libc::POLLERR as i32, &transient),
+                AcceptFailureDisposition::Propagate
+            );
+            assert_eq!(transient.raw_os_error(), Some(raw_error));
+        }
+
+        let refused = io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        assert_eq!(
+            accept_failure_disposition(libc::POLLIN as i32, &refused),
+            AcceptFailureDisposition::Propagate
+        );
+        assert_eq!(refused.raw_os_error(), Some(libc::ECONNREFUSED));
+        let terminal = terminal_accept_error();
+        assert_eq!(terminal.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(terminal.raw_os_error(), None);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn pollnval_ebadf_accept_readiness_latches_after_preserving_the_first_errno() {
+        crate::runtime::executor::with_ringless_poll_context_for_test(1, |_owner, cx| {
+            let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
+            let mut slot = AcceptReadinessSlot::new(listener_fd);
+            slot.prepare().expect("fresh accept slot should prepare");
+            slot.state_ptr =
+                completed_accept_readiness_for_test(cx, &slot.listener_fd, libc::POLLNVAL as i32);
+
+            let outcome: Poll<io::Result<()>> =
+                slot.poll_accept(true, cx, |_accepted, _provenance, _addr, _addrlen| {
+                    panic!("invalid listener unexpectedly accepted a peer")
+                });
+            let Poll::Ready(Err(err)) = outcome else {
+                panic!("POLLNVAL did not complete the invalid listener accept");
+            };
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+            assert!(slot.state_ptr.is_null());
+            assert!(!slot.in_use);
+            assert!(slot.terminal);
+
+            let later = slot
+                .prepare()
+                .expect_err("invalid listener should remain terminal");
+            assert_eq!(later.kind(), io::ErrorKind::ConnectionAborted);
+            assert_eq!(later.raw_os_error(), None);
+            assert!(slot.state_ptr.is_null());
+            assert!(!slot.in_use);
+            assert!(slot.terminal);
+        });
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn shutdown_socket_maps_all_modes_and_preserves_errno() {
@@ -1223,6 +1609,67 @@ mod tests {
         );
     }
 
+    #[cfg(not(miri))]
+    #[test]
+    fn queued_connection_wins_mixed_terminal_accept_readiness() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("listener bind failed");
+        listener
+            .set_nonblocking(true)
+            .expect("listener nonblocking setup failed");
+        let listener_addr = listener.local_addr().expect("listener address missing");
+        let peer =
+            std::net::TcpStream::connect_timeout(&listener_addr, std::time::Duration::from_secs(1))
+                .expect("peer connect failed");
+        let expected_peer = peer.local_addr().expect("peer local address missing");
+
+        let listener_fd = Rc::new(RuntimeFd::from_fresh_owned(OwnedFd::from(listener)));
+        let listener_keepalive = Rc::clone(&listener_fd);
+        let mut slot = AcceptReadinessSlot::new(listener_fd);
+        let mut executor =
+            crate::runtime::executor::Executor::new().expect("executor construction failed");
+
+        executor
+            .run(async move {
+                slot.prepare().expect("accept slot preparation failed");
+                let state_ptr = std::future::poll_fn(|cx| {
+                    Poll::Ready(completed_accept_readiness_for_test(
+                        cx,
+                        &slot.listener_fd,
+                        (libc::POLLIN | libc::POLLHUP) as i32,
+                    ))
+                })
+                .await;
+                slot.state_ptr = state_ptr;
+
+                let outcome = std::future::poll_fn(|cx| {
+                    Poll::Ready(slot.poll_accept(
+                        true,
+                        cx,
+                        |accepted, _provenance, addr, addrlen| {
+                            Ok((accepted, socket_addr_from_c(addr, addrlen)?))
+                        },
+                    ))
+                })
+                .await;
+                let Poll::Ready(Ok((accepted, accepted_peer))) = outcome else {
+                    panic!("queued connection did not win mixed terminal readiness");
+                };
+                assert_eq!(accepted_peer, expected_peer);
+                drop(accepted);
+                assert!(slot.state_ptr.is_null());
+                assert!(!slot.in_use);
+                assert!(
+                    !slot.terminal,
+                    "successful accept incorrectly latched terminal readiness"
+                );
+            })
+            .expect("queued-peer accept run failed");
+
+        drop(listener_keepalive);
+        drop(peer);
+    }
+
     #[test]
     fn socket_addr_v6_c_layout_and_round_trip_preserve_all_fields() {
         let ip = std::net::Ipv6Addr::new(
@@ -1250,6 +1697,40 @@ mod tests {
             socket_addr_from_c(&storage, len).expect("IPv6 sockaddr should decode"),
             addr
         );
+    }
+
+    #[test]
+    fn retained_connect_address_owns_exact_ipv4_and_ipv6_storage() {
+        let addresses = [
+            SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 17), 0x1234)),
+            SocketAddr::V6(SocketAddrV6::new(
+                std::net::Ipv6Addr::new(
+                    0x2001, 0x0db8, 0x1234, 0x5678, 0x90ab, 0xcdef, 0x1020, 0x3040,
+                ),
+                0x5678,
+                0x0102_0304,
+                0x0506_0708,
+            )),
+        ];
+
+        for address in addresses {
+            let retained = RetainedConnectAddr::from_socket_addr(address);
+            let expected_len = match address {
+                SocketAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
+                SocketAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
+            } as libc::socklen_t;
+
+            assert_eq!(retained.addrlen, expected_len);
+            assert_eq!(
+                retained.addr_ptr().cast::<libc::sockaddr_storage>(),
+                std::ptr::addr_of!(retained.addr)
+            );
+            assert_eq!(
+                socket_addr_from_c(&retained.addr, retained.addrlen)
+                    .expect("retained connect address should decode"),
+                address
+            );
+        }
     }
 
     #[test]
@@ -1336,6 +1817,17 @@ mod tests {
     #[test]
     fn checked_lengths_reject_u32_overflow_with_static_message() {
         let oversized = u32::MAX as usize + 1;
+
+        assert_eq!(
+            send_len_u32(u32::MAX as usize),
+            Some(u32::MAX),
+            "the exact io_uring byte-count limit should remain valid"
+        );
+        assert_eq!(
+            send_len_u32(oversized),
+            None,
+            "the first oversized byte count should be rejected"
+        );
 
         let read_err =
             checked_read_len(oversized, usize::MAX).expect_err("oversize read should fail");

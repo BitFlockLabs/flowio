@@ -7,7 +7,10 @@ use common::{
     make_read_only_chain, poll_once_pending, run_test, set_positive_linger,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-use common::{SparseOversizedReadOnly, assert_oversized_send_rejected, run_test_output};
+use common::{
+    SparseOversizedReadOnly, assert_oversized_send_rejected, assert_oversized_try_send_rejected,
+    run_test_output,
+};
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -429,15 +432,16 @@ fn runtime_unix_try_writev_projected_invalid_projection_returns_source() {
     let (mut stream, mut peer) = connected_try_unix_stream();
 
     common::assert_empty_projected_try_cases!(stream);
+    common::assert_reported_projected_try_cases!(stream);
 
     let (res, source) = stream.try_writev_projected(TryMismatchedProjected);
     let err = res.expect_err("mismatched projection should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    common::assert_message_free_invalid_input(err);
     let _source = source;
 
     let (res, source) = stream.try_writev_projected(TryCountMismatchedProjected);
     let err = res.expect_err("piece-count mismatch should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    common::assert_message_free_invalid_input(err);
     let _source = source;
 
     let (res, source) = stream.try_writev_projected(TryOversizedProjected);
@@ -465,6 +469,8 @@ fn runtime_unix_async_empty_projected_validation_uses_no_submission_or_retained_
         .run(async move {
             common::assert_empty_projected_async_cases!(stream, writev_projected);
             common::assert_empty_projected_async_cases!(stream, writev_all_projected);
+            common::assert_reported_projected_async_cases!(stream, writev_projected);
+            common::assert_reported_projected_async_cases!(stream, writev_all_projected);
 
             return_slot.set(Some(stream));
         })
@@ -850,6 +856,9 @@ fn runtime_unix_write_rejects_oversize_iobuff() {
 
     let (_oversized, _writer, _reader) = run_test_output(&mut executor, async move {
         let (mut writer, reader) = UnixStream::pair().expect("socketpair failed");
+
+        let (res, oversized) = writer.try_write(oversized);
+        assert_oversized_try_send_rejected(res, &oversized);
 
         let (res, oversized) = writer.write(oversized).await;
         assert_oversized_send_rejected(res, &oversized);

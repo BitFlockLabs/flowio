@@ -11,6 +11,7 @@ static DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static FAIL_NEXT_SIZE: Cell<usize> = const { Cell::new(0) };
     static COUNT_SIZE_ALLOCS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static COUNT_SIZE_ZEROED_ALLOCS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 fn should_fail(size: usize) -> bool {
@@ -25,6 +26,15 @@ fn should_fail(size: usize) -> bool {
 
 fn record_size_allocation(size: usize) {
     COUNT_SIZE_ALLOCS.with(|state| {
+        let (target, allocations) = state.get();
+        if target == size {
+            state.set((target, allocations.saturating_add(1)));
+        }
+    });
+}
+
+fn record_size_zeroed_allocation(size: usize) {
+    COUNT_SIZE_ZEROED_ALLOCS.with(|state| {
         let (target, allocations) = state.get();
         if target == size {
             state.set((target, allocations.saturating_add(1)));
@@ -53,6 +63,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             record_size_allocation(layout.size());
+            record_size_zeroed_allocation(layout.size());
         }
         ptr
     }
@@ -112,6 +123,30 @@ pub fn finish_counting_allocations_of_size() -> usize {
     COUNT_SIZE_ALLOCS.with(|state| {
         let (size, allocations) = state.replace((0, 0));
         assert_ne!(size, 0, "allocation-size counter was not armed");
+        allocations
+    })
+}
+
+/// Starts counting successful zero-initializing allocations of exactly `size`
+/// bytes on this thread.
+#[allow(dead_code)]
+pub fn start_counting_zeroed_allocations_of_size(size: usize) {
+    assert!(size > 0, "allocation count size must be nonzero");
+    COUNT_SIZE_ZEROED_ALLOCS.with(|state| {
+        let previous = state.replace((size, 0));
+        assert_eq!(
+            previous.0, 0,
+            "zeroed allocation-size counter already armed"
+        );
+    });
+}
+
+/// Stops the active zero-initializing allocation counter.
+#[allow(dead_code)]
+pub fn finish_counting_zeroed_allocations_of_size() -> usize {
+    COUNT_SIZE_ZEROED_ALLOCS.with(|state| {
+        let (size, allocations) = state.replace((0, 0));
+        assert_ne!(size, 0, "zeroed allocation-size counter was not armed");
         allocations
     })
 }

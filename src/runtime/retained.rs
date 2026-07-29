@@ -23,6 +23,7 @@
 //! never uses heap fallback: oversized requests return `InvalidInput`, and
 //! slab allocation failure returns `WouldBlock`.
 
+use crate::utils::disarm_unwind_guard;
 use crate::utils::list::intrusive::slist::{Link, SList};
 use crate::utils::memory::provider::{BasicMemoryProvider, ProviderOwner};
 use crate::utils::memory::slab::{SlabAllocator, SlabAllocatorConfigError, SlabPageChain};
@@ -113,6 +114,25 @@ pub(crate) struct RetainedPayloadPoolStats {
     pub(crate) writev_scratch_alloc_failures: usize,
 }
 
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[inline(always)]
+fn record_class_allocation(
+    result: &ClassAllocResult,
+    allocations: &mut usize,
+    reuses: &mut usize,
+    slab_allocations: &mut usize,
+) {
+    // The class has already removed the block from its free list. Saturation
+    // keeps debug/test bookkeeping from panicking after that ownership change.
+    *allocations = allocations.saturating_add(1);
+    if result.reused {
+        *reuses = reuses.saturating_add(1);
+    }
+    if result.new_slab {
+        *slab_allocations = slab_allocations.saturating_add(1);
+    }
+}
+
 /// Scratch-only counters stored with the heap-stable iovec sidecar owner.
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -150,20 +170,26 @@ struct RetainedIovecScratchPool {
 
 struct RetainedIovecScratchPoolState {
     classes: [RetainedSizeClass; RETAINED_IOVEC_SIZE_CLASSES.len()],
+    /// One heap-stable provider shared by every iovec size class. This field
+    /// follows `classes` so all slab allocators release their pages first.
+    _provider: ProviderOwner<BasicMemoryProvider>,
     #[cfg(any(debug_assertions, feature = "test-support"))]
     stats: RetainedIovecScratchStats,
 }
 
 impl RetainedIovecScratchPool {
     fn new() -> io::Result<Rc<Self>> {
+        let provider = ProviderOwner::new(BasicMemoryProvider::new());
+        let classes = [
+            RetainedSizeClass::new(&provider, iovec_class_block_size(0))?,
+            RetainedSizeClass::new(&provider, iovec_class_block_size(1))?,
+            RetainedSizeClass::new(&provider, iovec_class_block_size(2))?,
+            RetainedSizeClass::new(&provider, iovec_class_block_size(3))?,
+        ];
         Ok(Rc::new(Self {
             state: UnsafeCell::new(RetainedIovecScratchPoolState {
-                classes: [
-                    RetainedSizeClass::new(iovec_class_block_size(0))?,
-                    RetainedSizeClass::new(iovec_class_block_size(1))?,
-                    RetainedSizeClass::new(iovec_class_block_size(2))?,
-                    RetainedSizeClass::new(iovec_class_block_size(3))?,
-                ],
+                classes,
+                _provider: provider,
                 #[cfg(any(debug_assertions, feature = "test-support"))]
                 stats: RetainedIovecScratchStats::default(),
             }),
@@ -206,13 +232,12 @@ impl RetainedIovecScratchPool {
 
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
-            state.stats.writev_scratch_pooled_allocs += 1;
-            if result.reused {
-                state.stats.writev_scratch_pooled_reuses += 1;
-            }
-            if result.new_slab {
-                state.stats.writev_scratch_slab_allocs += 1;
-            }
+            record_class_allocation(
+                &result,
+                &mut state.stats.writev_scratch_pooled_allocs,
+                &mut state.stats.writev_scratch_pooled_reuses,
+                &mut state.stats.writev_scratch_slab_allocs,
+            );
         }
 
         Some(result)
@@ -233,7 +258,8 @@ impl RetainedIovecScratchPool {
         unsafe { state.classes[class_index].free_block(ptr) };
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
-            state.stats.writev_scratch_pooled_frees += 1;
+            state.stats.writev_scratch_pooled_frees =
+                state.stats.writev_scratch_pooled_frees.saturating_add(1);
         }
     }
 
@@ -249,6 +275,9 @@ impl RetainedIovecScratchPool {
 pub(crate) struct RetainedPayloadPool {
     /// Size classes for retained operation payload structs.
     classes: [RetainedSizeClass; RETAINED_SIZE_CLASSES.len()],
+    /// One heap-stable provider shared by every retained-payload size class.
+    /// This field follows `classes` so their slab pages are released first.
+    _provider: ProviderOwner<BasicMemoryProvider>,
     /// Heap-stable owner for retained sidecar `iovec` scratch arrays.
     iovec_pool: Rc<RetainedIovecScratchPool>,
     #[cfg(any(debug_assertions, feature = "test-support"))]
@@ -268,21 +297,25 @@ pub(crate) struct RetainedPayloadPool {
 
 impl RetainedPayloadPool {
     pub(crate) fn new() -> io::Result<Self> {
+        let iovec_pool = RetainedIovecScratchPool::new()?;
+        let provider = ProviderOwner::new(BasicMemoryProvider::new());
+        let classes = [
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[0])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[1])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[2])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[3])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[4])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[5])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[6])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[7])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[8])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[9])?,
+            RetainedSizeClass::new(&provider, RETAINED_SIZE_CLASSES[10])?,
+        ];
         Ok(Self {
-            classes: [
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[0])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[1])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[2])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[3])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[4])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[5])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[6])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[7])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[8])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[9])?,
-                RetainedSizeClass::new(RETAINED_SIZE_CLASSES[10])?,
-            ],
-            iovec_pool: RetainedIovecScratchPool::new()?,
+            classes,
+            _provider: provider,
+            iovec_pool,
             #[cfg(any(debug_assertions, feature = "test-support"))]
             stats: RetainedPayloadPoolStats::default(),
             #[cfg(test)]
@@ -308,15 +341,12 @@ impl RetainedPayloadPool {
             Some(class_index) => {
                 if let Some(result) = self.classes[class_index].alloc_block() {
                     #[cfg(any(debug_assertions, feature = "test-support"))]
-                    {
-                        self.stats.pooled_allocs = self.stats.pooled_allocs.saturating_add(1);
-                        if result.reused {
-                            self.stats.pooled_reuses = self.stats.pooled_reuses.saturating_add(1);
-                        }
-                        if result.new_slab {
-                            self.stats.slab_allocs = self.stats.slab_allocs.saturating_add(1);
-                        }
-                    }
+                    record_class_allocation(
+                        &result,
+                        &mut self.stats.pooled_allocs,
+                        &mut self.stats.pooled_reuses,
+                        &mut self.stats.slab_allocs,
+                    );
 
                     let ptr = result.ptr as *mut T;
                     unsafe { ptr.write(value) };
@@ -344,38 +374,34 @@ impl RetainedPayloadPool {
 
     /// Reserves uninitialized storage through the same pooled/heap policy as
     /// [`Self::alloc`] without retaining a Rust borrow across the caller's
-    /// synchronous scope. The returned guard recycles untouched backing on
+    /// synchronous scope. The returned raw slot recycles untouched backing on
     /// Drop.
     ///
     /// # Safety
     ///
     /// `pool` must point to a live pool on its executor owner thread and must
-    /// not move for the lifetime of the returned storage.
+    /// not move while the returned slot can drop. The invariant `'slot`
+    /// lifetime must be chosen only for one invocation of
+    /// [`with_raw_retained_slot`]'s higher-ranked closure.
     #[inline(always)]
-    unsafe fn alloc_storage_from_raw<T: 'static>(
+    unsafe fn alloc_raw_slot_from_raw<'slot, T: 'static>(
         pool: NonNull<RetainedPayloadPool>,
-    ) -> RetainedStorage<T> {
+    ) -> RawRetainedSlot<'slot, T> {
         if let Some(class_index) = class_index_for::<T>() {
             // SAFETY: guaranteed by the caller. This temporary borrow ends
             // before the returned guard can be observed or re-entered.
             let pool_ref = unsafe { &mut *pool.as_ptr() };
             if let Some(result) = pool_ref.classes[class_index].alloc_block() {
                 #[cfg(any(debug_assertions, feature = "test-support"))]
-                {
-                    // Saturation keeps bookkeeping non-panicking after the
-                    // block has left its free list.
-                    pool_ref.stats.pooled_allocs = pool_ref.stats.pooled_allocs.saturating_add(1);
-                    if result.reused {
-                        pool_ref.stats.pooled_reuses =
-                            pool_ref.stats.pooled_reuses.saturating_add(1);
-                    }
-                    if result.new_slab {
-                        pool_ref.stats.slab_allocs = pool_ref.stats.slab_allocs.saturating_add(1);
-                    }
-                }
+                record_class_allocation(
+                    &result,
+                    &mut pool_ref.stats.pooled_allocs,
+                    &mut pool_ref.stats.pooled_reuses,
+                    &mut pool_ref.stats.slab_allocs,
+                );
 
                 return unsafe {
-                    RetainedStorage::new(
+                    RawRetainedSlot::new(
                         result.ptr.cast::<MaybeUninit<T>>(),
                         pool,
                         pooled_vtable::<T>(class_index),
@@ -386,18 +412,18 @@ impl RetainedPayloadPool {
             }
         }
 
-        unsafe { Self::alloc_heap_storage_from_raw(pool) }
+        unsafe { Self::alloc_heap_raw_slot_from_raw(pool) }
     }
 
     #[inline(always)]
-    unsafe fn alloc_heap_storage_from_raw<T: 'static>(
+    unsafe fn alloc_heap_raw_slot_from_raw<'slot, T: 'static>(
         pool: NonNull<RetainedPayloadPool>,
-    ) -> RetainedStorage<T> {
+    ) -> RawRetainedSlot<'slot, T> {
         let ptr = Box::into_raw(Box::<T>::new_uninit());
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             // SAFETY: guaranteed by the caller. The borrow ends before the
-            // storage guard below becomes observable.
+            // raw slot below becomes observable.
             let pool_ref = unsafe { &mut *pool.as_ptr() };
             pool_ref.stats.heap_fallbacks = pool_ref.stats.heap_fallbacks.saturating_add(1);
         }
@@ -406,7 +432,7 @@ impl RetainedPayloadPool {
         // `MaybeUninit<T>` allocation, including its aligned dangling value for
         // a zero-sized `T`.
         unsafe {
-            RetainedStorage::new(
+            RawRetainedSlot::new(
                 ptr,
                 pool,
                 heap_vtable::<T>(),
@@ -452,7 +478,7 @@ impl RetainedPayloadPool {
         unsafe { self.classes[class_index].free_block(ptr) };
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
-            self.stats.pooled_frees += 1;
+            self.stats.pooled_frees = self.stats.pooled_frees.saturating_add(1);
         }
     }
 
@@ -469,7 +495,7 @@ impl RetainedPayloadPool {
         }
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
-            self.stats.heap_frees += 1;
+            self.stats.heap_frees = self.stats.heap_frees.saturating_add(1);
         }
     }
 
@@ -540,62 +566,6 @@ impl RetainedPayloadPool {
     }
 }
 
-/// Owns one uninitialized retained allocation until it is converted to a
-/// closure-branded raw slot before user code can observe it.
-struct RetainedStorage<T: 'static> {
-    ptr: NonNull<MaybeUninit<T>>,
-    pool: NonNull<RetainedPayloadPool>,
-    vtable: RetainedPayloadVtable,
-    #[cfg(test)]
-    poison_cleanup: Option<unsafe fn(*mut ())>,
-}
-
-impl<T: 'static> RetainedStorage<T> {
-    /// # Safety
-    ///
-    /// `ptr` must own live, uninitialized storage for `T` allocated from
-    /// `pool`, and `vtable.free_storage` must release exactly that backing.
-    #[inline(always)]
-    unsafe fn new(
-        ptr: *mut MaybeUninit<T>,
-        pool: NonNull<RetainedPayloadPool>,
-        vtable: RetainedPayloadVtable,
-        #[cfg(test)] poison_cleanup: Option<unsafe fn(*mut ())>,
-    ) -> Self {
-        Self {
-            // SAFETY: guaranteed by the constructor contract. Pooled blocks
-            // are non-null, and Box supplies a non-null aligned dangling value
-            // for zero-sized heap fallback.
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
-            pool,
-            vtable,
-            #[cfg(test)]
-            poison_cleanup,
-        }
-    }
-
-    #[inline(always)]
-    fn into_raw_slot<'slot>(self) -> RawRetainedSlot<'slot, T> {
-        let this = ManuallyDrop::new(self);
-        RawRetainedSlot {
-            ptr: this.ptr,
-            pool: this.pool,
-            vtable: this.vtable,
-            _brand: PhantomData,
-            _owner_thread_only: PhantomData,
-            #[cfg(test)]
-            poison_cleanup: this.poison_cleanup,
-        }
-    }
-}
-
-impl<T: 'static> Drop for RetainedStorage<T> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        unsafe { (self.vtable.free_storage)(self.ptr.as_ptr().cast::<()>(), self.pool.as_ptr()) };
-    }
-}
-
 /// Runs `f` with one uninitialized retained slot carrying a fresh invariant
 /// scope brand.
 ///
@@ -616,8 +586,8 @@ pub(crate) unsafe fn with_raw_retained_slot<T: 'static, R>(
 ) -> R {
     // SAFETY: the caller guarantees pool liveness and owner-thread access. The
     // temporary exclusive borrow ends before the higher-ranked closure runs.
-    let storage = unsafe { RetainedPayloadPool::alloc_storage_from_raw::<T>(pool) };
-    f(storage.into_raw_slot())
+    let slot = unsafe { RetainedPayloadPool::alloc_raw_slot_from_raw::<T>(pool) };
+    f(slot)
 }
 
 /// Uninitialized retained storage that still contains no ownership-bearing
@@ -638,6 +608,31 @@ pub(crate) struct RawRetainedSlot<'slot, T: 'static> {
 }
 
 impl<'slot, T: 'static> RawRetainedSlot<'slot, T> {
+    /// # Safety
+    ///
+    /// `ptr` must own live, uninitialized storage for `T` allocated from
+    /// `pool`, and `vtable.free_storage` must release exactly that backing.
+    #[inline(always)]
+    unsafe fn new(
+        ptr: *mut MaybeUninit<T>,
+        pool: NonNull<RetainedPayloadPool>,
+        vtable: RetainedPayloadVtable,
+        #[cfg(test)] poison_cleanup: Option<unsafe fn(*mut ())>,
+    ) -> Self {
+        Self {
+            // SAFETY: guaranteed by the constructor contract. Pooled blocks
+            // are non-null, and Box supplies a non-null aligned dangling value
+            // for zero-sized heap fallback.
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            pool,
+            vtable,
+            _brand: PhantomData,
+            _owner_thread_only: PhantomData,
+            #[cfg(test)]
+            poison_cleanup,
+        }
+    }
+
     /// Returns the compiler-layout pointer used to prepare non-owning fields.
     #[inline(always)]
     pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
@@ -652,6 +647,7 @@ impl<'slot, T: 'static> RawRetainedSlot<'slot, T> {
         let this = ManuallyDrop::new(self);
         WritingRetainedSlot {
             ptr: this.ptr,
+            #[cfg(test)]
             pool: this.pool,
             vtable: this.vtable,
             _brand: PhantomData,
@@ -678,6 +674,7 @@ impl<T: 'static> Drop for RawRetainedSlot<'_, T> {
 #[must_use = "a writing retained slot must be finished after every field is initialized"]
 pub(crate) struct WritingRetainedSlot<'slot, T: 'static> {
     ptr: NonNull<MaybeUninit<T>>,
+    #[cfg(test)]
     pool: NonNull<RetainedPayloadPool>,
     vtable: RetainedPayloadVtable,
     _brand: RetainedSlotBrand<'slot>,
@@ -1036,6 +1033,9 @@ impl<T: 'static> RetainedPayload<T> {
     /// `pool` must be the same retained pool that created this handle.
     /// `extract` receives a pointer to the initialized payload and must move or
     /// drop every initialized field that requires destruction before returning.
+    /// If `extract` unwinds, the backing allocation is intentionally leaked:
+    /// the helper cannot know which payload fields remain initialized and
+    /// therefore cannot safely release or reuse the storage.
     #[inline(always)]
     pub(crate) unsafe fn take_with<R>(
         self,
@@ -1068,18 +1068,16 @@ struct RetainedSizeClass {
     slab_pages: SlabPageChain,
     /// Slab allocator that requests pages for this class.
     slab_factory: ManuallyDrop<SlabAllocator<'static, BasicMemoryProvider>>,
-    /// Stable provider backing `slab_factory` through its raw provider pointer.
-    _provider: ProviderOwner<BasicMemoryProvider>,
 }
 
 impl RetainedSizeClass {
-    fn new(block_size: usize) -> io::Result<Self> {
+    fn new(provider: &ProviderOwner<BasicMemoryProvider>, block_size: usize) -> io::Result<Self> {
         let blocks_per_slab = std::cmp::max(1, RETAINED_SLAB_TARGET_BYTES / block_size);
-        let provider = ProviderOwner::new(BasicMemoryProvider::new());
         let mut slab_factory = match unsafe {
-            // SAFETY: provider.as_ptr() comes from a heap allocation owned by
-            // ProviderOwner and remains stable until after slab_factory is
-            // manually dropped.
+            // SAFETY: the pool owns `provider` at a heap-stable address until
+            // after every class is dropped. All class operations remain
+            // serialized on the executor owner thread, so mutable provider
+            // calls through the shared raw pointer never overlap.
             SlabAllocator::new_uninit_from_raw(
                 provider.as_ptr(),
                 block_size,
@@ -1099,8 +1097,12 @@ impl RetainedSizeClass {
             free_list: SList::new(),
             slab_pages: SlabPageChain::new(),
             slab_factory,
-            _provider: provider,
         })
+    }
+
+    #[cfg(test)]
+    fn provider_ptr(&self) -> *mut BasicMemoryProvider {
+        self.slab_factory.provider_ptr()
     }
 
     #[inline(always)]
@@ -1284,7 +1286,7 @@ impl<C: RetainedBackingCleanup> RetainedBackingGuard<C> {
 
     #[inline(always)]
     unsafe fn finish(self) {
-        let this = ManuallyDrop::new(self);
+        let this = disarm_unwind_guard(self);
         unsafe { C::free(this.ptr, this.pool) };
     }
 }
@@ -1390,6 +1392,122 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: len,
         }
+    }
+
+    #[test]
+    fn class_allocation_stats_record_flags_and_saturate() {
+        let mut allocations = 7usize;
+        let mut reuses = 11usize;
+        let mut slab_allocations = 13usize;
+
+        record_class_allocation(
+            &ClassAllocResult {
+                ptr: std::ptr::null_mut(),
+                reused: false,
+                new_slab: false,
+            },
+            &mut allocations,
+            &mut reuses,
+            &mut slab_allocations,
+        );
+        assert_eq!((allocations, reuses, slab_allocations), (8, 11, 13));
+
+        record_class_allocation(
+            &ClassAllocResult {
+                ptr: std::ptr::null_mut(),
+                reused: true,
+                new_slab: false,
+            },
+            &mut allocations,
+            &mut reuses,
+            &mut slab_allocations,
+        );
+        assert_eq!((allocations, reuses, slab_allocations), (9, 12, 13));
+
+        record_class_allocation(
+            &ClassAllocResult {
+                ptr: std::ptr::null_mut(),
+                reused: false,
+                new_slab: true,
+            },
+            &mut allocations,
+            &mut reuses,
+            &mut slab_allocations,
+        );
+        assert_eq!((allocations, reuses, slab_allocations), (10, 12, 14));
+
+        allocations = usize::MAX;
+        reuses = usize::MAX;
+        slab_allocations = usize::MAX;
+        record_class_allocation(
+            &ClassAllocResult {
+                ptr: std::ptr::null_mut(),
+                reused: true,
+                new_slab: true,
+            },
+            &mut allocations,
+            &mut reuses,
+            &mut slab_allocations,
+        );
+        assert_eq!(
+            (allocations, reuses, slab_allocations),
+            (usize::MAX, usize::MAX, usize::MAX)
+        );
+    }
+
+    #[test]
+    fn release_statistics_saturate_after_backing_release() {
+        #[repr(align(128))]
+        struct HeapValue {
+            _byte: u8,
+        }
+
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+
+        let pooled = pool.alloc(0_u8);
+        pool.stats.pooled_frees = usize::MAX;
+        unsafe { pooled.drop_and_free(&mut pool) };
+        assert_eq!(pool.stats().pooled_frees, usize::MAX);
+
+        let heap = pool.alloc(HeapValue { _byte: 0 });
+        pool.stats.heap_frees = usize::MAX;
+        unsafe { heap.drop_and_free(&mut pool) };
+        assert_eq!(pool.stats().heap_frees, usize::MAX);
+
+        let scratch = pool
+            .alloc_iovec_scratch(RETAINED_IOVEC_INLINE_COUNT + 1)
+            .expect("pooled scratch allocation failed");
+        unsafe {
+            (*pool.iovec_pool.state.get())
+                .stats
+                .writev_scratch_pooled_frees = usize::MAX;
+        }
+        drop(scratch);
+        assert_eq!(pool.stats().writev_scratch_pooled_frees, usize::MAX);
+    }
+
+    #[test]
+    fn retained_classes_share_one_provider_per_independent_lifetime() {
+        let pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let payload_provider = pool._provider.as_ptr();
+        assert!(
+            pool.classes
+                .iter()
+                .all(|class| class.provider_ptr() == payload_provider)
+        );
+
+        let scratch_state = unsafe { &*pool.iovec_pool.state.get() };
+        let scratch_provider = scratch_state._provider.as_ptr();
+        assert!(
+            scratch_state
+                .classes
+                .iter()
+                .all(|class| class.provider_ptr() == scratch_provider)
+        );
+        assert_ne!(
+            payload_provider, scratch_provider,
+            "independently lived pools must retain independent providers"
+        );
     }
 
     #[test]

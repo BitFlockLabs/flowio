@@ -68,7 +68,8 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> ProviderOwnedPool<T, P> {
     /// # Safety
     ///
     /// `obj` must be null or a live slot returned by this exact pool and not
-    /// already freed.
+    /// already freed. While `T::drop` runs, it must not re-enter this pool
+    /// through any alias.
     #[inline(always)]
     pub(crate) unsafe fn free(&mut self, obj: *mut T) {
         unsafe { self.pool.free(obj) };

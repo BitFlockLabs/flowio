@@ -233,6 +233,11 @@ fn take_or_reserve_tls_scratch(
     }
 }
 
+#[inline]
+fn tls_read_submission_len(buffer_capacity: usize, configured_bound: usize) -> usize {
+    buffer_capacity.min(configured_bound)
+}
+
 /// Fixed-capacity append adapter for one reusable TLS ciphertext chunk.
 ///
 /// The configured limit, rather than the allocator-provided `Vec` capacity,
@@ -341,9 +346,12 @@ unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
 /// the buffering decision explicitly.
 ///
 /// `transport_read_buffer_size` is the nonzero requested reusable ciphertext
-/// scratch capacity. The effective capacity is the smaller of the requested
-/// value and 18,437 bytes (one maximum TLS wire record), so internal rustls
-/// ciphertext and plaintext buffers are drained between records.
+/// scratch bound. The stored effective raw-read bound and reservation request
+/// are the smaller of the requested value and 18,437 bytes (the maximum TLS
+/// wire-record byte bound), so internal rustls ciphertext and plaintext
+/// staging is drained between bounded transport feeds. The allocator may
+/// provide a larger `Vec` capacity, but that spare capacity never enlarges a
+/// raw read.
 /// `transport_write_buffer_size` is the nonzero hard bound for each reusable
 /// ciphertext chunk collected from rustls before writing it to the socket.
 /// Rustls output beyond that bound is drained only after the current owned
@@ -371,10 +379,11 @@ pub struct TlsClientOptions {
     /// rustls limit for unsent plaintext-before-handshake and pending TLS
     /// records.  `None` means rustls may buffer without bound.
     pub rustls_buffer_limit: Option<usize>,
-    /// Nonzero requested capacity of the reusable ciphertext receive scratch
-    /// buffer used for `read_tls`. The effective capacity is capped at 18,437
-    /// bytes, one maximum TLS wire record. The requested value must not exceed
-    /// `isize::MAX`.
+    /// Nonzero requested bound for the reusable ciphertext receive scratch
+    /// buffer used for `read_tls`. The stored effective raw-read bound and
+    /// reservation request are capped at 18,437 bytes, the maximum TLS
+    /// wire-record byte bound. Allocator-provided spare capacity does not
+    /// enlarge a raw read. The requested value must not exceed `isize::MAX`.
     pub transport_read_buffer_size: usize,
     /// Nonzero hard capacity of each reusable ciphertext send chunk used for
     /// `write_tls`. The value must not exceed `isize::MAX`.
@@ -438,7 +447,8 @@ pub struct TlsClientStream {
     /// rustls client connection holding TLS protocol state and plaintext
     /// buffers.
     connection: ClientConnection,
-    /// Effective capacity used when creating new raw TLS receive buffers.
+    /// Effective configured bound for raw TLS reads and receive-buffer
+    /// reservation requests.
     transport_read_buffer_size: usize,
     /// Hard per-chunk bound used when collecting rustls-emitted TLS records.
     transport_write_buffer_size: usize,
@@ -621,8 +631,10 @@ impl TlsClientStream {
     /// Creates a new TLS client wrapper around an already-connected TCP stream.
     ///
     /// This allocates the wrapper's reusable ciphertext scratch buffers up
-    /// front. Read scratch is capped at one maximum TLS wire record; write
-    /// scratch uses the capacity provided in [`TlsClientOptions`].
+    /// front. The read reservation request and every raw read honor the stored
+    /// configured bound, which is capped at the maximum TLS wire-record byte
+    /// bound; write scratch uses the capacity provided in
+    /// [`TlsClientOptions`].
     ///
     /// This is connection-setup work. The intended fast path is to construct
     /// the wrapper once per connection and reuse it for the session lifetime.
@@ -1058,7 +1070,7 @@ impl TlsClientStream {
             }
 
             let buffer = self.take_read_tls_buffer()?;
-            let len = buffer.capacity().min(TLS_MAX_WIRE_READ_SIZE);
+            let len = tls_read_submission_len(buffer.capacity(), self.transport_read_buffer_size);
             self.pending_read_tls = Some(stream::ReadFuture::new(
                 self.stream.as_raw_fd(),
                 buffer,
@@ -1650,7 +1662,7 @@ mod tests {
     use super::*;
     use super::{
         TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, TlsWriteScratch, allocate_tls_scratch,
-        take_or_reserve_tls_scratch, tls_userspace_destination,
+        take_or_reserve_tls_scratch, tls_read_submission_len, tls_userspace_destination,
     };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
@@ -1706,6 +1718,27 @@ mod tests {
             TlsScratchKind::Write.effective_capacity(64 * 1024),
             64 * 1024
         );
+    }
+
+    #[test]
+    fn tls_read_submission_length_honors_the_configured_bound() {
+        for requested in [
+            7,
+            TLS_MAX_WIRE_READ_SIZE - 1,
+            TLS_MAX_WIRE_READ_SIZE,
+            TLS_MAX_WIRE_READ_SIZE + 1,
+        ] {
+            let configured = TlsScratchKind::Read.effective_capacity(requested);
+            let scratch = Vec::<u8>::with_capacity(configured + 97);
+
+            assert!(scratch.capacity() > configured);
+            assert_eq!(
+                tls_read_submission_len(scratch.capacity(), configured),
+                configured
+            );
+        }
+
+        assert_eq!(tls_read_submission_len(127, 128), 127);
     }
 
     #[test]

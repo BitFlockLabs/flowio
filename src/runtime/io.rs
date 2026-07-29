@@ -45,7 +45,7 @@ fn complete_nop_op(pctx: PollCtx, state_ptr: &mut *mut CompletionState) -> Optio
 
     let result = state.result;
     let op_ctx = unsafe { completed_op_ctx(Some(pctx), *state_ptr) };
-    unsafe { (*op_ctx.reactor()).free_op(*state_ptr) };
+    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
 
     Some(if op_ctx.context_rejected() {
@@ -260,7 +260,9 @@ impl Drop for NopFuture<'_> {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use crate::runtime::executor::{Executor, ExecutorConfig, submit_retained_sqe};
+    use crate::runtime::executor::{
+        Executor, ExecutorConfig, UnsubmittedOpGuard, submit_retained_sqe,
+    };
     use crate::runtime::reactor::ReactorConfig;
     use std::cell::{Cell, RefCell};
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -345,6 +347,7 @@ mod tests {
                 if state.is_null() {
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
                 }
+                let state_guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state) };
                 unsafe { (*state).register_waiter(pctx.owner_task()) };
                 this.state_address.set(state);
                 let payload = *this.payload.take().expect("retained NOP payload missing");
@@ -356,7 +359,6 @@ mod tests {
                     })
                 };
                 if let Err((err, payload)) = submit {
-                    unsafe { (*pctx.reactor()).free_op(state) };
                     this.payload = Some(Box::new(payload));
                     return Poll::Ready(Err(err));
                 }
@@ -364,7 +366,7 @@ mod tests {
                     !this.payload_address.get().is_null(),
                     "retained NOP builder did not publish its payload address"
                 );
-                this.state_ptr = state;
+                this.state_ptr = state_guard.into_state_ptr();
                 return Poll::Pending;
             }
 

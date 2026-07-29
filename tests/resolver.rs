@@ -2,7 +2,7 @@ use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
 use flowio::test_support::net::resolver::{
-    lookup_ipv4, read_resolv_conf, resolve_local_host_with_hosts_path,
+    lookup_ipv4, read_resolv_conf, resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
 };
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
@@ -324,6 +324,72 @@ fn resolver_deduplicates_silent_nameserver_attempts() {
 }
 
 #[test]
+fn resolver_fully_qualified_hosts_entry_resolves_locally_without_dns() {
+    let contents =
+        b"192.0.2.42 other Pinned.FlowIO.Invalid.\n192.0.2.43 Repeated.FlowIO.Invalid..\n";
+    let hosts = TempResolverFile::padded("hosts-fqdn", contents, contents.len());
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind no-query DNS socket");
+    server
+        .set_nonblocking(true)
+        .expect("failed to make no-query DNS socket nonblocking");
+    let nameserver = server
+        .local_addr()
+        .expect("failed to read no-query DNS socket address");
+    let hosts_path = hosts.path().to_owned();
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            let addrs = resolve_host_with_hosts_path(
+                &resolver,
+                &hosts_path,
+                "PINNED.FLOWIO.INVALID.",
+                5432,
+            )
+            .await
+            .expect("a fully qualified hosts entry should resolve locally");
+            assert_eq!(
+                addrs,
+                [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 42), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    let mut packet = [0u8; 512];
+    let err = server
+        .recv_from(&mut packet)
+        .expect_err("a local fully qualified entry must not emit a DNS packet");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+    let localhost = resolve_local_host_with_hosts_path(hosts.path(), "LOCALHOST.", 5432)
+        .expect("fully qualified localhost should resolve locally");
+    assert_eq!(
+        localhost,
+        [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 5432)),
+        ]
+    );
+
+    let reverse = resolve_local_host_with_hosts_path(hosts.path(), "OTHER.", 5432)
+        .expect("a dotted query should match an undotted hosts alias");
+    assert_eq!(
+        reverse,
+        [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 42), 5432))]
+    );
+
+    let repeated =
+        resolve_local_host_with_hosts_path(hosts.path(), "repeated.flowio.invalid", 5432)
+            .expect("an invalid hosts alias should be ignored");
+    assert!(
+        repeated.is_empty(),
+        "more than one trailing dot must not be treated as one root dot"
+    );
+}
+
+#[test]
 fn resolver_hosts_file_accepts_four_mib_and_rejects_the_next_byte() {
     let host = "hosts-boundary.flowio.invalid";
     let prefix = format!("192.0.2.10 {host}\n");
@@ -338,6 +404,33 @@ fn resolver_hosts_file_accepts_four_mib_and_rejects_the_next_byte() {
     let over = TempResolverFile::padded("hosts-over", prefix.as_bytes(), HOSTS_FILE_MAX_BYTES + 1);
     let err = resolve_local_host_with_hosts_path(over.path(), host, 5432)
         .expect_err("a hosts file above four MiB should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "/etc/hosts exceeds the 4 MiB resolver configuration limit"
+    );
+}
+
+#[test]
+fn resolver_hosts_file_size_and_utf8_errors_keep_existing_precedence() {
+    let invalid = TempResolverFile::padded("hosts-invalid-utf8", &[0xff, b'\n'], 2);
+    let err =
+        resolve_local_host_with_hosts_path(invalid.path(), "invalid-utf8.flowio.invalid", 5432)
+            .expect_err("invalid hosts UTF-8 should be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("invalid utf-8"));
+
+    let invalid_over = TempResolverFile::padded(
+        "hosts-invalid-over",
+        &[0xff, b'\n'],
+        HOSTS_FILE_MAX_BYTES + 1,
+    );
+    let err = resolve_local_host_with_hosts_path(
+        invalid_over.path(),
+        "invalid-over.flowio.invalid",
+        5432,
+    )
+    .expect_err("the hosts size bound must win over an earlier UTF-8 error");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         err.to_string(),
@@ -394,6 +487,23 @@ fn resolver_hosts_result_accepts_64_unique_addresses_and_rejects_the_65th() {
         err.to_string(),
         "resolver result exceeds 64 unique addresses"
     );
+}
+
+#[test]
+fn resolver_hosts_utf8_validation_precedes_the_address_result_bound() {
+    let host = "address-utf8-precedence.flowio.invalid";
+    let mut contents = String::new();
+    for octet in 1..=65 {
+        contents.push_str(&format!("192.0.2.{octet} {host}\n"));
+    }
+    let mut bytes = contents.into_bytes();
+    bytes.push(0xff);
+    let invalid = TempResolverFile::padded("hosts-address-invalid", &bytes, bytes.len());
+
+    let err = resolve_local_host_with_hosts_path(invalid.path(), host, 5432)
+        .expect_err("whole-file UTF-8 validation should precede the address cap");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("invalid utf-8"));
 }
 
 #[test]
