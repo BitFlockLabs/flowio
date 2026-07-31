@@ -7,13 +7,14 @@
 //! at terminal drop: positive or unclassifiable linger goes to the executor's
 //! bounded close worker, while proven nonpositive linger normally uses the
 //! reactor close path. A final listener owner released during CQ reclamation
-//! uses a no-ring route. Outside an executor, drop preserves ordinary
-//! direct-close behavior.
+//! cannot re-enter the borrowed ring, so its nonpositive descriptor moves to
+//! that reactor's bounded post-view close FIFO. Outside an executor, drop
+//! preserves ordinary direct-close behavior.
 
 use crate::runtime::executor::{
-    CloseAdmission, CloseSubmission, has_active_close_context, note_close_direct,
-    note_close_linger_classification_failure, note_close_linger_query, note_close_linger_waiver,
-    try_admit_close, try_submit_close,
+    CloseAdmission, CloseSubmission, completion_drain_active, has_active_close_context,
+    note_close_direct, note_close_linger_classification_failure, note_close_linger_query,
+    note_close_linger_waiver, try_admit_close, try_submit_close,
 };
 use std::cell::Cell;
 use std::io;
@@ -112,12 +113,12 @@ impl RuntimeFd {
         (fd, self.linger_provenance())
     }
 
-    /// Closes this owner without submitting a new SQE to the active ring.
+    /// Closes this owner without immediately submitting to the active ring.
     ///
     /// Retained listener owners can be released while the reactor still holds
-    /// a mutable completion-queue view. Their final drop must not re-enter the
-    /// same ring, but uncertain positive linger must still use the bounded
-    /// close worker.
+    /// a mutable completion-queue view. Proven nonpositive owners defer until
+    /// that view is gone; overflow or later submission failure closes directly.
+    /// Uncertain positive linger still uses the bounded close worker.
     fn close_without_ring(mut self) {
         self.close_taken(false);
     }
@@ -150,9 +151,9 @@ impl Drop for RuntimeFd {
 /// Listener owner retained by a readiness SQE.
 ///
 /// TCP and SCTP listeners are owner-thread values while an accept operation is
-/// live. If this retained reference is the final listener owner, it uses the
-/// no-ring close route because orphan completion reclamation can drop it while
-/// the reactor's completion queue is still borrowed.
+/// live. If completion reclamation releases the final reference, nonpositive
+/// close ownership is retained in the exact reactor's bounded post-view FIFO
+/// rather than re-entering its borrowed completion ring.
 pub(crate) struct RetainedListenerFd {
     fd: Option<Rc<RuntimeFd>>,
 }
@@ -200,9 +201,9 @@ fn close_owned_in_active_context(owned: OwnedFd, provenance: LingerProvenance, a
 fn close_owned_by_route(owned: OwnedFd, route: CloseRoute, allow_ring: bool) {
     match route {
         CloseRoute::Ring => {
-            if allow_ring {
+            if allow_ring || completion_drain_active() {
                 match try_submit_close(owned) {
-                    CloseSubmission::Submitted => return,
+                    CloseSubmission::Submitted | CloseSubmission::Deferred => return,
                     CloseSubmission::OutsideExecutor(owned) | CloseSubmission::Rejected(owned) => {
                         close_direct(owned);
                         return;

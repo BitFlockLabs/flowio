@@ -61,6 +61,60 @@ impl Link {
 ///
 /// The list links but does not own or drop its containing nodes. Initialize it
 /// after final placement; a non-empty initialized list must not move.
+///
+/// # Container-pointer contract
+///
+/// Offset-based operations recover `*mut T` by subtracting a link-field offset
+/// from the stored pointer. Every inserted link pointer that may be recovered
+/// this way must therefore be derived from a pointer with provenance for the
+/// complete containing allocation, advanced by the exact
+/// `offset_of!(T, chosen_link)`. A pointer produced by taking a reference to
+/// only the embedded link field does not satisfy this recovery contract.
+///
+/// Each list must consistently use the same embedded [`Link`] and matching
+/// offset, although another list may use a different link in the same `T`.
+/// The containing allocation and chosen link must remain live and at the same
+/// address for the entire time that link remains linked; recovery that does
+/// not unlink the node does not shorten this requirement. A returned `*mut T`
+/// must not be dereferenced unless it identifies a valid initialized `T`.
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "test-support")]
+/// # {
+/// use flowio::test_support::utils::list::intrusive::dlist::{DList, Link};
+/// use std::mem::offset_of;
+///
+/// #[repr(C)]
+/// struct Entry {
+///     value: u32,
+///     link: Link,
+/// }
+///
+/// let mut entry = Box::new(Entry {
+///     value: 7,
+///     link: Link::new_unlinked(),
+/// });
+/// let entry_ptr: *mut Entry = &mut *entry;
+/// let link_offset = offset_of!(Entry, link);
+/// // SAFETY: the checked field offset stays within the complete boxed entry.
+/// let link_ptr = unsafe {
+///     entry_ptr.cast::<u8>().add(link_offset).cast::<Link>()
+/// };
+/// let mut list = DList::<Entry>::new_uninit();
+/// list.init();
+///
+/// // SAFETY: the pointer retains whole-entry provenance, the exact same
+/// // offset is used for recovery, and both the entry and list stay in place.
+/// unsafe {
+///     list.push_back(link_ptr);
+///     let recovered = list.pop_front(link_offset).unwrap();
+///     assert_eq!(recovered, entry_ptr);
+///     assert_eq!((*recovered).value, 7);
+/// }
+/// # }
+/// ```
 pub struct DList<T> {
     /// Sentinel head node anchoring the circular list.
     head: Link,
@@ -160,7 +214,8 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a currently unlinked `Link`.
+    /// to a currently unlinked `Link` and satisfies the whole-allocation
+    /// provenance and stable-storage requirements documented on [`DList`].
     pub unsafe fn push_back(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -187,7 +242,8 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is valid, non-null, and not
-    /// currently linked into any list.
+    /// currently linked into any list, and satisfies the whole-allocation
+    /// provenance and stable-storage requirements documented on [`DList`].
     pub unsafe fn push_back_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -211,7 +267,8 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a currently unlinked `Link`.
+    /// to a currently unlinked `Link` and satisfies the whole-allocation
+    /// provenance and stable-storage requirements documented on [`DList`].
     #[cfg(any(test, feature = "test-support"))]
     pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
@@ -242,7 +299,8 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a currently unlinked `Link`.
+    /// to a currently unlinked `Link` and satisfies the whole-allocation
+    /// provenance and stable-storage requirements documented on [`DList`].
     pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
@@ -328,8 +386,9 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure `offset` is the byte distance from `T` to its
-    /// embedded [`Link`]. Each linked node must belong to a live `T` allocation
-    /// that `f` may consume after the node is detached.
+    /// embedded [`Link`]. Each linked node must satisfy the whole-allocation
+    /// provenance and stable-storage contract documented on [`DList`] until
+    /// it is detached and transferred to `f`; `f` may then consume that node.
     pub(crate) unsafe fn drain_all_for_drop<F>(&mut self, offset: usize, mut f: F)
     where
         F: FnMut(*mut T),
@@ -378,7 +437,9 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid pointer to a `Link`
-    /// that is currently part of this specific list.
+    /// that is currently part of this specific list. Its containing allocation
+    /// and chosen link must satisfy the stable-storage requirements documented
+    /// on [`DList`] through removal.
     pub unsafe fn remove(&mut self, node_link: *mut Link) {
         if node_link.is_null() {
             return;
@@ -426,7 +487,10 @@ impl<T> DList<T> {
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
     /// distance from the start of the container `T` to the [`Link`] field used
-    /// by this list.
+    /// by this list. Every stored link must satisfy the whole-allocation
+    /// provenance and stable-storage contract documented on [`DList`]. Because
+    /// this method does not unlink the node, that contract continues after the
+    /// returned pointer is produced.
     #[inline(always)]
     pub unsafe fn front(&self, offset: usize) -> Option<*mut T> {
         debug_assert_list_inited!(self);
@@ -495,12 +559,30 @@ impl<T> DList<T> {
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
-    /// distance from the start of the container `T` to the `Link` field.
+    /// distance from the start of the container `T` to the [`Link`] field.
+    /// Every stored link must satisfy the whole-allocation provenance and
+    /// stable-storage contract documented on [`DList`] through removal.
     pub unsafe fn pop_front(&mut self, offset: usize) -> Option<*mut T> {
+        unsafe { self.pop_front_with_empty(offset).0 }
+    }
+
+    /// Removes the first element and reports whether the list is then empty.
+    ///
+    /// Returning the post-pop state lets internal queue consumers update
+    /// parallel occupancy metadata without probing the sentinel a second time.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the `offset` correctly represents the byte
+    /// distance from the start of the container `T` to the [`Link`] field.
+    /// Every stored link must satisfy the whole-allocation provenance and
+    /// stable-storage contract documented on [`DList`] through removal.
+    #[inline(always)]
+    pub(crate) unsafe fn pop_front_with_empty(&mut self, offset: usize) -> (Option<*mut T>, bool) {
         debug_assert_list_inited!(self);
 
         if self.is_empty() {
-            return None;
+            return (None, true);
         }
 
         unsafe {
@@ -510,8 +592,9 @@ impl<T> DList<T> {
             let head_ptr = &mut self.head as *mut Link;
             let next = Self::normalize_head_ptr((*node_ptr).next, head_ptr);
             let prev = Self::normalize_head_ptr((*node_ptr).prev, head_ptr);
+            let empty_after_pop = next == head_ptr && prev == head_ptr;
 
-            if next == head_ptr && prev == head_ptr {
+            if empty_after_pop {
                 self.set_empty(head_ptr);
             } else {
                 (*next).prev = prev;
@@ -521,7 +604,7 @@ impl<T> DList<T> {
             (*node_ptr).next = ptr::null_mut();
             (*node_ptr).prev = ptr::null_mut();
 
-            Some(container_ptr)
+            (Some(container_ptr), empty_after_pop)
         }
     }
 
@@ -590,7 +673,10 @@ impl<'a, T> CursorMut<'a, T> {
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
-    /// distance from the start of the container `T` to the `Link` field.
+    /// distance from the start of the container `T` to the [`Link`] field.
+    /// Every stored link must satisfy the whole-allocation provenance and
+    /// stable-storage contract documented on [`DList`]. This step does not
+    /// unlink the node, so that contract continues after recovery.
     pub unsafe fn next_with_offset(&mut self, offset: usize) -> Option<(*mut T, *mut Link)> {
         if self.current == self.head {
             return None;
@@ -645,7 +731,9 @@ impl<'a, T> CursorBackMut<'a, T> {
     /// # Safety
     ///
     /// The caller must ensure that the `offset` correctly represents the byte
-    /// distance from the start of the container `T` to the `Link` field.
+    /// distance from the start of the container `T` to the [`Link`] field.
+    /// Every stored link must satisfy the whole-allocation provenance and
+    /// stable-storage contract documented on [`DList`] through recovery.
     pub unsafe fn prev_with_offset(&mut self, offset: usize) -> Option<(*mut T, *mut Link)> {
         if self.current == self.head {
             return None;
@@ -840,6 +928,75 @@ mod tests {
             std::mem::align_of::<DList<Node>>(),
             std::mem::align_of::<Link>()
         );
+    }
+
+    #[test]
+    fn pop_front_with_empty_reports_empty_list() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+
+        let (item, empty_after_pop) = unsafe { list.pop_front_with_empty(offset_of!(Node, link)) };
+
+        assert!(item.is_none());
+        assert!(empty_after_pop);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn pop_front_with_empty_reports_singleton_transition() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut node = Node {
+            id: 1,
+            link: Link::new_unlinked(),
+        };
+        let node_ptr = std::ptr::addr_of_mut!(node);
+
+        unsafe {
+            list.push_back(node_link_ptr(&mut node));
+        }
+        let (item, empty_after_pop) = unsafe { list.pop_front_with_empty(offset_of!(Node, link)) };
+
+        assert_eq!(item, Some(node_ptr));
+        assert!(empty_after_pop);
+        assert!(node.link.is_unlinked());
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn pop_front_with_empty_reports_multi_node_transitions() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut nodes = [
+            Node {
+                id: 1,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 2,
+                link: Link::new_unlinked(),
+            },
+            Node {
+                id: 3,
+                link: Link::new_unlinked(),
+            },
+        ];
+
+        unsafe {
+            for node in &mut nodes {
+                list.push_back(node_link_ptr(node));
+            }
+
+            for (expected_id, expected_empty) in [(1, false), (2, false), (3, true)] {
+                let (item, empty_after_pop) = list.pop_front_with_empty(offset_of!(Node, link));
+                let item = item.expect("list ended before the expected node");
+                assert_eq!((*item).id, expected_id);
+                assert_eq!(empty_after_pop, expected_empty);
+            }
+        }
+
+        assert!(nodes.iter().all(|node| node.link.is_unlinked()));
+        assert!(list.is_empty());
     }
 
     #[test]

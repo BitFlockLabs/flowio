@@ -81,10 +81,13 @@ const TASKS_PER_SLAB: usize = 1024;
 /// The owner pointer and all-task link consume prior padding at the fixed
 /// payload boundary, so 64-bit task slots retain their pre-slice geometry.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 4224] = [(); size_of::<Task<TASK_POOL_SIZE>>()];
-const _: () = assert!(std::mem::offset_of!(Task<TASK_POOL_SIZE>, data) % TASK_DATA_ALIGN == 0);
+const _: () = {
+    assert!(TASK_DATA_ALIGN == 64);
+    assert!(std::mem::offset_of!(Task<TASK_POOL_SIZE>, data) == 128);
+    assert!(size_of::<Task<TASK_POOL_SIZE>>() == 4224);
+};
 
-#[allow(unused_macros)]
+#[cfg(any(test, feature = "test-support", debug_assertions))]
 macro_rules! define_runtime_stats {
     ($vis:vis) => {
         /// Development-only counters for scheduler and allocation regression
@@ -143,6 +146,10 @@ macro_rules! define_runtime_stats {
             /// queued connection or association and rearmed the one-shot poll.
             #[cfg(debug_assertions)]
             pub accept_readiness_rearms: usize,
+            /// Owner-thread accept attempts that returned `EMFILE` or `ENFILE`
+            /// while preserving observed readiness for the caller's retry.
+            #[cfg(debug_assertions)]
+            pub accept_descriptor_exhaustions: usize,
             /// Number of `clock_gettime` calls for timer tick computation.
             #[cfg(debug_assertions)]
             pub timer_now_tick_calls: usize,
@@ -283,7 +290,7 @@ impl ExecutorTaskMemProvider {
     fn note_request(&mut self) {
         #[cfg(any(debug_assertions, test))]
         {
-            self.request_count += 1;
+            self.request_count = self.request_count.saturating_add(1);
         }
     }
 
@@ -291,7 +298,7 @@ impl ExecutorTaskMemProvider {
     fn note_free(&mut self) {
         #[cfg(debug_assertions)]
         {
-            self.free_count += 1;
+            self.free_count = self.free_count.saturating_add(1);
         }
     }
 
@@ -752,7 +759,7 @@ impl Drop for ShutdownCompleteGuard {
 
 /// Runs one cleanup action without allowing a secondary panic to abort an
 /// already-unwinding thread.
-fn run_cleanup_preserving_panic(cleanup: impl FnOnce()) {
+pub(super) fn run_cleanup_preserving_panic(cleanup: impl FnOnce()) {
     let already_panicking = std::thread::panicking();
     if let Err(payload) = catch_unwind(AssertUnwindSafe(cleanup)) {
         if already_panicking {
@@ -918,52 +925,144 @@ pub(crate) fn with_ringless_poll_context_for_test<R>(
     result
 }
 
+/// Runs one repository benchmark with an initialized executor context and raw
+/// access to its heap-stable owner-thread fields.
+#[cfg(feature = "test-support")]
+pub(crate) fn with_executor_context_for_benchmark<R>(
+    ring_entries: u32,
+    benchmark: impl FnOnce(
+        *mut Reactor,
+        *mut RuntimeState,
+        *mut DList<TaskHeader>,
+        *mut DList<TaskHeader>,
+    ) -> io::Result<R>,
+) -> io::Result<R> {
+    let mut executor = Executor::new_with_config(ExecutorConfig {
+        reactor: ReactorConfig { ring_entries },
+        ..ExecutorConfig::default()
+    })?;
+    executor.init()?;
+
+    let owner = Rc::as_ptr(&executor.owner);
+    let state = executor.owner.state_ptr();
+    {
+        let _context = ExecutorCtxGuard::install(owner)?;
+        benchmark(
+            unsafe { std::ptr::addr_of_mut!((*state).reactor) },
+            unsafe { std::ptr::addr_of_mut!((*state).runtime_state) },
+            unsafe { std::ptr::addr_of_mut!((*state).ready_queue) },
+            unsafe { std::ptr::addr_of_mut!((*state).all_tasks) },
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExecutorThreadContext {
+    active_owner: *const ExecutorOwner,
+    completion_drain_active: bool,
+    completion_drain_reactor: *mut Reactor,
+}
+
+impl ExecutorThreadContext {
+    const INACTIVE: Self = Self {
+        active_owner: std::ptr::null(),
+        completion_drain_active: false,
+        completion_drain_reactor: std::ptr::null_mut(),
+    };
+}
+
 thread_local! {
-    static EXECUTOR_CTX: Cell<*const ExecutorOwner> = const { Cell::new(std::ptr::null()) };
-    static COMPLETION_DRAIN_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static EXECUTOR_CTX: Cell<ExecutorThreadContext> =
+        const { Cell::new(ExecutorThreadContext::INACTIVE) };
 }
 
 /// Marks the thread while any reactor completion view has its ring mutably
 /// borrowed.
 ///
 /// Descriptor destruction can run from retained-payload or task destructors
-/// during completion reclamation. The nestable flag conservatively keeps all
-/// destructor-driven owner-thread work off every ring until all active
-/// completion views have been released.
+/// during completion reclamation. The nestable flag keeps ordinary ring work
+/// excluded while any completion view is live. A production guard also
+/// publishes the exact current reactor so known-nonblocking descriptor owners
+/// can move into its bounded FIFO; that reactor submits them only after its own
+/// view is released, even when an outer view for another reactor remains live.
 pub(crate) struct CompletionDrainGuard {
-    previous: bool,
+    previous_active: bool,
+    previous_reactor: *mut Reactor,
 }
 
 impl CompletionDrainGuard {
     #[inline(always)]
     pub(crate) fn enter() -> Self {
-        let previous = COMPLETION_DRAIN_ACTIVE.with(|active| active.replace(true));
-        Self { previous }
+        EXECUTOR_CTX.with(|context| {
+            let previous = context.get();
+            context.set(ExecutorThreadContext {
+                completion_drain_active: true,
+                completion_drain_reactor: if previous.completion_drain_active {
+                    previous.completion_drain_reactor
+                } else {
+                    std::ptr::null_mut()
+                },
+                ..previous
+            });
+            Self {
+                previous_active: previous.completion_drain_active,
+                previous_reactor: previous.completion_drain_reactor,
+            }
+        })
+    }
+
+    /// Marks a production completion drain and publishes its exact reactor for
+    /// bounded descriptor deferral.
+    #[inline(always)]
+    pub(crate) fn enter_for_reactor(reactor: *mut Reactor) -> Self {
+        debug_assert!(
+            !reactor.is_null(),
+            "completion-drain reactor must be non-null"
+        );
+        EXECUTOR_CTX.with(|context| {
+            let previous = context.get();
+            context.set(ExecutorThreadContext {
+                completion_drain_active: true,
+                completion_drain_reactor: reactor,
+                ..previous
+            });
+            Self {
+                previous_active: previous.completion_drain_active,
+                previous_reactor: previous.completion_drain_reactor,
+            }
+        })
     }
 }
 
 impl Drop for CompletionDrainGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        COMPLETION_DRAIN_ACTIVE.with(|active| active.set(self.previous));
+        EXECUTOR_CTX.with(|context| {
+            let current = context.get();
+            context.set(ExecutorThreadContext {
+                completion_drain_active: self.previous_active,
+                completion_drain_reactor: self.previous_reactor,
+                ..current
+            });
+        });
     }
 }
 
 #[inline(always)]
 pub(crate) fn completion_drain_active() -> bool {
-    COMPLETION_DRAIN_ACTIVE.with(Cell::get)
+    EXECUTOR_CTX.with(|context| context.get().completion_drain_active)
 }
 
 struct ExecutorCtxGuard {
     owner: *const ExecutorOwner,
-    previous: *const ExecutorOwner,
+    previous_owner: *const ExecutorOwner,
 }
 
 impl ExecutorCtxGuard {
     #[inline(always)]
     fn reject_if_active() -> io::Result<()> {
         EXECUTOR_CTX.with(|ctx_cell| {
-            if ctx_cell.get().is_null() {
+            if ctx_cell.get().active_owner.is_null() {
                 Ok(())
             } else {
                 Err(io::Error::new(
@@ -985,8 +1084,17 @@ impl ExecutorCtxGuard {
     /// same thread, so the previous context is restored on scope exit.
     #[inline(always)]
     fn install_for_shutdown(owner: *const ExecutorOwner) -> Self {
-        let previous = EXECUTOR_CTX.with(|ctx_cell| ctx_cell.replace(owner));
-        Self { owner, previous }
+        EXECUTOR_CTX.with(|context| {
+            let previous = context.get();
+            context.set(ExecutorThreadContext {
+                active_owner: owner,
+                ..previous
+            });
+            Self {
+                owner,
+                previous_owner: previous.active_owner,
+            }
+        })
     }
 }
 
@@ -994,8 +1102,12 @@ impl Drop for ExecutorCtxGuard {
     #[inline(always)]
     fn drop(&mut self) {
         EXECUTOR_CTX.with(|ctx_cell| {
-            if ctx_cell.get() == self.owner {
-                ctx_cell.set(self.previous);
+            let current = ctx_cell.get();
+            if current.active_owner == self.owner {
+                ctx_cell.set(ExecutorThreadContext {
+                    active_owner: self.previous_owner,
+                    ..current
+                });
             }
         });
     }
@@ -1044,24 +1156,72 @@ fn inactive_poll_context_error() -> io::Error {
     io::Error::from(ErrorKind::NotConnected)
 }
 
+#[derive(Clone, Copy)]
+enum PollCtxRejection {
+    Permanent,
+    CompletionDrain(PollCtx),
+}
+
+/// Validates and extracts the FlowIO task and active executor represented by
+/// one future poll.
+#[inline(always)]
+fn classify_poll_ctx_from_waker(cx: &std::task::Context<'_>) -> Result<PollCtx, PollCtxRejection> {
+    let task = task_ptr_from_waker(cx.waker()).ok_or(PollCtxRejection::Permanent)?;
+    let owner = unsafe { (*task).owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr) };
+    let thread_context = EXECUTOR_CTX.with(Cell::get);
+    let shutting_down = !owner.is_null() && unsafe { (*(*owner).state_ptr()).shutting_down };
+    if owner.is_null() || thread_context.active_owner != owner || shutting_down {
+        return Err(PollCtxRejection::Permanent);
+    }
+    let pctx = PollCtx { owner, task };
+    if thread_context.completion_drain_active {
+        return Err(PollCtxRejection::CompletionDrain(pctx));
+    }
+
+    #[cfg(debug_assertions)]
+    unsafe {
+        let stats = &mut (*pctx.runtime_state()).stats;
+        stats.poll_context_extractions = stats.poll_context_extractions.saturating_add(1);
+    }
+    Ok(pctx)
+}
+
 /// Validates and extracts the FlowIO task and active executor represented by
 /// one future poll.
 #[inline(always)]
 pub(crate) fn poll_ctx_from_waker(cx: &std::task::Context<'_>) -> io::Result<PollCtx> {
-    let task = task_ptr_from_waker(cx.waker()).ok_or_else(inactive_poll_context_error)?;
-    let owner = unsafe { (*task).owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr) };
-    let active_owner = EXECUTOR_CTX.with(Cell::get);
-    let shutting_down = !owner.is_null() && unsafe { (*(*owner).state_ptr()).shutting_down };
-    if owner.is_null() || active_owner != owner || shutting_down || completion_drain_active() {
-        return Err(inactive_poll_context_error());
-    }
+    classify_poll_ctx_from_waker(cx).map_err(|_| inactive_poll_context_error())
+}
 
-    let pctx = PollCtx { owner, task };
-    #[cfg(debug_assertions)]
-    unsafe {
-        (*pctx.runtime_state()).stats.poll_context_extractions += 1;
+/// Validates a leading operation-poll boundary while allowing an existing
+/// matching-owner operation to remain pending during a completion drain.
+///
+/// `Ok(None)` means the caller must return `Poll::Pending` without changing
+/// the operation pointer, flags, waiter, or payload. Fresh, completed,
+/// ring-abandoned, and foreign-owner operations retain ordinary context
+/// rejection.
+///
+/// # Safety
+///
+/// A non-null `state_ptr` must identify the live completion state exclusively
+/// owned by the currently polled future.
+#[inline(always)]
+pub(crate) unsafe fn poll_ctx_or_transient_pending_op(
+    cx: &std::task::Context<'_>,
+    state_ptr: *mut CompletionState,
+) -> io::Result<Option<PollCtx>> {
+    match classify_poll_ctx_from_waker(cx) {
+        Ok(pctx) => Ok(Some(pctx)),
+        Err(PollCtxRejection::CompletionDrain(pctx))
+            if !state_ptr.is_null()
+                && unsafe { !(*state_ptr).is_completed() }
+                && unsafe { !(*state_ptr).is_ring_abandoned() }
+                && unsafe { (*state_ptr).owner_ptr() == pctx.owner_ptr() } =>
+        {
+            Ok(None)
+        }
+        Err(_) => Err(inactive_poll_context_error()),
     }
-    Ok(pctx)
 }
 
 /// Validates the current FlowIO poll context before an I/O future completes
@@ -1195,9 +1355,11 @@ pub(crate) unsafe fn completed_op_ctx(
 /// Invalid or foreign polls are remembered so completion returns
 /// `NotConnected`; a valid foreign FlowIO task may still be registered so the
 /// original reactor can notify it through its stable executor owner after the
-/// CQE. Returns `true` when reactor teardown abandoned the operation without
-/// observing its target CQE; callers may report that terminal condition only
-/// when doing so cannot expose a retained kernel-visible caller payload.
+/// CQE. A transient re-poll while a completion view owns the ring leaves both
+/// the registered waiter and rejection flag unchanged. Returns `true` when
+/// reactor teardown abandoned the operation without observing its target CQE;
+/// callers may report that terminal condition only when doing so cannot expose
+/// a retained kernel-visible caller payload.
 ///
 /// # Safety
 ///
@@ -1215,22 +1377,34 @@ pub(crate) unsafe fn refresh_op_waiter_from_waker(
         return false;
     }
 
-    let state = unsafe { &mut *state_ptr };
     debug_assert!(
-        !state.is_completed(),
+        unsafe { !(*state_ptr).is_completed() },
         "cannot refresh a completed operation"
     );
-    if state.is_ring_abandoned() {
+    if unsafe { (*state_ptr).is_ring_abandoned() } {
         return true;
     }
-    match poll_ctx_from_waker(cx) {
+    match classify_poll_ctx_from_waker(cx) {
         Ok(pctx) => {
-            if state.owner_ptr() != pctx.owner_ptr() {
-                state.set_context_rejected();
+            if unsafe { (*state_ptr).owner_ptr() } != pctx.owner_ptr() {
+                unsafe {
+                    (*state_ptr).set_context_rejected();
+                }
             }
-            unsafe { state.register_waiter(pctx.owner_task()) };
+            unsafe {
+                CompletionState::replace_waiter_unchecked(state_ptr, pctx.owner_task());
+            }
         }
-        Err(_) => state.set_context_rejected(),
+        Err(PollCtxRejection::Permanent) => unsafe {
+            (*state_ptr).set_context_rejected();
+        },
+        Err(PollCtxRejection::CompletionDrain(pctx)) => {
+            if unsafe { (*state_ptr).owner_ptr() } != pctx.owner_ptr() {
+                unsafe {
+                    (*state_ptr).set_context_rejected();
+                }
+            }
+        }
     }
     false
 }
@@ -1270,6 +1444,119 @@ unsafe fn init_join_task_at<F: Future>(dst: *mut JoinTask<F>, future: F) {
     }
 }
 
+/// Owns the setup reference for one already-completed benchmark task.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct StagedCompletedTaskOutput<T: 'static> {
+    task: *mut TaskHeader,
+    output: *mut T,
+    owns_reference: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> StagedCompletedTaskOutput<T> {
+    /// Returns the stable output address inside the task's completed result.
+    pub(crate) fn output_ptr(&self) -> *mut T {
+        self.output
+    }
+
+    /// Transfers the staging reference to one completion-state waiter.
+    /// The returned output pointer remains valid only until that waiter
+    /// releases the task's final reference.
+    ///
+    /// # Safety
+    ///
+    /// `state` must be a live unsubmitted state owned by the active executor,
+    /// and it must not already own a waiter.
+    pub(crate) unsafe fn transfer_to_waiter(mut self, state: *mut CompletionState) -> *mut T {
+        debug_assert!(!state.is_null(), "benchmark waiter state is null");
+        unsafe {
+            (*state).register_waiter(self.task);
+        }
+        self.owns_reference = false;
+        unsafe {
+            release_task(self.task);
+        }
+        self.output
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<T: 'static> Drop for StagedCompletedTaskOutput<T> {
+    fn drop(&mut self) {
+        if self.owns_reference {
+            unsafe {
+                release_task(self.task);
+            }
+            self.owns_reference = false;
+        }
+    }
+}
+
+/// Stages one completed detached join result in the real executor task pool.
+///
+/// The returned setup owner can transfer its sole task reference into a
+/// completion-state waiter. Final waiter release then runs the ordinary
+/// `JoinTask` result destructor, all-task unlink, and pooled slot return.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn stage_completed_task_output_for_benchmark<T: 'static>(
+    output: T,
+) -> io::Result<StagedCompletedTaskOutput<T>> {
+    type CompletedFuture<T> = std::future::Ready<T>;
+
+    EXECUTOR_CTX.with(|context| {
+        let owner = context.get().active_owner;
+        if owner.is_null() {
+            return Err(io::Error::from(ErrorKind::InvalidInput));
+        }
+        if size_of::<JoinTask<CompletedFuture<T>>>() > TASK_POOL_SIZE
+            || align_of::<JoinTask<CompletedFuture<T>>>() > TASK_DATA_ALIGN
+        {
+            return Err(io::Error::from(ErrorKind::InvalidInput));
+        }
+
+        let state = unsafe { (*owner).state_ptr() };
+        if unsafe { (*state).shutting_down } {
+            return Err(io::Error::from(ErrorKind::InvalidInput));
+        }
+        let slot = unsafe { (*state).task_pool.alloc(()) }
+            .ok_or_else(|| io::Error::from(ErrorKind::OutOfMemory))?;
+        let join = unsafe { (&mut *slot).data.as_mut_ptr() as *mut JoinTask<CompletedFuture<T>> };
+        unsafe {
+            std::ptr::addr_of_mut!((*join).future).write(None);
+            std::ptr::addr_of_mut!((*join).result).write(Some(Ok(output)));
+            std::ptr::addr_of_mut!((*join).join_waker).write(None);
+        }
+        let output = match unsafe { (&mut *std::ptr::addr_of_mut!((*join).result)).as_mut() } {
+            Some(Ok(output)) => std::ptr::from_mut(output),
+            _ => unreachable!("completed benchmark output was not published"),
+        };
+
+        unsafe {
+            (*slot).header.ready_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
+            (*slot).header.all_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
+            (*slot).header.owner = Some(ExecutorOwner::clone_rc(owner));
+            (*slot).header.refs.set(1);
+            (*slot).header.flags.set(TaskHeader::FLAG_COMPLETED);
+            init_cached_waker(std::ptr::addr_of_mut!((*slot).header));
+            (*slot).header.vtable = join_task_vtable_for::<CompletedFuture<T>>();
+            #[cfg(debug_assertions)]
+            {
+                let stats = &mut (*state).runtime_state.stats;
+                stats.task_allocs = stats.task_allocs.saturating_add(1);
+            }
+            (*state)
+                .all_tasks
+                .push_back_unchecked(std::ptr::addr_of_mut!((*slot).header.all_link));
+        }
+
+        Ok(StagedCompletedTaskOutput {
+            task: unsafe { std::ptr::addr_of_mut!((*slot).header) },
+            output,
+            owns_reference: true,
+        })
+    })
+}
+
 /// Reclaims one zero-reference task after its join payload is destroyed.
 trait TaskDestroyCleanup {
     /// # Safety
@@ -1291,7 +1578,8 @@ impl TaskDestroyCleanup for ExecutorOwner {
         }
         #[cfg(debug_assertions)]
         unsafe {
-            (*state).runtime_state.stats.task_frees += 1;
+            let stats = &mut (*state).runtime_state.stats;
+            stats.task_frees = stats.task_frees.saturating_add(1);
         }
         unsafe {
             (*state).task_pool.free(task as *mut Task<TASK_POOL_SIZE>);
@@ -1804,7 +2092,7 @@ impl Executor {
         F::Output: 'static,
     {
         EXECUTOR_CTX.with(|ctx_cell| {
-            let owner_ptr = ctx_cell.get();
+            let owner_ptr = ctx_cell.get().active_owner;
             if owner_ptr.is_null() {
                 return Err(TrySpawnError::NoExecutor { future });
             }
@@ -1853,14 +2141,15 @@ impl Executor {
                 (*state_ptr).runtime_state.live_tasks += 1;
                 #[cfg(debug_assertions)]
                 {
-                    (*state_ptr).runtime_state.stats.task_allocs += 1;
+                    let stats = &mut (*state_ptr).runtime_state.stats;
+                    stats.task_allocs = stats.task_allocs.saturating_add(1);
                 }
                 (*state_ptr)
                     .all_tasks
-                    .push_back_unchecked(&mut (*slot_ptr).header.all_link as *mut _);
+                    .push_back_unchecked(std::ptr::addr_of_mut!((*slot_ptr).header.all_link));
                 (*state_ptr)
                     .ready_queue
-                    .push_back_unchecked(&mut (*slot_ptr).header.ready_link as *mut _);
+                    .push_back_unchecked(std::ptr::addr_of_mut!((*slot_ptr).header.ready_link));
 
                 Ok(JoinHandle {
                     task_ptr: &mut (*slot_ptr).header as *mut TaskHeader,
@@ -1908,9 +2197,14 @@ impl Executor {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if another executor run is
     /// already active on this thread. Nested and reentrant runs are not
-    /// supported. Futures submitted or armed by one executor must remain on
-    /// that executor; polling them outside an active run or through another
-    /// executor's task waker returns [`io::ErrorKind::NotConnected`].
+    /// supported. An out-of-range configured CPU affinity or a root future too
+    /// large for one task slot also returns [`io::ErrorKind::InvalidInput`].
+    /// Root-task allocation pressure returns [`io::ErrorKind::OutOfMemory`].
+    /// Returns [`io::ErrorKind::NotConnected`] if this executor has begun
+    /// shutdown; an executor cannot be restarted after shutdown.
+    /// Futures submitted or armed by one executor must remain on that executor;
+    /// polling them outside an active run or through another executor's task
+    /// waker also returns [`io::ErrorKind::NotConnected`].
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] if live runtime work remains but
     /// there are no ready tasks, in-flight I/O operations, or timers that can
@@ -1943,11 +2237,14 @@ impl Executor {
     /// ```
     pub fn run<F: Future<Output = ()> + 'static>(&mut self, initial_task: F) -> io::Result<()> {
         ExecutorCtxGuard::reject_if_active()?;
+        let state_ptr = self.owner.state_ptr();
+        if unsafe { (*state_ptr).shutting_down } {
+            return Err(io::Error::from(ErrorKind::NotConnected));
+        }
         self.init()?;
         apply_cpu_affinity(self.cpu_affinity)?;
 
         let owner_ptr = Rc::as_ptr(&self.owner);
-        let state_ptr = self.owner.state_ptr();
         let starts_clean = unsafe {
             (*state_ptr).runtime_state.live_tasks == 0
                 && (*state_ptr).runtime_state.inflight_ops == 0
@@ -1995,7 +2292,8 @@ impl Executor {
                 let poll_guard = TaskPollPanicGuard::new(header_ptr, runtime_state);
                 #[cfg(debug_assertions)]
                 unsafe {
-                    (*state_ptr).runtime_state.stats.task_polls += 1;
+                    let stats = &mut (*state_ptr).runtime_state.stats;
+                    stats.task_polls = stats.task_polls.saturating_add(1);
                 }
                 let poll = unsafe { (*header_ptr).vtable.poll };
                 let poll_res = unsafe { poll(header_ptr) };
@@ -2435,11 +2733,7 @@ unsafe fn free_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
         return;
     };
     let reactor = owner.reactor_ptr();
-    if completion_drain_active() {
-        unsafe { Reactor::free_op_unchecked(reactor, ptr) };
-    } else {
-        unsafe { (*reactor).free_op(ptr) };
-    }
+    unsafe { Reactor::free_op_unchecked(reactor, ptr) };
 }
 
 /// Release a future-owned `CompletionState` pointer from `Drop`.
@@ -2529,7 +2823,7 @@ impl UnsubmittedOpGuard {
 impl Drop for UnsubmittedOpGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { self.reactor.as_mut().free_op(self.state.as_ptr()) };
+        unsafe { Reactor::free_op_unchecked(self.reactor.as_ptr(), self.state.as_ptr()) };
     }
 }
 
@@ -2618,7 +2912,8 @@ pub(crate) unsafe fn submit_tracked_sqe(
         (*pctx.runtime_state()).inflight_ops += 1;
         #[cfg(debug_assertions)]
         {
-            (*pctx.runtime_state()).stats.sqe_submits += 1;
+            let stats = &mut (*pctx.runtime_state()).stats;
+            stats.sqe_submits = stats.sqe_submits.saturating_add(1);
         }
     }
     Ok(())
@@ -2692,7 +2987,7 @@ where
     };
 
     if let Err(err) = unsafe { submit_tracked_sqe(pctx, sqe) } {
-        let payload = unsafe { (*reactor).take_retained_payload::<T>(state_ptr) };
+        let payload = unsafe { Reactor::take_retained_payload_unchecked::<T>(reactor, state_ptr) };
         return Err((err, payload));
     }
 
@@ -2718,6 +3013,9 @@ pub(crate) enum CloseSubmission {
     /// The reactor queued a plain close SQE and retained the owner until kernel
     /// admission.
     Submitted,
+    /// A live completion view prevented ring access, so the exact reactor
+    /// retained the owner in its bounded post-view FIFO.
+    Deferred,
     /// No executor is active, so the caller retains ordinary drop semantics.
     OutsideExecutor(OwnedFd),
     /// The active reactor could not queue the close; the unchanged owner is
@@ -2732,7 +3030,7 @@ pub(crate) enum CloseSubmission {
 #[inline(always)]
 pub(crate) fn has_active_close_context() -> bool {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let owner = ctx_cell.get();
+        let owner = ctx_cell.get().active_owner;
         if owner.is_null() {
             return false;
         }
@@ -2746,7 +3044,7 @@ pub(crate) fn has_active_close_context() -> bool {
 #[inline(always)]
 pub(crate) fn try_admit_close(fd: OwnedFd) -> CloseAdmission {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let owner = ctx_cell.get();
+        let owner = ctx_cell.get().active_owner;
         if owner.is_null() {
             return CloseAdmission::OutsideExecutor(fd);
         }
@@ -2760,21 +3058,27 @@ pub(crate) fn try_admit_close(fd: OwnedFd) -> CloseAdmission {
                 Ok(()) => {
                     #[cfg(debug_assertions)]
                     {
-                        (*_runtime_state).stats.close_worker_admissions += 1;
+                        let stats = &mut (*_runtime_state).stats;
+                        stats.close_worker_admissions =
+                            stats.close_worker_admissions.saturating_add(1);
                     }
                     CloseAdmission::Admitted
                 }
                 Err(CloseWorkerRejection::Full(fd)) => {
                     #[cfg(debug_assertions)]
                     {
-                        (*_runtime_state).stats.close_worker_full_fallbacks += 1;
+                        let stats = &mut (*_runtime_state).stats;
+                        stats.close_worker_full_fallbacks =
+                            stats.close_worker_full_fallbacks.saturating_add(1);
                     }
                     CloseAdmission::Full(fd)
                 }
                 Err(CloseWorkerRejection::Disconnected(fd)) => {
                     #[cfg(debug_assertions)]
                     {
-                        (*_runtime_state).stats.close_worker_disconnected_fallbacks += 1;
+                        let stats = &mut (*_runtime_state).stats;
+                        stats.close_worker_disconnected_fallbacks =
+                            stats.close_worker_disconnected_fallbacks.saturating_add(1);
                     }
                     CloseAdmission::Disconnected(fd)
                 }
@@ -2792,14 +3096,35 @@ pub(crate) fn try_admit_close(fd: OwnedFd) -> CloseAdmission {
 #[inline(always)]
 pub(crate) fn try_submit_close(fd: OwnedFd) -> CloseSubmission {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let owner = ctx_cell.get();
-        if completion_drain_active() {
+        let context = ctx_cell.get();
+        let owner = context.active_owner;
+        if context.completion_drain_active {
             #[cfg(debug_assertions)]
             if !owner.is_null() {
                 unsafe {
                     (*owner).debug_assert_owner_thread();
-                    let state_ptr = (*owner).state_ptr();
-                    (*state_ptr).runtime_state.stats.close_ring_fallbacks += 1;
+                }
+            }
+            let drain_reactor = context.completion_drain_reactor;
+            if !owner.is_null() && !drain_reactor.is_null() {
+                match unsafe { Reactor::defer_close_during_completion_drain(drain_reactor, fd) } {
+                    Ok(()) => return CloseSubmission::Deferred,
+                    Err(fd) => {
+                        #[cfg(debug_assertions)]
+                        unsafe {
+                            let stats = &mut (*(*owner).state_ptr()).runtime_state.stats;
+                            stats.close_ring_fallbacks =
+                                stats.close_ring_fallbacks.saturating_add(1);
+                        }
+                        return CloseSubmission::Rejected(fd);
+                    }
+                }
+            }
+            #[cfg(debug_assertions)]
+            if !owner.is_null() {
+                unsafe {
+                    let stats = &mut (*(*owner).state_ptr()).runtime_state.stats;
+                    stats.close_ring_fallbacks = stats.close_ring_fallbacks.saturating_add(1);
                 }
             }
             return CloseSubmission::Rejected(fd);
@@ -2813,34 +3138,9 @@ pub(crate) fn try_submit_close(fd: OwnedFd) -> CloseSubmission {
             let state_ptr = (*owner).state_ptr();
             let reactor = std::ptr::addr_of_mut!((*state_ptr).reactor);
             let runtime_state = std::ptr::addr_of_mut!((*state_ptr).runtime_state);
-            let op = (*reactor).alloc_op();
-            if op.is_null() {
-                #[cfg(debug_assertions)]
-                {
-                    (*runtime_state).stats.close_ring_fallbacks += 1;
-                }
-                return CloseSubmission::Rejected(fd);
-            }
-
-            (*op).set_detached();
-            match (*reactor).submit_close_sqe(fd, op as u64) {
-                Ok(()) => {
-                    (*runtime_state).inflight_ops += 1;
-                    #[cfg(debug_assertions)]
-                    {
-                        (*runtime_state).stats.sqe_submits += 1;
-                        (*runtime_state).stats.close_ring_submissions += 1;
-                    }
-                    CloseSubmission::Submitted
-                }
-                Err((_err, fd)) => {
-                    (*reactor).free_op(op);
-                    #[cfg(debug_assertions)]
-                    {
-                        (*runtime_state).stats.close_ring_fallbacks += 1;
-                    }
-                    CloseSubmission::Rejected(fd)
-                }
+            match Reactor::try_submit_close_on_reactor(reactor, runtime_state, fd) {
+                Ok(()) => CloseSubmission::Submitted,
+                Err(fd) => CloseSubmission::Rejected(fd),
             }
         }
     })
@@ -2849,33 +3149,54 @@ pub(crate) fn try_submit_close(fd: OwnedFd) -> CloseSubmission {
 #[inline(always)]
 pub(crate) fn note_close_direct() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.close_direct_closes += 1);
+    record_runtime_stat(|stats| {
+        stats.close_direct_closes = stats.close_direct_closes.saturating_add(1);
+    });
 }
 
 #[inline(always)]
 pub(crate) fn note_accept_readiness_rearm() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.accept_readiness_rearms += 1);
+    record_runtime_stat(|stats| {
+        stats.accept_readiness_rearms = stats.accept_readiness_rearms.saturating_add(1);
+    });
+}
+
+#[inline(always)]
+pub(crate) fn note_accept_descriptor_exhaustion() {
+    #[cfg(debug_assertions)]
+    record_runtime_stat(|stats| {
+        stats.accept_descriptor_exhaustions = stats.accept_descriptor_exhaustions.saturating_add(1);
+    });
 }
 
 #[inline(always)]
 pub(crate) fn note_close_linger_query() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.close_linger_queries += 1);
+    record_runtime_stat(|stats| {
+        stats.close_linger_queries = stats.close_linger_queries.saturating_add(1);
+    });
 }
 
 #[inline(always)]
 pub(crate) fn note_close_linger_classification_failure() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.close_linger_classification_failures += 1);
+    record_runtime_stat(|stats| {
+        stats.close_linger_classification_failures =
+            stats.close_linger_classification_failures.saturating_add(1);
+    });
 }
 
 #[inline(always)]
 pub(crate) fn note_close_linger_waiver(waived: bool, failed: bool) {
     #[cfg(debug_assertions)]
     record_runtime_stat(|stats| {
-        stats.close_linger_waivers += usize::from(waived);
-        stats.close_linger_waiver_failures += usize::from(failed);
+        stats.close_linger_waivers = stats
+            .close_linger_waivers
+            .saturating_add(usize::from(waived));
+        stats.close_linger_waiver_failures = stats
+            .close_linger_waiver_failures
+            .saturating_add(usize::from(failed));
     });
     #[cfg(not(debug_assertions))]
     let _ = (waived, failed);
@@ -2884,26 +3205,32 @@ pub(crate) fn note_close_linger_waiver(waived: bool, failed: bool) {
 #[inline(always)]
 pub(crate) fn note_waiter_wake() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.waiter_wakes += 1);
+    record_runtime_stat(|stats| {
+        stats.waiter_wakes = stats.waiter_wakes.saturating_add(1);
+    });
 }
 
 #[inline(always)]
 pub(crate) fn note_timer_now_tick_call() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.timer_now_tick_calls += 1);
+    record_runtime_stat(|stats| {
+        stats.timer_now_tick_calls = stats.timer_now_tick_calls.saturating_add(1);
+    });
 }
 
 #[inline(always)]
 pub(crate) fn note_timer_expired() {
     #[cfg(debug_assertions)]
-    record_runtime_stat(|stats| stats.timer_expired += 1);
+    record_runtime_stat(|stats| {
+        stats.timer_expired = stats.timer_expired.saturating_add(1);
+    });
 }
 
 #[cfg(debug_assertions)]
 #[inline(always)]
 fn record_runtime_stat(update: impl FnOnce(&mut RuntimeStats)) {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let owner = ctx_cell.get();
+        let owner = ctx_cell.get().active_owner;
         if owner.is_null() {
             return;
         }
@@ -2923,7 +3250,7 @@ fn record_runtime_stat(update: impl FnOnce(&mut RuntimeStats)) {
 #[inline(always)]
 pub(crate) fn schedule_ctx_from_active_executor() -> io::Result<ScheduleCtx> {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let owner = ctx_cell.get();
+        let owner = ctx_cell.get().active_owner;
         if owner.is_null() {
             return Err(inactive_poll_context_error());
         }
@@ -2953,7 +3280,7 @@ unsafe fn schedule_ctx_from_owner_unchecked(owner: *const ExecutorOwner) -> Sche
 #[inline(always)]
 pub(crate) unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
     EXECUTOR_CTX.with(|ctx_cell| {
-        let owner = ctx_cell.get();
+        let owner = ctx_cell.get().active_owner;
         debug_assert!(
             !owner.is_null(),
             "runtime schedule_ctx_unchecked requested outside executor context"
@@ -3229,7 +3556,8 @@ unsafe fn enqueue_ready_task_unchecked(
     {
         if !_runtime_state.is_null() {
             unsafe {
-                (*_runtime_state).stats.task_schedules += 1;
+                let stats = &mut (*_runtime_state).stats;
+                stats.task_schedules = stats.task_schedules.saturating_add(1);
             }
         }
     }
@@ -3285,6 +3613,179 @@ mod tests {
         static RUNTIME_SHUTDOWN_DROP_STATE: Cell<*mut CompletionState> =
             const { Cell::new(std::ptr::null_mut()) };
         static RUNTIME_SHUTDOWN_DROP_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct StagedTaskDropProbe {
+        drops: Rc<Cell<usize>>,
+        panic_on_drop: bool,
+    }
+
+    impl StagedTaskDropProbe {
+        fn new(drops: Rc<Cell<usize>>, panic_on_drop: bool) -> Self {
+            Self {
+                drops,
+                panic_on_drop,
+            }
+        }
+    }
+
+    impl Drop for StagedTaskDropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if self.panic_on_drop {
+                panic!("staged task output drop panic");
+            }
+        }
+    }
+
+    unsafe fn assert_staged_tasks_reclaimed(
+        owner: &ExecutorOwner,
+        expected_allocs: usize,
+        expected_frees: usize,
+    ) {
+        let state = owner.state_ptr();
+        assert!(
+            unsafe { (*state).all_tasks.is_empty() },
+            "staged task remained linked after final release"
+        );
+        #[cfg(debug_assertions)]
+        unsafe {
+            assert_eq!(
+                (*state).runtime_state.stats.task_allocs,
+                expected_allocs,
+                "staged task allocation count changed"
+            );
+            assert_eq!(
+                (*state).runtime_state.stats.task_frees,
+                expected_frees,
+                "staged task free count changed"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (expected_allocs, expected_frees);
+        }
+    }
+
+    #[test]
+    fn staged_completed_task_owner_drop_unlinks_and_reuses_exact_slot() {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let drops = Rc::new(Cell::new(0));
+            let staged = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("completed task staging failed");
+            let first_task = staged.task;
+            assert!(
+                unsafe { !(*owner.state_ptr()).all_tasks.is_empty() },
+                "staged task was not linked"
+            );
+
+            drop(staged);
+            assert_eq!(drops.get(), 1);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 1, 1);
+            }
+
+            let replacement = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("replacement completed task staging failed");
+            assert_eq!(
+                replacement.task, first_task,
+                "staged task slot was not exactly reusable"
+            );
+            drop(replacement);
+            assert_eq!(drops.get(), 2);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 2, 2);
+            }
+        });
+    }
+
+    #[test]
+    fn staged_completed_task_waiter_transfer_releases_on_operation_free() {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let drops = Rc::new(Cell::new(0));
+            let reactor = owner.reactor_ptr();
+            let state = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state.is_null(), "operation allocation failed");
+            let staged = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("completed task staging failed");
+            let task = staged.task;
+
+            let _output = unsafe { staged.transfer_to_waiter(state) };
+            assert_eq!(unsafe { (*task).refs.get() }, 1);
+            assert_eq!(drops.get(), 0);
+            unsafe {
+                Reactor::free_op_unchecked(reactor, state);
+            }
+            assert_eq!(drops.get(), 1);
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 1, 1);
+            }
+
+            let replacement = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("replacement completed task staging failed");
+            assert_eq!(
+                replacement.task, task,
+                "waiter-released task slot was not exactly reusable"
+            );
+            drop(replacement);
+            assert_eq!(drops.get(), 2);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 2, 2);
+            }
+        });
+    }
+
+    #[test]
+    fn staged_completed_task_panicking_output_still_returns_task_slot() {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let drops = Rc::new(Cell::new(0));
+            let staged = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                true,
+            ))
+            .expect("completed task staging failed");
+            let task = staged.task;
+
+            let unwind = catch_unwind(AssertUnwindSafe(|| drop(staged)))
+                .expect_err("staged output destructor did not panic");
+            assert!(
+                unwind
+                    .downcast_ref::<&'static str>()
+                    .is_some_and(|message| *message == "staged task output drop panic")
+            );
+            assert_eq!(drops.get(), 1);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 1, 1);
+            }
+
+            let replacement = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("replacement completed task staging failed");
+            assert_eq!(
+                replacement.task, task,
+                "panic cleanup did not return the exact task slot"
+            );
+            drop(replacement);
+            assert_eq!(drops.get(), 2);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 2, 2);
+            }
+        });
     }
 
     unsafe fn runtime_shutdown_output_destroy(_: *mut TaskHeader) {
@@ -3389,6 +3890,64 @@ mod tests {
         drop(owner);
     }
 
+    #[test]
+    fn executor_and_completion_drain_guards_restore_only_their_own_fields() {
+        let active_owner = ringless_owner_for_test(2);
+        let shutdown_owner = ringless_owner_for_test(2);
+        let active_owner_ptr = Rc::as_ptr(&active_owner);
+        let shutdown_owner_ptr = Rc::as_ptr(&shutdown_owner);
+        let active_reactor = active_owner.reactor_ptr();
+        let shutdown_reactor = shutdown_owner.reactor_ptr();
+        let assert_context = |expected_owner: *const ExecutorOwner,
+                              expected_drain_active: bool,
+                              expected_drain_reactor: *mut Reactor| {
+            EXECUTOR_CTX.with(|context| {
+                let actual = context.get();
+                assert_eq!(actual.active_owner, expected_owner);
+                assert_eq!(
+                    actual.completion_drain_active, expected_drain_active,
+                    "completion-drain activity changed"
+                );
+                assert_eq!(
+                    actual.completion_drain_reactor, expected_drain_reactor,
+                    "completion-drain reactor changed"
+                );
+            });
+        };
+
+        assert_context(std::ptr::null(), false, std::ptr::null_mut());
+        let active_guard = ExecutorCtxGuard::install(active_owner_ptr)
+            .expect("active owner context installation failed");
+        assert_context(active_owner_ptr, false, std::ptr::null_mut());
+
+        // Ordinary LIFO nesting restores each exact reactor in turn.
+        let outer_drain = CompletionDrainGuard::enter_for_reactor(active_reactor);
+        assert_context(active_owner_ptr, true, active_reactor);
+        let inner_drain = CompletionDrainGuard::enter_for_reactor(shutdown_reactor);
+        assert_context(active_owner_ptr, true, shutdown_reactor);
+        drop(inner_drain);
+        assert_context(active_owner_ptr, true, active_reactor);
+        drop(outer_drain);
+        assert_context(active_owner_ptr, false, std::ptr::null_mut());
+
+        // Interleave the independent guards deliberately: dropping either kind
+        // must leave the other kind's current fields untouched.
+        let drain_during_shutdown = CompletionDrainGuard::enter_for_reactor(active_reactor);
+        let shutdown_guard = ExecutorCtxGuard::install_for_shutdown(shutdown_owner_ptr);
+        assert_context(shutdown_owner_ptr, true, active_reactor);
+        drop(drain_during_shutdown);
+        assert_context(shutdown_owner_ptr, false, std::ptr::null_mut());
+
+        let shutdown_drain = CompletionDrainGuard::enter_for_reactor(shutdown_reactor);
+        drop(shutdown_guard);
+        assert_context(active_owner_ptr, true, shutdown_reactor);
+        drop(shutdown_drain);
+        assert_context(active_owner_ptr, false, std::ptr::null_mut());
+
+        drop(active_guard);
+        assert_context(std::ptr::null(), false, std::ptr::null_mut());
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn completion_drain_rejects_nested_same_thread_future_poll() {
@@ -3426,6 +3985,37 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
+    fn completion_drain_pending_nop_repoll_returns_real_completion() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run(async {
+                let mut nop = Nop::new();
+                let mut submitted = false;
+                let result = std::future::poll_fn(|cx| {
+                    if !submitted {
+                        assert!(
+                            Pin::new(&mut nop).poll(cx).is_pending(),
+                            "first NOP poll did not submit"
+                        );
+                        let drain = CompletionDrainGuard::enter();
+                        assert!(
+                            Pin::new(&mut nop).poll(cx).is_pending(),
+                            "pending NOP did not park during completion drain"
+                        );
+                        drop(drain);
+                        submitted = true;
+                        return Poll::Pending;
+                    }
+                    Pin::new(&mut nop).poll(cx)
+                })
+                .await;
+                assert_eq!(result.expect("NOP completion was rejected"), 0);
+            })
+            .expect("executor failed after transient NOP repoll");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn completion_drain_reclaims_completed_operation_from_task_output_drop() {
         let mut executor = Executor::new().expect("executor construction failed");
         executor
@@ -3453,6 +4043,147 @@ mod tests {
             .expect("executor failed after reentrant operation reclamation");
         assert_eq!(unsafe { (*state).runtime_state.inflight_ops }, 0);
         assert_eq!(unsafe { (*state).reactor.live_op_count() }, 0);
+    }
+
+    #[test]
+    fn completion_drain_waiter_refresh_preserves_later_completion() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let pctx = poll_ctx_from_waker(cx).expect("valid poll context was rejected");
+            let reactor = owner.reactor_ptr();
+            let state = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state.is_null(), "operation allocation failed");
+
+            unsafe {
+                (*state).register_waiter(pctx.owner_task());
+            }
+            let flags = unsafe { (*state).state_flags };
+            let waiter = unsafe { (*state).waiter };
+            let waiter_refs = unsafe { (*waiter).refs.get() };
+
+            let drain = CompletionDrainGuard::enter();
+            assert!(
+                unsafe { poll_ctx_or_transient_pending_op(cx, state) }
+                    .expect("matching drain context was rejected")
+                    .is_none(),
+                "leading operation validation did not park during the drain"
+            );
+            assert!(
+                !unsafe { refresh_op_waiter_from_waker(cx, state) },
+                "transient completion drain reported ring abandonment"
+            );
+            unsafe {
+                assert_eq!(
+                    (*state).state_flags,
+                    flags,
+                    "completion drain changed operation flags"
+                );
+                assert_eq!(
+                    (*state).waiter,
+                    waiter,
+                    "completion drain replaced the registered waiter"
+                );
+                assert_eq!(
+                    (*waiter).refs.get(),
+                    waiter_refs,
+                    "completion drain changed waiter ownership"
+                );
+            }
+            drop(drain);
+
+            unsafe {
+                (*state).result = 73;
+                (*state).set_completed();
+            }
+            let completed = unsafe { completed_op_ctx(Some(pctx), state) };
+            assert!(
+                !completed.context_rejected(),
+                "transient drain permanently rejected the operation"
+            );
+            assert_eq!(
+                unsafe { (*state).result },
+                73,
+                "later completion result was not preserved"
+            );
+            unsafe {
+                completed.free_op_unchecked(state);
+            }
+            drop(completed);
+
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            let reused = unsafe { (&mut *reactor).alloc_op() };
+            assert_eq!(reused, state, "completion state was not exactly reusable");
+            unsafe {
+                Reactor::free_op_unchecked(reactor, reused);
+            }
+        });
+    }
+
+    #[test]
+    fn completion_drain_does_not_mask_permanent_context_rejection() {
+        let mut state = CompletionState::empty();
+        let cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let drain = CompletionDrainGuard::enter();
+
+        assert!(!unsafe { refresh_op_waiter_from_waker(&cx, &mut state) });
+        assert!(
+            state.is_context_rejected(),
+            "completion drain masked a non-FlowIO poll context"
+        );
+        drop(drain);
+    }
+
+    #[test]
+    fn completion_drain_does_not_mask_foreign_operation_owner() {
+        let origin = ringless_owner_for_test(1);
+        let reactor = origin.reactor_ptr();
+        let state = unsafe { (&mut *reactor).alloc_op() };
+        assert!(!state.is_null(), "origin operation allocation failed");
+
+        let mut origin_waiter = TaskHeader::new();
+        origin_waiter.owner = Some(Rc::clone(&origin));
+        let origin_waiter_ptr = std::ptr::addr_of_mut!(origin_waiter);
+        unsafe {
+            (*state).register_waiter(origin_waiter_ptr);
+        }
+        let waiter_refs = origin_waiter.refs.get();
+
+        with_ringless_poll_context_for_test(1, |_foreign, foreign_cx| {
+            let drain = CompletionDrainGuard::enter();
+            let err = match unsafe { poll_ctx_or_transient_pending_op(foreign_cx, state) } {
+                Err(err) => err,
+                Ok(_) => panic!("foreign operation owner was treated as transient"),
+            };
+            assert_eq!(err.kind(), ErrorKind::NotConnected);
+            assert!(!unsafe { refresh_op_waiter_from_waker(foreign_cx, state) });
+            unsafe {
+                assert!(
+                    (*state).is_context_rejected(),
+                    "completion drain masked the foreign operation owner"
+                );
+                assert_eq!(
+                    (*state).waiter,
+                    origin_waiter_ptr,
+                    "foreign drain poll replaced the origin waiter"
+                );
+                assert_eq!(
+                    origin_waiter.refs.get(),
+                    waiter_refs,
+                    "foreign drain poll changed origin waiter ownership"
+                );
+            }
+            drop(drain);
+        });
+
+        unsafe {
+            (*state).set_completed();
+            Reactor::free_op_unchecked(reactor, state);
+        }
+        assert_eq!(
+            origin_waiter.refs.get(),
+            1,
+            "origin waiter reference was not released"
+        );
+        assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
     }
 
     #[test]
@@ -4045,6 +4776,50 @@ mod tests {
             raw_fd_is_closed(raw),
             "joined close worker must retire the pending task descriptor"
         );
+    }
+
+    #[test]
+    fn run_after_completed_shutdown_returns_not_connected_without_polling_root() {
+        struct TrackedRoot {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for TrackedRoot {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Ready(())
+            }
+        }
+
+        impl Drop for TrackedRoot {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        executor.shutdown_owner();
+
+        let err = executor
+            .run(TrackedRoot {
+                polls: Rc::clone(&polls),
+                drops: Rc::clone(&drops),
+            })
+            .expect_err("a completed executor shutdown must reject a later run");
+        assert_eq!(err.kind(), ErrorKind::NotConnected);
+        assert_eq!(polls.get(), 0, "rejected post-shutdown root was polled");
+        assert_eq!(drops.get(), 1, "rejected post-shutdown root drop count");
     }
 
     #[cfg(not(miri))]
@@ -5067,7 +5842,7 @@ mod tests {
         impl Drop for SpawnChildOnDrop {
             fn drop(&mut self) {
                 self.drops.set(self.drops.get() + 1);
-                let active_owner = EXECUTOR_CTX.with(Cell::get);
+                let active_owner = EXECUTOR_CTX.with(|context| context.get().active_owner);
                 let active_owner_is_expected = active_owner == self.expected_owner;
                 let active_owner_is_shutting_down = active_owner_is_expected
                     && unsafe { (*(*active_owner).state_ptr()).shutting_down };
@@ -5614,6 +6389,21 @@ mod tests {
     }
 
     #[test]
+    fn task_provider_diagnostic_counters_saturate() {
+        let mut provider = ExecutorTaskMemProvider::new();
+        provider.request_count = usize::MAX;
+        provider.note_request();
+        assert_eq!(provider.request_count, usize::MAX);
+
+        #[cfg(debug_assertions)]
+        {
+            provider.free_count = usize::MAX;
+            provider.note_free();
+            assert_eq!(provider.free_count, usize::MAX);
+        }
+    }
+
+    #[test]
     fn join_task_initializer_writes_near_capacity_future_in_final_slot() {
         let drops = Rc::new(Cell::new(0));
         assert!(size_of::<JoinTask<NearSlotSpawnFuture>>() <= TASK_POOL_SIZE);
@@ -5827,6 +6617,27 @@ mod tests {
         assert!(ready_queue.is_empty());
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn task_schedule_counter_saturates_without_changing_queue_ownership() {
+        let mut ready_queue = DList::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState::new();
+        runtime_state.stats.task_schedules = usize::MAX;
+        let mut header = TaskHeader::new();
+        let task_ptr = &mut header as *mut TaskHeader;
+
+        assert!(unsafe {
+            notify_task_into_list_unchecked(task_ptr, &mut ready_queue, &mut runtime_state)
+        });
+        assert_eq!(runtime_state.stats.task_schedules, usize::MAX);
+        assert_eq!(
+            unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) },
+            Some(task_ptr)
+        );
+        assert!(ready_queue.is_empty());
+    }
+
     #[test]
     fn reactor_waiter_notification_keeps_matching_owner_direct_path() {
         let mut ready_queue = DList::new_uninit();
@@ -5942,10 +6753,11 @@ mod tests {
         executor.init().expect("executor init failed");
 
         let mut header = TaskHeader::new();
+        let header_ptr = &mut header as *mut TaskHeader;
         unsafe {
             (*executor.owner.state_ptr())
                 .ready_queue
-                .push_back(&mut header.ready_link as *mut _);
+                .push_back(std::ptr::addr_of_mut!((*header_ptr).ready_link));
         }
 
         drop(executor);

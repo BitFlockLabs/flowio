@@ -36,7 +36,14 @@ pub mod utils {
 
 pub mod runtime {
     pub mod reactor {
-        pub use crate::runtime::reactor::benchmark_cancel_submit_pressure;
+        #[cfg(not(miri))]
+        pub use crate::runtime::reactor::{
+            CompletionDrainDescriptorReport, CompletionDrainReentrancyReport,
+            test_completion_drain_descriptor_close, test_completion_drain_reentrancy,
+        };
+        pub use crate::runtime::reactor::{
+            benchmark_cancel_submit_pressure, benchmark_completion_drain_close,
+        };
     }
 
     pub mod timer {
@@ -86,17 +93,18 @@ pub mod net {
 
     pub mod sctp {
         pub use crate::net::sctp::test_support::{
-            SctpSocketOptionSnapshot, capability_unavailable,
+            SctpSocketOptionSnapshot, append_initialized_test_cmsg, capability_unavailable,
             test_accept_slot_drop_cached_state_preserves_unrelated_fd,
             test_accept_slot_drop_future_preserves_unrelated_fd, test_adaptation_indication_type,
             test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
+            test_connect_slot_drop_cached_state_closes_socket_fd,
             test_connect_slot_drop_future_closes_socket_fd, test_parse_notification,
-            test_parse_recv_meta, test_partial_delivery_event_type, test_peer_addr_change_type,
-            test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
-            test_sctp_socket_receive_options, test_send_failed_error_offset,
-            test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
-            test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
-            test_stream_reset_event_type,
+            test_parse_recv_meta, test_parse_stream_recv_meta, test_partial_delivery_event_type,
+            test_peer_addr_change_type, test_peer_addr_params_rejects_optlen,
+            test_remote_error_type, test_sctp_socket_options, test_sctp_socket_receive_options,
+            test_send_failed_error_offset, test_send_failed_event_type,
+            test_send_failed_info_offset, test_send_failed_type, test_sender_dry_event_type,
+            test_shutdown_event_type, test_stream_change_event_type, test_stream_reset_event_type,
         };
     }
 

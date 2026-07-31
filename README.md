@@ -184,13 +184,25 @@ an active FlowIO run or through another executor returns `NotConnected`.
 An accept future that reports an occupied reusable slot has not claimed that
 slot; later polls park, and dropping it cannot cancel the earlier accept.
 TCP/SCTP accept rearms a nonterminal stale readiness hint. If owner-thread
-`accept4` finds no queued peer after `POLLERR`, `POLLHUP`, or `POLLNVAL`, the
-listener instead latches `ConnectionAborted`; this and later accepts report
-that non-retryable kind without another readiness submission. A queued peer
-still wins a mixed readiness mask because `accept4` runs first. A positive
+`accept4` finds no queued peer after `POLLHUP` or `POLLNVAL`, the listener
+instead latches `ConnectionAborted`; this and later accepts report that
+non-retryable kind without another readiness submission. A bare `POLLERR`
+gets one internal rearm per accept future; if it recurs while `accept4` still
+returns `EAGAIN`, the exact `WouldBlock` result propagates without latching.
+A queued peer still wins a mixed readiness mask because `accept4` runs first.
+`TcpListener::is_terminal` and `SctpListener::is_terminal` expose only this
+sticky FlowIO latch; `false` is not a general socket-health result. A positive
 `POLLNVAL` confirmed by `EBADF` preserves that first errno while latching the
-same later state; other non-`WouldBlock` accept errors propagate without
-latching.
+same later state. `EMFILE` and `ENFILE` propagate exactly without latching or
+rearming; the slot preserves the observed readiness, so the next accept polled
+in the owner context makes one direct nonblocking `accept4` attempt without
+another readiness submission. FlowIO performs no hidden retry, timer, or
+backoff. Relieve descriptor pressure and apply bounded caller backoff before
+retrying; an immediate retry under unchanged pressure costs one syscall. If
+the direct attempt returns `WouldBlock`, the retained mask is classified by
+the same rules: HUP/NVAL latches, bare `POLLERR` uses its bounded budget, and
+plain stale readiness takes the ordinary one-shot rearm. Other
+non-`WouldBlock` accept errors propagate without latching.
 Unsubmitted rental I/O returns its buffer immediately; submitted I/O retains
 the buffer until the original completion and then returns it with that error.
 If the exceptional bounded shutdown fallback abandons an `io_uring` without
@@ -313,8 +325,12 @@ metadata (or use the rich/signaling configuration) when stream, PPID, TSN,
 association metadata, notifications, or partial-delivery recovery matter.
 All SCTP send and receive APIs reject a zero-length caller payload/window with
 `InvalidInput` before kernel submission and return the rental owner unchanged.
-This includes empty or zero-readable vectored sends. A successful zero-byte
-result from the flag-less lean `recv` path therefore denotes clean peer EOF.
+This includes empty or zero-readable vectored sends. After owner-context
+validation, an invalid metadata receive also leaves any prior dropped receive
+in the stream's one-entry recovery slot; the next valid metadata receive adopts
+it. Without a valid FlowIO context, `NotConnected` retains precedence and the
+slot is still untouched. A successful zero-byte result from the flag-less lean
+`recv` path therefore denotes clean peer EOF.
 
 On sockets configured by FlowIO, enabling `recv_rcvinfo` also keeps the SCTP
 partial-delivery event subscribed even when the requested notification mask
@@ -339,8 +355,9 @@ PDAPI-assisted discard recovery, it must enable `SCTP_RECVRCVINFO` to obtain
 ancillary fields and also subscribe to `SCTP_PARTIAL_DELIVERY_EVENT` for
 assisted recovery. Without receive-info, message receives return default
 ancillary fields. Calling FlowIO's `set_notification_mask` later queries the
-descriptor's current receive-info setting and preserves that dependency, but
-adoption itself remains syscall-free.
+descriptor's current receive-info setting, preserves that dependency, and
+refreshes the stream's strict-or-default absent-metadata policy after the
+kernel accepts the update. Adoption itself remains syscall-free.
 
 SCTP stream reset is a setup/control-plane operation. The generic
 `SctpResetStreams::incoming`, `outgoing`, and `bidirectional` constructors are

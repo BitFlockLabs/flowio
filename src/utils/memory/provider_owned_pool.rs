@@ -207,7 +207,6 @@ mod tests {
     }
 
     struct TestSlot {
-        #[allow(dead_code)]
         value: usize,
     }
 

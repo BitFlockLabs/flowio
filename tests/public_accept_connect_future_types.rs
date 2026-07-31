@@ -15,6 +15,7 @@ use std::time::Duration;
 
 #[test]
 fn tcp_accept_and_connect_method_futures_are_publicly_nameable() {
+    let _: fn(&TcpListener) -> bool = TcpListener::is_terminal;
     let _: for<'a> fn(&'a mut TcpListener) -> TcpAcceptFuture<'a> = TcpListener::accept;
     let _: for<'a> fn(&'a mut TcpConnector, SocketAddr) -> io::Result<TcpConnectFuture<'a>> =
         TcpConnector::connect;
@@ -30,6 +31,7 @@ fn tcp_accept_and_connect_method_futures_are_publicly_nameable() {
 
 #[test]
 fn sctp_accept_and_connect_method_futures_are_publicly_nameable() {
+    let _: fn(&SctpListener) -> bool = SctpListener::is_terminal;
     let _: for<'a> fn(&'a mut SctpListener) -> SctpAcceptFuture<'a> = SctpListener::accept;
     let _: for<'a> fn(&'a mut SctpConnector, SocketAddr) -> io::Result<SctpConnectFuture<'a>> =
         SctpConnector::connect;

@@ -28,10 +28,11 @@
 //! If a future is dropped after completion but before polling its result, the
 //! completed state is freed immediately from `Drop`.
 
-use crate::net::complete_read_with_progress;
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
+use crate::net::{CompletionTake, complete_read_with_progress, completion_cqe_result};
 use crate::runtime::buffer::iobuffvec::{
-    IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut, invalid_read_iovec_shape,
+    IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut, checked_iovec_count_and_length_sum,
+    invalid_read_iovec_shape,
 };
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
@@ -471,7 +472,7 @@ pub(crate) use impl_stream_rw;
 unsafe fn take_completed_result_and_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
-) -> Option<(i32, T, bool)> {
+) -> Option<CompletionTake<i32, T>> {
     if state_ptr.is_null() {
         return None;
     }
@@ -486,7 +487,11 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
     let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(*state_ptr) };
     unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
-    Some((result, payload, op_ctx.context_rejected()))
+    Some(CompletionTake::from_context(
+        result,
+        payload,
+        op_ctx.context_rejected(),
+    ))
 }
 
 #[inline(always)]
@@ -502,7 +507,7 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
     extract: impl FnOnce(*mut T) -> R,
-) -> Option<(i32, R, bool)> {
+) -> Option<CompletionTake<i32, R>> {
     if state_ptr.is_null() {
         return None;
     }
@@ -517,7 +522,11 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     let value = unsafe { op_ctx.take_retained_payload_with_unchecked::<T, R>(*state_ptr, extract) };
     unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
-    Some((result, value, op_ctx.context_rejected()))
+    Some(CompletionTake::from_context(
+        result,
+        value,
+        op_ctx.context_rejected(),
+    ))
 }
 
 #[inline(always)]
@@ -573,7 +582,7 @@ unsafe fn retry_poll_ctx_or_rejected_payload_with<T: 'static, R>(
 /// `*state_ptr` must be a non-null operation owned by `pctx`'s reactor, and no
 /// kernel submission may still reference that state or its retained payload.
 unsafe fn free_retry_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
-    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+    unsafe { Reactor::free_op_unchecked(pctx.reactor(), *state_ptr) };
     *state_ptr = std::ptr::null_mut();
 }
 
@@ -635,7 +644,7 @@ unsafe fn take_retained_payload_and_free_state<T: 'static>(
 ) -> T {
     debug_assert!(!(*state_ptr).is_null(), "missing retained operation state");
     let op = *state_ptr;
-    let payload = unsafe { (*pctx.reactor()).take_retained_payload::<T>(op) };
+    let payload = unsafe { Reactor::take_retained_payload_unchecked::<T>(pctx.reactor(), op) };
     unsafe { free_retry_state(pctx, state_ptr) };
     payload
 }
@@ -655,7 +664,9 @@ unsafe fn take_retained_payload_with_and_free_state<T: 'static, R>(
 ) -> R {
     debug_assert!(!(*state_ptr).is_null(), "missing retained operation state");
     let op = *state_ptr;
-    let value = unsafe { (*pctx.reactor()).take_retained_payload_with::<T, R>(op, extract) };
+    let value = unsafe {
+        Reactor::take_retained_payload_with_unchecked::<T, R>(pctx.reactor(), op, extract)
+    };
     unsafe { free_retry_state(pctx, state_ptr) };
     value
 }
@@ -666,9 +677,9 @@ unsafe fn take_retained_payload_with_and_free_state<T: 'static, R>(
 /// # Safety
 ///
 /// `state` must be an exclusively accessible completed operation whose prior
-/// CQE has been consumed. Any retained payload must remain attached and valid
-/// for the next submission. `waiter` must point to a live task on its executor
-/// owner thread.
+/// CQE and waiter have been consumed. Any retained payload must remain attached
+/// and valid for the next submission. `waiter` must point to a live task on its
+/// executor owner thread.
 unsafe fn reset_existing_retry_state(state: &mut CompletionState, waiter: *mut TaskHeader) {
     debug_assert!(!waiter.is_null(), "retry waiter was missing");
     state.reset_for_resubmit();
@@ -800,16 +811,7 @@ where
     I: IntoIterator<Item = &'a T>,
     T: WriteBufferItem + 'a,
 {
-    let mut iov_count = 0;
-    let mut total = 0usize;
-    for buf in iter {
-        let len = buf.write_len();
-        total = total.checked_add(len)?;
-        if len != 0 {
-            iov_count += 1;
-        }
-    }
-    Some((iov_count, total))
+    checked_iovec_count_and_length_sum(iter.into_iter().map(WriteBufferItem::write_len))
 }
 
 #[inline(always)]
@@ -823,19 +825,25 @@ where
 {
     let mut iov_count = 0;
     let mut total = 0usize;
-    for buf in iter {
+    let mut active = iter.into_iter().filter_map(|buf| {
         let len = buf.write_len();
+        (len != 0).then_some((buf, len))
+    });
+
+    for (iovec, (buf, len)) in dst.iter_mut().zip(active.by_ref()) {
         total = total.checked_add(len).ok_or_else(invalid_writev_shape)?;
-        if len == 0 {
-            continue;
-        }
-        let iovec = dst.get_mut(iov_count).ok_or_else(invalid_writev_shape)?;
         iovec.write(libc::iovec {
             iov_base: buf.write_ptr() as *mut libc::c_void,
             iov_len: len,
         });
         iov_count += 1;
     }
+
+    for (_, len) in active {
+        total = total.checked_add(len).ok_or_else(invalid_writev_shape)?;
+        iov_count += 1;
+    }
+
     Ok((iov_count, total))
 }
 
@@ -847,10 +855,17 @@ pub(super) fn fill_iobuffvec_write_iovecs<const N: usize>(
     fill_write_iovecs(buffer.iter(), dst)
 }
 
+#[inline(always)]
+pub(super) fn checked_iobuffvec_write_iovec_count_and_len<const N: usize>(
+    buffer: &IoBuffVec<N>,
+) -> Option<(usize, usize)> {
+    checked_write_iovec_count_and_len(buffer.iter())
+}
+
 impl<const N: usize> write_buffer_chain_sealed::Sealed<N> for IoBuffVec<N> {
     #[inline(always)]
     fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
-        checked_write_iovec_count_and_len(self.iter())
+        checked_iobuffvec_write_iovec_count_and_len(self)
     }
 
     #[inline(always)]
@@ -881,15 +896,21 @@ impl<B: IoBuffReadOnly, const N: usize> write_buffer_chain_sealed::Sealed<N>
 
 const WRITEV_SHAPE_CHANGED: &str = "write buffer chain shape changed before submission";
 const WRITEV_AGGREGATE_OVERFLOW: &str = "write buffer chain byte length exceeds usize::MAX";
+const READV_AGGREGATE_OVERFLOW: &str = "read buffer chain writable length exceeds usize::MAX";
 
 #[inline(always)]
-fn invalid_writev_shape() -> io::Error {
+pub(super) fn invalid_writev_shape() -> io::Error {
     invalid_input(WRITEV_SHAPE_CHANGED)
 }
 
 #[inline(always)]
 fn invalid_writev_aggregate() -> io::Error {
     invalid_input(WRITEV_AGGREGATE_OVERFLOW)
+}
+
+#[inline(always)]
+pub(super) fn invalid_readv_aggregate() -> io::Error {
+    invalid_input(READV_AGGREGATE_OVERFLOW)
 }
 
 struct RetainedWritePayload<B: IoBuffReadOnly> {
@@ -1765,17 +1786,15 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
             return complete_empty_stream_io(cx, buffer);
         }
 
-        if let Some((result, payload, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_result_and_payload::<RetainedReadPayload<B>>(cx, &mut this.state_ptr)
         } {
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            let actual = result as usize;
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), buffer)),
+            };
             return Poll::Ready(unsafe {
                 complete_read_with_progress(buffer, this.write_base_len, actual, Ok(actual))
             });
@@ -1810,7 +1829,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
                             .user_data(state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -1894,17 +1913,11 @@ impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
             return complete_empty_stream_io(cx, buffer);
         }
 
-        if let Some((result, payload, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_result_and_payload::<RetainedWritePayload<B>>(cx, &mut this.state_ptr)
         } {
-            let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            return Poll::Ready((Ok(result as usize), buffer));
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
+            return Poll::Ready((result, payload.buffer));
         }
 
         if this.state_ptr.is_null() {
@@ -1934,7 +1947,7 @@ impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
                         Ok(build_write_entry(this.fd, ptr, this.len, state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -2122,7 +2135,7 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
                         ))
                     })
                 {
-                    (*pctx.reactor()).free_op(this.state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), this.state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -2362,7 +2375,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                             .user_data(this.state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(this.state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), this.state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready(complete_read_with_progress(
                         payload.buffer,
@@ -2435,13 +2448,6 @@ impl<S> Future for ReadExactAppendFuture<'_, S> {
     }
 }
 
-impl<S> Drop for ReadExactAppendFuture<'_, S> {
-    fn drop(&mut self) {
-        // Keep the explicit public `Drop` surface stable. The inner future's
-        // cancellation cleanup runs automatically after this returns.
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ReadvFuture
 // ---------------------------------------------------------------------------
@@ -2460,19 +2466,26 @@ pub struct ReadvFuture<'a, const N: usize, S> {
     writable: usize,
     /// Stream descriptor read from by this future.
     fd: RawFd,
+    /// Whether the sizing pass found an unrepresentable writable aggregate.
+    invalid_aggregate: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, const N: usize, S> ReadvFuture<'a, N, S> {
     pub(crate) fn new(fd: RawFd, buffer: IoBuffVecMut<N>) -> Self {
-        let (iov_count, writable) = buffer.read_iovec_count_and_writable_len();
+        let (iov_count, writable, invalid_aggregate) =
+            match buffer.checked_read_iovec_count_and_writable_len() {
+                Some((iov_count, writable)) => (iov_count, writable, false),
+                None => (0, 0, true),
+            };
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             iov_count,
             writable,
             fd,
+            invalid_aggregate,
             _marker: PhantomData,
         }
     }
@@ -2484,25 +2497,29 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, mut buffer, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_result_and_payload_with::<RetainedReadvPayload<N>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload| take_readv_buffer_from_retained(payload),
             )
         } {
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            let actual = result as usize;
+            let (result, mut buffer) = completion.into_io_result(completion_cqe_result);
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), buffer)),
+            };
             unsafe { buffer.distribute_written(actual) };
             return Poll::Ready((Ok(actual), buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
+        }
+
+        if this.state_ptr.is_null() && this.invalid_aggregate {
+            let result = validate_local_io_result(cx, Err(invalid_readv_aggregate()));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((result, buffer));
         }
 
         if this.writable == 0 {
@@ -2596,31 +2613,18 @@ pub struct WritevFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     total: usize,
     /// Stream descriptor written by this future.
     fd: RawFd,
-    /// Whether the sizing pass found an unrepresentable aggregate byte count.
-    invalid_aggregate: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevFuture<'a, C, N, S> {
     pub(crate) fn new(fd: RawFd, buffer: C) -> Self {
-        let (iov_count, total, invalid_aggregate) = match buffer.write_iovec_count_and_len() {
-            Some((iov_count, total)) => {
-                debug_assert!(
-                    total == 0 || iov_count > 0,
-                    "non-empty write chain produced no iovecs"
-                );
-                (iov_count, total, false)
-            }
-            None => (0, 0, true),
-        };
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
-            iov_count,
-            total,
+            iov_count: 0,
+            total: 0,
             fd,
-            invalid_aggregate,
             _marker: PhantomData,
         }
     }
@@ -2632,35 +2636,18 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, completion, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_result_and_payload_with::<RetainedWritevPayload<C>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload| take_writev_completion_from_retained(payload),
             )
         } {
-            let buffer = completion.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            return Poll::Ready((Ok(result as usize), buffer));
+            let (result, completion) = completion.into_io_result(completion_cqe_result);
+            return Poll::Ready((result, completion.buffer));
         }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
-        }
-
-        if this.state_ptr.is_null() && this.invalid_aggregate {
-            let result = validate_local_io_result(cx, Err(invalid_writev_aggregate()));
-            let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((result, buffer));
-        }
-
-        if this.total == 0 {
-            let buffer = unsafe { opt_take(&mut this.buffer) };
-            return complete_empty_stream_io(cx, buffer);
         }
 
         if this.state_ptr.is_null() {
@@ -2671,6 +2658,23 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
                     return Poll::Ready((Err(err), buffer));
                 }
             };
+            let Some((iov_count, total)) =
+                unsafe { opt_ref(&this.buffer) }.write_iovec_count_and_len()
+            else {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Err(invalid_writev_aggregate()), buffer));
+            };
+            debug_assert!(
+                total == 0 || iov_count > 0,
+                "non-empty write chain produced no iovecs"
+            );
+            this.iov_count = iov_count;
+            this.total = total;
+            if total == 0 {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Ok(0), buffer));
+            }
+
             let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
             let scratch_init =
                 match unsafe { (*retained_pool.as_ptr()).alloc_iovec_scratch_init(this.iov_count) }
@@ -2754,31 +2758,18 @@ pub struct WritevAllFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     fd: RawFd,
     /// Total bytes that must be written before completion.
     total: usize,
-    /// Whether the sizing pass found an unrepresentable aggregate byte count.
-    invalid_aggregate: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevAllFuture<'a, C, N, S> {
     pub(crate) fn new(fd: RawFd, buffer: C) -> Self {
-        let (iov_count, total, invalid_aggregate) = match buffer.write_iovec_count_and_len() {
-            Some((iov_count, total)) => {
-                debug_assert!(
-                    total == 0 || iov_count > 0,
-                    "non-empty write-all chain produced no iovecs"
-                );
-                (iov_count, total, false)
-            }
-            None => (0, 0, true),
-        };
         Self {
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
-            iov_count,
+            iov_count: 0,
             fd,
-            total,
-            invalid_aggregate,
+            total: 0,
             _marker: PhantomData,
         }
     }
@@ -2794,19 +2785,8 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             return Poll::Pending;
         }
 
-        if this.state_ptr.is_null() && this.invalid_aggregate {
-            let result = validate_local_io_result(cx, Err(invalid_writev_aggregate()));
-            let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((result, buffer));
-        }
-
         if unsafe { retry_state_is_in_flight(cx, this.state_ptr) } {
             return Poll::Pending;
-        }
-
-        if this.state_ptr.is_null() && this.total == 0 {
-            let buffer = unsafe { opt_take(&mut this.buffer) };
-            return complete_empty_stream_io(cx, buffer);
         }
 
         let pctx = if this.state_ptr.is_null() {
@@ -2834,6 +2814,25 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                 }
             }
         };
+
+        if this.buffer.is_some() {
+            let Some((iov_count, total)) =
+                unsafe { opt_ref(&this.buffer) }.write_iovec_count_and_len()
+            else {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Err(invalid_writev_aggregate()), buffer));
+            };
+            debug_assert!(
+                total == 0 || iov_count > 0,
+                "non-empty write-all chain produced no iovecs"
+            );
+            this.iov_count = iov_count;
+            this.total = total;
+            if total == 0 {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Ok(0), buffer));
+            }
+        }
 
         if !this.state_ptr.is_null() {
             match classify_retry_cqe_result(unsafe { (*this.state_ptr).result }) {
@@ -2895,7 +2894,9 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                     }
                     #[cfg(debug_assertions)]
                     unsafe {
-                        (*pctx.runtime_state()).stats.writev_partial_continuations += 1;
+                        let stats = &mut (*pctx.runtime_state()).stats;
+                        stats.writev_partial_continuations =
+                            stats.writev_partial_continuations.saturating_add(1);
                     }
                 }
             }
@@ -3041,20 +3042,14 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((result, payload, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_result_and_payload::<RetainedProjectedWritevPayload<T>>(
                 cx,
                 &mut this.state_ptr,
             )
         } {
-            let source = payload.source;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), source));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), source));
-            }
-            return Poll::Ready((Ok(result as usize), source));
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
+            return Poll::Ready((result, payload.source));
         }
         if this.state_ptr.is_null() && this.source.is_none() {
             return Poll::Pending;
@@ -3253,7 +3248,9 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
                     }
                     #[cfg(debug_assertions)]
                     unsafe {
-                        (*pctx.runtime_state()).stats.writev_partial_continuations += 1;
+                        let stats = &mut (*pctx.runtime_state()).stats;
+                        stats.writev_partial_continuations =
+                            stats.writev_partial_continuations.saturating_add(1);
                     }
                 }
             }
@@ -3350,13 +3347,20 @@ pub struct ReadvExactFuture<'a, const N: usize, S> {
 
 impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
     pub(crate) fn new(fd: RawFd, buffer: IoBuffVecMut<N>, target: usize) -> Self {
-        let (iov_count, writable) = buffer.read_iovec_count_and_writable_len();
-        let mut input_error = None;
-        let target = match super::checked_read_len(target, writable) {
-            Ok(target) => target as usize,
-            Err(err) => {
-                input_error = Some(err);
-                0
+        let (iov_count, writable, mut input_error) =
+            match buffer.checked_read_iovec_count_and_writable_len() {
+                Some((iov_count, writable)) => (iov_count, writable, None),
+                None => (0, 0, Some(invalid_readv_aggregate())),
+            };
+        let target = if input_error.is_some() {
+            0
+        } else {
+            match super::checked_read_len(target, writable) {
+                Ok(target) => target as usize,
+                Err(err) => {
+                    input_error = Some(err);
+                    0
+                }
             }
         };
 
@@ -3588,11 +3592,12 @@ impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
 mod tests {
     use super::*;
     use crate::net::send_sqe::test_support::sqe_prefix;
-    use crate::runtime::executor::with_ringless_poll_context_for_test;
+    use crate::runtime::executor::{CompletionDrainGuard, with_ringless_poll_context_for_test};
     #[cfg(not(miri))]
     use crate::runtime::executor::{Executor, ExecutorConfig};
     #[cfg(not(miri))]
     use crate::runtime::reactor::ReactorConfig;
+    use crate::runtime::task::release_task;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -3610,6 +3615,74 @@ mod tests {
             err.get_ref().is_none(),
             "try-path shape errors must remain message-free"
         );
+    }
+
+    #[test]
+    fn pending_write_repoll_during_completion_drain_returns_real_result() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let pctx = poll_ctx_from_waker(cx).expect("valid poll context was rejected");
+            let reactor = owner.reactor_ptr();
+            let state = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state.is_null(), "operation allocation failed");
+
+            let mut future = WriteFuture::<Vec<u8>, ()>::new(-1, b"done".to_vec());
+            let payload = RetainedWritePayload {
+                buffer: future.buffer.take().expect("write buffer was missing"),
+            };
+            let retained = unsafe { (&mut *reactor).alloc_retained_payload(payload) };
+            unsafe {
+                (*state).attach_retained_payload(retained);
+                (*state).register_waiter(pctx.owner_task());
+            }
+            future.state_ptr = state;
+
+            let flags = unsafe { (*state).state_flags };
+            let waiter = unsafe { (*state).waiter };
+            let waiter_refs = unsafe { (*waiter).refs.get() };
+            let drain = CompletionDrainGuard::enter();
+            assert!(
+                Pin::new(&mut future).poll(cx).is_pending(),
+                "transient completion drain completed the pending write"
+            );
+            unsafe {
+                assert_eq!(
+                    (*state).state_flags,
+                    flags,
+                    "transient drain changed write-operation flags"
+                );
+                assert_eq!(
+                    (*state).waiter,
+                    waiter,
+                    "transient drain replaced the write waiter"
+                );
+                assert_eq!(
+                    (*waiter).refs.get(),
+                    waiter_refs,
+                    "transient drain changed write-waiter ownership"
+                );
+            }
+            drop(drain);
+
+            unsafe {
+                (*state).result = 4;
+                (*state).set_completed();
+                let completed_waiter = CompletionState::take_waiter_unchecked(state);
+                assert_eq!(completed_waiter, waiter);
+                release_task(completed_waiter);
+            }
+
+            let Poll::Ready((result, buffer)) = Pin::new(&mut future).poll(cx) else {
+                panic!("completed write remained pending after the drain");
+            };
+            assert_eq!(result.expect("completed write was rejected"), 4);
+            assert_eq!(buffer, b"done");
+            assert!(future.state_ptr.is_null());
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 1);
+            assert_eq!(stats.pooled_frees, 1);
+        });
     }
 
     #[test]
@@ -3717,17 +3790,24 @@ mod tests {
     struct AggregateOverflowWriteChain {
         id: usize,
         token: Box<u8>,
+        sizing_calls: Rc<Cell<usize>>,
         fill_calls: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
         items: [AggregateLengthItem; 3],
     }
 
     impl AggregateOverflowWriteChain {
-        fn new(id: usize, fill_calls: &Rc<Cell<usize>>, drops: &Rc<Cell<usize>>) -> Self {
+        fn new(
+            id: usize,
+            sizing_calls: &Rc<Cell<usize>>,
+            fill_calls: &Rc<Cell<usize>>,
+            drops: &Rc<Cell<usize>>,
+        ) -> Self {
             let half = isize::MAX as usize;
             Self {
                 id,
                 token: Box::new(id as u8),
+                sizing_calls: Rc::clone(sizing_calls),
                 fill_calls: Rc::clone(fill_calls),
                 drops: Rc::clone(drops),
                 items: [
@@ -3745,6 +3825,7 @@ mod tests {
 
     impl write_buffer_chain_sealed::Sealed<3> for AggregateOverflowWriteChain {
         fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+            self.sizing_calls.set(self.sizing_calls.get() + 1);
             checked_write_iovec_count_and_len(self.items.iter())
         }
 
@@ -3795,7 +3876,7 @@ mod tests {
     }
 
     #[test]
-    fn write_iovec_fill_checks_bounds_overflow_and_compaction() {
+    fn write_iovec_fill_reports_complete_shape_overflow_and_compaction() {
         let half = isize::MAX as usize;
         let exact = [
             AggregateLengthItem(half),
@@ -3824,10 +3905,19 @@ mod tests {
 
         let short = [AggregateLengthItem(1), AggregateLengthItem(1)];
         let mut short_scratch = [MaybeUninit::uninit()];
-        let short_err = fill_write_iovecs(short.iter(), &mut short_scratch)
-            .expect_err("short iovec scratch should fail");
-        assert_eq!(short_err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(short_err.to_string(), WRITEV_SHAPE_CHANGED);
+        assert_eq!(
+            fill_write_iovecs(short.iter(), &mut short_scratch)
+                .expect("short scratch should still report the complete source shape"),
+            (2, 2)
+        );
+        let short_prefix = unsafe { short_scratch[0].assume_init_ref() };
+        assert_eq!(short_prefix.iov_len, 1);
+
+        let mut short_overflow_scratch = [MaybeUninit::uninit()];
+        let short_overflow_err = fill_write_iovecs(overflow.iter(), &mut short_overflow_scratch)
+            .expect_err("overflow in the unmaterialized tail should fail");
+        assert_eq!(short_overflow_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(short_overflow_err.to_string(), WRITEV_SHAPE_CHANGED);
 
         let mut first = IoBuffMut::new(0, 3, 0).expect("first segment allocation failed");
         first
@@ -3868,6 +3958,7 @@ mod tests {
         future: F,
         expected_id: usize,
         expected_token: *const u8,
+        sizing_calls: &Rc<Cell<usize>>,
         fill_calls: &Rc<Cell<usize>>,
         drops: &Rc<Cell<usize>>,
     ) where
@@ -3887,6 +3978,7 @@ mod tests {
         );
         assert_eq!(chain.id, expected_id);
         assert_eq!(chain.token_ptr(), expected_token);
+        assert_eq!(sizing_calls.get(), 0);
         assert_eq!(fill_calls.get(), 0);
         assert_eq!(drops.get(), 0);
         assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -3896,26 +3988,30 @@ mod tests {
 
     #[test]
     fn writev_aggregate_overflow_preserves_context_precedence_and_post_ready_state() {
+        let sizing_calls = Rc::new(Cell::new(0));
         let fill_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
-        let chain = AggregateOverflowWriteChain::new(118, &fill_calls, &drops);
+        let chain = AggregateOverflowWriteChain::new(118, &sizing_calls, &fill_calls, &drops);
         let token = chain.token_ptr();
         assert_overflow_context_rejection(
             WritevFuture::<_, 3, ()>::new(-1, chain),
             118,
             token,
+            &sizing_calls,
             &fill_calls,
             &drops,
         );
 
+        let sizing_calls = Rc::new(Cell::new(0));
         let fill_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
-        let chain = AggregateOverflowWriteChain::new(119, &fill_calls, &drops);
+        let chain = AggregateOverflowWriteChain::new(119, &sizing_calls, &fill_calls, &drops);
         let token = chain.token_ptr();
         assert_overflow_context_rejection(
             WritevAllFuture::<_, 3, ()>::new(-1, chain),
             119,
             token,
+            &sizing_calls,
             &fill_calls,
             &drops,
         );
@@ -3926,6 +4022,7 @@ mod tests {
         future: F,
         expected_id: usize,
         expected_token: *const u8,
+        sizing_calls: &Rc<Cell<usize>>,
         fill_calls: &Rc<Cell<usize>>,
         drops: &Rc<Cell<usize>>,
     ) where
@@ -3941,6 +4038,7 @@ mod tests {
         assert_eq!(err.to_string(), WRITEV_AGGREGATE_OVERFLOW);
         assert_eq!(chain.id, expected_id);
         assert_eq!(chain.token_ptr(), expected_token);
+        assert_eq!(sizing_calls.get(), 1);
         assert_eq!(fill_calls.get(), 0);
         assert_eq!(drops.get(), 0);
 
@@ -3966,27 +4064,33 @@ mod tests {
         let mut executor = Executor::new().expect("executor creation failed");
         executor
             .run(async move {
+                let sizing_calls = Rc::new(Cell::new(0));
                 let fill_calls = Rc::new(Cell::new(0));
                 let drops = Rc::new(Cell::new(0));
-                let chain = AggregateOverflowWriteChain::new(120, &fill_calls, &drops);
+                let chain =
+                    AggregateOverflowWriteChain::new(120, &sizing_calls, &fill_calls, &drops);
                 let token = chain.token_ptr();
                 assert_overflow_inside_flowio(
                     WritevFuture::<_, 3, ()>::new(-1, chain),
                     120,
                     token,
+                    &sizing_calls,
                     &fill_calls,
                     &drops,
                 )
                 .await;
 
+                let sizing_calls = Rc::new(Cell::new(0));
                 let fill_calls = Rc::new(Cell::new(0));
                 let drops = Rc::new(Cell::new(0));
-                let chain = AggregateOverflowWriteChain::new(121, &fill_calls, &drops);
+                let chain =
+                    AggregateOverflowWriteChain::new(121, &sizing_calls, &fill_calls, &drops);
                 let token = chain.token_ptr();
                 assert_overflow_inside_flowio(
                     WritevAllFuture::<_, 3, ()>::new(-1, chain),
                     121,
                     token,
+                    &sizing_calls,
                     &fill_calls,
                     &drops,
                 )
@@ -4018,7 +4122,7 @@ mod tests {
         bytes: Box<[u8; 2]>,
         initial_len: usize,
         materialized_len: usize,
-        len_calls: Cell<usize>,
+        len_calls: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
     }
 
@@ -4056,7 +4160,7 @@ mod tests {
                     bytes: Box::new([id as u8, id as u8]),
                     initial_len: shape.initial[id],
                     materialized_len: shape.materialized[id],
-                    len_calls: Cell::new(0),
+                    len_calls: Rc::new(Cell::new(0)),
                     drops: Rc::clone(drops),
                 }),
             }
@@ -4073,6 +4177,11 @@ mod tests {
         fn len_calls(&self) -> [usize; 2] {
             self.items.each_ref().map(|item| item.len_calls.get())
         }
+
+        #[cfg(not(miri))]
+        fn len_call_handles(&self) -> [Rc<Cell<usize>>; 2] {
+            self.items.each_ref().map(|item| Rc::clone(&item.len_calls))
+        }
     }
 
     impl write_buffer_chain_sealed::Sealed<2> for ShapeDriftingWriteChain {
@@ -4086,6 +4195,96 @@ mod tests {
         ) -> io::Result<(usize, usize)> {
             fill_write_iovecs(self.items.iter(), dst)
         }
+    }
+
+    #[test]
+    fn direct_writev_construction_does_not_size_unpolled_chains() {
+        let stable_shape = WritevShape {
+            initial: [2, 2],
+            materialized: [2, 2],
+        };
+
+        let drops = Rc::new(Cell::new(0));
+        let future =
+            WritevFuture::<_, 2, ()>::new(-1, ShapeDriftingWriteChain::new(stable_shape, &drops));
+        assert_eq!(
+            future
+                .buffer
+                .as_ref()
+                .expect("unpolled writev chain missing")
+                .len_calls(),
+            [0, 0]
+        );
+        assert_eq!((future.iov_count, future.total), (0, 0));
+        drop(future);
+        assert_eq!(drops.get(), 2);
+
+        let drops = Rc::new(Cell::new(0));
+        let future = WritevAllFuture::<_, 2, ()>::new(
+            -1,
+            ShapeDriftingWriteChain::new(stable_shape, &drops),
+        );
+        assert_eq!(
+            future
+                .buffer
+                .as_ref()
+                .expect("unpolled writev_all chain missing")
+                .len_calls(),
+            [0, 0]
+        );
+        assert_eq!((future.iov_count, future.total), (0, 0));
+        drop(future);
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn direct_writev_sizing_runs_once_on_first_valid_poll() {
+        let mut executor = Executor::new().expect("executor creation failed");
+        executor
+            .run(async move {
+                for write_all in [false, true] {
+                    let drops = Rc::new(Cell::new(0));
+                    let chain = ShapeDriftingWriteChain::new(
+                        WritevShape {
+                            initial: [2, 2],
+                            materialized: [2, 2],
+                        },
+                        &drops,
+                    );
+                    let calls = chain.len_call_handles();
+                    let future: Pin<
+                        Box<dyn Future<Output = (io::Result<usize>, ShapeDriftingWriteChain)>>,
+                    > = if write_all {
+                        Box::pin(WritevAllFuture::<_, 2, ()>::new(-1, chain))
+                    } else {
+                        Box::pin(WritevFuture::<_, 2, ()>::new(-1, chain))
+                    };
+                    let mut future = future;
+
+                    std::future::poll_fn(|cx| {
+                        assert!(future.as_mut().poll(cx).is_pending());
+                        assert_eq!(calls.each_ref().map(|calls| calls.get()), [2, 2]);
+                        assert!(future.as_mut().poll(cx).is_pending());
+                        assert_eq!(calls.each_ref().map(|calls| calls.get()), [2, 2]);
+                        Poll::Ready(())
+                    })
+                    .await;
+
+                    let (result, chain) = future.await;
+                    assert_eq!(
+                        result
+                            .expect_err("invalid descriptor should fail the write")
+                            .raw_os_error(),
+                        Some(libc::EBADF)
+                    );
+                    assert_eq!(chain.len_calls(), [2, 2]);
+                    assert_eq!(drops.get(), 0);
+                    drop(chain);
+                    assert_eq!(drops.get(), 2);
+                }
+            })
+            .expect("first-poll sizing executor run failed");
     }
 
     #[test]
@@ -4224,6 +4423,9 @@ mod tests {
         state.set_completed();
         state.attach_retained_payload(payload);
         unsafe { state.register_waiter(old_waiter_ptr) };
+        let completed_waiter =
+            unsafe { CompletionState::take_waiter_unchecked(std::ptr::addr_of_mut!(state)) };
+        unsafe { crate::runtime::task::release_task(completed_waiter) };
 
         unsafe { reset_existing_retry_state(&mut state, new_waiter_ptr) };
 
@@ -4236,7 +4438,9 @@ mod tests {
         assert_eq!(retained.id, 79);
         assert_eq!(drops.get(), 0, "retained payload was dropped during reset");
 
-        state.clear_waiter();
+        unsafe {
+            CompletionState::clear_waiter_unchecked(std::ptr::addr_of_mut!(state));
+        }
         assert_eq!(new_waiter.refs.get(), 1, "new waiter reference leaked");
         let payload = unsafe { state.take_retained_payload::<DropTracker>(&mut pool) };
         drop(payload);
@@ -4252,6 +4456,7 @@ mod tests {
         let readv = ReadvFuture::<4, ()>::new(-1, compacted_readv_test_chain());
         assert_eq!(readv.iov_count, 2);
         assert_eq!(readv.writable, 12);
+        assert!(!readv.invalid_aggregate);
         assert_eq!(
             readv
                 .buffer
@@ -4274,6 +4479,120 @@ mod tests {
                 .segments(),
             4
         );
+    }
+
+    fn aggregate_rejection_test_chain() -> IoBuffVecMut<1> {
+        IoBuffVecMut::from_array([
+            IoBuffMut::new(0, 8, 0).expect("aggregate-rejection segment allocation failed")
+        ])
+    }
+
+    fn aggregate_rejection_chain_ptr(chain: &mut IoBuffVecMut<1>) -> usize {
+        chain
+            .get_mut(0)
+            .expect("aggregate-rejection segment missing")
+            .as_mut_ptr() as usize
+    }
+
+    fn assert_readv_aggregate_rejection<F>(
+        future: F,
+        expected_ptr: usize,
+        cx: &mut Context<'_>,
+        expected_kind: io::ErrorKind,
+    ) where
+        F: Future<Output = (io::Result<usize>, IoBuffVecMut<1>)>,
+    {
+        let mut future = Box::pin(future);
+        let Poll::Ready((result, mut returned)) = future.as_mut().poll(cx) else {
+            panic!("invalid read aggregate remained pending");
+        };
+        let err = result.expect_err("invalid read aggregate unexpectedly succeeded");
+        assert_eq!(err.kind(), expected_kind);
+        if expected_kind == io::ErrorKind::InvalidInput {
+            assert_eq!(err.to_string(), READV_AGGREGATE_OVERFLOW);
+        }
+        assert_eq!(aggregate_rejection_chain_ptr(&mut returned), expected_ptr);
+        assert!(
+            future.as_mut().poll(cx).is_pending(),
+            "completed invalid-read-aggregate future did not fuse"
+        );
+    }
+
+    #[test]
+    fn readv_aggregate_overflow_preserves_context_precedence_and_returns_exact_chain() {
+        let mut readv = ReadvFuture::<1, ()>::new(-1, aggregate_rejection_test_chain());
+        readv.invalid_aggregate = true;
+        readv.iov_count = 0;
+        readv.writable = 0;
+        let expected_ptr = aggregate_rejection_chain_ptr(
+            readv
+                .buffer
+                .as_mut()
+                .expect("readv rejection chain missing"),
+        );
+        let mut outside_cx = Context::from_waker(std::task::Waker::noop());
+        assert_readv_aggregate_rejection(
+            readv,
+            expected_ptr,
+            &mut outside_cx,
+            io::ErrorKind::NotConnected,
+        );
+
+        let mut readv_exact =
+            ReadvExactFuture::<1, ()>::new(-1, aggregate_rejection_test_chain(), 1);
+        readv_exact.input_error = Some(invalid_readv_aggregate());
+        let expected_ptr = aggregate_rejection_chain_ptr(
+            readv_exact
+                .buffer
+                .as_mut()
+                .expect("readv_exact rejection chain missing"),
+        );
+        assert_readv_aggregate_rejection(
+            readv_exact,
+            expected_ptr,
+            &mut outside_cx,
+            io::ErrorKind::NotConnected,
+        );
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+
+            let mut readv = ReadvFuture::<1, ()>::new(-1, aggregate_rejection_test_chain());
+            readv.invalid_aggregate = true;
+            readv.iov_count = 0;
+            readv.writable = 0;
+            let expected_ptr = aggregate_rejection_chain_ptr(
+                readv
+                    .buffer
+                    .as_mut()
+                    .expect("readv rejection chain missing"),
+            );
+            assert_readv_aggregate_rejection(readv, expected_ptr, cx, io::ErrorKind::InvalidInput);
+
+            let mut readv_exact =
+                ReadvExactFuture::<1, ()>::new(-1, aggregate_rejection_test_chain(), 1);
+            readv_exact.input_error = Some(invalid_readv_aggregate());
+            let expected_ptr = aggregate_rejection_chain_ptr(
+                readv_exact
+                    .buffer
+                    .as_mut()
+                    .expect("readv_exact rejection chain missing"),
+            );
+            assert_readv_aggregate_rejection(
+                readv_exact,
+                expected_ptr,
+                cx,
+                io::ErrorKind::InvalidInput,
+            );
+
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 0);
+            assert_eq!(stats.heap_fallbacks, 0);
+            assert_eq!(stats.writev_scratch_inline_allocs, 0);
+            assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+        });
     }
 
     fn assert_retained_iovec_initialized_prefix<const N: usize>() {

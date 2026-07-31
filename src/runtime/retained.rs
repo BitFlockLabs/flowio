@@ -203,7 +203,9 @@ impl RetainedIovecScratchPool {
         // one executor owner thread, and this synchronous update does not
         // overlap another access to the sidecar state.
         unsafe {
-            (*self.state.get()).stats.writev_scratch_inline_allocs += 1;
+            let stats = &mut (*self.state.get()).stats;
+            stats.writev_scratch_inline_allocs =
+                stats.writev_scratch_inline_allocs.saturating_add(1);
         }
     }
 
@@ -213,7 +215,9 @@ impl RetainedIovecScratchPool {
         // SAFETY: same owner-thread-only access invariant as
         // `record_inline_alloc`.
         unsafe {
-            (*self.state.get()).stats.writev_scratch_oversize_rejections += 1;
+            let stats = &mut (*self.state.get()).stats;
+            stats.writev_scratch_oversize_rejections =
+                stats.writev_scratch_oversize_rejections.saturating_add(1);
         }
     }
 
@@ -225,7 +229,8 @@ impl RetainedIovecScratchPool {
         let Some(result) = state.classes[class_index].alloc_block() else {
             #[cfg(any(debug_assertions, feature = "test-support"))]
             {
-                state.stats.writev_scratch_alloc_failures += 1;
+                state.stats.writev_scratch_alloc_failures =
+                    state.stats.writev_scratch_alloc_failures.saturating_add(1);
             }
             return None;
         };
@@ -365,7 +370,7 @@ impl RetainedPayloadPool {
     fn alloc_heap<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
-            self.stats.heap_fallbacks += 1;
+            self.stats.heap_fallbacks = self.stats.heap_fallbacks.saturating_add(1);
         }
 
         let ptr = Box::into_raw(Box::new(value));
@@ -506,6 +511,7 @@ impl RetainedPayloadPool {
     /// const-generic chain capacity. It stores metadata only and has no heap
     /// fallback.
     #[inline(always)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn alloc_iovec_scratch(
         &mut self,
         iov_count: usize,
@@ -834,6 +840,7 @@ impl RetainedIovecScratchInit {
     }
 
     /// Returns the active iovec count carried into the final scratch value.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn len(&self) -> usize {
         self.len
@@ -902,6 +909,7 @@ impl RetainedIovecScratchInit {
     /// Builds the established movable scratch value for unaffected safe
     /// callers while sharing the token's allocation and release policy.
     #[inline(always)]
+    #[cfg(any(test, feature = "test-support"))]
     fn into_scratch(self) -> RetainedIovecScratch {
         let mut scratch = MaybeUninit::<RetainedIovecScratch>::uninit();
         unsafe {
@@ -974,14 +982,9 @@ impl<T: 'static> RetainedPayload<T> {
 
     #[inline(always)]
     /// Returns the stable address of the retained value.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn as_ptr(&self) -> *mut T {
         self.ptr.as_ptr()
-    }
-
-    #[inline(always)]
-    /// Returns the release hooks paired with this handle's allocation path.
-    pub(crate) fn vtable(&self) -> RetainedPayloadVtable {
-        self.vtable
     }
 
     #[inline(always)]
@@ -998,6 +1001,7 @@ impl<T: 'static> RetainedPayload<T> {
     /// # Safety
     ///
     /// The caller must ensure the payload has not been taken or freed.
+    #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     pub(crate) unsafe fn as_ref(&self) -> &T {
         unsafe { self.ptr.as_ref() }
@@ -1008,6 +1012,7 @@ impl<T: 'static> RetainedPayload<T> {
     /// # Safety
     ///
     /// The caller must have exclusive logical access to the retained payload.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
         unsafe { self.ptr.as_mut() }
@@ -1053,6 +1058,7 @@ impl<T: 'static> RetainedPayload<T> {
     /// # Safety
     ///
     /// `pool` must be the same retained pool that created this handle.
+    #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     pub(crate) unsafe fn drop_and_free(self, pool: &mut RetainedPayloadPool) {
         unsafe { (self.vtable.drop_and_free)(self.ptr.as_ptr() as *mut (), pool) };
@@ -1110,7 +1116,9 @@ impl RetainedSizeClass {
         if let Some(ptr) = unsafe { self.free_list.pop_front() } {
             return Some(ClassAllocResult {
                 ptr,
+                #[cfg(any(debug_assertions, test, feature = "test-support"))]
                 reused: true,
+                #[cfg(any(debug_assertions, test, feature = "test-support"))]
                 new_slab: false,
             });
         }
@@ -1122,7 +1130,9 @@ impl RetainedSizeClass {
 
         Some(ClassAllocResult {
             ptr: result.ptr,
+            #[cfg(any(debug_assertions, test, feature = "test-support"))]
             reused: false,
+            #[cfg(any(debug_assertions, test, feature = "test-support"))]
             new_slab: result.new_slab,
         })
     }
@@ -1156,8 +1166,10 @@ struct ClassAllocResult {
     /// Raw block pointer returned to the caller.
     ptr: *mut u8,
     /// True when `ptr` came from the free list.
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     reused: bool,
     /// True when this allocation requested a fresh slab page.
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     new_slab: bool,
 }
 
@@ -1456,6 +1468,56 @@ mod tests {
     }
 
     #[test]
+    fn remaining_allocation_statistics_saturate() {
+        #[repr(align(128))]
+        struct HeapValue(u8);
+
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        pool.stats.heap_fallbacks = usize::MAX;
+        let heap = pool.alloc(HeapValue(0));
+        assert_eq!(pool.stats().heap_fallbacks, usize::MAX);
+        let value = unsafe { heap.take(&mut pool) };
+        assert_eq!(value.0, 0);
+
+        unsafe {
+            let stats = &mut (*pool.iovec_pool.state.get()).stats;
+            stats.writev_scratch_inline_allocs = usize::MAX;
+            stats.writev_scratch_oversize_rejections = usize::MAX;
+        }
+
+        let inline = pool
+            .alloc_iovec_scratch(RETAINED_IOVEC_INLINE_COUNT)
+            .expect("inline scratch allocation failed");
+        drop(inline);
+        assert_eq!(pool.stats().writev_scratch_inline_allocs, usize::MAX);
+
+        let err = match pool.alloc_iovec_scratch(RETAINED_IOVEC_MAX_COUNT + 1) {
+            Ok(_) => panic!("oversized scratch should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(pool.stats().writev_scratch_oversize_rejections, usize::MAX);
+
+        let scratch_provider = unsafe {
+            let state = &mut *pool.iovec_pool.state.get();
+            state.stats.writev_scratch_alloc_failures = usize::MAX;
+            state.classes[0].provider_ptr()
+        };
+        unsafe {
+            <BasicMemoryProvider as crate::utils::memory::provider::MemoryProvider>::init(
+                &mut *scratch_provider,
+                1usize << (usize::BITS - 1),
+            );
+        }
+        let err = match pool.alloc_iovec_scratch(RETAINED_IOVEC_INLINE_COUNT + 1) {
+            Ok(_) => panic!("unrepresentable scratch slab should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(pool.stats().writev_scratch_alloc_failures, usize::MAX);
+    }
+
+    #[test]
     fn release_statistics_saturate_after_backing_release() {
         #[repr(align(128))]
         struct HeapValue {
@@ -1603,7 +1665,9 @@ mod tests {
     }
 
     #[repr(align(128))]
-    struct HeapRetainedDropBomb(RetainedDropBomb);
+    struct HeapRetainedDropBomb {
+        _bomb: RetainedDropBomb,
+    }
 
     #[test]
     fn pooled_retained_payload_drop_panic_recycles_backing_once() {
@@ -1652,7 +1716,9 @@ mod tests {
         let replacement_drops = Cell::new(0);
         let replacement_armed = Cell::new(false);
         let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
-        let payload = pool.alloc(HeapRetainedDropBomb(RetainedDropBomb::new(&drops, &armed)));
+        let payload = pool.alloc(HeapRetainedDropBomb {
+            _bomb: RetainedDropBomb::new(&drops, &armed),
+        });
 
         let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
             payload.drop_and_free(&mut pool);
@@ -1667,10 +1733,9 @@ mod tests {
         assert_eq!(after_unwind.heap_fallbacks, 1);
         assert_eq!(after_unwind.heap_frees, 1);
 
-        let replacement = pool.alloc(HeapRetainedDropBomb(RetainedDropBomb::new(
-            &replacement_drops,
-            &replacement_armed,
-        )));
+        let replacement = pool.alloc(HeapRetainedDropBomb {
+            _bomb: RetainedDropBomb::new(&replacement_drops, &replacement_armed),
+        });
         unsafe { replacement.drop_and_free(&mut pool) };
         assert_eq!(replacement_drops.get(), 1);
         let after_replacement = pool.stats();

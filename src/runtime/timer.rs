@@ -50,7 +50,7 @@ use crate::runtime::executor::{
     schedule_ctx_unchecked,
 };
 use crate::runtime::task::{
-    TaskHeader, clear_task_ref, release_task, replace_task_ref, take_task_ref,
+    TaskHeader, release_task, replace_task_ref, retain_task, take_task_ref,
 };
 use crate::utils::list::intrusive::dlist::{DList, Link};
 use crate::utils::memory::pool::InPlaceInit;
@@ -141,22 +141,45 @@ impl TimerEntry {
         }
     }
 
-    /// Replaces this timer's owned waiter reference.
+    /// Registers the initial waiter in a freshly allocated timer entry.
     ///
     /// # Safety
     ///
     /// A non-null `task` must point to a live task on its executor owner thread,
-    /// and this entry must be exclusively accessible.
-    unsafe fn register_waiter(&mut self, task: *mut TaskHeader) {
-        unsafe { replace_task_ref(&mut self.waiter, task) };
+    /// `entry` must identify a live, exclusively owned timer entry, and its
+    /// waiter word must be null.
+    unsafe fn register_waiter(entry: *mut Self, task: *mut TaskHeader) {
+        debug_assert!(
+            unsafe { (*entry).waiter.is_null() },
+            "initial timer waiter was already registered"
+        );
+        if !task.is_null() {
+            unsafe { retain_task(task) };
+        }
+        unsafe {
+            (*entry).waiter = task;
+        }
     }
 
-    fn take_waiter(&mut self) -> *mut TaskHeader {
-        unsafe { take_task_ref(&mut self.waiter) }
+    /// Replaces a timer waiter without retaining an entry borrow while
+    /// releasing the prior task reference.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must identify a live, exclusively owned timer entry, and a
+    /// non-null `task` must identify a live task on its executor owner thread.
+    unsafe fn replace_waiter_unchecked(entry: *mut Self, task: *mut TaskHeader) {
+        unsafe { replace_task_ref(std::ptr::addr_of_mut!((*entry).waiter), task) };
     }
 
-    fn clear_waiter(&mut self) {
-        unsafe { clear_task_ref(&mut self.waiter) };
+    /// Transfers the timer's waiter reference to the caller.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must identify a live, exclusively owned timer entry. The caller
+    /// must release or transfer the returned reference exactly once.
+    unsafe fn take_waiter_unchecked(entry: *mut Self) -> *mut TaskHeader {
+        unsafe { take_task_ref(std::ptr::addr_of_mut!((*entry).waiter)) }
     }
 
     #[inline(always)]
@@ -297,6 +320,13 @@ impl TimerWheel {
         self.cascade_started_tick_valid = false;
     }
 
+    fn all_buckets_empty(&self) -> bool {
+        self.lvl0.iter().all(DList::is_empty)
+            && self.lvl1.iter().all(DList::is_empty)
+            && self.lvl2.iter().all(DList::is_empty)
+            && self.lvl3.iter().all(DList::is_empty)
+    }
+
     fn insert(&mut self, entry: *mut TimerEntry) {
         let deadline = unsafe { (*entry).deadline_tick };
         let delta = deadline.saturating_sub(self.current_tick);
@@ -428,14 +458,17 @@ impl TimerWheel {
     }
 
     #[inline(always)]
-    fn clear_bucket_if_empty(&mut self, level: u8, index: usize) {
-        if !self.is_bucket_empty(level, index) {
-            return;
-        }
-
+    fn clear_bucket_occupied(&mut self, level: u8, index: usize) {
         match level {
             0 => self.lvl0_bits[index / 64] &= !(1u64 << (index % 64)),
             _ => *self.bits_mut(level) &= !(1u64 << index),
+        }
+    }
+
+    #[inline(always)]
+    fn clear_bucket_if_empty(&mut self, level: u8, index: usize) {
+        if self.is_bucket_empty(level, index) {
+            self.clear_bucket_occupied(level, index);
         }
     }
 
@@ -650,11 +683,11 @@ impl TimerWheel {
                 self.cascade_pos += 1;
                 continue;
             }
-            let entry_ptr = unsafe {
+            let (entry_ptr, bucket_empty) = unsafe {
                 match level {
-                    1 => self.lvl1[index].pop_front(TimerEntry::LINK_OFFSET),
-                    2 => self.lvl2[index].pop_front(TimerEntry::LINK_OFFSET),
-                    _ => self.lvl3[index].pop_front(TimerEntry::LINK_OFFSET),
+                    1 => self.lvl1[index].pop_front_with_empty(TimerEntry::LINK_OFFSET),
+                    2 => self.lvl2[index].pop_front_with_empty(TimerEntry::LINK_OFFSET),
+                    _ => self.lvl3[index].pop_front_with_empty(TimerEntry::LINK_OFFSET),
                 }
             };
             let Some(entry_ptr) = entry_ptr else {
@@ -666,7 +699,9 @@ impl TimerWheel {
             };
             let entry_link = unsafe { std::ptr::addr_of_mut!((*entry_ptr).link) };
             let reached_outer_tail = level == 3 && entry_link == self.outer_cascade_tail;
-            self.clear_bucket_if_empty(level, index);
+            if bucket_empty {
+                self.clear_bucket_occupied(level, index);
+            }
             unsafe {
                 (*entry_ptr).bucket_level = INVALID_BUCKET_LEVEL;
                 (*entry_ptr).bucket_index = 0;
@@ -674,6 +709,8 @@ impl TimerWheel {
             self.insert(entry_ptr);
             if reached_outer_tail {
                 self.outer_cascade_tail = std::ptr::null_mut();
+                self.cascade_pos += 1;
+            } else if level != 3 && bucket_empty {
                 self.cascade_pos += 1;
             }
             consumed += 1;
@@ -828,7 +865,7 @@ impl TimerRuntime {
             } else {
                 Some(ExecutorOwner::clone_rc(self.owner))
             };
-            (*entry).register_waiter(task);
+            TimerEntry::register_waiter(entry, task);
             (*entry).deadline_tick = deadline_tick;
         }
         self.wheel.insert(entry);
@@ -900,27 +937,60 @@ impl TimerRuntime {
         self.submit_sleep_at_tick(task, deadline_tick).map(Some)
     }
 
-    pub(crate) fn cancel_sleep(&mut self, entry: *mut TimerEntry) -> io::Result<()> {
+    #[cfg(test)]
+    fn cancel_sleep(&mut self, entry: *mut TimerEntry) -> io::Result<()> {
+        unsafe { Self::cancel_sleep_unchecked(self, entry) }
+    }
+
+    /// Cancels and returns one timer entry without retaining a runtime or entry
+    /// borrow across final waiter release.
+    ///
+    /// # Safety
+    ///
+    /// `timers` must identify the initialized origin runtime for `entry` and
+    /// remain alive for the complete call. The caller must run on that
+    /// runtime's owner thread and keep an independent owner pin when entry
+    /// release could otherwise destroy the runtime. The entry must remain
+    /// exclusively owned by the calling timer future until it is detached.
+    unsafe fn cancel_sleep_unchecked(timers: *mut Self, entry: *mut TimerEntry) -> io::Result<()> {
+        debug_assert!(!timers.is_null(), "timer cancellation requires a runtime");
         if entry.is_null() {
             return Ok(());
         }
 
         if unsafe { (*entry).state } == TimerState::Armed {
             let deadline_tick = unsafe { (*entry).deadline_tick };
-            self.wheel.remove(entry);
+            unsafe {
+                (*std::ptr::addr_of_mut!((*timers).wheel)).remove(entry);
+            }
             // Upper-level cached deadlines are cascade boundaries, not entry
             // deadlines. Missing an exact match after cancellation can leave
             // only an earlier stale boundary, which forces an early recompute
             // rather than delaying another timer.
-            if self.wheel.next_deadline_tick == Some(deadline_tick) {
-                self.wheel.next_deadline_dirty = true;
+            if unsafe { (*timers).wheel.next_deadline_tick } == Some(deadline_tick) {
+                unsafe {
+                    (*timers).wheel.next_deadline_dirty = true;
+                }
             }
         }
-        unsafe {
+
+        let waiter = unsafe {
             (*entry).state = TimerState::Idle;
-            (*entry).clear_waiter();
-            self.timer_pool.free(entry);
+            (*entry).bucket_level = INVALID_BUCKET_LEVEL;
+            (*entry).bucket_index = 0;
+            TimerEntry::take_waiter_unchecked(entry)
+        };
+        let timer_pool = unsafe {
+            std::ptr::addr_of_mut!((*timers).timer_pool)
+                .cast::<ProviderOwnedPool<TimerEntry, BasicMemoryProvider>>()
+        };
+        let slot = unsafe { TimerSlotReturnGuard::new(timer_pool, entry) };
+        if !waiter.is_null() {
+            unsafe {
+                release_task(waiter);
+            }
         }
+        unsafe { slot.finish() };
         Ok(())
     }
 
@@ -964,7 +1034,7 @@ impl TimerRuntime {
     }
 
     /// Returns `true` if any timer is currently armed.
-    pub fn has_pending(&mut self) -> bool {
+    pub fn has_pending(&self) -> bool {
         self.wheel.has_pending_entries()
     }
 
@@ -1025,11 +1095,17 @@ impl TimerRuntime {
             }
 
             let idx = unsafe { ((*timers).wheel.current_tick & LVL0_SLOT_MASK) as usize };
-            while let Some(entry_ptr) =
-                unsafe { (*timers).wheel.lvl0[idx].pop_front(TimerEntry::LINK_OFFSET) }
-            {
-                unsafe {
-                    (*std::ptr::addr_of_mut!((*timers).wheel)).clear_bucket_if_empty(0, idx);
+            loop {
+                let (entry_ptr, bucket_empty) = unsafe {
+                    (*timers).wheel.lvl0[idx].pop_front_with_empty(TimerEntry::LINK_OFFSET)
+                };
+                let Some(entry_ptr) = entry_ptr else {
+                    break;
+                };
+                if bucket_empty {
+                    unsafe {
+                        (*std::ptr::addr_of_mut!((*timers).wheel)).clear_bucket_occupied(0, idx);
+                    }
                 }
                 if remaining_budget == 0 {
                     unsafe {
@@ -1045,7 +1121,7 @@ impl TimerRuntime {
                     (*entry_ptr).bucket_level = INVALID_BUCKET_LEVEL;
                     (*entry_ptr).bucket_index = 0;
                     (*entry_ptr).state = TimerState::Fired;
-                    let waiter = (*entry_ptr).take_waiter();
+                    let waiter = TimerEntry::take_waiter_unchecked(entry_ptr);
                     if !waiter.is_null() {
                         note_timer_expired();
                         note_waiter_wake();
@@ -1121,28 +1197,37 @@ impl TimerRuntime {
         }
         let mut first_panic = None;
 
-        let lvl0 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl0).cast::<DList<_>>() };
-        for index in 0..LVL0_SLOTS {
-            unsafe {
-                cancel_timer_bucket_entries(lvl0.add(index), &mut first_panic);
+        loop {
+            let lvl0 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl0).cast::<DList<_>>() };
+            for index in 0..LVL0_SLOTS {
+                unsafe {
+                    cancel_timer_bucket_entries(lvl0.add(index), &mut first_panic);
+                }
             }
-        }
-        let lvl1 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl1).cast::<DList<_>>() };
-        for index in 0..LVLN_SLOTS {
-            unsafe {
-                cancel_timer_bucket_entries(lvl1.add(index), &mut first_panic);
+            let lvl1 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl1).cast::<DList<_>>() };
+            for index in 0..LVLN_SLOTS {
+                unsafe {
+                    cancel_timer_bucket_entries(lvl1.add(index), &mut first_panic);
+                }
             }
-        }
-        let lvl2 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl2).cast::<DList<_>>() };
-        for index in 0..LVLN_SLOTS {
-            unsafe {
-                cancel_timer_bucket_entries(lvl2.add(index), &mut first_panic);
+            let lvl2 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl2).cast::<DList<_>>() };
+            for index in 0..LVLN_SLOTS {
+                unsafe {
+                    cancel_timer_bucket_entries(lvl2.add(index), &mut first_panic);
+                }
             }
-        }
-        let lvl3 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl3).cast::<DList<_>>() };
-        for index in 0..LVLN_SLOTS {
-            unsafe {
-                cancel_timer_bucket_entries(lvl3.add(index), &mut first_panic);
+            let lvl3 = unsafe { std::ptr::addr_of_mut!((*timers).wheel.lvl3).cast::<DList<_>>() };
+            for index in 0..LVLN_SLOTS {
+                unsafe {
+                    cancel_timer_bucket_entries(lvl3.add(index), &mut first_panic);
+                }
+            }
+
+            // A waiter destructor may arm a timer into a bucket that this pass
+            // already visited. Inspect the actual lists only after every
+            // callback has returned, and repeat until no linked entry remains.
+            if unsafe { (*timers).wheel.all_buckets_empty() } {
+                break;
             }
         }
         unsafe {
@@ -1152,6 +1237,60 @@ impl TimerRuntime {
 
         if let Some(payload) = first_panic {
             resume_unwind(payload);
+        }
+    }
+}
+
+/// Returns one detached timer entry if final waiter release unwinds.
+///
+/// All wheel links and entry metadata are retired before this guard is armed.
+/// The checked-out slot therefore remains unavailable to reentrant timer work
+/// until waiter destruction completes normally or transfers control to unwind.
+struct TimerSlotReturnGuard {
+    timer_pool: *mut ProviderOwnedPool<TimerEntry, BasicMemoryProvider>,
+    entry: *mut TimerEntry,
+}
+
+impl TimerSlotReturnGuard {
+    #[inline(always)]
+    unsafe fn new(
+        timer_pool: *mut ProviderOwnedPool<TimerEntry, BasicMemoryProvider>,
+        entry: *mut TimerEntry,
+    ) -> Self {
+        Self { timer_pool, entry }
+    }
+
+    #[inline(always)]
+    unsafe fn free_slot(&mut self) {
+        debug_assert!(
+            unsafe {
+                (*self.entry)
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| Rc::strong_count(owner) > 1)
+            },
+            "timer entry reclaim requires an independent origin-owner pin"
+        );
+        unsafe {
+            (*self.timer_pool).free(self.entry);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(self) {
+        let mut this = crate::utils::disarm_unwind_guard(self);
+        unsafe {
+            this.free_slot();
+        }
+    }
+}
+
+impl Drop for TimerSlotReturnGuard {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        unsafe {
+            self.free_slot();
         }
     }
 }
@@ -1175,7 +1314,18 @@ fn free_timer_bucket_entries(
             (*entry).state = TimerState::Idle;
             (*entry).bucket_level = INVALID_BUCKET_LEVEL;
             (*entry).bucket_index = 0;
-            (*entry).clear_waiter();
+            let waiter = TimerEntry::take_waiter_unchecked(entry);
+            let owner = std::ptr::replace(std::ptr::addr_of_mut!((*entry).owner), None);
+            let owner_was_present = owner.is_some();
+            // Runtime drop must never invoke task or executor destruction while
+            // it holds the runtime and pool bookkeeping exclusively. Preserve
+            // ownership as an intentional leak if this impossible production
+            // state is encountered.
+            std::mem::forget(owner);
+            debug_assert!(
+                waiter.is_null() && !owner_was_present,
+                "timer runtime drop found an owner-bound entry or live waiter"
+            );
             timer_pool.free(entry);
         });
     }
@@ -1190,7 +1340,7 @@ unsafe fn cancel_timer_bucket_entries(
             (*entry).state = TimerState::Cancelled;
             (*entry).bucket_level = INVALID_BUCKET_LEVEL;
             (*entry).bucket_index = 0;
-            (*entry).take_waiter()
+            TimerEntry::take_waiter_unchecked(entry)
         };
         if !waiter.is_null() {
             retain_first_panic(
@@ -1270,7 +1420,7 @@ unsafe fn refresh_sleep_waiter(entry: *mut TimerEntry, pctx: &PollCtx) {
         return;
     }
     unsafe {
-        (*entry).register_waiter(pctx.owner_task());
+        TimerEntry::replace_waiter_unchecked(entry, pctx.owner_task());
     }
 }
 
@@ -1349,9 +1499,11 @@ impl Sleep {
 
         let entry = self.entry;
         self.entry = std::ptr::null_mut();
+        // This clone is the independent pin required while slot release drops
+        // the entry's own origin reference.
         let (owner, timers) = unsafe { timer_runtime_for_entry(entry) };
         if !timers.is_null() {
-            let _ = unsafe { &mut *timers }.cancel_sleep(entry);
+            let _ = unsafe { TimerRuntime::cancel_sleep_unchecked(timers, entry) };
         }
         drop(owner);
     }
@@ -1681,6 +1833,18 @@ mod tests {
         static TIMER_REENTRY_ENTRY: Cell<*mut TimerEntry> =
             const { Cell::new(std::ptr::null_mut()) };
         static TIMER_REENTRY_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static TIMER_REPLACEMENT_ENTRY: Cell<*mut TimerEntry> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static EXPECTED_TIMER_REPLACEMENT: Cell<*mut TaskHeader> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static TIMER_REPLACEMENT_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static TIMER_SHUTDOWN_ARM_RUNTIME: Cell<*mut TimerRuntime> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static TIMER_SHUTDOWN_ARM_WAITER: Cell<*mut TaskHeader> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static TIMER_SHUTDOWN_ARMED_ENTRY: Cell<*mut TimerEntry> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static TIMER_SHUTDOWN_ARM_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     #[derive(Debug)]
@@ -1691,6 +1855,9 @@ mod tests {
 
     #[derive(Debug)]
     struct ReentrantTimerDrainWaiterPanic;
+
+    #[derive(Debug)]
+    struct ShutdownArmTimerWaiterPanic;
 
     unsafe fn panic_timer_waiter_destroy(_: *mut TaskHeader) {
         TIMER_DRAIN_DESTROYS.with(|destroys| destroys.set(destroys.get() + 1));
@@ -1723,8 +1890,7 @@ mod tests {
         assert!(!runtime.is_null(), "timer re-entry runtime is missing");
         assert!(!entry.is_null(), "timer re-entry entry is missing");
         unsafe {
-            (*runtime)
-                .cancel_sleep(entry)
+            TimerRuntime::cancel_sleep_unchecked(runtime, entry)
                 .expect("timer re-entry cancellation failed");
         }
     }
@@ -1748,6 +1914,58 @@ mod tests {
         finish: |_| {},
         cancel: |_| {},
         destroy: reenter_then_panic_timer_waiter_destroy,
+    };
+
+    unsafe fn arm_timer_during_shutdown_waiter_destroy(_: *mut TaskHeader) {
+        TIMER_SHUTDOWN_ARM_DESTROYS.with(|destroys| destroys.set(destroys.get() + 1));
+        let runtime = TIMER_SHUTDOWN_ARM_RUNTIME.with(Cell::get);
+        let waiter = TIMER_SHUTDOWN_ARM_WAITER.with(Cell::get);
+        assert!(!runtime.is_null(), "shutdown timer-arm runtime is missing");
+        assert!(!waiter.is_null(), "shutdown timer-arm waiter is missing");
+        let entry = unsafe {
+            (*runtime)
+                .submit_sleep_at_tick(waiter, 10)
+                .expect("shutdown waiter could not arm the earlier timer")
+        };
+        TIMER_SHUTDOWN_ARMED_ENTRY.with(|stored| {
+            assert!(
+                stored.replace(entry).is_null(),
+                "shutdown waiter armed more than one timer"
+            );
+        });
+        std::panic::panic_any(ShutdownArmTimerWaiterPanic);
+    }
+
+    static ARM_TIMER_DURING_SHUTDOWN_WAITER_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Ready(()),
+        finish: |_| {},
+        cancel: |_| {},
+        destroy: arm_timer_during_shutdown_waiter_destroy,
+    };
+
+    unsafe fn inspect_replaced_timer_waiter(_: *mut TaskHeader) {
+        TIMER_REPLACEMENT_DESTROYS.with(|count| count.set(count.get() + 1));
+        let entry = TIMER_REPLACEMENT_ENTRY.with(Cell::get);
+        let expected = EXPECTED_TIMER_REPLACEMENT.with(Cell::get);
+        assert!(
+            !entry.is_null(),
+            "timer replacement entry was not published"
+        );
+        unsafe {
+            assert_eq!(
+                (*entry).waiter,
+                expected,
+                "replacement timer waiter was not published before prior destruction"
+            );
+            (*entry).deadline_tick = 37;
+        }
+    }
+
+    static REPLACED_TIMER_WAITER_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Ready(()),
+        finish: |_| {},
+        cancel: |_| {},
+        destroy: inspect_replaced_timer_waiter,
     };
 
     enum ScriptedMode {
@@ -2107,27 +2325,67 @@ mod tests {
         let first_ptr = &first as *const TaskHeader as *mut TaskHeader;
         let second_ptr = &second as *const TaskHeader as *mut TaskHeader;
         let mut entry = TimerEntry::new();
+        let entry_ptr = std::ptr::addr_of_mut!(entry);
 
-        unsafe { entry.register_waiter(first_ptr) };
+        unsafe { TimerEntry::register_waiter(entry_ptr, first_ptr) };
         assert_eq!(first.refs.get(), 2);
 
-        unsafe { entry.register_waiter(first_ptr) };
+        unsafe { TimerEntry::replace_waiter_unchecked(entry_ptr, first_ptr) };
         assert_eq!(first.refs.get(), 2, "same timer waiter retained twice");
 
-        unsafe { entry.register_waiter(second_ptr) };
+        unsafe { TimerEntry::replace_waiter_unchecked(entry_ptr, second_ptr) };
         assert_eq!(first.refs.get(), 1, "replaced timer waiter leaked");
         assert_eq!(second.refs.get(), 2);
 
-        let transferred = entry.take_waiter();
+        let transferred = unsafe { TimerEntry::take_waiter_unchecked(entry_ptr) };
         assert_eq!(transferred, second_ptr);
         assert!(entry.waiter.is_null());
         assert_eq!(second.refs.get(), 2, "taking timer waiter released it");
         unsafe { release_task(transferred) };
         assert_eq!(second.refs.get(), 1);
 
-        unsafe { entry.register_waiter(first_ptr) };
-        entry.clear_waiter();
+        unsafe {
+            TimerEntry::register_waiter(entry_ptr, first_ptr);
+            let transferred = TimerEntry::take_waiter_unchecked(entry_ptr);
+            release_task(transferred);
+        }
         assert_eq!(first.refs.get(), 1, "clearing timer waiter leaked it");
+    }
+
+    #[test]
+    fn timer_waiter_replacement_publishes_before_reentrant_release() {
+        TIMER_REPLACEMENT_DESTROYS.with(|count| count.set(0));
+        let mut entry = TimerEntry::new();
+        let entry_ptr = std::ptr::addr_of_mut!(entry);
+        let mut prior = TaskHeader::new();
+        prior.vtable = &REPLACED_TIMER_WAITER_VTABLE;
+        let prior_ptr = std::ptr::addr_of_mut!(prior);
+        let replacement = TaskHeader::new();
+        let replacement_ptr = &replacement as *const TaskHeader as *mut TaskHeader;
+
+        unsafe {
+            TimerEntry::register_waiter(entry_ptr, prior_ptr);
+            release_task(prior_ptr);
+        }
+        assert_eq!(prior.refs.get(), 1);
+
+        TIMER_REPLACEMENT_ENTRY.with(|stored| stored.set(entry_ptr));
+        EXPECTED_TIMER_REPLACEMENT.with(|stored| stored.set(replacement_ptr));
+        unsafe {
+            TimerEntry::replace_waiter_unchecked(entry_ptr, replacement_ptr);
+        }
+        TIMER_REPLACEMENT_ENTRY.with(|stored| stored.set(std::ptr::null_mut()));
+        EXPECTED_TIMER_REPLACEMENT.with(|stored| stored.set(std::ptr::null_mut()));
+
+        TIMER_REPLACEMENT_DESTROYS.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(entry.deadline_tick, 37);
+        assert_eq!(entry.waiter, replacement_ptr);
+        assert_eq!(replacement.refs.get(), 2);
+        let transferred = unsafe { TimerEntry::take_waiter_unchecked(entry_ptr) };
+        unsafe {
+            release_task(transferred);
+        }
+        assert_eq!(replacement.refs.get(), 1);
     }
 
     fn init_wheel_at(wheel: &mut TimerWheel, current_tick: u64) {
@@ -2432,6 +2690,95 @@ mod tests {
     }
 
     #[test]
+    fn timer_level0_pop_preserves_budget_reinsert_and_occupancy() {
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        runtime.wheel.current_tick = 257;
+        let deadline = runtime.wheel.current_tick;
+        let entries = [
+            runtime
+                .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+                .expect("first level-0 timer arm failed"),
+            runtime
+                .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+                .expect("second level-0 timer arm failed"),
+        ];
+        let index = (deadline & LVL0_SLOT_MASK) as usize;
+
+        let mut ready_queue = DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState {
+            live_tasks: 0,
+            inflight_ops: 0,
+            #[cfg(debug_assertions)]
+            stats: crate::runtime::executor::RuntimeStats::default(),
+        };
+        let schedule_ctx = ScheduleCtx {
+            ready_queue: std::ptr::addr_of_mut!(ready_queue),
+            runtime_state: std::ptr::addr_of_mut!(runtime_state),
+        };
+
+        let pending = unsafe {
+            TimerRuntime::collect_expired_unchecked(
+                std::ptr::addr_of_mut!(runtime),
+                deadline,
+                0,
+                schedule_ctx,
+            )
+        };
+        assert!(pending);
+        assert!(runtime.wheel.lvl0_bucket_occupied(index));
+        assert_eq!(
+            unsafe { runtime.wheel.lvl0[index].front(TimerEntry::LINK_OFFSET) },
+            Some(entries[0])
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| unsafe { (**entry).state == TimerState::Armed })
+        );
+
+        let pending = unsafe {
+            TimerRuntime::collect_expired_unchecked(
+                std::ptr::addr_of_mut!(runtime),
+                deadline,
+                1,
+                schedule_ctx,
+            )
+        };
+        assert!(pending);
+        assert!(runtime.wheel.lvl0_bucket_occupied(index));
+        assert!(unsafe { (*entries[0]).state == TimerState::Fired });
+        assert!(unsafe { (*entries[1]).state == TimerState::Armed });
+        assert_eq!(
+            unsafe { runtime.wheel.lvl0[index].front(TimerEntry::LINK_OFFSET) },
+            Some(entries[1])
+        );
+
+        let pending = unsafe {
+            TimerRuntime::collect_expired_unchecked(
+                std::ptr::addr_of_mut!(runtime),
+                deadline,
+                1,
+                schedule_ctx,
+            )
+        };
+        assert!(!pending);
+        assert!(!runtime.wheel.lvl0_bucket_occupied(index));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| unsafe { (**entry).state == TimerState::Fired })
+        );
+
+        for entry in entries {
+            runtime
+                .cancel_sleep(entry)
+                .expect("fired level-0 timer reclaim failed");
+        }
+    }
+
+    #[test]
     fn timer_wheel_level0_candidate_deadline_ignores_upper_cascade_buckets() {
         let mut wheel = TimerWheel::new_uninit();
         init_wheel_at(&mut wheel, 0);
@@ -2499,6 +2846,65 @@ mod tests {
         assert!(unsafe { wheel.lvl0[0].front(TimerEntry::LINK_OFFSET).is_some() });
 
         wheel.remove(entry_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_cascade_pop_preserves_then_clears_source_occupancy() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let first_deadline = LVL0_SLOTS as u64;
+        let second_deadline = first_deadline + 1;
+        let mut first = timer_entry_at(first_deadline);
+        let mut second = timer_entry_at(second_deadline);
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let source_index = 1usize;
+        let source_bit = 1u64 << source_index;
+
+        wheel.insert(first_ptr);
+        wheel.insert(second_ptr);
+        assert_eq!(first.bucket_level, 1);
+        assert_eq!(second.bucket_level, 1);
+        assert_eq!(first.bucket_index as usize, source_index);
+        assert_eq!(second.bucket_index as usize, source_index);
+        assert_ne!(wheel.lvl1_bits & source_bit, 0);
+
+        wheel.current_tick = first_deadline;
+        wheel.begin_tick_cascade();
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(wheel.has_pending_cascade());
+        assert_ne!(wheel.lvl1_bits & source_bit, 0);
+        assert_eq!(first.bucket_level, 0);
+        assert_eq!(second.bucket_level, 1);
+
+        assert_eq!(wheel.process_cascade_with_budget(1), 1);
+        assert!(!wheel.has_pending_cascade());
+        assert_eq!(wheel.lvl1_bits & source_bit, 0);
+        assert_eq!(second.bucket_level, 0);
+
+        wheel.remove(first_ptr);
+        wheel.remove(second_ptr);
+    }
+
+    #[test]
+    fn timer_wheel_cascade_trailing_probe_skips_cancelled_empty_bucket() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+        let deadline = LVL0_SLOTS as u64;
+        let mut entry = timer_entry_at(deadline);
+        let entry_ptr = std::ptr::addr_of_mut!(entry);
+
+        wheel.insert(entry_ptr);
+        wheel.current_tick = deadline;
+        wheel.begin_tick_cascade();
+        assert!(wheel.has_pending_cascade());
+
+        wheel.remove(entry_ptr);
+        assert_eq!(wheel.process_cascade_with_budget(0), 0);
+        assert!(
+            !wheel.has_pending_cascade(),
+            "zero-budget trailing probe retained a cancelled empty bucket"
+        );
     }
 
     #[test]
@@ -2924,6 +3330,132 @@ mod tests {
     }
 
     #[test]
+    fn timer_cancel_waiter_destructor_can_cancel_second_entry_under_miri() {
+        TIMER_REENTRY_DESTROYS.with(|destroys| destroys.set(0));
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        let deadline = runtime.wheel.current_tick.saturating_add(10);
+
+        let mut reenter_waiter = TaskHeader::new();
+        reenter_waiter.vtable = &REENTER_TIMER_WAITER_VTABLE;
+        let reenter_waiter_ptr = std::ptr::addr_of_mut!(reenter_waiter);
+        let first_entry = runtime
+            .submit_sleep_at_tick(reenter_waiter_ptr, deadline)
+            .expect("reentrant timer arm failed");
+        let second_entry = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), deadline.saturating_add(1))
+            .expect("nested-cancel target arm failed");
+
+        let runtime_ptr = std::ptr::addr_of_mut!(runtime);
+        TIMER_REENTRY_RUNTIME.with(|stored| stored.set(runtime_ptr));
+        TIMER_REENTRY_ENTRY.with(|stored| stored.set(second_entry));
+        // Leave the first timer's waiter as the final task reference so its
+        // destruction synchronously cancels the second entry.
+        unsafe {
+            release_task(reenter_waiter_ptr);
+        }
+        assert_eq!(reenter_waiter.refs.get(), 1);
+
+        unsafe {
+            TimerRuntime::cancel_sleep_unchecked(runtime_ptr, first_entry)
+                .expect("outer timer cancellation failed");
+        }
+        TIMER_REENTRY_ENTRY.with(|stored| stored.set(std::ptr::null_mut()));
+        TIMER_REENTRY_RUNTIME.with(|stored| stored.set(std::ptr::null_mut()));
+        TIMER_REENTRY_DESTROYS.with(|destroys| assert_eq!(destroys.get(), 1));
+        assert!(!runtime.has_pending());
+
+        let replacements = [
+            deadline,
+            deadline.saturating_add(1),
+            deadline.saturating_add(2),
+        ]
+        .map(|replacement_deadline| {
+            runtime
+                .submit_sleep_at_tick(std::ptr::null_mut(), replacement_deadline)
+                .expect("replacement timer arm failed")
+        });
+        assert_eq!(
+            replacements[0], first_entry,
+            "outer cancellation did not return its timer slot first"
+        );
+        assert_eq!(
+            replacements[1], second_entry,
+            "nested cancellation did not return its timer slot exactly once"
+        );
+        assert_ne!(
+            replacements[2], first_entry,
+            "outer cancellation returned the same timer slot twice"
+        );
+        assert_ne!(
+            replacements[2], second_entry,
+            "nested cancellation returned the same timer slot twice"
+        );
+
+        let runtime_ptr = std::ptr::addr_of_mut!(runtime);
+        for replacement in replacements {
+            unsafe {
+                TimerRuntime::cancel_sleep_unchecked(runtime_ptr, replacement)
+                    .expect("replacement timer cancellation failed");
+            }
+        }
+    }
+
+    #[test]
+    fn timer_cancel_waiter_panic_returns_slot_exactly_once_under_miri() {
+        TIMER_DRAIN_DESTROYS.with(|destroys| destroys.set(0));
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        let deadline = runtime.wheel.current_tick.saturating_add(10);
+
+        let mut waiter = TaskHeader::new();
+        waiter.vtable = &PANIC_TIMER_WAITER_VTABLE;
+        let waiter_ptr = std::ptr::addr_of_mut!(waiter);
+        let entry = runtime
+            .submit_sleep_at_tick(waiter_ptr, deadline)
+            .expect("panic timer arm failed");
+        let runtime_ptr = std::ptr::addr_of_mut!(runtime);
+        unsafe {
+            release_task(waiter_ptr);
+        }
+        assert_eq!(waiter.refs.get(), 1);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            TimerRuntime::cancel_sleep_unchecked(runtime_ptr, entry)
+                .expect("panic timer cancellation returned an error");
+        }))
+        .expect_err("final waiter release did not panic");
+        assert!(
+            unwind.downcast_ref::<TimerDrainWaiterPanic>().is_some(),
+            "timer cancellation replaced the waiter-destroy panic"
+        );
+        TIMER_DRAIN_DESTROYS.with(|destroys| assert_eq!(destroys.get(), 1));
+        assert!(!runtime.has_pending());
+
+        let first_replacement = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+            .expect("first replacement timer arm failed");
+        let second_replacement = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), deadline.saturating_add(1))
+            .expect("second replacement timer arm failed");
+        assert_eq!(
+            first_replacement, entry,
+            "waiter unwind did not return the timer slot"
+        );
+        assert_ne!(
+            second_replacement, entry,
+            "waiter unwind returned the timer slot more than once"
+        );
+        let runtime_ptr = std::ptr::addr_of_mut!(runtime);
+        for replacement in [first_replacement, second_replacement] {
+            unsafe {
+                TimerRuntime::cancel_sleep_unchecked(runtime_ptr, replacement)
+                    .expect("replacement timer cancellation failed");
+            }
+        }
+    }
+
+    #[test]
     fn timer_expiry_notified_flag_coalesces_same_waiter() {
         let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
         runtime.init().expect("timer runtime init failed");
@@ -3164,6 +3696,108 @@ mod tests {
         unsafe { release_task(same_bucket_waiter_ptr) };
         unsafe { release_task(level_one_waiter_ptr) };
         unsafe { release_task(level_three_waiter_ptr) };
+    }
+
+    #[test]
+    fn timer_shutdown_revisits_bucket_armed_by_waiter_destructor() {
+        TIMER_SHUTDOWN_ARM_DESTROYS.with(|destroys| destroys.set(0));
+        TIMER_SHUTDOWN_ARMED_ENTRY.with(|stored| stored.set(std::ptr::null_mut()));
+
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        runtime.wheel.current_tick = 0;
+
+        let mut trigger_waiter = TaskHeader::new();
+        trigger_waiter.vtable = &ARM_TIMER_DURING_SHUTDOWN_WAITER_VTABLE;
+        let trigger_waiter_ptr = std::ptr::addr_of_mut!(trigger_waiter);
+        let mut armed_waiter = TaskHeader::new();
+        let armed_waiter_ptr = std::ptr::addr_of_mut!(armed_waiter);
+        let trigger_entry = runtime
+            .submit_sleep_at_tick(trigger_waiter_ptr, 1u64 << LVL1_SHIFT)
+            .expect("shutdown trigger timer arm failed");
+        assert_eq!(unsafe { (*trigger_entry).bucket_level }, 1);
+
+        let runtime_ptr = std::ptr::addr_of_mut!(runtime);
+        TIMER_SHUTDOWN_ARM_RUNTIME.with(|stored| stored.set(runtime_ptr));
+        TIMER_SHUTDOWN_ARM_WAITER.with(|stored| stored.set(armed_waiter_ptr));
+        // Leave the trigger timer's waiter as its final task reference. The
+        // first shutdown pass reaches it only after all level-0 buckets.
+        unsafe {
+            release_task(trigger_waiter_ptr);
+        }
+        assert_eq!(trigger_waiter.refs.get(), 1);
+        assert_eq!(armed_waiter.refs.get(), 1);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            TimerRuntime::cancel_all_for_shutdown_unchecked(runtime_ptr);
+        }))
+        .expect_err("shutdown timer-arm waiter did not panic");
+        let armed_entry = TIMER_SHUTDOWN_ARMED_ENTRY.with(Cell::get);
+        TIMER_SHUTDOWN_ARM_RUNTIME.with(|stored| stored.set(std::ptr::null_mut()));
+        TIMER_SHUTDOWN_ARM_WAITER.with(|stored| stored.set(std::ptr::null_mut()));
+        TIMER_SHUTDOWN_ARMED_ENTRY.with(|stored| stored.set(std::ptr::null_mut()));
+
+        assert!(
+            unwind
+                .downcast_ref::<ShutdownArmTimerWaiterPanic>()
+                .is_some(),
+            "timer shutdown replaced the timer-arm waiter panic"
+        );
+        TIMER_SHUTDOWN_ARM_DESTROYS.with(|destroys| assert_eq!(destroys.get(), 1));
+        assert!(
+            !armed_entry.is_null(),
+            "waiter destructor did not arm a timer"
+        );
+        assert_eq!(
+            unsafe { (*armed_entry).deadline_tick },
+            10,
+            "waiter destructor armed the wrong deadline"
+        );
+        for entry in [trigger_entry, armed_entry] {
+            assert!(unsafe { (*entry).link.is_unlinked() });
+            assert!(unsafe { (*entry).waiter.is_null() });
+            assert!(unsafe { (*entry).state == TimerState::Cancelled });
+            assert_eq!(unsafe { (*entry).bucket_level }, INVALID_BUCKET_LEVEL);
+            assert_eq!(unsafe { (*entry).bucket_index }, 0);
+        }
+        assert_eq!(
+            armed_waiter.refs.get(),
+            1,
+            "revisited shutdown bucket retained its waiter"
+        );
+        assert!(!runtime.has_pending());
+        assert!(runtime.wheel.all_buckets_empty());
+        assert_eq!(runtime.wheel.lvl0_bits, [0; 4]);
+        assert_eq!(runtime.wheel.lvl1_bits, 0);
+        assert_eq!(runtime.wheel.lvl2_bits, 0);
+        assert_eq!(runtime.wheel.lvl3_bits, 0);
+        assert_eq!(runtime.wheel.next_deadline_tick, None);
+        assert!(runtime.absolute_arm_base.is_none());
+
+        for entry in [trigger_entry, armed_entry] {
+            runtime
+                .cancel_sleep(entry)
+                .expect("detached shutdown timer reclaim failed");
+        }
+        let replacements = [10, 1u64 << LVL1_SHIFT].map(|deadline| {
+            runtime
+                .submit_sleep_at_tick(std::ptr::null_mut(), deadline)
+                .expect("shutdown timer replacement arm failed")
+        });
+        assert_ne!(
+            replacements[0], replacements[1],
+            "shutdown returned one timer slot twice"
+        );
+        assert!([trigger_entry, armed_entry].contains(&replacements[0]));
+        assert!([trigger_entry, armed_entry].contains(&replacements[1]));
+        for replacement in replacements {
+            runtime
+                .cancel_sleep(replacement)
+                .expect("shutdown timer replacement reclaim failed");
+        }
+        unsafe {
+            release_task(armed_waiter_ptr);
+        }
     }
 
     #[test]

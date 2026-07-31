@@ -1,12 +1,13 @@
 //! `io_uring` reactor: SQE submission, CQE completion, and operation lifecycle.
 
 use crate::runtime::executor::{
-    CompletionDrainGuard, ExecutorOwner, PanicPayload, RuntimeState, retain_first_panic,
+    CompletionDrainGuard, ExecutorOwner, PanicPayload, RuntimeState, completion_drain_active,
+    retain_first_panic, run_cleanup_preserving_panic,
 };
 use crate::runtime::op::CompletionState;
 #[cfg(all(test, not(miri)))]
 use crate::runtime::retained::RetainedIovecScratch;
-#[cfg(any(debug_assertions, feature = "test-support"))]
+#[cfg(any(debug_assertions, test))]
 use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool};
 use crate::runtime::task::{TaskHeader, release_task};
@@ -77,7 +78,7 @@ fn retire_tracked_completion(runtime_state: &mut RuntimeState) -> io::Result<()>
     runtime_state.inflight_ops -= 1;
     #[cfg(debug_assertions)]
     {
-        runtime_state.stats.cqe_completions += 1;
+        runtime_state.stats.cqe_completions = runtime_state.stats.cqe_completions.saturating_add(1);
     }
     Ok(())
 }
@@ -215,13 +216,17 @@ impl PendingCancelQueue {
 /// must describe this reactor. Before an attached payload is released, either
 /// the original target CQE must have retired or SQE construction must have
 /// aborted before submission.
-unsafe fn free_op_fields(
+unsafe fn free_op_fields_with_removal_report<F>(
     pending_cancels: *mut PendingCancelQueue,
     retained_pool: *mut RetainedPayloadPool,
     op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
     live_registry: *mut Vec<*mut CompletionState>,
     ptr: *mut CompletionState,
-) -> io::Result<()> {
+    report_removal: F,
+) -> io::Result<()>
+where
+    F: FnOnce(),
+{
     if unsafe { (*live_registry).is_empty() } {
         return Err(io::Error::other(
             "reactor freed more operations than it allocated",
@@ -247,13 +252,101 @@ unsafe fn free_op_fields(
     unsafe {
         (*ptr).registry_index = u32::MAX;
     }
+    // Publish the structural removal before waiter or payload destruction can
+    // unwind. Callers that must repair a swap-remove cursor can then use the
+    // event itself instead of re-deriving identity from a recyclable address.
+    report_removal();
 
     unsafe { (*pending_cancels).unlink(ptr) };
-    unsafe { (*ptr).clear_waiter() };
+    let waiter = unsafe { CompletionState::take_waiter_unchecked(ptr) };
+    let reclaim = unsafe { OpReclaimGuard::new(retained_pool, op_pool, ptr) };
+    if !waiter.is_null() {
+        unsafe { release_task(waiter) };
+    }
+    unsafe { reclaim.finish() };
+    Ok(())
+}
+
+#[inline(always)]
+#[cfg(test)]
+unsafe fn free_op_fields(
+    pending_cancels: *mut PendingCancelQueue,
+    retained_pool: *mut RetainedPayloadPool,
+    op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+    live_registry: *mut Vec<*mut CompletionState>,
+    ptr: *mut CompletionState,
+) -> io::Result<()> {
+    unsafe {
+        free_op_fields_with_removal_report(
+            pending_cancels,
+            retained_pool,
+            op_pool,
+            live_registry,
+            ptr,
+            || {},
+        )
+    }
+}
+
+/// Drops one operation payload and returns its completion-state slot.
+///
+/// The slot guard is armed before payload destruction so both pooled retained
+/// backing and the operation slot return exactly once if user drop glue
+/// unwinds.
+#[inline(always)]
+unsafe fn drop_payload_and_return_op_slot(
+    retained_pool: *mut RetainedPayloadPool,
+    op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+    ptr: *mut CompletionState,
+) {
     let slot = unsafe { OpSlotReturnGuard::new(op_pool, ptr) };
     unsafe { CompletionState::drop_retained_payload_unchecked(ptr, retained_pool) };
     unsafe { slot.finish() };
-    Ok(())
+}
+
+/// Owns complete operation reclamation while waiter destruction can unwind.
+///
+/// Registry and cancel-queue ownership have already been removed, and the
+/// waiter has already been transferred out of the state. The checked-out
+/// payload backing and operation slot remain unavailable to reentrant work
+/// until this guard finishes or unwinds.
+struct OpReclaimGuard {
+    retained_pool: *mut RetainedPayloadPool,
+    op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+    ptr: *mut CompletionState,
+}
+
+impl OpReclaimGuard {
+    #[inline(always)]
+    unsafe fn new(
+        retained_pool: *mut RetainedPayloadPool,
+        op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+        ptr: *mut CompletionState,
+    ) -> Self {
+        Self {
+            retained_pool,
+            op_pool,
+            ptr,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(self) {
+        let this = disarm_unwind_guard(self);
+        unsafe {
+            drop_payload_and_return_op_slot(this.retained_pool, this.op_pool, this.ptr);
+        }
+    }
+}
+
+impl Drop for OpReclaimGuard {
+    #[cold]
+    #[inline(never)]
+    fn drop(&mut self) {
+        run_cleanup_preserving_panic(|| unsafe {
+            drop_payload_and_return_op_slot(self.retained_pool, self.op_pool, self.ptr);
+        });
+    }
 }
 
 /// Returns one completion-state slot if retained-payload destruction unwinds.
@@ -278,6 +371,9 @@ impl OpSlotReturnGuard {
     #[inline(always)]
     unsafe fn finish(self) {
         let mut this = disarm_unwind_guard(self);
+        unsafe {
+            (*this.ptr).debug_assert_reclaim_owner_pinned();
+        }
         unsafe { (*this.op_pool).free(this.ptr) };
     }
 }
@@ -286,7 +382,10 @@ impl Drop for OpSlotReturnGuard {
     #[cold]
     #[inline(never)]
     fn drop(&mut self) {
-        unsafe { (*self.op_pool).free(self.ptr) };
+        unsafe {
+            (*self.ptr).debug_assert_reclaim_owner_pinned();
+            (*self.op_pool).free(self.ptr);
+        }
     }
 }
 
@@ -334,7 +433,10 @@ unsafe fn orphan_and_clear_waiter_with_cancel_fallback(
         (*ptr).set_orphaned();
         let pending_cancels = std::ptr::addr_of_mut!((*reactor).pending_cancels);
         let enqueue = PendingCancelEnqueueGuard::new(pending_cancels, ptr);
-        (*ptr).clear_waiter();
+        let waiter = CompletionState::take_waiter_unchecked(ptr);
+        if !waiter.is_null() {
+            release_task(waiter);
+        }
         enqueue
     }
 }
@@ -423,6 +525,13 @@ pub(crate) struct Reactor {
     pending_closes: VecDeque<PendingClose>,
     /// Explicit close-marker bound, independent of allocator capacity details.
     max_pending_closes: usize,
+    /// Bounded owners released while this reactor's completion view is live.
+    ///
+    /// The post-view guard drains this FIFO immediately after the view and its
+    /// thread-local exclusion guard are released.
+    deferred_closes: VecDeque<OwnedFd>,
+    /// Explicit deferred-owner bound, independent of allocator capacity.
+    max_deferred_closes: usize,
     /// Bounded FIFO of orphaned operations whose `ASYNC_CANCEL` SQE could not
     /// be submitted.
     pending_cancels: PendingCancelQueue,
@@ -441,6 +550,40 @@ pub(crate) struct Reactor {
     storage_abandoned: bool,
 }
 
+/// Drains descriptor owners only after this reactor's completion view and
+/// thread-local exclusion guard have both been released.
+///
+/// A nested drain may run while a different reactor's completion view remains
+/// live. The cleanup submits only to this guard's exact reactor, whose own view
+/// is already gone.
+struct DeferredCloseDrainGuard {
+    reactor: *mut Reactor,
+    runtime_state: *mut RuntimeState,
+}
+
+impl DeferredCloseDrainGuard {
+    #[inline(always)]
+    unsafe fn new(reactor: *mut Reactor, runtime_state: *mut RuntimeState) -> Self {
+        Self {
+            reactor,
+            runtime_state,
+        }
+    }
+}
+
+impl Drop for DeferredCloseDrainGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let deferred = unsafe { std::ptr::addr_of!((*self.reactor).deferred_closes) };
+        if unsafe { (*deferred).is_empty() } {
+            return;
+        }
+        run_cleanup_preserving_panic(|| unsafe {
+            Reactor::drain_deferred_closes_unchecked(self.reactor, self.runtime_state);
+        });
+    }
+}
+
 impl Reactor {
     pub fn new_with_config(config: ReactorConfig) -> io::Result<Self> {
         let ring = IoUring::new(config.ring_entries)?;
@@ -457,6 +600,10 @@ impl Reactor {
         pending_closes
             .try_reserve_exact(config.ring_entries as usize)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let mut deferred_closes = VecDeque::new();
+        deferred_closes
+            .try_reserve_exact(config.ring_entries as usize)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
 
         Ok(Self {
             ring: Some(ring),
@@ -465,6 +612,8 @@ impl Reactor {
             next_sequence: 0,
             pending_closes,
             max_pending_closes: config.ring_entries as usize,
+            deferred_closes,
+            max_deferred_closes: config.ring_entries as usize,
             pending_cancels: PendingCancelQueue::new(),
             op_pool: ManuallyDrop::new(op_pool),
             max_live_ops: config.ring_entries as usize,
@@ -487,6 +636,10 @@ impl Reactor {
         pending_closes
             .try_reserve_exact(max_live_ops)
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let mut deferred_closes = VecDeque::new();
+        deferred_closes
+            .try_reserve_exact(max_live_ops)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
 
         let mut reactor = Self {
             ring: None,
@@ -495,6 +648,8 @@ impl Reactor {
             next_sequence: 0,
             pending_closes,
             max_pending_closes: max_live_ops,
+            deferred_closes,
+            max_deferred_closes: max_live_ops,
             pending_cancels: PendingCancelQueue::new(),
             op_pool: ManuallyDrop::new(op_pool),
             max_live_ops,
@@ -589,22 +744,8 @@ impl Reactor {
         self.retained_pool.alloc_iovec_scratch(iov_count)
     }
 
-    /// Detach a retained payload from a completed operation and return it.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to a live completion state that has a retained payload
-    /// of exactly type `T`.
-    #[inline(always)]
-    pub(crate) unsafe fn take_retained_payload<T: 'static>(
-        &mut self,
-        ptr: *mut CompletionState,
-    ) -> T {
-        unsafe { Self::take_retained_payload_unchecked(self, ptr) }
-    }
-
-    /// Raw-pointer form of [`Self::take_retained_payload`] for callback-capable
-    /// completion drains that cannot create a whole-reactor mutable reference.
+    /// Detaches a retained payload without creating a whole-reactor mutable
+    /// reference.
     ///
     /// # Safety
     ///
@@ -622,25 +763,8 @@ impl Reactor {
         unsafe { (*ptr).take_retained_payload::<T>(&mut *pool) }
     }
 
-    /// Detach a retained payload from a completed operation, extract selected
-    /// data in place, and release only the backing storage.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to a live completion state that has a retained payload
-    /// of exactly type `T`. `extract` must move or drop every initialized field
-    /// in the payload that requires destruction.
-    #[inline(always)]
-    pub(crate) unsafe fn take_retained_payload_with<T: 'static, R>(
-        &mut self,
-        ptr: *mut CompletionState,
-        extract: impl FnOnce(*mut T) -> R,
-    ) -> R {
-        unsafe { Self::take_retained_payload_with_unchecked(self, ptr, extract) }
-    }
-
-    /// Raw-pointer form of [`Self::take_retained_payload_with`] for
-    /// callback-capable completion drains.
+    /// Extracts selected retained data without creating a whole-reactor mutable
+    /// reference.
     ///
     /// # Safety
     ///
@@ -659,8 +783,7 @@ impl Reactor {
         unsafe { (*ptr).take_retained_payload_with::<T, R>(&mut *pool, extract) }
     }
 
-    #[cfg(any(debug_assertions, feature = "test-support"))]
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn retained_payload_stats(&self) -> RetainedPayloadPoolStats {
         self.retained_pool.stats()
     }
@@ -734,14 +857,132 @@ impl Reactor {
         Ok(())
     }
 
-    /// Releases close owners whose SQEs never crossed into the kernel.
+    /// Releases close owners whose SQEs never crossed into the kernel, plus
+    /// any post-view owners left before close-SQE construction.
     ///
     /// The ring must already be gone (or SQPOLL must remain disabled, as it is
     /// for every FlowIO reactor), so no queued SQE can consume these fds later.
     fn drop_unsubmitted_close_owners(&mut self) {
         self.pending_closes.clear();
+        self.deferred_closes.clear();
         self.queued_head = 0;
         self.next_sequence = 0;
+    }
+
+    /// Retains one sole descriptor owner without touching the completion
+    /// drain's borrowed ring field.
+    ///
+    /// # Safety
+    ///
+    /// `reactor` must be the exact reactor published for the active completion
+    /// drain on its owner thread. The deferred queue must have its
+    /// construction-time reservation and no other code may access it
+    /// concurrently.
+    #[inline(always)]
+    pub(crate) unsafe fn defer_close_during_completion_drain(
+        reactor: *mut Self,
+        fd: OwnedFd,
+    ) -> Result<(), OwnedFd> {
+        debug_assert!(
+            completion_drain_active(),
+            "descriptor deferral requires an active completion drain"
+        );
+        debug_assert!(!reactor.is_null(), "descriptor deferral requires a reactor");
+        let deferred = unsafe { std::ptr::addr_of_mut!((*reactor).deferred_closes) };
+        let max_deferred = unsafe { *std::ptr::addr_of!((*reactor).max_deferred_closes) };
+        debug_assert!(
+            unsafe { (*deferred).capacity() } >= max_deferred,
+            "deferred-close queue lost its construction-time reservation"
+        );
+        if unsafe { (*deferred).len() } >= max_deferred {
+            return Err(fd);
+        }
+        unsafe {
+            (*deferred).push_back(fd);
+        }
+        Ok(())
+    }
+
+    /// Submits one known-nonblocking close to a specific reactor.
+    ///
+    /// # Safety
+    ///
+    /// `reactor` and `runtime_state` must be the matching initialized
+    /// owner-thread fields. This reactor's completion view must no longer be
+    /// live, though a nested view for a different reactor may remain active.
+    pub(crate) unsafe fn try_submit_close_on_reactor(
+        reactor: *mut Self,
+        runtime_state: *mut RuntimeState,
+        fd: OwnedFd,
+    ) -> Result<(), OwnedFd> {
+        let op = unsafe { (&mut *reactor).alloc_op() };
+        if op.is_null() {
+            #[cfg(debug_assertions)]
+            unsafe {
+                let stats = &mut (*runtime_state).stats;
+                stats.close_ring_fallbacks = stats.close_ring_fallbacks.saturating_add(1);
+            }
+            return Err(fd);
+        }
+
+        unsafe {
+            (*op).set_detached();
+        }
+        match unsafe { (&mut *reactor).submit_close_sqe(fd, op as u64) } {
+            Ok(()) => {
+                unsafe {
+                    (*runtime_state).inflight_ops += 1;
+                }
+                #[cfg(debug_assertions)]
+                unsafe {
+                    let stats = &mut (*runtime_state).stats;
+                    stats.sqe_submits = stats.sqe_submits.saturating_add(1);
+                    stats.close_ring_submissions = stats.close_ring_submissions.saturating_add(1);
+                }
+                Ok(())
+            }
+            Err((_err, fd)) => {
+                unsafe {
+                    Self::free_op_unchecked(reactor, op);
+                }
+                #[cfg(debug_assertions)]
+                unsafe {
+                    let stats = &mut (*runtime_state).stats;
+                    stats.close_ring_fallbacks = stats.close_ring_fallbacks.saturating_add(1);
+                }
+                Err(fd)
+            }
+        }
+    }
+
+    /// Empties the post-completion descriptor FIFO without retaining a queue
+    /// borrow across close submission or direct fallback.
+    ///
+    /// # Safety
+    ///
+    /// The requirements of [`Self::try_submit_close_on_reactor`] apply, and
+    /// this reactor's completion view and exclusion guard must already be
+    /// released.
+    unsafe fn drain_deferred_closes_unchecked(
+        reactor: *mut Self,
+        runtime_state: *mut RuntimeState,
+    ) {
+        loop {
+            let deferred = unsafe { std::ptr::addr_of_mut!((*reactor).deferred_closes) };
+            let Some(fd) = (unsafe { (*deferred).pop_front() }) else {
+                break;
+            };
+            if let Err(fd) =
+                unsafe { Self::try_submit_close_on_reactor(reactor, runtime_state, fd) }
+            {
+                #[cfg(debug_assertions)]
+                unsafe {
+                    let stats = &mut (*runtime_state).stats;
+                    stats.close_direct_closes = stats.close_direct_closes.saturating_add(1);
+                }
+                drop(fd);
+            }
+        }
     }
 
     #[inline(always)]
@@ -850,6 +1091,7 @@ impl Reactor {
     /// This releases any retained payload before recycling the state slot. The
     /// retained payload, if present, owns memory referenced by the original
     /// SQE and must only be released after that original CQE has been observed.
+    #[cfg(test)]
     #[inline(always)]
     fn try_free_op(&mut self, ptr: *mut CompletionState) -> io::Result<()> {
         unsafe { Self::try_free_op_unchecked(self, ptr) }
@@ -867,19 +1109,37 @@ impl Reactor {
         reactor: *mut Self,
         ptr: *mut CompletionState,
     ) -> io::Result<()> {
+        unsafe { Self::try_free_op_unchecked_with_removal_report(reactor, ptr, || {}) }
+    }
+
+    /// Reporting variant of [`Self::try_free_op_unchecked`].
+    ///
+    /// `report_removal` runs after the live-registry entry and any moved index
+    /// are repaired, but before waiter or retained-payload destruction.
+    #[inline(always)]
+    unsafe fn try_free_op_unchecked_with_removal_report<F>(
+        reactor: *mut Self,
+        ptr: *mut CompletionState,
+        report_removal: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(),
+    {
         debug_assert!(!ptr.is_null(), "reactor free_op called with null pointer");
         unsafe {
-            free_op_fields(
+            free_op_fields_with_removal_report(
                 std::ptr::addr_of_mut!((*reactor).pending_cancels),
                 std::ptr::addr_of_mut!((*reactor).retained_pool).cast::<RetainedPayloadPool>(),
                 std::ptr::addr_of_mut!((*reactor).op_pool)
                     .cast::<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>(),
                 std::ptr::addr_of_mut!((*reactor).live_registry),
                 ptr,
+                report_removal,
             )
         }
     }
 
+    #[cfg(test)]
     #[inline(always)]
     pub fn free_op(&mut self, ptr: *mut CompletionState) {
         if let Err(err) = self.try_free_op(ptr) {
@@ -965,12 +1225,11 @@ impl Reactor {
             self.submit_ring_for_sqe_capacity()?;
         }
 
-        let Some(ring) = self.ring.as_mut() else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "io_uring reactor is shut down",
-            ));
-        };
+        // SAFETY: `ring_mut` above established that the ring is present.
+        // Capacity handling may submit or synchronize it, but cannot remove or
+        // replace the ring. No ring borrow is retained across that `&mut self`
+        // call, so this creates only the final submission-queue reborrow.
+        let ring = unsafe { self.ring.as_mut().unwrap_unchecked() };
         let next_sequence = &mut self.next_sequence;
         let mut sq = ring.submission();
         unsafe {
@@ -1014,12 +1273,11 @@ impl Reactor {
             return Err((io::Error::from(io::ErrorKind::WouldBlock), fd));
         }
 
-        let Some(ring) = self.ring.as_mut() else {
-            return Err((
-                io::Error::new(io::ErrorKind::NotConnected, "io_uring reactor is shut down"),
-                fd,
-            ));
-        };
+        // SAFETY: `ring_mut` above established that the ring is present.
+        // Capacity handling may submit or synchronize it, and the marker-bound
+        // check reads only the close ledger; neither can remove or replace the
+        // ring. No ring borrow is retained across either operation.
+        let ring = unsafe { self.ring.as_mut().unwrap_unchecked() };
         let pending_closes = &mut self.pending_closes;
         let next_sequence = &mut self.next_sequence;
         let sequence = *next_sequence;
@@ -1082,13 +1340,13 @@ impl Reactor {
             } else {
                 timeout
             };
-            let mut now = Instant::now();
-            let deadline = now + initial_timeout;
+            let started = Instant::now();
+            let mut elapsed = Duration::ZERO;
             loop {
-                if now >= deadline {
+                if elapsed >= initial_timeout {
                     return Ok(ReactorSubmitStatus::Ready);
                 }
-                let remaining = deadline.saturating_duration_since(now);
+                let remaining = initial_timeout.saturating_sub(elapsed);
                 let timeout = if remaining.is_zero() {
                     Duration::from_nanos(1)
                 } else {
@@ -1112,7 +1370,7 @@ impl Reactor {
                         });
                     }
                     Err(err) if is_raw_os_error(&err, libc::EINTR) => {
-                        now = Instant::now();
+                        elapsed = started.elapsed();
                         continue;
                     }
                     Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
@@ -1161,7 +1419,7 @@ impl Reactor {
                 }
 
                 debug_assert!(!(*state).is_cancel_pending());
-                let waiter = (*state).take_waiter();
+                let waiter = CompletionState::take_waiter_unchecked(state);
                 if (*state).is_build_aborted() {
                     release_shutdown_waiter(waiter, first_panic);
                 } else {
@@ -1215,35 +1473,41 @@ impl Reactor {
         while index < unsafe { (&*std::ptr::addr_of!((*reactor).live_registry)).len() } {
             let state = unsafe { (&*std::ptr::addr_of!((*reactor).live_registry))[index] };
             let mut released_waiter = false;
-            let mut attempted_reclaim = false;
+            let mut reclaimed_current = false;
             unsafe {
-                (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
                 if (*state).is_build_aborted() {
-                    let waiter = (*state).take_waiter();
+                    (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
+                    let waiter = CompletionState::take_waiter_unchecked(state);
                     released_waiter = !waiter.is_null();
                     release_shutdown_waiter(waiter, first_panic);
                 } else if !(*state).is_completed() {
-                    let waiter = (*state).take_waiter();
+                    (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
+                    let waiter = CompletionState::take_waiter_unchecked(state);
                     (*state).set_ring_abandoned();
                     released_waiter = !waiter.is_null();
                     release_shutdown_waiter(waiter, first_panic);
                 } else if (*state).is_orphaned() || (*state).is_detached() {
-                    attempted_reclaim = true;
                     retain_first_panic(
                         first_panic,
                         catch_unwind(AssertUnwindSafe(|| {
-                            Self::free_op_unchecked(reactor, state);
+                            if let Err(err) = Self::try_free_op_unchecked_with_removal_report(
+                                reactor,
+                                state,
+                                || {
+                                    reclaimed_current = true;
+                                },
+                            ) {
+                                debug_assert!(false, "reactor raw free_op failed: {err}");
+                            }
                         })),
                     );
                 } else {
+                    (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
                     index += 1;
                     continue;
                 }
             }
 
-            let registry = unsafe { &*std::ptr::addr_of!((*reactor).live_registry) };
-            let reclaimed_current =
-                attempted_reclaim && registry.iter().all(|&candidate| candidate != state);
             if released_waiter || reclaimed_current {
                 // Waiter and retained-payload destruction may mutate the
                 // registry without changing its length. Revisit from the
@@ -1291,10 +1555,10 @@ impl Reactor {
         let force_fallback = crate::runtime::test_hooks::take_reactor_shutdown_fallback();
         #[cfg(not(any(debug_assertions, feature = "test-support")))]
         let force_fallback = false;
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let shutdown_started = Instant::now();
         while !force_fallback
             && unsafe { (*runtime_state).inflight_ops > 0 }
-            && Instant::now() < deadline
+            && shutdown_started.elapsed() < Duration::from_secs(1)
         {
             if unsafe { (&mut *reactor).flush_sqes() }.is_err() {
                 break;
@@ -1359,33 +1623,20 @@ impl Reactor {
 
             if (*state).is_runtime_shutdown() {
                 (*state).result = -libc::ECANCELED;
-                (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
                 if (*state).is_orphaned() || (*state).is_detached() {
-                    free_op_fields(
-                        std::ptr::addr_of_mut!((*reactor).pending_cancels),
-                        std::ptr::addr_of_mut!((*reactor).retained_pool)
-                            .cast::<RetainedPayloadPool>(),
-                        std::ptr::addr_of_mut!((*reactor).op_pool)
-                            .cast::<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>(),
-                        std::ptr::addr_of_mut!((*reactor).live_registry),
-                        state,
-                    )?;
+                    Self::try_free_op_unchecked(reactor, state)?;
+                } else {
+                    (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
                 }
             } else if (*state).is_orphaned() || (*state).is_detached() {
-                free_op_fields(
-                    std::ptr::addr_of_mut!((*reactor).pending_cancels),
-                    std::ptr::addr_of_mut!((*reactor).retained_pool).cast::<RetainedPayloadPool>(),
-                    std::ptr::addr_of_mut!((*reactor).op_pool)
-                        .cast::<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>(),
-                    std::ptr::addr_of_mut!((*reactor).live_registry),
-                    state,
-                )?;
+                Self::try_free_op_unchecked(reactor, state)?;
             } else {
-                let waiter = (*state).take_waiter();
+                let waiter = CompletionState::take_waiter_unchecked(state);
                 if !waiter.is_null() {
                     #[cfg(debug_assertions)]
                     {
-                        (*runtime_state).stats.waiter_wakes += 1;
+                        let stats = &mut (*runtime_state).stats;
+                        stats.waiter_wakes = stats.waiter_wakes.saturating_add(1);
                     }
                     crate::runtime::executor::notify_reactor_waiter_unchecked(
                         waiter,
@@ -1435,12 +1686,12 @@ impl Reactor {
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?
             as *mut IoUring;
         let owner = unsafe { (*reactor).owner };
-        // Declare the guard before the view so reverse local-drop order
-        // releases `cq` before ordinary owner-thread work may access this ring
-        // again. While the view is live, destructor-driven descriptor closes
-        // and future polls stay off-ring, and operation drops use raw disjoint
-        // bookkeeping paths.
-        let _completion_drain = CompletionDrainGuard::enter();
+        // Reverse local-drop order is deliberate: release `cq`, restore the
+        // prior thread-local drain target, then submit owners accumulated in
+        // this exact reactor's bounded deferred list. The final guard also runs
+        // on error or unwind and preserves an already-active user panic.
+        let _deferred_close_drain = unsafe { DeferredCloseDrainGuard::new(reactor, runtime_state) };
+        let _completion_drain = CompletionDrainGuard::enter_for_reactor(reactor);
         // SAFETY: the completion view exclusively borrows the ring field.
         // Completion handling mutates only disjoint bookkeeping fields, and
         // the guard above prevents destructor-driven polling, cancellation,
@@ -1497,6 +1748,1108 @@ impl Drop for Reactor {
     }
 }
 
+#[cfg(any(test, all(feature = "test-support", not(miri))))]
+mod completion_drain_probe {
+    use super::*;
+    use crate::runtime::executor::{CloseSubmission, completion_drain_active, try_submit_close};
+    #[cfg(not(miri))]
+    use crate::runtime::executor::{Executor, ExecutorConfig, UnsubmittedOpGuard};
+    #[cfg(not(miri))]
+    use crate::runtime::fd::{
+        RetainedListenerFd, RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed,
+    };
+    #[cfg(not(miri))]
+    use crate::runtime::io::Nop;
+    use std::cell::Cell;
+    #[cfg(not(miri))]
+    use std::future::Future;
+    #[cfg(not(miri))]
+    use std::io::Write;
+    #[cfg(not(miri))]
+    use std::os::fd::{AsRawFd, FromRawFd};
+    #[cfg(not(miri))]
+    use std::os::unix::net::UnixStream;
+    #[cfg(not(miri))]
+    use std::pin::Pin;
+    use std::rc::Rc;
+    #[cfg(not(miri))]
+    use std::task::{Context, Poll};
+
+    unsafe fn reactor_owns_state(reactor: *mut Reactor, state: *mut CompletionState) -> bool {
+        !state.is_null()
+            && unsafe { (&*std::ptr::addr_of!((*reactor).live_registry)).contains(&state) }
+    }
+
+    pub(super) struct CompletionDrainDescriptor {
+        pub(super) fd: Option<OwnedFd>,
+        pub(super) armed: Rc<Cell<bool>>,
+        pub(super) rejected: Rc<Cell<bool>>,
+        pub(super) saw_active_drain: Rc<Cell<bool>>,
+    }
+
+    impl Drop for CompletionDrainDescriptor {
+        fn drop(&mut self) {
+            let Some(fd) = self.fd.take() else {
+                return;
+            };
+            if !self.armed.get() {
+                drop(fd);
+                return;
+            }
+            self.saw_active_drain.set(completion_drain_active());
+            match try_submit_close(fd) {
+                CloseSubmission::Rejected(fd) => {
+                    self.rejected.set(true);
+                    drop(fd);
+                }
+                CloseSubmission::OutsideExecutor(fd) => {
+                    drop(fd);
+                    panic!("completion-drain descriptor reached the outside-executor route");
+                }
+                CloseSubmission::Submitted => {
+                    panic!("completion-drain descriptor re-entered ring submission");
+                }
+                CloseSubmission::Deferred => {
+                    panic!("standalone completion probe unexpectedly deferred a descriptor");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    pub(super) struct CompletionDrainCloseOwners {
+        nop: ManuallyDrop<Nop>,
+        runtime_fd: Option<RuntimeFd>,
+        retained_listener: Option<RetainedListenerFd>,
+        runtime_raw: i32,
+        listener_raw: i32,
+        drops: Rc<Cell<usize>>,
+        saw_active_drain: Rc<Cell<bool>>,
+        owners_open_after_drop: Rc<Cell<bool>>,
+        fail_close_submit: bool,
+        panic_after_drop: bool,
+    }
+
+    #[cfg(not(miri))]
+    #[derive(Debug)]
+    pub(super) struct CompletionDrainClosePanic;
+
+    #[cfg(not(miri))]
+    impl Drop for CompletionDrainCloseOwners {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            self.saw_active_drain.set(completion_drain_active());
+            // Release the completed operation before the descriptors so its
+            // slot is available to the post-view close submissions.
+            unsafe {
+                ManuallyDrop::drop(&mut self.nop);
+            }
+            drop(self.runtime_fd.take());
+            drop(self.retained_listener.take());
+            self.owners_open_after_drop.set(
+                (self.runtime_raw < 0 || !raw_fd_is_closed(self.runtime_raw))
+                    && (self.listener_raw < 0 || !raw_fd_is_closed(self.listener_raw)),
+            );
+            if self.fail_close_submit {
+                crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+            }
+            if self.panic_after_drop {
+                std::panic::panic_any(CompletionDrainClosePanic);
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    pub(super) struct ReturnPendingNopWithCloseOwners {
+        nop: Option<Nop>,
+        runtime_fd: Option<RuntimeFd>,
+        retained_listener: Option<RetainedListenerFd>,
+        runtime_raw: i32,
+        listener_raw: i32,
+        drops: Rc<Cell<usize>>,
+        saw_active_drain: Rc<Cell<bool>>,
+        owners_open_after_drop: Rc<Cell<bool>>,
+        fail_close_submit: bool,
+        panic_after_drop: bool,
+    }
+
+    #[cfg(not(miri))]
+    impl ReturnPendingNopWithCloseOwners {
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn new(
+            runtime_fd: Option<RuntimeFd>,
+            retained_listener: Option<RetainedListenerFd>,
+            runtime_raw: i32,
+            listener_raw: i32,
+            drops: Rc<Cell<usize>>,
+            saw_active_drain: Rc<Cell<bool>>,
+            owners_open_after_drop: Rc<Cell<bool>>,
+            fail_close_submit: bool,
+            panic_after_drop: bool,
+        ) -> Self {
+            Self {
+                nop: Some(Nop::new()),
+                runtime_fd,
+                retained_listener,
+                runtime_raw,
+                listener_raw,
+                drops,
+                saw_active_drain,
+                owners_open_after_drop,
+                fail_close_submit,
+                panic_after_drop,
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Future for ReturnPendingNopWithCloseOwners {
+        type Output = CompletionDrainCloseOwners;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            let nop = this.nop.as_mut().expect("completion probe NOP missing");
+            assert!(
+                Pin::new(nop).poll(cx).is_pending(),
+                "completion probe NOP completed before submission"
+            );
+            Poll::Ready(CompletionDrainCloseOwners {
+                nop: ManuallyDrop::new(this.nop.take().expect("completion probe NOP disappeared")),
+                runtime_fd: this.runtime_fd.take(),
+                retained_listener: this.retained_listener.take(),
+                runtime_raw: this.runtime_raw,
+                listener_raw: this.listener_raw,
+                drops: Rc::clone(&this.drops),
+                saw_active_drain: Rc::clone(&this.saw_active_drain),
+                owners_open_after_drop: Rc::clone(&this.owners_open_after_drop),
+                fail_close_submit: this.fail_close_submit,
+                panic_after_drop: this.panic_after_drop,
+            })
+        }
+    }
+
+    pub(super) struct ReentrantOperationPayload {
+        pub(super) reactor: *mut Reactor,
+        pub(super) completed: *mut CompletionState,
+        pub(super) pending: *mut CompletionState,
+        pub(super) armed: Rc<Cell<bool>>,
+        pub(super) drops: Rc<Cell<usize>>,
+        pub(super) saw_active_drain: Rc<Cell<bool>>,
+    }
+
+    impl Drop for ReentrantOperationPayload {
+        fn drop(&mut self) {
+            if !self.armed.get() {
+                return;
+            }
+            self.drops.set(self.drops.get() + 1);
+            let drain_active = completion_drain_active();
+            self.saw_active_drain.set(drain_active);
+            assert!(
+                drain_active,
+                "operation payload dropped outside completion drain"
+            );
+            let completed_live = unsafe { reactor_owns_state(self.reactor, self.completed) };
+            assert!(
+                completed_live,
+                "nested completed operation left the live registry before payload destruction"
+            );
+            let pending_live = unsafe { reactor_owns_state(self.reactor, self.pending) };
+            assert!(
+                pending_live,
+                "pending operation left the live registry before payload destruction"
+            );
+            unsafe {
+                assert!(
+                    (*self.completed).is_completed(),
+                    "nested completion was not retired before payload destruction"
+                );
+                assert!(
+                    !(*self.pending).is_completed(),
+                    "pending operation completed before payload destruction"
+                );
+                Reactor::free_op_unchecked(self.reactor, self.completed);
+                Reactor::defer_cancel_during_completion_drain(self.reactor, self.pending);
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    struct PendingReadPayload {
+        fd: OwnedFd,
+        byte: [u8; 1],
+        drops: Rc<Cell<usize>>,
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for PendingReadPayload {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[derive(Clone, Copy)]
+    enum ProbeOperationOwner {
+        Detached,
+        Pending,
+    }
+
+    #[cfg(not(miri))]
+    struct TrackedProbeOperation {
+        ptr: Cell<*mut CompletionState>,
+        submitted: Cell<bool>,
+        owner: ProbeOperationOwner,
+    }
+
+    #[cfg(not(miri))]
+    impl TrackedProbeOperation {
+        const fn new(owner: ProbeOperationOwner) -> Self {
+            Self {
+                ptr: Cell::new(std::ptr::null_mut()),
+                submitted: Cell::new(false),
+                owner,
+            }
+        }
+    }
+
+    /// Makes every exceptional probe exit safe before the reactor is dropped.
+    ///
+    /// The probes intentionally retain completed and kernel-visible operation
+    /// owners in unusual states. This guard neutralizes their order-sensitive
+    /// test destructors, reclaims only operations known not to be
+    /// kernel-visible, and delegates submitted retirement to the production
+    /// bounded shutdown path.
+    #[cfg(not(miri))]
+    struct CompletionProbeCleanup {
+        reactor: *mut Reactor,
+        runtime_state: *mut RuntimeState,
+        ready_queue: *mut crate::utils::list::intrusive::dlist::DList<TaskHeader>,
+        completed: TrackedProbeOperation,
+        pending: TrackedProbeOperation,
+        outer: TrackedProbeOperation,
+        descriptor_armed: Rc<Cell<bool>>,
+        reentrant_armed: Rc<Cell<bool>>,
+        armed: bool,
+    }
+
+    #[cfg(not(miri))]
+    impl CompletionProbeCleanup {
+        unsafe fn new(
+            reactor: *mut Reactor,
+            runtime_state: *mut RuntimeState,
+            ready_queue: *mut crate::utils::list::intrusive::dlist::DList<TaskHeader>,
+            descriptor_armed: Rc<Cell<bool>>,
+            reentrant_armed: Rc<Cell<bool>>,
+        ) -> Self {
+            Self {
+                reactor,
+                runtime_state,
+                ready_queue,
+                completed: TrackedProbeOperation::new(ProbeOperationOwner::Detached),
+                pending: TrackedProbeOperation::new(ProbeOperationOwner::Pending),
+                outer: TrackedProbeOperation::new(ProbeOperationOwner::Detached),
+                descriptor_armed,
+                reentrant_armed,
+                armed: true,
+            }
+        }
+
+        fn tracks(&self) -> [&TrackedProbeOperation; 3] {
+            [&self.completed, &self.pending, &self.outer]
+        }
+
+        unsafe fn state_is_live(&self, ptr: *mut CompletionState) -> bool {
+            unsafe { reactor_owns_state(self.reactor, ptr) }
+        }
+
+        fn clear_reclaimed(&self) {
+            for tracked in self.tracks() {
+                let ptr = tracked.ptr.get();
+                if !ptr.is_null() && !unsafe { self.state_is_live(ptr) } {
+                    tracked.ptr.set(std::ptr::null_mut());
+                    tracked.submitted.set(false);
+                }
+            }
+        }
+
+        unsafe fn clean_up(&self) {
+            self.descriptor_armed.set(false);
+            self.reentrant_armed.set(false);
+
+            let completion_drain = CompletionDrainGuard::enter();
+            for tracked in self.tracks() {
+                let ptr = tracked.ptr.get();
+                if !unsafe { self.state_is_live(ptr) } {
+                    continue;
+                }
+
+                if !tracked.submitted.get() || unsafe { (*ptr).is_completed() } {
+                    unsafe { Reactor::free_op_unchecked(self.reactor, ptr) };
+                    continue;
+                }
+
+                match tracked.owner {
+                    ProbeOperationOwner::Detached => unsafe {
+                        (*ptr).set_detached();
+                    },
+                    ProbeOperationOwner::Pending => unsafe {
+                        if !(*ptr).is_orphaned() && !(*ptr).is_cancel_pending() {
+                            Reactor::defer_cancel_during_completion_drain(self.reactor, ptr);
+                        }
+                    },
+                }
+            }
+
+            let inflight = self
+                .tracks()
+                .into_iter()
+                .filter(|tracked| {
+                    let ptr = tracked.ptr.get();
+                    tracked.submitted.get()
+                        && unsafe { self.state_is_live(ptr) && !(*ptr).is_completed() }
+                })
+                .count();
+            unsafe {
+                (*self.runtime_state).inflight_ops = inflight;
+            }
+            drop(completion_drain);
+
+            unsafe {
+                Reactor::shutdown_unchecked(self.reactor, self.runtime_state, self.ready_queue);
+            }
+        }
+
+        unsafe fn force_storage_abandonment(&self) {
+            unsafe {
+                (*self.reactor).storage_abandoned = true;
+                drop((&mut *std::ptr::addr_of_mut!((*self.reactor).ring)).take());
+                (*self.runtime_state).inflight_ops = 0;
+            }
+        }
+
+        unsafe fn abandon(mut self) {
+            unsafe {
+                self.force_storage_abandonment();
+            }
+            self.armed = false;
+        }
+
+        fn finish_if_clean(mut self) {
+            let clean = unsafe {
+                (*self.runtime_state).inflight_ops == 0
+                    && (&*std::ptr::addr_of!((*self.reactor).live_registry)).is_empty()
+                    && (&*std::ptr::addr_of!((*self.reactor).pending_cancels)).is_empty()
+            };
+            if clean {
+                self.armed = false;
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for CompletionProbeCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+
+            let already_panicking = std::thread::panicking();
+            let cleanup = catch_unwind(AssertUnwindSafe(|| unsafe {
+                self.clean_up();
+            }));
+            if cleanup.is_ok() {
+                let reactor_safe = unsafe {
+                    (&*std::ptr::addr_of!((*self.reactor).ring)).is_none()
+                        && ((*self.reactor).storage_abandoned
+                            || (&*std::ptr::addr_of!((*self.reactor).live_registry)).is_empty())
+                };
+                if reactor_safe {
+                    return;
+                }
+            }
+
+            unsafe {
+                self.force_storage_abandonment();
+            }
+            if let Err(payload) = cleanup {
+                if already_panicking {
+                    std::mem::forget(payload);
+                } else {
+                    resume_unwind(payload);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn submit_and_wait_retry_eintr(
+        reactor: &mut Reactor,
+        min_complete: usize,
+    ) -> io::Result<usize> {
+        loop {
+            match reactor.submit_and_wait(min_complete) {
+                Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    /// Exact observations from the real-operation completion-drain probe.
+    #[doc(hidden)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CompletionDrainReentrancyReport {
+        initial_inflight: usize,
+        completed_setup_completions: usize,
+        completed_payload_retained: bool,
+        first_drain_completions: usize,
+        payload_drops: usize,
+        payload_saw_active_drain: bool,
+        descriptor_rejected_ring: bool,
+        descriptor_saw_active_drain: bool,
+        descriptor_closed: bool,
+        first_drain_inflight: usize,
+        first_drain_live_ops: usize,
+        first_drain_pending_cancels: usize,
+        first_drain_registry_exact: bool,
+        first_drain_cancel_links_exact: bool,
+        first_drain_pending_payload_drops: usize,
+        first_drain_waiter_refs: usize,
+        first_drain_ready_queue_empty: bool,
+        first_drain_guard_released: bool,
+        second_drain_completions: usize,
+        final_inflight: usize,
+        final_live_ops: usize,
+        final_pending_cancels: usize,
+        final_cancel_links_clear: bool,
+        final_pending_payload_drops: usize,
+        final_waiter_refs: usize,
+        final_ready_queue_empty: bool,
+        final_guard_released: bool,
+        all_operation_slots_reused: bool,
+    }
+
+    #[cfg(not(miri))]
+    impl CompletionDrainReentrancyReport {
+        /// Expected result when reentrant reclamation preserves every owner.
+        pub const EXPECTED: Self = Self {
+            initial_inflight: 0,
+            completed_setup_completions: 1,
+            completed_payload_retained: true,
+            first_drain_completions: 1,
+            payload_drops: 1,
+            payload_saw_active_drain: true,
+            descriptor_rejected_ring: true,
+            descriptor_saw_active_drain: true,
+            descriptor_closed: true,
+            first_drain_inflight: 1,
+            first_drain_live_ops: 1,
+            first_drain_pending_cancels: 1,
+            first_drain_registry_exact: true,
+            first_drain_cancel_links_exact: true,
+            first_drain_pending_payload_drops: 0,
+            first_drain_waiter_refs: 1,
+            first_drain_ready_queue_empty: true,
+            first_drain_guard_released: true,
+            second_drain_completions: 1,
+            final_inflight: 0,
+            final_live_ops: 0,
+            final_pending_cancels: 0,
+            final_cancel_links_clear: true,
+            final_pending_payload_drops: 1,
+            final_waiter_refs: 1,
+            final_ready_queue_empty: true,
+            final_guard_released: true,
+            all_operation_slots_reused: true,
+        };
+    }
+
+    #[cfg(not(miri))]
+    /// Exact observations from the real-CQ descriptor-drop probe.
+    #[doc(hidden)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CompletionDrainDescriptorReport {
+        output_drops: usize,
+        destructor_saw_active_drain: bool,
+        owners_open_during_destructor: bool,
+        runtime_fd_closed: bool,
+        retained_listener_closed: bool,
+        #[cfg(debug_assertions)]
+        close_ring_submissions: usize,
+        #[cfg(debug_assertions)]
+        close_ring_fallbacks: usize,
+        #[cfg(debug_assertions)]
+        close_direct_closes: usize,
+        #[cfg(debug_assertions)]
+        close_worker_admissions: usize,
+        #[cfg(debug_assertions)]
+        sqe_submits: usize,
+        #[cfg(debug_assertions)]
+        cqe_completions: usize,
+        guard_released: bool,
+    }
+
+    #[cfg(not(miri))]
+    impl CompletionDrainDescriptorReport {
+        /// Expected result when both production descriptor owners defer to the
+        /// post-view ring-close drain.
+        pub const EXPECTED: Self = Self {
+            output_drops: 1,
+            destructor_saw_active_drain: true,
+            owners_open_during_destructor: true,
+            runtime_fd_closed: true,
+            retained_listener_closed: true,
+            #[cfg(debug_assertions)]
+            close_ring_submissions: 2,
+            #[cfg(debug_assertions)]
+            close_ring_fallbacks: 0,
+            #[cfg(debug_assertions)]
+            close_direct_closes: 0,
+            #[cfg(debug_assertions)]
+            close_worker_admissions: 0,
+            #[cfg(debug_assertions)]
+            sqe_submits: 3,
+            #[cfg(debug_assertions)]
+            cqe_completions: 3,
+            guard_released: true,
+        };
+    }
+
+    /// Runs completed, pending, and reentrant operations through real CQ views.
+    #[cfg(not(miri))]
+    #[doc(hidden)]
+    pub fn test_completion_drain_reentrancy() -> io::Result<CompletionDrainReentrancyReport> {
+        let drops = Rc::new(Cell::new(0));
+        let saw_active_drain = Rc::new(Cell::new(false));
+        let reentrant_armed = Rc::new(Cell::new(false));
+        let descriptor_armed = Rc::new(Cell::new(false));
+        let descriptor_rejected = Rc::new(Cell::new(false));
+        let descriptor_saw_active_drain = Rc::new(Cell::new(false));
+        let pending_payload_drops = Rc::new(Cell::new(0));
+        let descriptor_fd = unsafe {
+            // SAFETY: ownership is captured immediately after the helper
+            // returns its one live descriptor.
+            OwnedFd::from_raw_fd(distinctive_closeable_test_fd()?)
+        };
+        let descriptor_raw = descriptor_fd.as_raw_fd();
+        let mut reactor = Box::new(Reactor::new_with_config(ReactorConfig { ring_entries: 8 })?);
+        reactor.init();
+        let reactor_ptr = std::ptr::from_mut(reactor.as_mut());
+        let mut runtime_state = RuntimeState {
+            live_tasks: 0,
+            inflight_ops: 0,
+            #[cfg(debug_assertions)]
+            stats: crate::runtime::executor::RuntimeStats::default(),
+        };
+        let initial_inflight = runtime_state.inflight_ops;
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let mut pending_waiter = TaskHeader::new();
+        let pending_waiter_ptr = std::ptr::addr_of_mut!(pending_waiter);
+        let (read_end, mut write_end) = UnixStream::pair()?;
+        let cleanup = unsafe {
+            CompletionProbeCleanup::new(
+                reactor_ptr,
+                std::ptr::addr_of_mut!(runtime_state),
+                std::ptr::addr_of_mut!(ready_queue),
+                Rc::clone(&descriptor_armed),
+                Rc::clone(&reentrant_armed),
+            )
+        };
+
+        let completed = reactor.alloc_op();
+        if completed.is_null() {
+            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+        }
+        cleanup.completed.ptr.set(completed);
+        let completed_guard = unsafe { UnsubmittedOpGuard::new(reactor_ptr, completed) };
+        let completed_payload = reactor.alloc_retained_payload(CompletionDrainDescriptor {
+            fd: Some(descriptor_fd),
+            armed: Rc::clone(&descriptor_armed),
+            rejected: Rc::clone(&descriptor_rejected),
+            saw_active_drain: Rc::clone(&descriptor_saw_active_drain),
+        });
+        unsafe {
+            (*completed).attach_retained_payload(completed_payload);
+        }
+        reactor.submit_sqe(opcode::Nop::new().build().user_data(completed as u64))?;
+        runtime_state.inflight_ops += 1;
+        cleanup.completed.submitted.set(true);
+        let completed = completed_guard.into_state_ptr();
+        descriptor_armed.set(true);
+        submit_and_wait_retry_eintr(&mut reactor, 1)?;
+        let completed_setup_completions = unsafe {
+            Reactor::poll_io_unchecked(reactor_ptr, 1, &mut runtime_state, &mut ready_queue)
+        }?;
+        let completed_payload_retained = unsafe {
+            reactor_owns_state(reactor_ptr, completed)
+                && (*completed).is_completed()
+                && !descriptor_rejected.get()
+                && !raw_fd_is_closed(descriptor_raw)
+        };
+
+        let read_fd = OwnedFd::from(read_end);
+        let pending = reactor.alloc_op();
+        if pending.is_null() {
+            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+        }
+        cleanup.pending.ptr.set(pending);
+        let pending_guard = unsafe { UnsubmittedOpGuard::new(reactor_ptr, pending) };
+        let pending_payload = reactor.alloc_retained_payload(PendingReadPayload {
+            fd: read_fd,
+            byte: [0],
+            drops: Rc::clone(&pending_payload_drops),
+        });
+        let pending_payload_ptr = pending_payload.as_ptr();
+        let pending_sqe = unsafe {
+            opcode::Read::new(
+                types::Fd((*pending_payload_ptr).fd.as_raw_fd()),
+                (*pending_payload_ptr).byte.as_mut_ptr(),
+                1,
+            )
+            .build()
+            .user_data(pending as u64)
+        };
+        unsafe {
+            (*pending).attach_retained_payload(pending_payload);
+            (*pending).register_waiter(pending_waiter_ptr);
+        }
+        reactor.submit_sqe(pending_sqe)?;
+        runtime_state.inflight_ops += 1;
+        cleanup.pending.submitted.set(true);
+        let pending = pending_guard.into_state_ptr();
+
+        let outer = reactor.alloc_op();
+        if outer.is_null() {
+            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+        }
+        cleanup.outer.ptr.set(outer);
+        let outer_guard = unsafe { UnsubmittedOpGuard::new(reactor_ptr, outer) };
+        let outer_payload = reactor.alloc_retained_payload(ReentrantOperationPayload {
+            reactor: reactor_ptr,
+            completed,
+            pending,
+            armed: Rc::clone(&reentrant_armed),
+            drops: Rc::clone(&drops),
+            saw_active_drain: Rc::clone(&saw_active_drain),
+        });
+        unsafe {
+            (*outer).attach_retained_payload(outer_payload);
+            (*outer).set_detached();
+        }
+        reactor.submit_sqe(opcode::Nop::new().build().user_data(outer as u64))?;
+        runtime_state.inflight_ops += 1;
+        cleanup.outer.submitted.set(true);
+        let outer = outer_guard.into_state_ptr();
+        reentrant_armed.set(true);
+        submit_and_wait_retry_eintr(&mut reactor, 1)?;
+        let first_drain_completions = unsafe {
+            Reactor::poll_io_unchecked(reactor_ptr, 1, &mut runtime_state, &mut ready_queue)
+        }?;
+        cleanup.clear_reclaimed();
+
+        let first_drain_registry_exact = reactor.live_registry.as_slice() == [pending]
+            && unsafe { (*pending).registry_index == 0 };
+        let first_drain_cancel_links_exact = first_drain_registry_exact
+            && unsafe {
+                (*pending).is_orphaned()
+                    && (*pending).is_cancel_pending()
+                    && (*pending).waiter.is_null()
+                    && (*pending).cancel_prev().is_null()
+                    && (*pending).cancel_next.is_null()
+                    && reactor.pending_cancels.head == pending
+                    && reactor.pending_cancels.tail == pending
+            };
+        let first_drain_inflight = runtime_state.inflight_ops;
+        let first_drain_live_ops = reactor.live_registry.len();
+        let first_drain_pending_cancels = reactor.pending_cancels.len();
+        let first_drain_pending_payload_drops = pending_payload_drops.get();
+        let first_drain_waiter_refs = pending_waiter.refs.get();
+        let first_drain_ready_queue_empty = ready_queue.is_empty();
+        let first_drain_guard_released = !completion_drain_active();
+
+        write_end.write_all(&[0x5a])?;
+        submit_and_wait_retry_eintr(&mut reactor, 1)?;
+        let second_drain_completions = unsafe {
+            Reactor::poll_io_unchecked(reactor_ptr, 1, &mut runtime_state, &mut ready_queue)
+        }?;
+        let final_inflight = runtime_state.inflight_ops;
+        let final_live_ops = reactor.live_registry.len();
+        let final_pending_cancels = reactor.pending_cancels.len();
+        let final_cancel_links_clear =
+            reactor.pending_cancels.head.is_null() && reactor.pending_cancels.tail.is_null();
+        let final_pending_payload_drops = pending_payload_drops.get();
+        let final_waiter_refs = pending_waiter.refs.get();
+        let final_ready_queue_empty = ready_queue.is_empty();
+        let final_guard_released = !completion_drain_active();
+
+        cleanup.clear_reclaimed();
+        let mut reused = [std::ptr::null_mut(); 3];
+        let mut reuse_guards: [Option<UnsubmittedOpGuard>; 3] = [None, None, None];
+        let mut reuse_ambiguous = false;
+        for index in 0..reused.len() {
+            let ptr = reactor.alloc_op();
+            reused[index] = ptr;
+            if !ptr.is_null() && reused[..index].contains(&ptr) {
+                reuse_ambiguous = true;
+                break;
+            }
+            if !ptr.is_null() {
+                reuse_guards[index] = Some(unsafe { UnsubmittedOpGuard::new(reactor_ptr, ptr) });
+            }
+        }
+        let [first_reuse, second_reuse, third_reuse] = reused;
+        let all_operation_slots_reused = !first_reuse.is_null()
+            && !second_reuse.is_null()
+            && !third_reuse.is_null()
+            && first_reuse != second_reuse
+            && first_reuse != third_reuse
+            && second_reuse != third_reuse
+            && [outer, completed, pending].contains(&first_reuse)
+            && [outer, completed, pending].contains(&second_reuse)
+            && [outer, completed, pending].contains(&third_reuse);
+        if reuse_ambiguous {
+            for guard in reuse_guards.into_iter().flatten() {
+                let _ = guard.into_state_ptr();
+            }
+        } else {
+            drop(reuse_guards);
+        }
+
+        let report = CompletionDrainReentrancyReport {
+            initial_inflight,
+            completed_setup_completions,
+            completed_payload_retained,
+            first_drain_completions,
+            payload_drops: drops.get(),
+            payload_saw_active_drain: saw_active_drain.get(),
+            descriptor_rejected_ring: descriptor_rejected.get(),
+            descriptor_saw_active_drain: descriptor_saw_active_drain.get(),
+            descriptor_closed: raw_fd_is_closed(descriptor_raw),
+            first_drain_inflight,
+            first_drain_live_ops,
+            first_drain_pending_cancels,
+            first_drain_registry_exact,
+            first_drain_cancel_links_exact,
+            first_drain_pending_payload_drops,
+            first_drain_waiter_refs,
+            first_drain_ready_queue_empty,
+            first_drain_guard_released,
+            second_drain_completions,
+            final_inflight,
+            final_live_ops,
+            final_pending_cancels,
+            final_cancel_links_clear,
+            final_pending_payload_drops,
+            final_waiter_refs,
+            final_ready_queue_empty,
+            final_guard_released,
+            all_operation_slots_reused,
+        };
+        if reuse_ambiguous {
+            unsafe {
+                cleanup.abandon();
+            }
+        } else {
+            cleanup.finish_if_clean();
+        }
+        Ok(report)
+    }
+
+    /// Runs descriptor destruction through the production completion view.
+    #[cfg(not(miri))]
+    #[doc(hidden)]
+    pub fn test_completion_drain_descriptor_close() -> io::Result<CompletionDrainDescriptorReport> {
+        let runtime_raw = distinctive_closeable_test_fd()?;
+        let listener_raw = distinctive_closeable_test_fd()?;
+        let runtime_fd = RuntimeFd::from_fresh_raw_fd(runtime_raw);
+        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(listener_raw));
+        let retained_listener = RetainedListenerFd::new(&listener);
+        drop(listener);
+
+        let output_drops = Rc::new(Cell::new(0));
+        let saw_active_drain = Rc::new(Cell::new(false));
+        let owners_open_during_destructor = Rc::new(Cell::new(false));
+
+        let mut executor = Executor::new_with_config(ExecutorConfig {
+            reactor: ReactorConfig { ring_entries: 8 },
+            ..ExecutorConfig::default()
+        })?;
+        executor.run({
+            let output_drops = Rc::clone(&output_drops);
+            let saw_active_drain = Rc::clone(&saw_active_drain);
+            let owners_open_during_destructor = Rc::clone(&owners_open_during_destructor);
+            async move {
+                let handle = Executor::spawn(ReturnPendingNopWithCloseOwners::new(
+                    Some(runtime_fd),
+                    Some(retained_listener),
+                    runtime_raw,
+                    listener_raw,
+                    output_drops,
+                    saw_active_drain,
+                    owners_open_during_destructor,
+                    false,
+                    false,
+                ))
+                .expect("completion-drain descriptor task did not fit");
+                drop(handle);
+            }
+        })?;
+
+        #[cfg(debug_assertions)]
+        let stats = executor.last_stats();
+
+        let report = CompletionDrainDescriptorReport {
+            output_drops: output_drops.get(),
+            destructor_saw_active_drain: saw_active_drain.get(),
+            owners_open_during_destructor: owners_open_during_destructor.get(),
+            runtime_fd_closed: raw_fd_is_closed(runtime_raw),
+            retained_listener_closed: raw_fd_is_closed(listener_raw),
+            #[cfg(debug_assertions)]
+            close_ring_submissions: stats.close_ring_submissions,
+            #[cfg(debug_assertions)]
+            close_ring_fallbacks: stats.close_ring_fallbacks,
+            #[cfg(debug_assertions)]
+            close_direct_closes: stats.close_direct_closes,
+            #[cfg(debug_assertions)]
+            close_worker_admissions: stats.close_worker_admissions,
+            #[cfg(debug_assertions)]
+            sqe_submits: stats.sqe_submits,
+            #[cfg(debug_assertions)]
+            cqe_completions: stats.cqe_completions,
+            guard_released: !completion_drain_active(),
+        };
+        Ok(report)
+    }
+}
+
+#[cfg(all(feature = "test-support", not(miri)))]
+pub use completion_drain_probe::{
+    CompletionDrainDescriptorReport, CompletionDrainReentrancyReport,
+    test_completion_drain_descriptor_close, test_completion_drain_reentrancy,
+};
+
+#[cfg(feature = "test-support")]
+struct CompletionDrainCloseBenchmarkOutput {
+    state: *mut CompletionState,
+    retained_listener: Option<crate::runtime::fd::RetainedListenerFd>,
+}
+
+#[cfg(feature = "test-support")]
+impl CompletionDrainCloseBenchmarkOutput {
+    fn new(retained_listener: crate::runtime::fd::RetainedListenerFd) -> Self {
+        Self {
+            state: std::ptr::null_mut(),
+            retained_listener: Some(retained_listener),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for CompletionDrainCloseBenchmarkOutput {
+    fn drop(&mut self) {
+        unsafe {
+            crate::runtime::executor::drop_op_ptr_unchecked(&mut self.state);
+        }
+        drop(self.retained_listener.take());
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn benchmark_submit_and_wait(reactor: &mut Reactor, min_complete: usize) -> io::Result<usize> {
+    loop {
+        match reactor.submit_and_wait(min_complete) {
+            Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Measures final listener-owner destruction during completion retirement.
+///
+/// Repository benchmark setup creates and completes one NOP per listener
+/// outside timing. The timed interval contains only production completion
+/// retirement, final task-owned listener destruction, and the post-view close
+/// submission pass. Close-CQE retirement and validation remain outside timing.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn benchmark_completion_drain_close(
+    total_rounds: usize,
+    ops_per_round: usize,
+    queue_depth: usize,
+) -> io::Result<Vec<Duration>> {
+    if total_rounds == 0 || ops_per_round == 0 || queue_depth == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let ring_entries =
+        u32::try_from(queue_depth).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+    crate::runtime::executor::with_executor_context_for_benchmark(
+        ring_entries,
+        |reactor, runtime_state, ready_queue, all_tasks| {
+            let mut raw_fds = Vec::new();
+            raw_fds
+                .try_reserve_exact(queue_depth)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            let mut durations = Vec::new();
+            durations
+                .try_reserve_exact(total_rounds)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+
+            for _ in 0..total_rounds {
+                let mut remaining = ops_per_round;
+                let mut elapsed = Duration::ZERO;
+
+                while remaining > 0 {
+                    let batch = remaining.min(queue_depth);
+                    raw_fds.clear();
+
+                    for _ in 0..batch {
+                        let raw = crate::runtime::fd::distinctive_closeable_test_fd()?;
+                        let listener =
+                            std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(raw));
+                        let retained = crate::runtime::fd::RetainedListenerFd::new(&listener);
+                        drop(listener);
+
+                        let staged =
+                            crate::runtime::executor::stage_completed_task_output_for_benchmark(
+                                CompletionDrainCloseBenchmarkOutput::new(retained),
+                            )?;
+                        let output = staged.output_ptr();
+                        let state = unsafe { (&mut *reactor).alloc_op() };
+                        if state.is_null() {
+                            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                        }
+                        unsafe {
+                            (*output).state = state;
+                        }
+                        let output = unsafe { staged.transfer_to_waiter(state) };
+
+                        let sqe = opcode::Nop::new().build().user_data(state as u64);
+                        if let Err(err) = unsafe { (&mut *reactor).submit_sqe(sqe) } {
+                            // Submission never made the state kernel-visible.
+                            // Clear the task's back-pointer before operation
+                            // reclamation releases its final waiter reference.
+                            unsafe {
+                                (*output).state = std::ptr::null_mut();
+                                Reactor::free_op_unchecked(reactor, state);
+                            }
+                            return Err(err);
+                        }
+                        unsafe {
+                            (*runtime_state).inflight_ops += 1;
+                        }
+                        raw_fds.push(raw);
+                    }
+
+                    benchmark_submit_and_wait(unsafe { &mut *reactor }, batch)?;
+                    let started = Instant::now();
+                    let completions = unsafe {
+                        Reactor::poll_io_unchecked(reactor, batch, runtime_state, ready_queue)
+                    }?;
+                    elapsed += started.elapsed();
+                    if completions != batch {
+                        return Err(io::Error::other(
+                            "completion-close benchmark drained a short NOP batch",
+                        ));
+                    }
+
+                    let close_ops = unsafe { (*runtime_state).inflight_ops };
+                    if close_ops != 0 && close_ops != batch {
+                        return Err(io::Error::other(
+                            "completion-close benchmark produced a partial close batch",
+                        ));
+                    }
+                    if unsafe { !(&*ready_queue).is_empty() } {
+                        return Err(io::Error::other(
+                            "completion-close benchmark unexpectedly queued a task",
+                        ));
+                    }
+                    if unsafe { !(&*all_tasks).is_empty() } {
+                        return Err(io::Error::other(
+                            "completion-close benchmark retained a staged task",
+                        ));
+                    }
+
+                    let live_ops =
+                        unsafe { (&*std::ptr::addr_of!((*reactor).live_registry)).len() };
+                    let pending_closes =
+                        unsafe { (&*std::ptr::addr_of!((*reactor).pending_closes)).len() };
+                    let queued_sqes = unsafe { (&mut *reactor).ring_mut()?.submission().len() };
+                    let any_closed = raw_fds
+                        .iter()
+                        .any(|&raw| crate::runtime::fd::raw_fd_is_closed(raw));
+                    let all_closed = raw_fds
+                        .iter()
+                        .all(|&raw| crate::runtime::fd::raw_fd_is_closed(raw));
+                    if close_ops == batch {
+                        if live_ops != batch
+                            || pending_closes != batch
+                            || queued_sqes != batch
+                            || any_closed
+                        {
+                            return Err(io::Error::other(
+                                "completion-close benchmark deferred an inexact close batch",
+                            ));
+                        }
+                    } else if live_ops != 0
+                        || pending_closes != 0
+                        || queued_sqes != 0
+                        || !all_closed
+                    {
+                        return Err(io::Error::other(
+                            "completion-close benchmark completed an inexact direct-close batch",
+                        ));
+                    }
+
+                    if close_ops > 0 {
+                        benchmark_submit_and_wait(unsafe { &mut *reactor }, close_ops)?;
+                        let close_completions = unsafe {
+                            Reactor::poll_io_unchecked(
+                                reactor,
+                                close_ops,
+                                runtime_state,
+                                ready_queue,
+                            )
+                        }?;
+                        if close_completions != close_ops {
+                            return Err(io::Error::other(
+                                "completion-close benchmark drained a short close batch",
+                            ));
+                        }
+                    }
+
+                    if unsafe { (*runtime_state).inflight_ops != 0 }
+                        || unsafe { !(&*std::ptr::addr_of!((*reactor).live_registry)).is_empty() }
+                        || unsafe { !(&*std::ptr::addr_of!((*reactor).pending_closes)).is_empty() }
+                        || unsafe { (&*reactor).has_queued_sqes() }
+                    {
+                        return Err(io::Error::other(
+                            "completion-close benchmark left reactor ownership live",
+                        ));
+                    }
+                    if raw_fds
+                        .iter()
+                        .any(|&raw| !crate::runtime::fd::raw_fd_is_closed(raw))
+                    {
+                        return Err(io::Error::other(
+                            "completion-close benchmark left a descriptor open",
+                        ));
+                    }
+
+                    remaining -= batch;
+                }
+
+                durations.push(elapsed);
+            }
+
+            Ok(durations)
+        },
+    )
+}
+
 /// Measures retirement of targets queued after cancel-submit pressure.
 ///
 /// This repository-only benchmark seam excludes queue construction from the
@@ -1545,7 +2898,7 @@ pub fn benchmark_cancel_submit_pressure(
                 // seam constructs the equivalent queued state directly.
                 unsafe {
                     (*state).set_orphaned();
-                    (*state).clear_waiter();
+                    CompletionState::clear_waiter_unchecked(state);
                 }
                 reactor.queue_pending_cancel(state);
                 queued.push(state);
@@ -1559,7 +2912,12 @@ pub fn benchmark_cancel_submit_pressure(
 
             let started = Instant::now();
             while let Some(state) = queued.pop() {
-                reactor.free_op(state);
+                // The benchmark constructs an ownerless state with a null
+                // waiter and no retained payload, so reclamation cannot invoke
+                // callback-capable drop glue.
+                unsafe {
+                    Reactor::free_op_unchecked(std::ptr::addr_of_mut!(reactor), state);
+                }
             }
             elapsed += started.elapsed();
 
@@ -1579,12 +2937,22 @@ pub fn benchmark_cancel_submit_pressure(
 
 #[cfg(test)]
 mod pending_cancel_tests {
+    #[cfg(not(miri))]
+    use super::completion_drain_probe::{
+        CompletionDrainClosePanic, CompletionDrainDescriptorReport,
+        ReturnPendingNopWithCloseOwners, test_completion_drain_descriptor_close,
+    };
+    use super::completion_drain_probe::{CompletionDrainDescriptor, ReentrantOperationPayload};
     use super::*;
-    use crate::runtime::executor::{CloseSubmission, completion_drain_active, try_submit_close};
-    use crate::runtime::fd::{distinctive_closeable_test_fd, raw_fd_is_closed};
+    use crate::runtime::executor::{
+        CloseSubmission, completion_drain_active, poll_ctx_from_waker, try_submit_close,
+        with_ringless_poll_context_for_test,
+    };
+    #[cfg(not(miri))]
+    use crate::runtime::executor::{Executor, ExecutorConfig};
+    use crate::runtime::fd::{RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed};
     use crate::runtime::task::{TaskHeader, TaskVTable};
     use std::cell::Cell;
-    #[cfg(not(miri))]
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
     #[cfg(not(miri))]
@@ -1753,55 +3121,232 @@ mod pending_cancel_tests {
         _bomb: OpPayloadDropBomb,
     }
 
-    struct CompletionDrainDescriptor {
-        fd: Option<OwnedFd>,
-        rejected: Rc<Cell<bool>>,
-    }
-
-    impl Drop for CompletionDrainDescriptor {
-        fn drop(&mut self) {
-            let Some(fd) = self.fd.take() else {
-                return;
-            };
-            match try_submit_close(fd) {
-                CloseSubmission::Rejected(fd) => {
-                    self.rejected.set(true);
-                    drop(fd);
-                }
-                CloseSubmission::OutsideExecutor(fd) => {
-                    drop(fd);
-                    panic!("completion-drain descriptor reached the outside-executor route");
-                }
-                CloseSubmission::Submitted => {
-                    panic!("completion-drain descriptor re-entered ring submission");
-                }
-            }
-        }
-    }
-
-    struct ReentrantOperationPayload {
-        reactor: *mut Reactor,
-        completed: *mut CompletionState,
-        pending: *mut CompletionState,
-        drops: Rc<Cell<usize>>,
-    }
-
-    impl Drop for ReentrantOperationPayload {
-        fn drop(&mut self) {
-            self.drops.set(self.drops.get() + 1);
-            assert!(
-                completion_drain_active(),
-                "operation payload dropped outside completion drain"
-            );
-            unsafe {
-                Reactor::free_op_unchecked(self.reactor, self.completed);
-                Reactor::defer_cancel_during_completion_drain(self.reactor, self.pending);
-            }
-        }
-    }
-
     fn ringless_reactor() -> Reactor {
         Reactor::new_ringless_for_test(8).expect("ringless reactor construction failed")
+    }
+
+    #[test]
+    fn ringless_nop_submission_returns_broken_pipe_without_sequence_change() {
+        let mut reactor = ringless_reactor();
+        let ringless = reactor
+            .submit_sqe(opcode::Nop::new().build().user_data(17))
+            .expect_err("ringless submission unexpectedly succeeded");
+        assert_eq!(ringless.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 0);
+        assert!(reactor.pending_closes.is_empty());
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn ringless_nop_submission_preserves_test_hook_precedence() {
+        let mut reactor = ringless_reactor();
+        crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+
+        let injected = reactor
+            .submit_sqe(opcode::Nop::new().build().user_data(17))
+            .expect_err("injected submission failure lost precedence");
+
+        assert_eq!(injected.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 0);
+    }
+
+    #[test]
+    fn deferred_close_queue_is_preallocated_bounded_and_fifo() {
+        let mut reactor =
+            Reactor::new_ringless_for_test(2).expect("ringless reactor construction failed");
+        let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+        let initial_capacity = reactor.deferred_closes.capacity();
+        assert!(initial_capacity >= 2);
+        assert_eq!(reactor.max_deferred_closes, 2);
+
+        let mut raw = [-1; 3];
+        let mut owners = Vec::new();
+        for slot in &mut raw {
+            *slot = distinctive_closeable_test_fd().expect("distinctive descriptor failed");
+            // SAFETY: the helper returned one live descriptor whose sole owner
+            // moves into this vector.
+            owners.push(unsafe { OwnedFd::from_raw_fd(*slot) });
+        }
+
+        let drain = CompletionDrainGuard::enter_for_reactor(reactor_ptr);
+        for owner in owners.drain(..2) {
+            unsafe {
+                Reactor::defer_close_during_completion_drain(reactor_ptr, owner)
+                    .expect("in-bound descriptor was rejected");
+            }
+        }
+        let rejected = unsafe {
+            Reactor::defer_close_during_completion_drain(
+                reactor_ptr,
+                owners.pop().expect("overflow owner missing"),
+            )
+        }
+        .expect_err("capacity-plus-one descriptor was admitted");
+        assert_eq!(rejected.as_raw_fd(), raw[2]);
+        assert!(!raw_fd_is_closed(raw[2]));
+        assert_eq!(reactor.deferred_closes.capacity(), initial_capacity);
+        assert_eq!(reactor.deferred_closes.len(), 2);
+
+        for expected in &raw[..2] {
+            let owner = reactor
+                .deferred_closes
+                .pop_front()
+                .expect("deferred owner missing");
+            assert_eq!(owner.as_raw_fd(), *expected);
+            drop(owner);
+            assert!(raw_fd_is_closed(*expected));
+        }
+        assert!(reactor.deferred_closes.is_empty());
+        drop(rejected);
+        assert!(raw_fd_is_closed(raw[2]));
+        drop(drain);
+    }
+
+    #[test]
+    fn nested_completion_drains_restore_the_exact_deferred_close_target() {
+        with_ringless_poll_context_for_test(4, |owner, cx| {
+            let outer = owner.reactor_ptr();
+            let outer_runtime_state = poll_ctx_from_waker(cx)
+                .expect("outer poll context was rejected")
+                .runtime_state();
+            let mut inner =
+                Reactor::new_ringless_for_test(4).expect("inner ringless reactor failed");
+            let inner = std::ptr::addr_of_mut!(inner);
+            let mut inner_runtime_state = runtime_state_with_shutdown_inflight(0);
+            let raw = [
+                distinctive_closeable_test_fd().expect("outer descriptor creation failed"),
+                distinctive_closeable_test_fd().expect("inner descriptor creation failed"),
+                distinctive_closeable_test_fd().expect("restored descriptor creation failed"),
+            ];
+            let owners = raw.map(|fd| {
+                // SAFETY: each helper result is one distinct live descriptor
+                // whose sole ownership transfers into this array.
+                unsafe { OwnedFd::from_raw_fd(fd) }
+            });
+            let [outer_owner, inner_owner, restored_owner] = owners;
+
+            let outer_drain = unsafe { DeferredCloseDrainGuard::new(outer, outer_runtime_state) };
+            let outer_guard = CompletionDrainGuard::enter_for_reactor(outer);
+            assert!(matches!(
+                try_submit_close(outer_owner),
+                CloseSubmission::Deferred
+            ));
+            let inner_drain = unsafe {
+                DeferredCloseDrainGuard::new(inner, std::ptr::addr_of_mut!(inner_runtime_state))
+            };
+            let inner_guard = CompletionDrainGuard::enter_for_reactor(inner);
+            assert!(matches!(
+                try_submit_close(inner_owner),
+                CloseSubmission::Deferred
+            ));
+            drop(inner_guard);
+            drop(inner_drain);
+            assert!(raw_fd_is_closed(raw[1]));
+            assert!(!raw_fd_is_closed(raw[0]));
+            assert!(completion_drain_active());
+            assert!(matches!(
+                try_submit_close(restored_owner),
+                CloseSubmission::Deferred
+            ));
+
+            let outer_queue = unsafe { &mut *std::ptr::addr_of_mut!((*outer).deferred_closes) };
+            assert_eq!(
+                outer_queue
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .collect::<Vec<_>>(),
+                [raw[0], raw[2]]
+            );
+            drop(outer_guard);
+            drop(outer_drain);
+            assert!(!completion_drain_active());
+            for fd in raw {
+                assert!(raw_fd_is_closed(fd));
+            }
+        });
+    }
+
+    #[test]
+    fn shutdown_cleanup_releases_deferred_close_owners() {
+        let mut reactor =
+            Reactor::new_ringless_for_test(1).expect("ringless reactor construction failed");
+        let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+        let raw = distinctive_closeable_test_fd().expect("descriptor creation failed");
+        // SAFETY: the helper returned one live descriptor whose sole ownership
+        // transfers into the deferred queue.
+        let owner = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        let drain = CompletionDrainGuard::enter_for_reactor(reactor_ptr);
+        unsafe {
+            Reactor::defer_close_during_completion_drain(reactor_ptr, owner)
+                .expect("deferred owner was rejected");
+        }
+        drop(drain);
+        assert!(!raw_fd_is_closed(raw));
+        reactor.drop_unsubmitted_close_owners();
+        assert!(reactor.deferred_closes.is_empty());
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn deferred_close_submission_failure_drains_during_output_unwind() {
+        let raw = distinctive_closeable_test_fd().expect("descriptor creation failed");
+        let output_drops = Rc::new(Cell::new(0));
+        let saw_active_drain = Rc::new(Cell::new(false));
+        let owner_open_during_destructor = Rc::new(Cell::new(false));
+        let mut executor = Executor::new_with_config(ExecutorConfig {
+            reactor: ReactorConfig { ring_entries: 4 },
+            ..ExecutorConfig::default()
+        })
+        .expect("executor construction failed");
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            executor
+                .run({
+                    let output_drops = Rc::clone(&output_drops);
+                    let saw_active_drain = Rc::clone(&saw_active_drain);
+                    let owner_open_during_destructor = Rc::clone(&owner_open_during_destructor);
+                    async move {
+                        let handle = Executor::spawn(ReturnPendingNopWithCloseOwners::new(
+                            Some(RuntimeFd::from_fresh_raw_fd(raw)),
+                            None,
+                            raw,
+                            -1,
+                            output_drops,
+                            saw_active_drain,
+                            owner_open_during_destructor,
+                            true,
+                            true,
+                        ))
+                        .expect("completion-drain unwind task did not fit");
+                        drop(handle);
+                    }
+                })
+                .expect("executor returned an error before the output panic");
+        }))
+        .expect_err("task output destructor did not unwind");
+
+        assert!(unwind.is::<CompletionDrainClosePanic>());
+        assert_eq!(output_drops.get(), 1);
+        assert!(saw_active_drain.get());
+        assert!(owner_open_during_destructor.get());
+        assert_eq!(
+            crate::runtime::test_hooks::raw_sqe_submit_failures_remaining(),
+            0,
+            "post-view close submission did not consume the injected failure"
+        );
+        assert!(
+            raw_fd_is_closed(raw),
+            "failed post-view close submission did not directly close its owner"
+        );
+        assert!(!completion_drain_active());
+
+        executor
+            .run(async {})
+            .expect("executor was not reusable after output unwind cleanup");
     }
 
     fn runtime_state_with_shutdown_inflight(inflight_ops: usize) -> RuntimeState {
@@ -1918,7 +3463,7 @@ mod pending_cancel_tests {
 
         unsafe { (*second).register_waiter(task_ptr) };
         assert_eq!(task.refs.get(), 2);
-        unsafe { (*second).clear_waiter() };
+        unsafe { CompletionState::clear_waiter_unchecked(second) };
         assert_eq!(task.refs.get(), 1);
 
         let mut queue = PendingCancelQueue::new();
@@ -1959,6 +3504,122 @@ mod pending_cancel_tests {
     }
 
     #[test]
+    fn queued_shutdown_head_middle_tail_reclaim_preserves_exact_accounting() {
+        let mut reactor = ringless_reactor();
+        let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+        let head = reactor.alloc_op();
+        let middle = reactor.alloc_op();
+        let tail = reactor.alloc_op();
+        assert!(!head.is_null() && !middle.is_null() && !tail.is_null());
+
+        let payload_drops = Rc::new(Cell::new(0));
+        for &state in &[head, middle, tail] {
+            let payload = reactor.alloc_retained_payload(ShutdownRetainedPayload {
+                drops: Rc::clone(&payload_drops),
+                _bytes: [0; 8],
+            });
+            unsafe {
+                (*state).attach_retained_payload(payload);
+                (*state).set_runtime_shutdown();
+            }
+        }
+        unsafe {
+            (*middle).set_orphaned();
+            (*tail).set_detached();
+        }
+        for &state in &[head, middle, tail] {
+            reactor.queue_pending_cancel(state);
+        }
+        unsafe {
+            assert_queue_links(&reactor.pending_cancels, &[head, middle, tail]);
+        }
+        assert_eq!(reactor.live_registry, vec![head, middle, tail]);
+
+        let mut runtime_state = runtime_state_with_shutdown_inflight(3);
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let owner = reactor.owner;
+
+        unsafe {
+            Reactor::retire_completion_unchecked(
+                reactor_ptr,
+                owner,
+                middle,
+                -libc::EIO,
+                &mut runtime_state,
+                &mut ready_queue,
+            )
+            .expect("queued shutdown middle retirement failed");
+            assert_queue_links(&reactor.pending_cancels, &[head, tail]);
+            assert_eq!((*head).registry_index, 0);
+            assert_eq!((*tail).registry_index, 1);
+        }
+        assert_eq!(runtime_state.inflight_ops, 2);
+        assert_eq!(reactor.live_registry, vec![head, tail]);
+        assert_eq!(payload_drops.get(), 1);
+
+        unsafe {
+            Reactor::retire_completion_unchecked(
+                reactor_ptr,
+                owner,
+                head,
+                -libc::EIO,
+                &mut runtime_state,
+                &mut ready_queue,
+            )
+            .expect("queued shutdown head retirement failed");
+            assert_queue_links(&reactor.pending_cancels, &[tail]);
+            assert!((*head).is_completed());
+            assert_eq!((*head).result, -libc::ECANCELED);
+            assert_eq!((*head).registry_index, 0);
+            assert_eq!((*tail).registry_index, 1);
+        }
+        assert_eq!(runtime_state.inflight_ops, 1);
+        assert_eq!(reactor.live_registry, vec![head, tail]);
+        assert_eq!(payload_drops.get(), 1);
+
+        unsafe {
+            (*tail).result = -libc::ECANCELED;
+            (*tail).set_completed();
+        }
+        let mut first_panic = None;
+        unsafe {
+            Reactor::abandon_shutdown_storage_unchecked(
+                reactor_ptr,
+                std::ptr::addr_of_mut!(runtime_state),
+                &mut first_panic,
+            );
+            assert_queue_links(&reactor.pending_cancels, &[]);
+            assert_eq!((*head).registry_index, 0);
+        }
+        assert!(first_panic.is_none());
+        assert_eq!(runtime_state.inflight_ops, 0);
+        assert_eq!(reactor.live_registry, vec![head]);
+        assert_eq!(payload_drops.get(), 2);
+        assert!(ready_queue.is_empty());
+
+        // This ringless model has no kernel-visible storage. Re-enable normal
+        // pool destruction after proving the abandonment reclaim shape.
+        reactor.storage_abandoned = false;
+        reactor.free_op(head);
+        assert!(reactor.live_registry.is_empty());
+        assert_eq!(payload_drops.get(), 3);
+
+        let reused = [reactor.alloc_op(), reactor.alloc_op(), reactor.alloc_op()];
+        assert!(reused.iter().all(|state| !state.is_null()));
+        let mut expected = [head as usize, middle as usize, tail as usize];
+        let mut actual = reused.map(|state| state as usize);
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "shutdown reclaim stranded an op slot");
+        for state in reused.into_iter().rev() {
+            reactor.free_op(state);
+        }
+        assert!(reactor.live_registry.is_empty());
+    }
+
+    #[test]
     fn completion_state_remains_one_cache_line() {
         assert_eq!(std::mem::size_of::<CompletionState>(), 64);
         assert_eq!(std::mem::align_of::<CompletionState>(), 64);
@@ -1967,7 +3628,9 @@ mod pending_cancel_tests {
     #[test]
     fn completion_drain_rejects_descriptor_submission_from_payload_destructor() {
         let raw = distinctive_closeable_test_fd().expect("descriptor creation failed");
+        let armed = Rc::new(Cell::new(true));
         let rejected = Rc::new(Cell::new(false));
+        let saw_active_drain = Rc::new(Cell::new(false));
         let mut pending_cancels = PendingCancelQueue::new();
         let mut retained_pool =
             RetainedPayloadPool::new().expect("retained payload pool construction failed");
@@ -1985,7 +3648,9 @@ mod pending_cancel_tests {
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let payload = retained_pool.alloc(CompletionDrainDescriptor {
             fd: Some(fd),
+            armed,
             rejected: Rc::clone(&rejected),
+            saw_active_drain: Rc::clone(&saw_active_drain),
         });
         unsafe {
             (*state).attach_retained_payload(payload);
@@ -2008,6 +3673,10 @@ mod pending_cancel_tests {
             "payload descriptor did not take the no-ring close path"
         );
         assert!(
+            saw_active_drain.get(),
+            "payload descriptor destructor did not observe the completion drain"
+        );
+        assert!(
             raw_fd_is_closed(raw),
             "payload descriptor remained open after direct fallback"
         );
@@ -2023,6 +3692,8 @@ mod pending_cancel_tests {
     #[test]
     fn completion_drain_allows_nested_operation_free_and_defers_cancel() {
         let drops = Rc::new(Cell::new(0));
+        let saw_active_drain = Rc::new(Cell::new(false));
+        let armed = Rc::new(Cell::new(true));
         let mut reactor = ringless_reactor();
         let reactor_ptr = std::ptr::addr_of_mut!(reactor);
         let outer = reactor.alloc_op();
@@ -2036,17 +3707,42 @@ mod pending_cancel_tests {
             reactor: reactor_ptr,
             completed,
             pending,
+            armed,
             drops: Rc::clone(&drops),
+            saw_active_drain: Rc::clone(&saw_active_drain),
         });
         unsafe {
             (*outer).attach_retained_payload(payload);
+            (*outer).set_detached();
         }
 
+        let mut runtime_state = runtime_state_with_shutdown_inflight(1);
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let owner = reactor.owner;
+        // Keep a mutable ring-field borrow live across retirement. Miri then
+        // proves completion handling touches only disjoint bookkeeping fields.
+        let ring = unsafe { &mut *std::ptr::addr_of_mut!((*reactor_ptr).ring) };
         let drain = CompletionDrainGuard::enter();
         unsafe {
-            Reactor::free_op_unchecked(reactor_ptr, outer);
+            Reactor::retire_completion_unchecked(
+                reactor_ptr,
+                owner,
+                outer,
+                0,
+                &mut runtime_state,
+                &mut ready_queue,
+            )
+            .expect("ringless completion retirement failed");
         }
+        assert!(
+            ring.is_none(),
+            "ringless probe unexpectedly acquired a ring"
+        );
+        assert_eq!(runtime_state.inflight_ops, 0);
         assert_eq!(drops.get(), 1);
+        assert!(saw_active_drain.get());
         assert_eq!(reactor.live_registry, vec![pending]);
         assert_eq!(reactor.pending_cancels.len(), 1);
         assert_eq!(reactor.pending_cancels.head, pending);
@@ -2575,60 +4271,205 @@ mod pending_cancel_tests {
     #[test]
     #[cfg(not(miri))]
     fn poll_io_keeps_payload_descriptor_off_the_live_completion_ring() {
-        let raw = distinctive_closeable_test_fd().expect("descriptor creation failed");
-        let rejected = Rc::new(Cell::new(false));
-        let mut reactor =
-            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
-        reactor.init();
-        let state = reactor.alloc_op();
-        assert!(!state.is_null(), "operation allocation failed");
-        let payload = reactor.alloc_retained_payload(CompletionDrainDescriptor {
-            // SAFETY: the test helper returned one live descriptor whose sole
-            // ownership transfers into this payload.
-            fd: Some(unsafe { OwnedFd::from_raw_fd(raw) }),
-            rejected: Rc::clone(&rejected),
+        assert_eq!(
+            test_completion_drain_descriptor_close()
+                .expect("real completion-drain descriptor probe failed"),
+            CompletionDrainDescriptorReport::EXPECTED
+        );
+    }
+
+    #[test]
+    fn free_op_fields_waiter_panic_reclaims_payload_and_operation_once() {
+        CANCEL_WAITER_DESTROYS.with(|count| count.set(0));
+        let payload_drops = Rc::new(Cell::new(0));
+        let mut pending_cancels = PendingCancelQueue::new();
+        let mut retained_pool =
+            RetainedPayloadPool::new().expect("retained payload pool construction failed");
+        let mut op_pool: ProviderOwnedPool<CompletionState, BasicMemoryProvider> =
+            ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+                .expect("operation pool construction failed");
+        op_pool.init();
+        let mut live_registry = Vec::new();
+
+        let state = unsafe { op_pool.alloc(()) }.expect("operation allocation failed");
+        unsafe { (*state).bind_owner(None, 0) };
+        live_registry.push(state);
+        // Stable execution also proves that a secondary payload panic cannot
+        // replace the waiter panic. That branch intentionally forgets the
+        // secondary panic payload, so Miri uses a nonpanicking payload while
+        // still checking the raw reclamation and exact reuse.
+        #[cfg(not(miri))]
+        let panic_tag = Some("secondary payload panic");
+        #[cfg(miri)]
+        let panic_tag = None;
+        let payload = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&payload_drops),
+            panic_tag,
         });
+        let payload_ptr = payload.as_ptr();
         unsafe {
             (*state).attach_retained_payload(payload);
-            (*state).set_detached();
         }
-        reactor
-            .submit_sqe(opcode::Nop::new().build().user_data(state as u64))
-            .expect("NOP submission failed");
-        reactor
-            .submit_and_wait(1)
-            .expect("NOP completion wait failed");
 
-        let mut runtime_state = RuntimeState {
-            live_tasks: 0,
-            inflight_ops: 1,
-            #[cfg(debug_assertions)]
-            stats: crate::runtime::executor::RuntimeStats::default(),
-        };
-        let mut ready_queue =
-            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
-        ready_queue.init();
+        let mut waiter = TaskHeader::new();
+        waiter.vtable = &PANIC_CANCEL_WAITER_VTABLE;
+        let waiter_ptr = std::ptr::addr_of_mut!(waiter);
+        unsafe {
+            (*state).register_waiter(waiter_ptr);
+            release_task(waiter_ptr);
+        }
+        assert_eq!(waiter.refs.get(), 1);
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                state,
+            )
+            .expect("operation retirement failed before waiter destruction");
+        }))
+        .expect_err("waiter destructor did not panic");
         assert_eq!(
-            unsafe {
-                Reactor::poll_io_unchecked(
-                    std::ptr::addr_of_mut!(reactor),
-                    1,
-                    &mut runtime_state,
-                    &mut ready_queue,
-                )
-            }
-            .expect("completion drain failed"),
-            1
+            unwind.downcast_ref::<&str>().copied(),
+            Some("cancel waiter destroy panic"),
+            "operation cleanup replaced the waiter panic"
+        );
+        CANCEL_WAITER_DESTROYS.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(payload_drops.get(), 1);
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
+        assert_eq!(retained_pool.stats().pooled_frees, 1);
+
+        let replacement =
+            unsafe { op_pool.alloc(()) }.expect("replacement operation allocation failed");
+        assert_eq!(
+            replacement, state,
+            "waiter panic stranded the completion-state slot"
+        );
+        unsafe { (*replacement).bind_owner(None, 0) };
+        live_registry.push(replacement);
+        let replacement_payload = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&payload_drops),
+            panic_tag: None,
+        });
+        assert_eq!(
+            replacement_payload.as_ptr(),
+            payload_ptr,
+            "waiter panic stranded retained payload backing"
+        );
+        unsafe {
+            (*replacement).attach_retained_payload(replacement_payload);
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                replacement,
+            )
+            .expect("replacement operation retirement failed");
+        }
+        assert_eq!(payload_drops.get(), 2);
+        assert_eq!(retained_pool.stats().pooled_reuses, 1);
+        assert_eq!(retained_pool.stats().pooled_frees, 2);
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
+    }
+
+    #[test]
+    fn free_op_reports_registry_removal_before_panicking_payload_and_address_reuse() {
+        let payload_drops = Rc::new(Cell::new(0));
+        let mut pending_cancels = PendingCancelQueue::new();
+        let mut retained_pool =
+            RetainedPayloadPool::new().expect("retained payload pool construction failed");
+        let mut op_pool: ProviderOwnedPool<CompletionState, BasicMemoryProvider> =
+            ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+                .expect("operation pool construction failed");
+        op_pool.init();
+        let mut live_registry = Vec::new();
+
+        let state = unsafe { op_pool.alloc(()) }.expect("operation allocation failed");
+        unsafe { (*state).bind_owner(None, 0) };
+        live_registry.push(state);
+        let payload = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&payload_drops),
+            panic_tag: Some("reported removal"),
+        });
+        let payload_ptr = payload.as_ptr();
+        unsafe {
+            (*state).attach_retained_payload(payload);
+        }
+
+        let mut removal_reported = false;
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            free_op_fields_with_removal_report(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                state,
+                || {
+                    removal_reported = true;
+                },
+            )
+            .expect("operation retirement failed before payload destruction");
+        }))
+        .expect_err("retained payload destructor did not panic");
+        let panic = unwind
+            .downcast_ref::<OpPayloadDropPanic>()
+            .expect("operation cleanup replaced the payload panic");
+        assert_eq!(panic.0, "reported removal");
+        assert!(
+            removal_reported,
+            "registry removal was not reported before payload destruction"
+        );
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
+        assert_eq!(payload_drops.get(), 1);
+
+        let replacement =
+            unsafe { op_pool.alloc(()) }.expect("replacement operation allocation failed");
+        assert_eq!(
+            replacement, state,
+            "panicking payload did not return the operation slot for exact address reuse"
+        );
+        unsafe { (*replacement).bind_owner(None, 0) };
+        live_registry.push(replacement);
+        assert!(
+            live_registry.contains(&state),
+            "replacement did not reproduce the ambiguous numerical pointer identity"
+        );
+        assert!(
+            removal_reported,
+            "address reuse changed the already-published removal event"
         );
 
-        assert!(
-            rejected.get(),
-            "payload close was not rejected from the ring"
+        let replacement_payload = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&payload_drops),
+            panic_tag: None,
+        });
+        assert_eq!(
+            replacement_payload.as_ptr(),
+            payload_ptr,
+            "panicking payload stranded its retained backing"
         );
-        assert!(raw_fd_is_closed(raw), "payload descriptor remained open");
-        assert_eq!(runtime_state.inflight_ops, 0);
-        assert!(reactor.live_registry.is_empty());
-        assert!(ready_queue.is_empty());
+        unsafe {
+            (*replacement).attach_retained_payload(replacement_payload);
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                &mut op_pool,
+                &mut live_registry,
+                replacement,
+            )
+            .expect("replacement operation retirement failed");
+        }
+        assert_eq!(payload_drops.get(), 2);
+        assert_eq!(retained_pool.stats().pooled_reuses, 1);
+        assert_eq!(retained_pool.stats().pooled_frees, 2);
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
     }
 
     #[test]
@@ -2801,6 +4642,49 @@ mod tests {
     #[cfg(any(debug_assertions, feature = "test-support"))]
     fn nop_sqe(user_data: u64) -> io_uring::squeue::Entry {
         opcode::Nop::new().build().user_data(user_data)
+    }
+
+    #[test]
+    fn ringless_close_submission_returns_broken_pipe_with_identical_owner() {
+        let mut reactor =
+            Reactor::new_ringless_for_test(8).expect("ringless reactor construction failed");
+        let (raw, owner) = distinctive_owner();
+
+        let (ringless, owner) = reactor
+            .submit_close_sqe(owner, 41)
+            .expect_err("ringless close submission unexpectedly succeeded");
+        assert_eq!(ringless.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(owner.as_raw_fd(), raw);
+        assert!(!raw_fd_is_closed(raw));
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 0);
+        assert!(reactor.pending_closes.is_empty());
+
+        drop(owner);
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn ringless_close_submission_preserves_test_hook_precedence_and_owner() {
+        let mut reactor =
+            Reactor::new_ringless_for_test(8).expect("ringless reactor construction failed");
+        let (raw, owner) = distinctive_owner();
+        crate::runtime::test_hooks::fail_next_raw_sqe_submit();
+
+        let (injected, owner) = reactor
+            .submit_close_sqe(owner, 41)
+            .expect_err("injected close submission failure lost precedence");
+
+        assert_eq!(injected.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(owner.as_raw_fd(), raw);
+        assert!(!raw_fd_is_closed(raw));
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 0);
+        assert!(reactor.pending_closes.is_empty());
+
+        drop(owner);
+        assert!(raw_fd_is_closed(raw));
     }
 
     #[test]
@@ -3281,6 +5165,24 @@ mod tests {
         );
 
         reactor.free_op(state);
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn wait_for_events_accepts_duration_max_without_instant_overflow() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+
+        crate::runtime::test_hooks::fail_next_ring_wait_errno(libc::EBUSY);
+        let status = reactor
+            .wait_for_events(Some(Duration::MAX))
+            .expect("injected busy wait should remain recoverable");
+        assert_eq!(status, ReactorSubmitStatus::Busy);
+        assert_eq!(
+            crate::runtime::test_hooks::ring_wait_failures_remaining(),
+            0
+        );
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]

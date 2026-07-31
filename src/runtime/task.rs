@@ -303,12 +303,17 @@ pub unsafe fn release_task(ptr: *mut TaskHeader) {
 ///
 /// # Safety
 ///
-/// Every non-null pointer already in `slot` must own one live task reference.
-/// A non-null `task` must point to a live task on its owner thread. The caller
-/// must clear or transfer the slot before its containing pool entry is reused.
+/// `slot` must point to one live, exclusively owned waiter word. Every non-null
+/// pointer already in that word must own one live task reference. A non-null
+/// `task` must point to a live task on its owner thread. The caller must clear
+/// or transfer the slot before its containing pool entry is reused.
+///
+/// The replacement is published before the prior reference is released. No
+/// Rust reference to the containing object remains live while that release can
+/// invoke user destructor code.
 #[inline(always)]
-pub(crate) unsafe fn replace_task_ref(slot: &mut *mut TaskHeader, task: *mut TaskHeader) {
-    let previous = *slot;
+pub(crate) unsafe fn replace_task_ref(slot: *mut *mut TaskHeader, task: *mut TaskHeader) {
+    let previous = unsafe { slot.read() };
     if previous == task {
         return;
     }
@@ -316,7 +321,9 @@ pub(crate) unsafe fn replace_task_ref(slot: &mut *mut TaskHeader, task: *mut Tas
     if !task.is_null() {
         unsafe { retain_task(task) };
     }
-    *slot = task;
+    unsafe {
+        slot.write(task);
+    }
     if !previous.is_null() {
         unsafe { release_task(previous) };
     }
@@ -326,22 +333,25 @@ pub(crate) unsafe fn replace_task_ref(slot: &mut *mut TaskHeader, task: *mut Tas
 ///
 /// # Safety
 ///
-/// A non-null pointer in `slot` must own one live task reference. The caller
-/// assumes that reference and must eventually pass it to [`release_task`] or
-/// transfer it into another owning slot.
+/// `slot` must point to one live, exclusively owned waiter word. A non-null
+/// pointer in that word must own one live task reference. The caller assumes
+/// that reference and must eventually pass it to [`release_task`] or transfer
+/// it into another owning slot.
 #[inline(always)]
-pub(crate) unsafe fn take_task_ref(slot: &mut *mut TaskHeader) -> *mut TaskHeader {
-    std::mem::replace(slot, std::ptr::null_mut())
+pub(crate) unsafe fn take_task_ref(slot: *mut *mut TaskHeader) -> *mut TaskHeader {
+    unsafe { slot.replace(std::ptr::null_mut()) }
 }
 
 /// Clears an internal waiter slot and releases its owned task reference.
 ///
 /// # Safety
 ///
-/// A non-null pointer in `slot` must own one live task reference on its owner
-/// thread.
+/// `slot` must point to one live, exclusively owned waiter word. A non-null
+/// pointer in that word must own one live task reference on its owner thread.
+/// No Rust reference to the containing object may remain live while releasing
+/// the final task reference.
 #[inline(always)]
-pub(crate) unsafe fn clear_task_ref(slot: &mut *mut TaskHeader) {
+pub(crate) unsafe fn clear_task_ref(slot: *mut *mut TaskHeader) {
     let task = unsafe { take_task_ref(slot) };
     if !task.is_null() {
         unsafe { release_task(task) };

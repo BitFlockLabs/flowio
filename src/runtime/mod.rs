@@ -67,7 +67,6 @@ pub(crate) mod io;
 pub(crate) mod op;
 pub mod reactor;
 pub(crate) mod refcount;
-#[allow(dead_code)]
 pub(crate) mod retained;
 #[cfg(feature = "test-support")]
 pub(crate) mod retained_test_support;

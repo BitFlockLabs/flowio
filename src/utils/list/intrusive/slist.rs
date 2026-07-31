@@ -64,6 +64,55 @@ impl Link {
 /// Unlike [`super::dlist::DList`], this list has no self-referential sentinel
 /// and is usable immediately after construction; [`SList::init`] is a no-op.
 /// The list links but does not own or drop its containing nodes.
+///
+/// # Container-pointer contract
+///
+/// [`SList::pop_front`] recovers `*mut T` by casting the stored link pointer, so
+/// the link address must equal the base address returned for `T`. An ordinary
+/// container therefore places [`Link`] at byte offset zero and derives the link
+/// pointer from a pointer with provenance for the complete container, for
+/// example by casting `*mut T` to `*mut Link`. A pointer produced by taking a
+/// reference to only an embedded link field does not satisfy this recovery
+/// contract.
+///
+/// Pool free lists may instead overlay a [`Link`] at the base of inactive
+/// storage, including when `T` is a byte type with no link field. In every
+/// case, the backing allocation must be large and aligned for both [`Link`] and
+/// `T`, and must remain allocated at the same address while linked. The
+/// overlaid [`Link`] must remain initialized while linked, and a valid `T` must
+/// be established before the recovered pointer is dereferenced as `T`.
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "test-support")]
+/// # {
+/// use flowio::test_support::utils::list::intrusive::slist::{Link, SList};
+///
+/// #[repr(C)]
+/// struct Entry {
+///     link: Link,
+///     value: u32,
+/// }
+///
+/// let mut entry = Box::new(Entry {
+///     link: Link::new_unlinked(),
+///     value: 7,
+/// });
+/// let entry_ptr: *mut Entry = &mut *entry;
+/// let link_ptr = entry_ptr.cast::<Link>();
+/// let mut list = SList::<Entry>::new();
+///
+/// // SAFETY: `link` is at offset zero, `link_ptr` comes from the complete
+/// // boxed allocation, and that allocation stays live and stationary.
+/// unsafe {
+///     list.push_front(link_ptr);
+///     let recovered = list.pop_front().unwrap();
+///     assert_eq!(recovered, entry_ptr);
+///     assert_eq!((*recovered).value, 7);
+/// }
+/// # }
+/// ```
 pub struct SList<T> {
     /// First link in the list, or null when empty.
     head: *mut Link,
@@ -109,7 +158,8 @@ impl<T> SList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a detached `Link`.
+    /// to a detached `Link` and satisfies the whole-allocation provenance and
+    /// stable-storage requirements documented on [`SList`].
     #[inline(always)]
     pub unsafe fn push_front(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
@@ -131,7 +181,9 @@ impl<T> SList<T> {
     /// # Safety
     ///
     /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a `Link` that is not currently linked into any list.
+    /// to a `Link` that is not currently linked into any list and satisfies
+    /// the whole-allocation provenance and stable-storage requirements
+    /// documented on [`SList`].
     #[inline(always)]
     pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
         debug_assert_slist_sanity!(self);
@@ -148,7 +200,12 @@ impl<T> SList<T> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `T` begins with the intrusive `Link` field.
+    /// Every stored link must satisfy the container-pointer contract documented
+    /// on [`SList`]: the stored link is at the base address returned for `T`,
+    /// the pointer retains provenance for the complete backing allocation, and
+    /// that allocation remains live and unmoved through recovery. The returned
+    /// pointer must not be dereferenced as `T` until it identifies a valid
+    /// initialized `T`.
     #[inline(always)]
     pub unsafe fn pop_front(&mut self) -> Option<*mut T> {
         debug_assert_slist_sanity!(self);

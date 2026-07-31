@@ -149,6 +149,10 @@ fn test_broken_list_detection() {
         id: 1,
         link: utils::list::intrusive::dlist::Link::new_unlinked(),
     };
+    let mut t2 = Task {
+        id: 2,
+        link: utils::list::intrusive::dlist::Link::new_unlinked(),
+    };
 
     unsafe {
         list.push_back(task_link_ptr(&mut t1));
@@ -161,13 +165,7 @@ fn test_broken_list_detection() {
         // The next push_back runs the debug sentinel consistency check, which
         // must detect `prev.next != head`.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            list.push_back(
-                &mut Task {
-                    id: 2,
-                    link: utils::list::intrusive::dlist::Link::new_unlinked(),
-                }
-                .link,
-            );
+            list.push_back(task_link_ptr(&mut t2));
         }));
         assert!(result.is_err());
         // The list is intentionally corrupted and non-empty; suppress Drop's

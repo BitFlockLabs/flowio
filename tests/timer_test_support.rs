@@ -5,6 +5,16 @@ use std::io;
 use flowio::runtime::executor::Executor;
 
 #[test]
+fn timer_runtime_pending_probe_accepts_shared_reference() {
+    let mut timers = TimerRuntime::new().expect("timer runtime construction failed");
+    timers.init().expect("timer runtime initialization failed");
+
+    let shared: &TimerRuntime = &timers;
+
+    assert!(!shared.has_pending());
+}
+
+#[test]
 fn timer_runtime_driver_rejects_missing_executor_context() {
     let mut timers = TimerRuntime::new().expect("timer runtime construction failed");
     timers.init().expect("timer runtime initialization failed");

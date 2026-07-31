@@ -14,6 +14,11 @@ use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{Sleep, TimeoutError, sleep, sleep_until, timeout, timeout_at};
 use flowio::test_support::runtime::io::{Nop, NopSlot};
 use flowio::test_support::runtime::op::CompletionState;
+#[cfg(not(miri))]
+use flowio::test_support::runtime::reactor::{
+    CompletionDrainDescriptorReport, CompletionDrainReentrancyReport,
+    test_completion_drain_descriptor_close, test_completion_drain_reentrancy,
+};
 use flowio::test_support::runtime::task::TaskHeader;
 use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
@@ -31,6 +36,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+const COMPLETION_DRAIN_REENTRANCY_CHILD_ENV: &str = "FLOWIO_COMPLETION_DRAIN_REENTRANCY_CHILD";
+const COMPLETION_DRAIN_REENTRANCY_CHILD_TEST: &str =
+    "runtime_real_completion_drain_preserves_reentrant_operation_ownership";
+const COMPLETION_DRAIN_DESCRIPTOR_CHILD_ENV: &str = "FLOWIO_COMPLETION_DRAIN_DESCRIPTOR_CHILD";
+const COMPLETION_DRAIN_DESCRIPTOR_CHILD_TEST: &str =
+    "runtime_real_completion_drain_closes_payload_descriptor_without_ring_reentry";
 
 fn new_executor() -> Executor {
     Executor::new().expect("failed to construct runtime executor")
@@ -1022,6 +1034,43 @@ fn runtime_layout_probe() {
     println!(
         "layout UnixStream size={}",
         std::mem::size_of::<flowio::net::unix::UnixStream>()
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_real_completion_drain_preserves_reentrant_operation_ownership() {
+    if std::env::var_os(COMPLETION_DRAIN_REENTRANCY_CHILD_ENV).is_none() {
+        run_exact_test_child_with_watchdog(
+            COMPLETION_DRAIN_REENTRANCY_CHILD_TEST,
+            COMPLETION_DRAIN_REENTRANCY_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    assert_eq!(
+        test_completion_drain_reentrancy().expect("real completion-drain re-entrancy probe failed"),
+        CompletionDrainReentrancyReport::EXPECTED
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_real_completion_drain_closes_payload_descriptor_without_ring_reentry() {
+    if std::env::var_os(COMPLETION_DRAIN_DESCRIPTOR_CHILD_ENV).is_none() {
+        run_exact_test_child_with_watchdog(
+            COMPLETION_DRAIN_DESCRIPTOR_CHILD_TEST,
+            COMPLETION_DRAIN_DESCRIPTOR_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    assert_eq!(
+        test_completion_drain_descriptor_close()
+            .expect("real completion-drain descriptor probe failed"),
+        CompletionDrainDescriptorReport::EXPECTED
     );
 }
 

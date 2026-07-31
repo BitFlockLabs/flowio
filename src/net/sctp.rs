@@ -201,12 +201,16 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-use super::stream::fill_iobuffvec_write_iovecs;
+use super::stream::{
+    checked_iobuffvec_write_iovec_count_and_len, fill_iobuffvec_write_iovecs,
+    invalid_readv_aggregate, invalid_writev_shape,
+};
 use super::{
-    AcceptReadinessSlot as AcceptSlot, MsgHdrInit, RetainedConnectAddr, checked_read_len,
-    checked_send_len, close_fd, close_if_valid, complete_read_with_progress, connect_cqe_result,
-    current_local_addr, get_sock_opt, invalid_input, map_connect_timeout, set_reuse_addr,
-    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
+    AcceptReadinessSlot as AcceptSlot, CompletionTake, ConnectSubmissionSlot, MsgHdrInit,
+    RetainedConnectAddr, checked_read_len, checked_send_len, close_fd, complete_read_with_progress,
+    completion_cqe_result, current_local_addr, get_sock_opt, invalid_input, map_connect_timeout,
+    set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    write_msghdr,
 };
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::bytes::{
@@ -223,6 +227,7 @@ use crate::runtime::fd::{LingerProvenance, RuntimeFd};
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool, with_raw_retained_slot};
+use crate::runtime::task::release_task;
 use crate::runtime::timer::{Timeout, timeout};
 use crate::utils::disarm_unwind_guard;
 use io_uring::{opcode, squeue, types};
@@ -379,10 +384,10 @@ pub struct SctpSendInfo {
 /// Per-message SCTP receive metadata reported by a message receive.
 ///
 /// This belongs to the metadata receive path returned by
-/// [`SctpStream::recv_msg`]. When receive info was not requested by FlowIO's
-/// socket configuration, absent ancillary fields remain at their defaults
-/// while [`SctpRecvInfo::end_of_record`] still reflects the receive flags.
-/// Ordinary data that omits receive info after FlowIO requested it is rejected
+/// [`SctpStream::recv_msg`]. When the stream's stored receive-info policy is
+/// disabled, absent ancillary fields remain at their defaults while
+/// [`SctpRecvInfo::end_of_record`] still reflects the receive flags. Ordinary
+/// data that omits receive info while the stored policy is enabled is rejected
 /// as [`io::ErrorKind::InvalidData`]. It is not produced by the lean data fast
 /// path; use [`SctpStream::recv`] when the caller only needs bytes.
 ///
@@ -1073,9 +1078,10 @@ impl SctpNotification {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SctpRecvMeta {
     /// Regular user data was received. The contained fields come from
-    /// `SCTP_RCVINFO`. When FlowIO did not request receive info, absent
-    /// ancillary fields are defaults and `end_of_record` still reflects the
-    /// receive flags; requested-but-absent receive info is `InvalidData`.
+    /// `SCTP_RCVINFO`. When the stream's stored receive-info policy is
+    /// disabled, absent ancillary fields are defaults and `end_of_record`
+    /// still reflects the receive flags; policy-enabled but absent receive
+    /// info is `InvalidData`.
     Data(#[doc = "Per-message receive information or default ancillary fields."] SctpRecvInfo),
     /// An SCTP notification was received instead of user data.
     Notification(#[doc = "Decoded kernel notification payload."] SctpNotification),
@@ -1793,109 +1799,58 @@ fn finish_accepted_stream(
     )
 }
 
-/// Reusable connect-side submission state kept by [`SctpConnector`].
-struct ConnectSlot {
-    /// Completion state for the current or last connect submission.
-    state_ptr: *mut CompletionState,
-    /// True while a [`ConnectFuture`] is borrowing this slot.
-    in_use: bool,
-    /// Socket being configured and connected for the current attempt.
-    fd: RawFd,
-    /// Prepared remote address for the current connect attempt.
-    addr: Option<RetainedConnectAddr>,
-    /// Socket configuration to apply after association establishment.
-    connected_config: SctpSocketConfig,
-}
+/// Reusable SCTP connect state with post-establishment socket configuration.
+type ConnectSlot = ConnectSubmissionSlot<SctpSocketConfig>;
 
-impl ConnectSlot {
-    fn new() -> Self {
-        Self {
-            state_ptr: std::ptr::null_mut(),
-            in_use: false,
-            fd: -1,
-            addr: None,
-            connected_config: SctpSocketConfig::default(),
-        }
+fn prepare_connect_slot(
+    slot: &mut ConnectSlot,
+    local_addr: Option<SocketAddr>,
+    remote_addr: SocketAddr,
+    config: SctpSocketConfig,
+) -> io::Result<()> {
+    if slot.in_use || !slot.state_ptr.is_null() {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
     }
-
-    fn prepare(
-        &mut self,
-        local_addr: Option<SocketAddr>,
-        remote_addr: SocketAddr,
-        config: SctpSocketConfig,
-    ) -> io::Result<()> {
-        if self.in_use || !self.state_ptr.is_null() {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        self.cleanup_fd();
-        self.connected_config = config;
-        self.in_use = true;
-        self.fd = match new_sctp_socket(socket_domain(remote_addr), libc::SOCK_STREAM) {
-            Ok(fd) => fd,
-            Err(err) => {
-                self.in_use = false;
-                return Err(err);
-            }
-        };
-        if let Err(err) = configure_sctp_socket(self.fd, config) {
-            self.cleanup_fd();
-            self.in_use = false;
+    slot.cleanup_fd();
+    slot.completion_data = config;
+    slot.in_use = true;
+    slot.fd = match new_sctp_socket(socket_domain(remote_addr), libc::SOCK_STREAM) {
+        Ok(fd) => fd,
+        Err(err) => {
+            slot.in_use = false;
             return Err(err);
         }
+    };
+    if let Err(err) = configure_sctp_socket(slot.fd, config) {
+        slot.cleanup_fd();
+        slot.in_use = false;
+        return Err(err);
+    }
 
-        if let Some(local_addr) = local_addr {
-            if let Err(err) = set_reuse_addr(self.fd) {
-                self.cleanup_fd();
-                self.in_use = false;
-                return Err(err);
-            }
-            let (sockaddr, sockaddr_len) = socket_addr_to_c(local_addr);
-            let bind_res = unsafe {
-                libc::bind(
-                    self.fd,
-                    &sockaddr as *const _ as *const libc::sockaddr,
-                    sockaddr_len,
-                )
-            };
-            if bind_res < 0 {
-                let err = io::Error::last_os_error();
-                self.cleanup_fd();
-                self.in_use = false;
-                return Err(err);
-            }
+    if let Some(local_addr) = local_addr {
+        if let Err(err) = set_reuse_addr(slot.fd) {
+            slot.cleanup_fd();
+            slot.in_use = false;
+            return Err(err);
         }
-
-        self.addr = Some(RetainedConnectAddr::from_socket_addr(remote_addr));
-        Ok(())
+        let (sockaddr, sockaddr_len) = socket_addr_to_c(local_addr);
+        let bind_res = unsafe {
+            libc::bind(
+                slot.fd,
+                &sockaddr as *const _ as *const libc::sockaddr,
+                sockaddr_len,
+            )
+        };
+        if bind_res < 0 {
+            let err = io::Error::last_os_error();
+            slot.cleanup_fd();
+            slot.in_use = false;
+            return Err(err);
+        }
     }
 
-    fn cleanup_fd(&mut self) {
-        close_if_valid(&mut self.fd);
-    }
-
-    fn take_stream(&mut self, remote_addr: SocketAddr) -> SctpStream {
-        let fd = self.fd;
-        self.fd = -1;
-        // SAFETY: this connect slot owns the successfully created socket, and
-        // clearing the sentinel above prevents later slot cleanup from closing
-        // the transferred descriptor.
-        SctpStream::from_configured_runtime_fd(
-            RuntimeFd::from_fresh_owned(unsafe { OwnedFd::from_raw_fd(fd) }),
-            remote_addr,
-            self.connected_config,
-        )
-    }
-
-    fn drop_future(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
-        self.addr = None;
-        self.cleanup_fd();
-        self.in_use = false;
-    }
-
-    fn drop_cached_state(&mut self) {
-        self.drop_future();
-    }
+    slot.addr = Some(RetainedConnectAddr::from_socket_addr(remote_addr));
+    Ok(())
 }
 
 /// One-to-one SCTP listener with a reusable accept slot.
@@ -2002,6 +1957,27 @@ impl SctpListener {
         self.local_addr
     }
 
+    /// Returns whether FlowIO has permanently latched the listener's accept
+    /// readiness as unusable.
+    ///
+    /// A `true` result is sticky: later [`Self::accept`] calls fail with
+    /// [`io::ErrorKind::ConnectionAborted`] until the listener is dropped and
+    /// rebuilt. A `false` result means only that FlowIO has not latched that
+    /// state; it is not a general socket-health probe. This is a pure
+    /// userspace query with no syscall, allocation, or runtime-context lookup.
+    ///
+    /// # Example
+    /// ```
+    /// use flowio::net::sctp::SctpListener;
+    ///
+    /// fn supervisor_should_rebuild(listener: &SctpListener) -> bool {
+    ///     listener.is_terminal()
+    /// }
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        self.accept_slot.is_terminal()
+    }
+
     /// Starts accepting one SCTP association.
     ///
     /// Accepting associations is setup/control-plane work, not the per-message
@@ -2017,12 +1993,26 @@ impl SctpListener {
     ///
     /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
     /// listener's reusable accept slot is occupied or runtime operation
-    /// capacity cannot accept the submission. A terminal readiness condition
-    /// with no queued association latches the listener and returns
+    /// capacity cannot accept the submission. `POLLHUP` or `POLLNVAL`
+    /// readiness with no queued association latches the listener and returns
     /// [`io::ErrorKind::ConnectionAborted`]. Later accepts return the same
-    /// non-retryable kind without another readiness submission.
-    /// A positive `POLLNVAL` confirmed as `EBADF` preserves that raw errno for
-    /// the current future while latching the same later fail-fast state.
+    /// non-retryable kind without another readiness submission. A bare
+    /// `POLLERR` gets one internal readiness rearm; if it recurs for the same
+    /// accept while `accept4` still reports `EAGAIN`, that exact
+    /// [`io::ErrorKind::WouldBlock`] result is returned without latching.
+    /// Readiness containing `POLLHUP` or `POLLNVAL` remains terminal even when
+    /// `POLLERR` is also present. A positive `POLLNVAL` confirmed as `EBADF`
+    /// preserves that raw errno for the current future while latching the same
+    /// later fail-fast state.
+    /// `EMFILE` and `ENFILE` propagate exactly without latching or rearming.
+    /// The slot preserves the observed readiness, so the next accept polled in
+    /// the owner context makes one direct nonblocking `accept4` attempt without
+    /// another readiness submission. FlowIO performs no hidden retry, timer,
+    /// or backoff; callers should relieve descriptor pressure and apply bounded
+    /// backoff before retrying. If the direct attempt returns
+    /// [`io::ErrorKind::WouldBlock`], the retained mask is classified by the
+    /// same rules above: HUP/NVAL latches, bare `POLLERR` uses its bounded
+    /// budget, and plain stale readiness takes the ordinary rearm.
     /// A future that reports the occupied-slot error never claims that slot;
     /// later polls park without replacing the previous accept's waiter.
     ///
@@ -2302,7 +2292,7 @@ impl SctpConnector {
     /// metadata, notifications, and data-path socket options.
     pub fn with_config(config: SctpSocketConfig) -> Self {
         Self {
-            connect_slot: ConnectSlot::new(),
+            connect_slot: ConnectSlot::new(SctpSocketConfig::default()),
             config,
             local_addr: None,
         }
@@ -2326,8 +2316,12 @@ impl SctpConnector {
     /// Once connected, keep suitable steady-state traffic on
     /// [`SctpStream::send`] / [`SctpStream::recv`].
     pub fn connect(&mut self, remote_addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
-        self.connect_slot
-            .prepare(self.local_addr, remote_addr, self.config)?;
+        prepare_connect_slot(
+            &mut self.connect_slot,
+            self.local_addr,
+            remote_addr,
+            self.config,
+        )?;
         Ok(ConnectFuture {
             slot: &mut self.connect_slot,
             remote_addr,
@@ -2392,7 +2386,7 @@ struct SctpRecvState {
     ///
     /// This records FlowIO's configured policy rather than querying a socket
     /// option on the per-message receive path.
-    recv_rcvinfo_requested: bool,
+    recv_rcvinfo_requested: Cell<bool>,
     /// Whether PDAPI notifications were explicitly requested by the caller.
     ///
     /// A false value means FlowIO subscribed only to preserve metadata-receive
@@ -2417,7 +2411,7 @@ impl SctpRecvState {
     const fn external() -> Self {
         Self {
             discarding_tail: false,
-            recv_rcvinfo_requested: false,
+            recv_rcvinfo_requested: Cell::new(false),
             partial_delivery_visible: Cell::new(true),
             any_notification_visible: Cell::new(true),
             stashed: StashedSctpRecv::empty(),
@@ -2428,15 +2422,16 @@ impl SctpRecvState {
     const fn configured(config: SctpSocketConfig) -> Self {
         Self {
             discarding_tail: false,
-            recv_rcvinfo_requested: config.recv_rcvinfo,
+            recv_rcvinfo_requested: Cell::new(config.recv_rcvinfo),
             partial_delivery_visible: Cell::new(config.notifications.partial_delivery),
             any_notification_visible: Cell::new(config.notifications.any()),
             stashed: StashedSctpRecv::empty(),
         }
     }
 
-    /// Records a successfully applied caller-requested notification policy.
-    fn set_notification_visibility(&self, mask: SctpNotificationMask) {
+    /// Records a successfully applied caller-requested receive policy.
+    fn set_receive_policy(&self, mask: SctpNotificationMask, recv_rcvinfo_requested: bool) {
+        self.recv_rcvinfo_requested.set(recv_rcvinfo_requested);
         self.partial_delivery_visible.set(mask.partial_delivery);
         self.any_notification_visible.set(mask.any());
     }
@@ -2455,7 +2450,7 @@ impl SctpRecvState {
             rcvinfo,
             msg_flags,
             data_slice,
-            self.recv_rcvinfo_requested,
+            self.recv_rcvinfo_requested.get(),
             parsed_notification,
         )
     }
@@ -2495,27 +2490,39 @@ impl SctpRecvState {
     ///
     /// # Safety
     ///
-    /// A non-null `*state_ptr` must be a live operation owned by this stream's
-    /// reactor, `process_completed` must match its retained payload type, and
-    /// no other receive may already be stashed.
-    unsafe fn stash(
-        &mut self,
-        state_ptr: &mut *mut CompletionState,
+    /// A non-null `*state_slot` must identify a live operation owned by this
+    /// stream's reactor, `process_completed` must match its retained payload
+    /// type, and no other receive may already be stashed.
+    unsafe fn stash_unchecked(
+        recv_state: *mut Self,
+        state_slot: *mut *mut CompletionState,
         iov_count: usize,
         process_completed: StashedSctpRecvProcessor,
     ) {
-        if (*state_ptr).is_null() {
+        debug_assert!(!recv_state.is_null(), "SCTP receive state is missing");
+        debug_assert!(!state_slot.is_null(), "SCTP operation slot is missing");
+        let state_ptr = unsafe { *state_slot };
+        if state_ptr.is_null() {
             return;
         }
         debug_assert!(
-            self.stashed.state_ptr.is_null(),
+            unsafe { (*recv_state).stashed.state_ptr.is_null() },
             "SCTP stream already has a stashed metadata receive"
         );
-        unsafe { (**state_ptr).clear_waiter() };
-        self.stashed.state_ptr = *state_ptr;
-        self.stashed.iov_count = iov_count;
-        self.stashed.process_completed = Some(process_completed);
-        *state_ptr = std::ptr::null_mut();
+        unsafe {
+            // Publish stream ownership before releasing the waiter. Its final
+            // task reference may run user drop glue and synchronously re-enter
+            // this receive state.
+            (*recv_state).stashed.state_ptr = state_ptr;
+            (*recv_state).stashed.iov_count = iov_count;
+            (*recv_state).stashed.process_completed = Some(process_completed);
+            *state_slot = std::ptr::null_mut();
+
+            let waiter = CompletionState::take_waiter_unchecked(state_ptr);
+            if !waiter.is_null() {
+                release_task(waiter);
+            }
+        }
     }
 
     /// Clears any waiter retained by the stream-owned dropped receive.
@@ -2524,9 +2531,14 @@ impl SctpRecvState {
     ///
     /// A non-null stashed pointer must identify a live completion state that
     /// this receive state exclusively owns.
-    unsafe fn clear_stashed_waiter(&mut self) {
-        if !self.stashed.state_ptr.is_null() {
-            unsafe { (*self.stashed.state_ptr).clear_waiter() };
+    unsafe fn clear_stashed_waiter_unchecked(recv_state: *mut Self) {
+        debug_assert!(!recv_state.is_null(), "SCTP receive state is missing");
+        let state_ptr = unsafe { (*recv_state).stashed.state_ptr };
+        if !state_ptr.is_null() {
+            let waiter = unsafe { CompletionState::take_waiter_unchecked(state_ptr) };
+            if !waiter.is_null() {
+                unsafe { release_task(waiter) };
+            }
         }
     }
 
@@ -2534,7 +2546,8 @@ impl SctpRecvState {
     ///
     /// # Safety
     ///
-    /// Any stashed pointer and processor must satisfy [`SctpRecvState::stash`],
+    /// Any stashed pointer and processor must satisfy
+    /// [`SctpRecvState::stash_unchecked`],
     /// and `cx` must carry the FlowIO waker for the owning reactor.
     unsafe fn poll_stashed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let state_ptr = self.stashed.state_ptr;
@@ -2580,7 +2593,7 @@ impl SctpRecvState {
     /// # Safety
     ///
     /// A non-null stashed pointer must identify the exclusively owned live
-    /// operation transferred by [`SctpRecvState::stash`].
+    /// operation transferred by [`SctpRecvState::stash_unchecked`].
     unsafe fn drop_stashed(&mut self) {
         unsafe { drop_op_ptr_unchecked(&mut self.stashed.state_ptr) };
         self.stashed.iov_count = 0;
@@ -2612,33 +2625,41 @@ impl SctpRecvState {
 /// A kernel zero-byte completion with no control message and no flags is clean
 /// peer EOF and resolves as
 /// `Ok((0, SctpRecvMeta::Data(SctpRecvInfo::default())))`. Both methods reject
-/// zero-length caller destinations before submission, so such a request cannot
-/// masquerade as EOF. When FlowIO's socket configuration did not request
-/// `SCTP_RCVINFO`, ordinary data with no receive info succeeds with default
+/// zero-length caller destinations before submission or adoption of a prior
+/// dropped metadata receive, so such a request cannot masquerade as EOF. The
+/// one-entry dropped-receive stash remains owned by the stream for the next
+/// valid metadata receive or stream destruction. When polled without a valid
+/// FlowIO context, `NotConnected` retains precedence over local `InvalidInput`
+/// and the stash is likewise untouched. When the stream's stored receive-info
+/// policy is disabled, ordinary data with no receive info succeeds with default
 /// ancillary fields and the kernel's end-of-record flag, including when
 /// complete unrelated socket control records are present. An externally
-/// adopted descriptor has the same no-request policy because adoption performs
-/// no option query. When FlowIO did request receive info, ordinary data that
-/// omits it is `InvalidData`. Metadata receive uses fixed-capacity control
-/// storage sized for common Linux timestamp, timestamping packet-info,
-/// receive-queue-overflow, and RCVINFO records; it never allocates control
-/// storage per message. Additional externally enabled records such as
-/// `SCTP_NXTINFO`, socket mark/priority, or Wi-Fi status are skipped if they
-/// fit but are outside that guaranteed combination. When `MSG_CTRUNC` arrives
-/// without usable `SCTP_RCVINFO`, `InvalidData` identifies fixed control-buffer
-/// capacity exhaustion. Present malformed control instead retains its specific
-/// parser diagnostic even if `MSG_CTRUNC` is also set. Intact receive info
-/// remains usable when only later control was truncated. Kernel receive errors
-/// are returned as `io::Error` values from the completed operation.
+/// adopted descriptor initially has that disabled policy because adoption
+/// performs no option query. A successful later
+/// [`SctpStream::set_notification_mask`] call refreshes the policy from the
+/// descriptor's live `SCTP_RECVRCVINFO` setting. When the stored policy is
+/// enabled, ordinary data that omits receive info is `InvalidData`. Metadata
+/// receive uses fixed-capacity control storage sized for common Linux timestamp,
+/// timestamping packet-info, receive-queue-overflow, and RCVINFO records; it
+/// never allocates control storage per message. Additional externally enabled
+/// records such as `SCTP_NXTINFO`, socket mark/priority, or Wi-Fi status are
+/// skipped if they fit but are outside that guaranteed combination. When
+/// `MSG_CTRUNC` arrives without usable `SCTP_RCVINFO`, `InvalidData` identifies
+/// fixed control-buffer capacity exhaustion. Present malformed control instead
+/// retains its specific parser diagnostic even if `MSG_CTRUNC` is also set.
+/// Intact receive info remains usable when only later control was truncated.
+/// Kernel receive errors are returned as `io::Error` values from the completed
+/// operation.
 ///
 /// # In-flight drop ownership
 ///
 /// Dropping an in-flight receive or send future relinquishes the caller buffer
 /// to the runtime until the original kernel completion retires; the buffer is
 /// not returned to the caller on that cancellation path. Dropped metadata
-/// receives are adopted by the next metadata receive so SCTP record-boundary
-/// resynchronization state is updated from the retired completion. While a
-/// metadata receive is discarding an oversized record tail, keep using
+/// receives are adopted by the next valid metadata receive so SCTP
+/// record-boundary resynchronization state is updated from the retired
+/// completion. While a metadata receive is discarding an oversized record tail,
+/// keep using
 /// [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until the next
 /// record boundary is reached; the data-only [`SctpStream::recv`] path does
 /// not participate in that resynchronization state. Notifications observed
@@ -3145,17 +3166,21 @@ impl SctpStream {
     /// setting the field to true keeps complete abort notifications
     /// caller-visible. If other notification types are also requested, a
     /// caller buffer too short to identify a fragmented notification retains
-    /// the normal truncated-notification error behavior. The visibility policy
-    /// changes only after the kernel accepts the new mask.
+    /// the normal truncated-notification error behavior. After the kernel
+    /// accepts the new mask, the stream also records the observed
+    /// `SCTP_RECVRCVINFO` setting so later metadata receives apply the matching
+    /// strict-or-default ancillary policy.
     ///
     /// This is signaling setup/control-plane work. Data-only fast paths should
     /// use [`SctpSocketConfig::data`] and avoid per-message mask changes.
     pub fn set_notification_mask(&self, mask: SctpNotificationMask) -> io::Result<()> {
         let recv_rcvinfo: libc::c_int =
             get_sock_opt(self.fd.raw_fd(), libc::IPPROTO_SCTP, libc::SCTP_RECVRCVINFO)?;
-        let effective = effective_sctp_notification_mask(mask, recv_rcvinfo != 0);
+        let recv_rcvinfo_requested = recv_rcvinfo != 0;
+        let effective = effective_sctp_notification_mask(mask, recv_rcvinfo_requested);
         set_sctp_events(self.fd.raw_fd(), effective)?;
-        self.recv_state.set_notification_visibility(mask);
+        self.recv_state
+            .set_receive_policy(mask, recv_rcvinfo_requested);
         Ok(())
     }
 
@@ -3262,7 +3287,9 @@ impl SctpStream {
     ///
     /// # Errors
     /// Returns `InvalidInput` if `len` is zero or exceeds
-    /// `buffer.writable_len()`.
+    /// `buffer.writable_len()`. After owner-context validation, this local
+    /// error returns the exact buffer before adopting a prior dropped metadata
+    /// receive; that stash remains for the next valid request.
     /// Shared metadata parsing, truncation, EOF, and record-tail recovery
     /// behavior is documented on [`SctpStream`].
     ///
@@ -3345,29 +3372,33 @@ impl SctpStream {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if the chain has no writable
-    /// bytes, iovec materialization overflows, or its active writable-segment
-    /// count changes before submission. Materialization and shape failures
-    /// return the exact chain without submitting kernel I/O. Shared metadata
-    /// parsing, truncation, EOF, and record-tail recovery behavior is
-    /// documented on [`SctpStream`].
+    /// bytes, its aggregate writable byte count cannot be represented by
+    /// `usize`, iovec materialization fails, or the materialized active
+    /// writable-segment count or byte total differs from the construction-time
+    /// snapshot. After owner-context validation, an empty or zero-writable
+    /// chain returns unchanged before adopting a prior dropped metadata
+    /// receive; that stash remains for the next valid request. Materialization
+    /// and shape failures return the exact chain without submitting kernel I/O.
+    /// Shared metadata parsing, truncation, EOF, and record-tail recovery
+    /// behavior is documented on [`SctpStream`].
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv_msg_vectored<const N: usize>(
         &mut self,
         buffer: IoBuffVecMut<N>,
     ) -> RecvVectoredFuture<'_, N> {
-        let (iov_count, writable_len) = buffer.read_iovec_count_and_writable_len();
-        let input_error = if writable_len == 0 {
-            Some(invalid_zero_length_sctp_recv())
-        } else {
-            None
-        };
+        let (iov_count, writable, invalid_aggregate) =
+            match buffer.checked_read_iovec_count_and_writable_len() {
+                Some((iov_count, writable)) => (iov_count, writable, false),
+                None => (0, 0, true),
+            };
         RecvVectoredFuture {
             fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
             iov_count,
-            input_error,
+            writable,
+            invalid_aggregate,
             recv_state: &mut self.recv_state,
             _marker: PhantomData,
         }
@@ -3391,12 +3422,18 @@ impl SctpStream {
         buffer: IoBuffVec<N>,
         info: SctpSendInfo,
     ) -> SendVectoredFuture<'_, N> {
-        let input_error = validate_sctp_vectored_send_len(buffer.checked_len()).err();
+        let (iov_count, total, invalid_aggregate) =
+            match checked_iobuffvec_write_iovec_count_and_len(&buffer) {
+                Some((iov_count, total)) => (iov_count, total, false),
+                None => (0, 0, true),
+            };
         SendVectoredFuture {
             fd: self.fd.raw_fd(),
             state_ptr: std::ptr::null_mut(),
             buffer: Some(buffer),
-            input_error,
+            iov_count,
+            total,
+            invalid_aggregate,
             sndinfo: raw_sndinfo_from_public(info),
             _marker: PhantomData,
         }
@@ -3499,12 +3536,12 @@ const SCTP_RECV_CONTROL_LEN: usize = SOCKET_TIMESTAMP_CONTROL_LEN
 const _: () = {
     assert!(std::mem::size_of::<LinuxKernelSockTimeval>() == 2 * std::mem::size_of::<i64>());
     assert!(std::mem::align_of::<LinuxKernelSockTimeval>() == std::mem::align_of::<i64>());
+    assert!(std::mem::offset_of!(LinuxKernelSockTimeval, tv_sec) == 0);
+    assert!(std::mem::offset_of!(LinuxKernelSockTimeval, tv_usec) == 8);
     assert!(std::mem::size_of::<LinuxKernelTimespec>() == 2 * std::mem::size_of::<i64>());
     assert!(std::mem::align_of::<LinuxKernelTimespec>() == std::mem::align_of::<i64>());
-    assert!(
-        SOCKET_TIMESTAMP_CONTROL_LEN == cmsg_space(std::mem::size_of::<LinuxKernelSockTimeval>())
-    );
-    assert!(SOCKET_TIMESTAMP_CONTROL_LEN == cmsg_space(std::mem::size_of::<LinuxKernelTimespec>()));
+    assert!(std::mem::offset_of!(LinuxKernelTimespec, tv_sec) == 0);
+    assert!(std::mem::offset_of!(LinuxKernelTimespec, tv_nsec) == 8);
     assert!(SOCKET_TIMESTAMP_CONTROL_LEN >= cmsg_space(std::mem::size_of::<libc::timeval>()));
     assert!(SOCKET_TIMESTAMP_CONTROL_LEN >= cmsg_space(std::mem::size_of::<libc::timespec>()));
 
@@ -3515,31 +3552,27 @@ const _: () = {
     assert!(
         std::mem::align_of::<LinuxScmTimestamping>() == std::mem::align_of::<LinuxKernelTimespec>()
     );
-    assert!(
-        SOCKET_TIMESTAMPING_CONTROL_LEN == cmsg_space(std::mem::size_of::<LinuxScmTimestamping>())
-    );
+    assert!(std::mem::offset_of!(LinuxScmTimestamping, ts) == 0);
 
     assert!(std::mem::size_of::<LinuxScmTimestampingPktInfo>() == 4 * std::mem::size_of::<u32>());
     assert!(std::mem::align_of::<LinuxScmTimestampingPktInfo>() == std::mem::align_of::<u32>());
-    assert!(
-        SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN
-            == cmsg_space(std::mem::size_of::<LinuxScmTimestampingPktInfo>())
-    );
+    assert!(std::mem::offset_of!(LinuxScmTimestampingPktInfo, if_index) == 0);
+    assert!(std::mem::offset_of!(LinuxScmTimestampingPktInfo, pkt_length) == 4);
+    assert!(std::mem::offset_of!(LinuxScmTimestampingPktInfo, reserved) == 8);
 
     assert!(std::mem::size_of::<LinuxSocketRxqOverflow>() == std::mem::size_of::<u32>());
     assert!(std::mem::align_of::<LinuxSocketRxqOverflow>() == std::mem::align_of::<u32>());
-    assert!(
-        SOCKET_RXQ_OVFL_CONTROL_LEN == cmsg_space(std::mem::size_of::<LinuxSocketRxqOverflow>())
-    );
-    assert!(SCTP_RCVINFO_CONTROL_LEN == cmsg_space(std::mem::size_of::<libc::sctp_rcvinfo>()));
-    assert!(
-        SCTP_RECV_CONTROL_LEN
-            == SOCKET_TIMESTAMP_CONTROL_LEN
-                + SOCKET_TIMESTAMPING_CONTROL_LEN
-                + SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN
-                + SOCKET_RXQ_OVFL_CONTROL_LEN
-                + SCTP_RCVINFO_CONTROL_LEN
-    );
+    assert!(std::mem::offset_of!(LinuxSocketRxqOverflow, 0) == 0);
+};
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = {
+    assert!(SOCKET_TIMESTAMP_CONTROL_LEN == 32);
+    assert!(SOCKET_TIMESTAMPING_CONTROL_LEN == 64);
+    assert!(SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN == 32);
+    assert!(SOCKET_RXQ_OVFL_CONTROL_LEN == 24);
+    assert!(SCTP_RCVINFO_CONTROL_LEN == 48);
+    assert!(SCTP_RECV_CONTROL_LEN == 200);
 };
 
 // These retained recvmsg/sendmsg payloads become self-referential after their
@@ -3729,26 +3762,27 @@ struct RetainedSctpRecvVectoredPayload<const N: usize> {
 /// # Safety
 ///
 /// `pool` must identify the live retained pool for the active owner-thread
-/// reactor. `buffer` must contain one chain and `iov_count` must be its expected
-/// nonempty writable-segment count. A mismatch returns `InvalidInput` before
-/// the chain moves out of `buffer`. A returned payload must be attached to a
-/// state owned by that same reactor or consumed through `pool`.
+/// reactor. `buffer` must contain one chain and `expected_shape` must be its
+/// checked `(nonempty writable-segment count, total writable length)` snapshot.
+/// A mismatch returns `InvalidInput` before the chain moves out of `buffer`. A
+/// returned payload must be attached to a state owned by that same reactor or
+/// consumed through `pool`.
 #[inline(always)]
 unsafe fn emplace_retained_sctp_recv_vectored_payload<const N: usize>(
     pool: NonNull<RetainedPayloadPool>,
     buffer: &mut Option<IoBuffVecMut<N>>,
-    iov_count: usize,
+    expected_shape: (usize, usize),
 ) -> io::Result<RetainedPayload<RetainedSctpRecvVectoredPayload<N>>> {
     unsafe {
         with_raw_retained_slot::<RetainedSctpRecvVectoredPayload<N>, _>(pool, |mut slot| {
             let dst = slot.as_mut_ptr();
             let iovecs = &mut *std::ptr::addr_of_mut!((*dst).iovecs);
             let expected_iovecs = iovecs
-                .get_mut(..iov_count)
+                .get_mut(..expected_shape.0)
                 .ok_or_else(invalid_read_iovec_shape)?;
-            let (materialized_count, writable_len) =
+            let materialized_shape =
                 fill_recv_vectored_iovecs(buffer.as_mut().unwrap_unchecked(), expected_iovecs)?;
-            if materialized_count != iov_count || writable_len == 0 {
+            if materialized_shape != expected_shape {
                 return Err(invalid_read_iovec_shape());
             }
 
@@ -3758,7 +3792,7 @@ unsafe fn emplace_retained_sctp_recv_vectored_payload<const N: usize>(
                     name: std::ptr::null_mut(),
                     namelen: 0,
                     iov: std::ptr::addr_of_mut!((*dst).iovecs).cast::<libc::iovec>(),
-                    iovlen: materialized_count,
+                    iovlen: materialized_shape.0,
                     control: std::ptr::addr_of_mut!((*dst).control)
                         .cast::<u8>()
                         .cast::<libc::c_void>(),
@@ -3797,30 +3831,32 @@ struct RetainedSctpSendVectoredPayload<const N: usize> {
 ///
 /// `pool` must identify the live retained pool for the active owner-thread
 /// reactor. `buffer` must contain a chain with at least one readable byte, and
-/// the returned payload must be attached to a state owned by that same reactor
-/// or consumed through `pool`. If checked iovec materialization fails, `buffer`
+/// `expected_shape` must be its checked `(nonempty segment count, total readable
+/// length)` snapshot. The returned payload must be attached to a state owned by
+/// that same reactor or consumed through `pool`. If checked iovec
+/// materialization fails or its shape differs from the snapshot, `buffer`
 /// remains untouched and no ownership is transferred into the raw slot.
 #[inline(always)]
 unsafe fn emplace_retained_sctp_send_vectored_payload<const N: usize>(
     pool: NonNull<RetainedPayloadPool>,
     buffer: &mut Option<IoBuffVec<N>>,
+    expected_shape: (usize, usize),
     sndinfo: libc::sctp_sndinfo,
 ) -> io::Result<RetainedPayload<RetainedSctpSendVectoredPayload<N>>> {
     unsafe {
         with_raw_retained_slot::<RetainedSctpSendVectoredPayload<N>, _>(pool, |mut slot| {
             let dst = slot.as_mut_ptr();
             let source = buffer.as_ref().unwrap_unchecked();
-            let (iov_count, readable_len) =
+            let materialized_shape =
                 fill_iobuffvec_write_iovecs(source, &mut *std::ptr::addr_of_mut!((*dst).iovecs))?;
-            debug_assert!(
-                iov_count > 0 && readable_len > 0,
-                "SCTP vectored send lost readable data before submission"
-            );
+            if materialized_shape != expected_shape {
+                return Err(invalid_writev_shape());
+            }
             init_retained_sctp_send_fields(
                 std::ptr::addr_of_mut!((*dst).msghdr),
                 std::ptr::addr_of_mut!((*dst).control),
                 std::ptr::addr_of_mut!((*dst).iovecs).cast::<libc::iovec>(),
-                iov_count,
+                materialized_shape.0,
                 sndinfo,
             );
 
@@ -4053,14 +4089,6 @@ unsafe fn take_stashed_sctp_recv_vectored_completion<const N: usize>(
 }
 
 #[inline(always)]
-fn sctp_cqe_result(result: i32) -> io::Result<usize> {
-    if result < 0 {
-        return Err(io::Error::from_raw_os_error(-result));
-    }
-    Ok(result as usize)
-}
-
-#[inline(always)]
 fn fill_recv_vectored_iovecs<const N: usize>(
     buffer: &mut IoBuffVecMut<N>,
     iovecs: &mut [MaybeUninit<libc::iovec>],
@@ -4282,7 +4310,7 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
     discarding_tail: &mut bool,
 ) {
     let state_return = unsafe { StashedSctpStateReturnGuard::new(reactor, state_ptr) };
-    let result = unsafe { sctp_cqe_result((*state_ptr).result) };
+    let result = unsafe { completion_cqe_result((*state_ptr).result) };
     if let Ok(actual) = result {
         let mut completion = unsafe {
             Reactor::take_retained_payload_with_unchecked::<RetainedSctpRecvPayload<B>, _>(
@@ -4316,7 +4344,7 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
     iov_count: usize,
     discarding_tail: &mut bool,
 ) {
-    let result = unsafe { sctp_cqe_result((*state_ptr).result) };
+    let result = unsafe { completion_cqe_result((*state_ptr).result) };
     if let Ok(actual) = result {
         let completion = unsafe {
             Reactor::take_retained_payload_with_unchecked::<RetainedSctpRecvVectoredPayload<N>, _>(
@@ -4345,7 +4373,7 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
 /// `*state_ptr` must be non-null, owned by `pctx`'s reactor, and no kernel
 /// operation may still reference its state or retained payload.
 unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
-    unsafe { (*pctx.reactor()).free_op(*state_ptr) };
+    unsafe { Reactor::free_op_unchecked(pctx.reactor(), *state_ptr) };
     *state_ptr = std::ptr::null_mut();
 }
 
@@ -4365,7 +4393,7 @@ unsafe fn take_completed_sctp_payload_with<T: 'static, R>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
     extract: impl FnOnce(*mut T, Option<usize>) -> R,
-) -> Option<(io::Result<usize>, R, bool)> {
+) -> Option<CompletionTake<io::Result<usize>, R>> {
     if (*state_ptr).is_null() {
         return None;
     }
@@ -4375,7 +4403,7 @@ unsafe fn take_completed_sctp_payload_with<T: 'static, R>(
         return None;
     }
 
-    let result = sctp_cqe_result(state.result);
+    let result = completion_cqe_result(state.result);
     let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
     let context_rejected = op_ctx.context_rejected();
     let actual = if context_rejected {
@@ -4390,7 +4418,11 @@ unsafe fn take_completed_sctp_payload_with<T: 'static, R>(
     };
     unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
-    Some((result, value, context_rejected))
+    Some(CompletionTake::from_context(
+        result,
+        value,
+        context_rejected,
+    ))
 }
 
 #[inline(always)]
@@ -4477,16 +4509,14 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, buffer, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedDataRecvPayload<B>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload, _| take_sctp_retained_buffer(std::ptr::addr_of!((*payload).buffer)),
             )
         } {
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
+            let (result, buffer) = completion.into_io_result(std::convert::identity);
             match result {
                 Err(err) => return Poll::Ready((Err(err), buffer)),
                 Ok(actual) => {
@@ -4571,16 +4601,14 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, buffer, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedDataSendPayload<B>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload, _| take_sctp_retained_buffer(std::ptr::addr_of!((*payload).buffer)),
             )
         } {
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
+            let (result, buffer) = completion.into_io_result(std::convert::identity);
             return Poll::Ready((result, buffer));
         }
 
@@ -4653,15 +4681,6 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        match unsafe { this.recv_state.poll_stashed(cx) } {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(err)) => {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(err), buffer));
-            }
-            Poll::Ready(Ok(())) => {}
-        }
-
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
         {
@@ -4673,8 +4692,17 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             return Poll::Pending;
         }
 
+        match unsafe { this.recv_state.poll_stashed(cx) } {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Err(err), buffer));
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+
         let inspect_metadata = !this.recv_state.discarding_tail;
-        if let Some((result, completion, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedSctpRecvPayload<B>, _>(
                 cx,
                 &mut this.state_ptr,
@@ -4683,30 +4711,35 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 },
             )
         } {
-            let mut completion = completion;
-            if context_rejected {
-                if let Ok(actual) = result {
-                    let header = completion.meta.header;
-                    // SAFETY: a successful CQE initialized exactly this
-                    // prefix, and the returned buffer still owns its stable
-                    // backing. Inspect a nonempty caller buffer before
-                    // changing record-recovery state because its pointer
-                    // callback may unwind. Zero progress bypasses the
-                    // callback inside the shared slice helper.
-                    let data_slice =
-                        unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-                    update_discarding_after_unpublished_completion(
-                        &mut this.recv_state.discarding_tail,
-                        actual,
-                        header,
-                        data_slice,
-                    );
+            let (result, mut completion) = match completion {
+                CompletionTake::Accepted { result, value } => (result, value),
+                CompletionTake::ContextRejected {
+                    result,
+                    value: mut completion,
+                } => {
+                    if let Ok(actual) = result {
+                        let header = completion.meta.header;
+                        // SAFETY: a successful CQE initialized exactly this
+                        // prefix, and the returned buffer still owns its stable
+                        // backing. Inspect a nonempty caller buffer before
+                        // changing record-recovery state because its pointer
+                        // callback may unwind. Zero progress bypasses the
+                        // callback inside the shared slice helper.
+                        let data_slice =
+                            unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
+                        update_discarding_after_unpublished_completion(
+                            &mut this.recv_state.discarding_tail,
+                            actual,
+                            header,
+                            data_slice,
+                        );
+                    }
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        completion.buffer,
+                    ));
                 }
-                return Poll::Ready((
-                    Err(io::Error::from(io::ErrorKind::NotConnected)),
-                    completion.buffer,
-                ));
-            }
+            };
             let actual = match result {
                 Ok(actual) => actual,
                 Err(err) => return Poll::Ready((Err(err), completion.buffer)),
@@ -4803,11 +4836,16 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
 impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
     fn drop(&mut self) {
         unsafe {
+            let recv_state = self.recv_state as *mut SctpRecvState;
             if self.state_ptr.is_null() {
-                self.recv_state.clear_stashed_waiter();
+                SctpRecvState::clear_stashed_waiter_unchecked(recv_state);
             } else {
-                self.recv_state
-                    .stash(&mut self.state_ptr, 0, process_stashed_sctp_recv::<B>);
+                SctpRecvState::stash_unchecked(
+                    recv_state,
+                    std::ptr::addr_of_mut!(self.state_ptr),
+                    0,
+                    process_stashed_sctp_recv::<B>,
+                );
             }
         }
     }
@@ -4848,16 +4886,14 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, buffer, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedSctpSendPayload<B>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload, _| take_sctp_retained_buffer(std::ptr::addr_of!((*payload).buffer)),
             )
         } {
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
+            let (result, buffer) = completion.into_io_result(std::convert::identity);
             return Poll::Ready((result, buffer));
         }
 
@@ -4921,8 +4957,10 @@ pub struct RecvVectoredFuture<'a, const N: usize> {
     buffer: Option<IoBuffVecMut<N>>,
     /// Number of nonempty writable segments materialized for each submission.
     iov_count: usize,
-    /// Deferred validation error returned before any SQE submission.
-    input_error: Option<io::Error>,
+    /// Total writable capacity paired with `iov_count` for each submission.
+    writable: usize,
+    /// Whether the sizing pass found an unrepresentable writable aggregate.
+    invalid_aggregate: bool,
     /// Parent stream metadata receive state shared across metadata receives.
     recv_state: &'a mut SctpRecvState,
     /// Borrows the parent stream for the future lifetime.
@@ -4935,6 +4973,27 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        if this.state_ptr.is_null() && this.buffer.is_none() {
+            return Poll::Pending;
+        }
+
+        let input_error = if this.state_ptr.is_null() {
+            if std::mem::take(&mut this.invalid_aggregate) {
+                Some(invalid_readv_aggregate())
+            } else if this.writable == 0 {
+                Some(invalid_zero_length_sctp_recv())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(err) = input_error {
+            let result = validate_local_io_result(cx, Err(err));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((result, buffer));
+        }
+
         match unsafe { this.recv_state.poll_stashed(cx) } {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(err)) => {
@@ -4944,20 +5003,8 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
             Poll::Ready(Ok(())) => {}
         }
 
-        if this.state_ptr.is_null()
-            && let Some(err) = this.input_error.take()
-        {
-            let result = validate_local_io_result(cx, Err(err));
-            let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((result, buffer));
-        }
-
-        if this.state_ptr.is_null() && this.buffer.is_none() {
-            return Poll::Pending;
-        }
-
         let inspect_metadata = !this.recv_state.discarding_tail;
-        if let Some((result, completion, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedSctpRecvVectoredPayload<N>, _>(
                 cx,
                 &mut this.state_ptr,
@@ -4970,26 +5017,33 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 },
             )
         } {
-            if context_rejected {
-                if let Ok(actual) = result {
-                    let header = completion.meta.header;
-                    // SAFETY: completion extraction copied the first active
-                    // kernel iovec before releasing retained storage, and the
-                    // returned chain still owns every referenced allocation.
-                    let data_slice =
-                        unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-                    update_discarding_after_unpublished_completion(
-                        &mut this.recv_state.discarding_tail,
-                        actual,
-                        header,
-                        data_slice,
-                    );
+            let (result, completion) = match completion {
+                CompletionTake::Accepted { result, value } => (result, value),
+                CompletionTake::ContextRejected {
+                    result,
+                    value: completion,
+                } => {
+                    if let Ok(actual) = result {
+                        let header = completion.meta.header;
+                        // SAFETY: completion extraction copied the first active
+                        // kernel iovec before releasing retained storage, and the
+                        // returned chain still owns every referenced allocation.
+                        let data_slice = unsafe {
+                            sctp_first_iov_slice(completion.first_iovec.as_ref(), actual)
+                        };
+                        update_discarding_after_unpublished_completion(
+                            &mut this.recv_state.discarding_tail,
+                            actual,
+                            header,
+                            data_slice,
+                        );
+                    }
+                    return Poll::Ready((
+                        Err(io::Error::from(io::ErrorKind::NotConnected)),
+                        completion.buffer,
+                    ));
                 }
-                return Poll::Ready((
-                    Err(io::Error::from(io::ErrorKind::NotConnected)),
-                    completion.buffer,
-                ));
-            }
+            };
             let actual = match result {
                 Ok(actual) => actual,
                 Err(err) => return Poll::Ready((Err(err), completion.buffer)),
@@ -5015,16 +5069,21 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 unsafe {
                     buffer.distribute_written(0);
                 }
-                let (iov_count, writable_len) = buffer.read_iovec_count_and_writable_len();
+                let Some((iov_count, writable)) =
+                    buffer.checked_read_iovec_count_and_writable_len()
+                else {
+                    return Poll::Ready((Err(invalid_readv_aggregate()), buffer));
+                };
+                if writable == 0 {
+                    return Poll::Ready((Err(invalid_read_iovec_shape()), buffer));
+                }
                 debug_assert_eq!(
-                    iov_count, this.iov_count,
+                    (iov_count, writable),
+                    (this.iov_count, this.writable),
                     "SCTP vectored internal recv changed the receive chain shape"
                 );
-                debug_assert!(
-                    writable_len > 0,
-                    "SCTP vectored internal recv lost writable capacity"
-                );
                 this.iov_count = iov_count;
+                this.writable = writable;
                 this.buffer = Some(buffer);
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -5068,7 +5127,7 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 emplace_retained_sctp_recv_vectored_payload(
                     Reactor::retained_payload_pool_ptr(pctx.reactor()),
                     &mut this.buffer,
-                    this.iov_count,
+                    (this.iov_count, this.writable),
                 )
             } {
                 Ok(payload) => payload,
@@ -5102,11 +5161,13 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
 impl<const N: usize> Drop for RecvVectoredFuture<'_, N> {
     fn drop(&mut self) {
         unsafe {
+            let recv_state = self.recv_state as *mut SctpRecvState;
             if self.state_ptr.is_null() {
-                self.recv_state.clear_stashed_waiter();
+                SctpRecvState::clear_stashed_waiter_unchecked(recv_state);
             } else {
-                self.recv_state.stash(
-                    &mut self.state_ptr,
+                SctpRecvState::stash_unchecked(
+                    recv_state,
+                    std::ptr::addr_of_mut!(self.state_ptr),
                     self.iov_count,
                     process_stashed_sctp_recv_vectored::<N>,
                 );
@@ -5127,8 +5188,12 @@ pub struct SendVectoredFuture<'a, const N: usize> {
     state_ptr: *mut CompletionState,
     /// Caller-owned vectored send chain returned on completion.
     buffer: Option<IoBuffVec<N>>,
-    /// Deferred validation error returned before any SQE submission.
-    input_error: Option<io::Error>,
+    /// Number of nonempty readable segments expected at materialization.
+    iov_count: usize,
+    /// Total readable byte count paired with `iov_count`.
+    total: usize,
+    /// Whether the sizing pass found an unrepresentable readable aggregate.
+    invalid_aggregate: bool,
     /// Public send metadata translated into the kernel ABI layout.
     sndinfo: libc::sctp_sndinfo,
     /// Borrows the parent stream for the future lifetime.
@@ -5141,27 +5206,33 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.state_ptr.is_null()
-            && let Some(err) = this.input_error.take()
-        {
-            let result = validate_local_io_result(cx, Err(err));
-            let buffer = unsafe { opt_take(&mut this.buffer) };
-            return Poll::Ready((result, buffer));
-        }
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
         }
 
-        if let Some((result, buffer, context_rejected)) = unsafe {
+        let input_error = if this.state_ptr.is_null() {
+            if std::mem::take(&mut this.invalid_aggregate) {
+                validate_sctp_vectored_send_len(None).err()
+            } else {
+                validate_sctp_vectored_send_len(Some(this.total)).err()
+            }
+        } else {
+            None
+        };
+        if let Some(err) = input_error {
+            let result = validate_local_io_result(cx, Err(err));
+            let buffer = unsafe { opt_take(&mut this.buffer) };
+            return Poll::Ready((result, buffer));
+        }
+
+        if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedSctpSendVectoredPayload<N>, _>(
                 cx,
                 &mut this.state_ptr,
                 |payload, _| take_sctp_retained_buffer(std::ptr::addr_of!((*payload).buffer)),
             )
         } {
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
+            let (result, buffer) = completion.into_io_result(std::convert::identity);
             return Poll::Ready((result, buffer));
         }
 
@@ -5179,6 +5250,7 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
                 emplace_retained_sctp_send_vectored_payload(
                     Reactor::retained_payload_pool_ptr(pctx.reactor()),
                     &mut this.buffer,
+                    (this.iov_count, this.total),
                     this.sndinfo,
                 )
             } {
@@ -5303,94 +5375,15 @@ impl Future for ConnectFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        if !this.slot.state_ptr.is_null() {
-            let state = unsafe { &*this.slot.state_ptr };
-            if state.is_completed() {
-                let result = state.result;
-                let op_ctx =
-                    unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), this.slot.state_ptr) };
-                unsafe { op_ctx.free_op_unchecked(this.slot.state_ptr) };
-                this.slot.state_ptr = std::ptr::null_mut();
-                this.slot.in_use = false;
-
-                if op_ctx.context_rejected() {
-                    this.slot.cleanup_fd();
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-                }
-                if let Err(err) = connect_cqe_result(result) {
-                    this.slot.cleanup_fd();
-                    return Poll::Ready(Err(err));
-                }
-
-                if let Err(err) =
-                    apply_sctp_established_config(this.slot.fd, this.slot.connected_config)
-                {
-                    this.slot.cleanup_fd();
-                    return Poll::Ready(Err(err));
-                }
-                return Poll::Ready(Ok(this.slot.take_stream(this.remote_addr)));
-            }
-        }
-
-        if this.slot.state_ptr.is_null() {
-            let pctx = match poll_ctx_from_waker(cx) {
-                Ok(pctx) => pctx,
-                Err(err) => {
-                    this.slot.in_use = false;
-                    this.slot.cleanup_fd();
-                    return Poll::Ready(Err(err));
-                }
-            };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                this.slot.in_use = false;
-                this.slot.cleanup_fd();
-                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
-            }
-            this.slot.state_ptr = state_ptr;
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
-
-            let payload = match this.slot.addr.take() {
-                Some(payload) => payload,
-                None => {
-                    unsafe { (*pctx.reactor()).free_op(state_ptr) };
-                    this.slot.state_ptr = std::ptr::null_mut();
-                    this.slot.in_use = false;
-                    this.slot.cleanup_fd();
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::InvalidInput)));
-                }
-            };
-
-            unsafe {
-                if let Err((e, _payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
-                        let sqe = opcode::Connect::new(
-                            types::Fd(this.slot.fd),
-                            payload.addr_ptr(),
-                            payload.addrlen,
-                        )
-                        .build()
-                        .user_data(state_ptr as u64);
-                        Ok(sqe)
-                    })
-                {
-                    (*pctx.reactor()).free_op(state_ptr);
-                    this.slot.state_ptr = std::ptr::null_mut();
-                    this.slot.in_use = false;
-                    this.slot.cleanup_fd();
-                    return Poll::Ready(Err(e));
-                }
-            }
-            return Poll::Pending;
-        }
-
-        if unsafe { refresh_op_waiter_from_waker(cx, this.slot.state_ptr) } {
-            this.slot.drop_future();
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-        }
-        Poll::Pending
+        let remote_addr = this.remote_addr;
+        this.slot.poll_connect(cx, move |fd, config| {
+            apply_sctp_established_config(fd.as_raw_fd(), *config)?;
+            Ok(SctpStream::from_configured_runtime_fd(
+                RuntimeFd::from_fresh_owned(fd),
+                remote_addr,
+                *config,
+            ))
+        })
     }
 }
 
@@ -5888,7 +5881,7 @@ const fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 /// Writes one test control-message header while leaving payload and padding
 /// bytes untouched. Panics when the supplied storage cannot hold the fields.
 pub(crate) fn write_test_cmsg_header(
@@ -5923,7 +5916,7 @@ pub(crate) fn write_test_cmsg_header(
     offset + data_offset
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 /// Appends zero-initialized test storage, then delegates the header layout to
 /// [`write_test_cmsg_header`].
 pub(crate) fn append_initialized_test_cmsg(
@@ -6087,6 +6080,25 @@ unsafe fn parse_completion_rcvinfo(
         return Ok(None);
     }
     unsafe { parse_rcvinfo(control, controllen, sctp_msg_end_of_record(msg_flags)) }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn parse_initialized_recv_state_meta_for_test(
+    recv_state: &SctpRecvState,
+    control: &[u8],
+    controllen: usize,
+    msg_flags: libc::c_int,
+    data_slice: &[u8],
+    parsed_notification: Option<io::Result<SctpRecvMeta>>,
+) -> io::Result<SctpRecvMeta> {
+    // SAFETY: initialized bytes may always be viewed as MaybeUninit bytes.
+    let control = unsafe {
+        std::slice::from_raw_parts(control.as_ptr().cast::<MaybeUninit<u8>>(), control.len())
+    };
+    // SAFETY: this test facade accepts fully initialized control bytes.
+    let rcvinfo =
+        unsafe { parse_completion_rcvinfo(control, controllen, msg_flags, !data_slice.is_empty()) };
+    recv_state.parse_completion_meta(rcvinfo, msg_flags, data_slice, parsed_notification)
 }
 
 #[cfg(any(feature = "fuzzing", feature = "test-support"))]
@@ -6587,16 +6599,49 @@ pub(crate) mod test_support {
     /// reusable connection slot.
     pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()> {
         let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-        let mut slot = ConnectSlot::new();
+        let mut slot = ConnectSlot::new(SctpSocketConfig::default());
         slot.in_use = true;
         slot.fd = fd;
+        slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
+            [127, 0, 0, 1],
+            9,
+        ))));
 
         slot.drop_future();
 
-        if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 {
+        if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 || slot.addr.is_some() {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
         if !crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        Ok(())
+    }
+
+    /// Verifies forgotten-future connector teardown closes the socket and
+    /// releases every field owned by its reusable connection slot.
+    pub fn test_connect_slot_drop_cached_state_closes_socket_fd() -> io::Result<()> {
+        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
+        let mut state = CompletionState::empty();
+        state.set_ring_abandoned();
+        let mut slot = ConnectSlot::new(SctpSocketConfig::default());
+        slot.state_ptr = &mut state;
+        slot.in_use = true;
+        slot.fd = fd;
+        slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
+            [127, 0, 0, 1],
+            9,
+        ))));
+
+        slot.drop_cached_state();
+
+        if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 || slot.addr.is_some() {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        if !crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        if !state.is_ring_abandoned() || state.is_completed() {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
         Ok(())
@@ -6629,6 +6674,36 @@ pub(crate) mod test_support {
         data_slice: &[u8],
     ) -> io::Result<SctpRecvMeta> {
         parse_recv_meta(control, controllen, msg_flags, data_slice, false)
+    }
+
+    /// Appends one zero-initialized control-message fixture using the
+    /// crate's canonical test header layout.
+    pub fn append_initialized_test_cmsg(
+        control: &mut Vec<u8>,
+        level: libc::c_int,
+        cmsg_type: libc::c_int,
+        payload_len: usize,
+    ) -> usize {
+        super::append_initialized_test_cmsg(control, level, cmsg_type, payload_len)
+    }
+
+    /// Classifies initialized receive metadata through an adopted stream's
+    /// current receive-option policy.
+    pub fn test_parse_stream_recv_meta(
+        stream: &SctpStream,
+        control: &[u8],
+        controllen: usize,
+        msg_flags: libc::c_int,
+        data_slice: &[u8],
+    ) -> io::Result<SctpRecvMeta> {
+        parse_initialized_recv_state_meta_for_test(
+            &stream.recv_state,
+            control,
+            controllen,
+            msg_flags,
+            data_slice,
+            None,
+        )
     }
 
     /// Returns the local Linux ABI value for `SCTP_ASSOC_CHANGE`.
@@ -6711,7 +6786,50 @@ mod tests {
     use crate::net::send_sqe::test_support::sqe_prefix;
     use crate::runtime::buffer::IoBuffMut;
     use crate::runtime::executor::with_ringless_poll_context_for_test;
+    use crate::runtime::task::{TaskHeader, TaskVTable};
     use crate::runtime::test_hooks;
+
+    thread_local! {
+        static STASH_PUBLICATION_RECV_STATE: Cell<*mut SctpRecvState> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static STASH_PUBLICATION_STATE_SLOT: Cell<*mut *mut CompletionState> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static STASH_PUBLICATION_EXPECTED_STATE: Cell<*mut CompletionState> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static STASH_PUBLICATION_DESTROYS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    unsafe fn inspect_stash_publication(_: *mut TaskHeader) {
+        let recv_state = STASH_PUBLICATION_RECV_STATE.with(Cell::get);
+        let state_slot = STASH_PUBLICATION_STATE_SLOT.with(Cell::get);
+        let expected_state = STASH_PUBLICATION_EXPECTED_STATE.with(Cell::get);
+        assert!(!recv_state.is_null(), "SCTP receive state was not recorded");
+        assert!(
+            !state_slot.is_null(),
+            "SCTP source state slot was not recorded"
+        );
+        unsafe {
+            assert_eq!(
+                (*recv_state).stashed.state_ptr,
+                expected_state,
+                "stream ownership was not published before waiter destruction"
+            );
+            assert!(
+                (*state_slot).is_null(),
+                "future ownership was not detached before waiter destruction"
+            );
+            assert_eq!((*recv_state).stashed.iov_count, 7);
+            assert!((*recv_state).stashed.process_completed.is_some());
+        }
+        STASH_PUBLICATION_DESTROYS.with(|count| count.set(count.get() + 1));
+    }
+
+    static STASH_PUBLICATION_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Ready(()),
+        finish: |_| {},
+        cancel: |_| {},
+        destroy: inspect_stash_publication,
+    };
 
     #[test]
     fn sctp_recv_len_rejects_zero_and_preserves_positive_bounds() {
@@ -6749,6 +6867,99 @@ mod tests {
         assert_eq!(overflow.to_string(), SCTP_SEND_AGGREGATE_OVERFLOW);
     }
 
+    fn assert_vectored_aggregate_rejections(cx: &mut Context<'_>, expected_kind: io::ErrorKind) {
+        let mut recv_segment =
+            IoBuffMut::new(0, 8, 0).expect("aggregate receive segment allocation failed");
+        let recv_ptr = recv_segment.as_mut_ptr();
+        let mut recv_state = SctpRecvState::external();
+        let mut recv = RecvVectoredFuture {
+            fd: -1,
+            state_ptr: std::ptr::null_mut(),
+            buffer: Some(IoBuffVecMut::from_array([recv_segment])),
+            iov_count: 0,
+            writable: 0,
+            invalid_aggregate: true,
+            recv_state: &mut recv_state,
+            _marker: PhantomData,
+        };
+        let Poll::Ready((Err(recv_err), mut recv_chain)) = Pin::new(&mut recv).poll(cx) else {
+            panic!("unrepresentable SCTP receive aggregate remained pending");
+        };
+        assert_eq!(recv_err.kind(), expected_kind);
+        if expected_kind == io::ErrorKind::InvalidInput {
+            assert_eq!(recv_err.to_string(), invalid_readv_aggregate().to_string());
+        }
+        assert_eq!(
+            recv_chain
+                .get_mut(0)
+                .expect("returned aggregate receive segment missing")
+                .as_mut_ptr(),
+            recv_ptr
+        );
+        assert!(
+            Pin::new(&mut recv).poll(cx).is_pending(),
+            "completed aggregate receive future did not fuse"
+        );
+        drop(recv);
+        assert!(recv_state.stashed.state_ptr.is_null());
+
+        let mut send_segment =
+            IoBuffMut::new(0, 8, 0).expect("aggregate send segment allocation failed");
+        send_segment
+            .payload_append(b"payload")
+            .expect("aggregate send segment initialization failed");
+        let send_chain = IoBuffVec::from_array([send_segment.freeze()]);
+        let send_ptr = send_chain
+            .get(0)
+            .expect("aggregate send segment missing")
+            .as_ptr();
+        let mut send = SendVectoredFuture {
+            fd: -1,
+            state_ptr: std::ptr::null_mut(),
+            buffer: Some(send_chain),
+            iov_count: 0,
+            total: 0,
+            invalid_aggregate: true,
+            sndinfo: raw_sndinfo_from_public(SctpSendInfo::default()),
+            _marker: PhantomData,
+        };
+        let Poll::Ready((Err(send_err), returned_send)) = Pin::new(&mut send).poll(cx) else {
+            panic!("unrepresentable SCTP send aggregate remained pending");
+        };
+        assert_eq!(send_err.kind(), expected_kind);
+        if expected_kind == io::ErrorKind::InvalidInput {
+            assert_eq!(send_err.to_string(), SCTP_SEND_AGGREGATE_OVERFLOW);
+        }
+        assert_eq!(
+            returned_send
+                .get(0)
+                .expect("returned aggregate send segment missing")
+                .as_ptr(),
+            send_ptr
+        );
+        assert!(
+            Pin::new(&mut send).poll(cx).is_pending(),
+            "completed aggregate send future did not fuse"
+        );
+    }
+
+    #[test]
+    fn sctp_vectored_aggregate_errors_preserve_context_and_return_exact_owners() {
+        let mut outside_cx = Context::from_waker(std::task::Waker::noop());
+        assert_vectored_aggregate_rejections(&mut outside_cx, io::ErrorKind::NotConnected);
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            assert_vectored_aggregate_rejections(cx, io::ErrorKind::InvalidInput);
+
+            let reactor = owner.reactor_ptr();
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 0);
+            assert_eq!(stats.heap_fallbacks, 0);
+        });
+    }
+
     unsafe fn reject_abandoned_stashed_processing(
         _reactor: *mut Reactor,
         _state_ptr: *mut CompletionState,
@@ -6756,6 +6967,215 @@ mod tests {
         _discarding_tail: &mut bool,
     ) {
         panic!("ring-abandoned stashed receive was processed as completed");
+    }
+
+    unsafe fn reject_invalid_request_stash_processing(
+        _reactor: *mut Reactor,
+        _state_ptr: *mut CompletionState,
+        _iov_count: usize,
+        _discarding_tail: &mut bool,
+    ) {
+        panic!("invalid metadata receive processed the prior stash");
+    }
+
+    fn assert_invalid_request_stash(
+        recv_state: &SctpRecvState,
+        expected_state: *mut CompletionState,
+        expected_iov_count: usize,
+    ) {
+        assert_eq!(recv_state.stashed.state_ptr, expected_state);
+        assert_eq!(recv_state.stashed.iov_count, expected_iov_count);
+        assert!(recv_state.stashed.process_completed.is_some());
+        assert!(
+            recv_state.discarding_tail,
+            "invalid metadata receive changed record recovery state"
+        );
+    }
+
+    fn assert_invalid_scalar_receive_precedes_stash(
+        cx: &mut Context<'_>,
+        expected_kind: io::ErrorKind,
+        expected_iov_count: usize,
+    ) {
+        let mut stashed_state = CompletionState::empty();
+        let stashed_state_ptr = std::ptr::addr_of_mut!(stashed_state);
+        let pointer_calls = Rc::new(Cell::new(0));
+        let published_len = Rc::new(Cell::new(0));
+        let buffer =
+            RejectedContextRecvBuffer::new(Rc::clone(&pointer_calls), Rc::clone(&published_len));
+        let original_buffer_ptr = buffer.backing_ptr();
+        let mut recv_state = SctpRecvState::external();
+        recv_state.discarding_tail = true;
+        recv_state.stashed = StashedSctpRecv {
+            state_ptr: stashed_state_ptr,
+            iov_count: expected_iov_count,
+            process_completed: Some(reject_invalid_request_stash_processing),
+        };
+        let mut recv = RecvFuture {
+            fd: -1,
+            state_ptr: std::ptr::null_mut(),
+            buffer: Some(buffer),
+            write_base_len: 0,
+            len: 0,
+            input_error: Some(invalid_zero_length_sctp_recv()),
+            recv_state: &mut recv_state,
+            _marker: PhantomData,
+        };
+
+        let Poll::Ready((Err(err), returned)) = Pin::new(&mut recv).poll(cx) else {
+            panic!("invalid scalar metadata receive did not return immediately");
+        };
+        assert_eq!(err.kind(), expected_kind);
+        if expected_kind == io::ErrorKind::InvalidInput {
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), ZERO_LENGTH_SCTP_RECV);
+        }
+        assert_eq!(returned.backing_ptr(), original_buffer_ptr);
+        assert_eq!(pointer_calls.get(), 0);
+        assert_eq!(published_len.get(), 0);
+        assert_invalid_request_stash(recv.recv_state, stashed_state_ptr, expected_iov_count);
+        assert!(!stashed_state.is_context_rejected());
+
+        stashed_state.set_completed();
+        assert!(
+            Pin::new(&mut recv).poll(cx).is_pending(),
+            "completed invalid scalar metadata receive did not stay fused"
+        );
+        assert_invalid_request_stash(recv.recv_state, stashed_state_ptr, expected_iov_count);
+        drop(recv);
+        assert_invalid_request_stash(&recv_state, stashed_state_ptr, expected_iov_count);
+        drop(returned);
+    }
+
+    fn assert_invalid_vectored_receive_precedes_stash(
+        cx: &mut Context<'_>,
+        expected_kind: io::ErrorKind,
+        expected_iov_count: usize,
+    ) {
+        let mut stashed_vectored_state = CompletionState::empty();
+        let stashed_vectored_state_ptr = std::ptr::addr_of_mut!(stashed_vectored_state);
+        let mut segment = IoBuffMut::new(4, 0, 0).expect("zero-writable segment allocation failed");
+        let original_segment_ptr = segment.as_mut_ptr();
+        let chain = IoBuffVecMut::from_array([segment]);
+        let mut vectored_recv_state = SctpRecvState::external();
+        vectored_recv_state.discarding_tail = true;
+        vectored_recv_state.stashed = StashedSctpRecv {
+            state_ptr: stashed_vectored_state_ptr,
+            iov_count: expected_iov_count,
+            process_completed: Some(reject_invalid_request_stash_processing),
+        };
+        let mut recv = RecvVectoredFuture {
+            fd: -1,
+            state_ptr: std::ptr::null_mut(),
+            buffer: Some(chain),
+            iov_count: 0,
+            writable: 0,
+            invalid_aggregate: false,
+            recv_state: &mut vectored_recv_state,
+            _marker: PhantomData,
+        };
+
+        let Poll::Ready((Err(err), mut returned)) = Pin::new(&mut recv).poll(cx) else {
+            panic!("invalid vectored metadata receive did not return immediately");
+        };
+        assert_eq!(err.kind(), expected_kind);
+        if expected_kind == io::ErrorKind::InvalidInput {
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(err.to_string(), ZERO_LENGTH_SCTP_RECV);
+        }
+        assert_eq!(returned.segments(), 1);
+        assert_eq!(
+            returned
+                .get_mut(0)
+                .expect("returned zero-writable segment missing")
+                .as_mut_ptr(),
+            original_segment_ptr
+        );
+        assert_invalid_request_stash(
+            recv.recv_state,
+            stashed_vectored_state_ptr,
+            expected_iov_count,
+        );
+        assert!(!stashed_vectored_state.is_context_rejected());
+
+        stashed_vectored_state.set_completed();
+        assert!(
+            Pin::new(&mut recv).poll(cx).is_pending(),
+            "completed invalid vectored metadata receive did not stay fused"
+        );
+        assert_invalid_request_stash(
+            recv.recv_state,
+            stashed_vectored_state_ptr,
+            expected_iov_count,
+        );
+        drop(recv);
+        assert_invalid_request_stash(
+            &vectored_recv_state,
+            stashed_vectored_state_ptr,
+            expected_iov_count,
+        );
+        drop(returned);
+    }
+
+    #[test]
+    fn invalid_metadata_receives_return_before_stash_recovery() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            assert_invalid_scalar_receive_precedes_stash(cx, io::ErrorKind::InvalidInput, 3);
+            assert_invalid_vectored_receive_precedes_stash(cx, io::ErrorKind::InvalidInput, 5);
+
+            let reactor = owner.reactor_ptr();
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
+    }
+
+    #[test]
+    fn invalid_metadata_receives_without_runtime_do_not_adopt_stash() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert_invalid_scalar_receive_precedes_stash(&mut cx, io::ErrorKind::NotConnected, 7);
+        assert_invalid_vectored_receive_precedes_stash(&mut cx, io::ErrorKind::NotConnected, 9);
+    }
+
+    #[test]
+    fn sctp_stash_publishes_ownership_before_waiter_destruction() {
+        STASH_PUBLICATION_DESTROYS.with(|count| count.set(0));
+        let mut recv_state = SctpRecvState::external();
+        let recv_state_ptr = std::ptr::addr_of_mut!(recv_state);
+        let mut state = CompletionState::empty();
+        let state_ptr = std::ptr::addr_of_mut!(state);
+        let mut state_slot = state_ptr;
+        let state_slot_ptr = std::ptr::addr_of_mut!(state_slot);
+        let mut waiter = TaskHeader::new();
+        waiter.vtable = &STASH_PUBLICATION_VTABLE;
+        let waiter_ptr = std::ptr::addr_of_mut!(waiter);
+
+        unsafe {
+            state.register_waiter(waiter_ptr);
+            release_task(waiter_ptr);
+        }
+        assert_eq!(waiter.refs.get(), 1);
+
+        STASH_PUBLICATION_RECV_STATE.with(|stored| stored.set(recv_state_ptr));
+        STASH_PUBLICATION_STATE_SLOT.with(|stored| stored.set(state_slot_ptr));
+        STASH_PUBLICATION_EXPECTED_STATE.with(|stored| stored.set(state_ptr));
+        unsafe {
+            SctpRecvState::stash_unchecked(
+                recv_state_ptr,
+                state_slot_ptr,
+                7,
+                reject_abandoned_stashed_processing,
+            );
+        }
+        STASH_PUBLICATION_RECV_STATE.with(|stored| stored.set(std::ptr::null_mut()));
+        STASH_PUBLICATION_STATE_SLOT.with(|stored| stored.set(std::ptr::null_mut()));
+        STASH_PUBLICATION_EXPECTED_STATE.with(|stored| stored.set(std::ptr::null_mut()));
+
+        STASH_PUBLICATION_DESTROYS.with(|count| assert_eq!(count.get(), 1));
+        assert!(state_slot.is_null());
+        assert_eq!(recv_state.stashed.state_ptr, state_ptr);
+        assert_eq!(recv_state.stashed.iov_count, 7);
+        assert!(recv_state.stashed.process_completed.is_some());
+        assert_eq!(waiter.refs.get(), 0);
     }
 
     #[test]
@@ -6801,7 +7221,7 @@ mod tests {
             .expect("SCTP connect fd creation failed");
         let mut state = CompletionState::empty();
         state.set_ring_abandoned();
-        let mut slot = ConnectSlot::new();
+        let mut slot = ConnectSlot::new(SctpSocketConfig::default());
         slot.state_ptr = &mut state;
         slot.in_use = true;
         slot.fd = fd;
@@ -6821,6 +7241,57 @@ mod tests {
         assert!(crate::runtime::fd::raw_fd_is_closed(fd));
         assert!(state.is_ring_abandoned());
         assert!(!state.is_completed());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn sctp_connect_established_config_error_closes_transferred_socket() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let remote_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+            let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+            assert!(
+                !state_ptr.is_null(),
+                "SCTP completed-connect state allocation failed"
+            );
+            let retained_addr = unsafe {
+                (&mut *reactor)
+                    .alloc_retained_payload(RetainedConnectAddr::from_socket_addr(remote_addr))
+            };
+            unsafe {
+                (*state_ptr).attach_retained_payload(retained_addr);
+                (*state_ptr).result = 0;
+                (*state_ptr).set_completed();
+            }
+
+            let fd = crate::runtime::fd::distinctive_closeable_test_fd()
+                .expect("SCTP completed-connect fd creation failed");
+            let config = SctpSocketConfig {
+                default_peer_addr_params: Some(SctpPeerAddrParams::for_address(remote_addr)),
+                ..SctpSocketConfig::default()
+            };
+            let mut slot = ConnectSlot::new(config);
+            slot.state_ptr = state_ptr;
+            slot.in_use = true;
+            slot.fd = fd;
+            let mut connect = ConnectFuture {
+                slot: &mut slot,
+                remote_addr,
+            };
+
+            let Poll::Ready(Err(err)) = Pin::new(&mut connect).poll(cx) else {
+                panic!("invalid established SCTP configuration did not fail");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            drop(connect);
+            assert!(slot.state_ptr.is_null());
+            assert!(!slot.in_use);
+            assert_eq!(slot.fd, -1);
+            assert!(slot.addr.is_none());
+            assert!(crate::runtime::fd::raw_fd_is_closed(fd));
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
     }
 
     #[cfg(not(miri))]
@@ -6855,6 +7326,24 @@ mod tests {
                 outcome
             },
         );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn sctp_bare_poll_error_budget_exhaustion_does_not_latch_listener() {
+        crate::net::test_bare_poll_error_budget_exhaustion("SCTP", |slot, cx, state_ptr| {
+            slot.state_ptr = state_ptr;
+            slot.in_use = true;
+            let mut accept = AcceptFuture {
+                slot,
+                accepted_config: SctpSocketConfig::default(),
+                input_error: None,
+                prepared: true,
+            };
+            let outcome = Future::poll(Pin::new(&mut accept), cx);
+            drop(accept);
+            outcome
+        });
     }
 
     #[test]
@@ -6912,11 +7401,12 @@ mod tests {
     enum SctpReadShapeDrift {
         Growth,
         Shrink,
+        Total,
     }
 
     fn sctp_read_shape_drift_chain(
         drift: SctpReadShapeDrift,
-    ) -> (IoBuffVecMut<2>, usize, [usize; 2]) {
+    ) -> (IoBuffVecMut<2>, (usize, usize), [usize; 2]) {
         let mut chain = match drift {
             SctpReadShapeDrift::Growth => {
                 let mut full =
@@ -6927,14 +7417,16 @@ mod tests {
                     IoBuffMut::new(0, 4, 0).expect("writable SCTP segment allocation failed");
                 IoBuffVecMut::from_array([full, writable])
             }
-            SctpReadShapeDrift::Shrink => {
+            SctpReadShapeDrift::Shrink | SctpReadShapeDrift::Total => {
                 let first = IoBuffMut::new(0, 4, 0).expect("first SCTP segment allocation failed");
                 let second =
                     IoBuffMut::new(0, 4, 0).expect("second SCTP segment allocation failed");
                 IoBuffVecMut::from_array([first, second])
             }
         };
-        let initial_iov_count = chain.read_iovec_count_and_writable_len().0;
+        let initial_shape = chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("initial SCTP receive shape overflowed");
         let first = chain
             .get_mut(0)
             .expect("first SCTP shape-drift segment missing");
@@ -6943,6 +7435,9 @@ mod tests {
             SctpReadShapeDrift::Shrink => first
                 .payload_append(b"full")
                 .expect("SCTP shrink mutation failed"),
+            SctpReadShapeDrift::Total => first
+                .payload_append(b"x")
+                .expect("SCTP total mutation failed"),
         }
         let pointers = std::array::from_fn(|index| {
             chain
@@ -6950,7 +7445,7 @@ mod tests {
                 .expect("SCTP shape-drift segment missing")
                 .as_mut_ptr() as usize
         });
-        (chain, initial_iov_count, pointers)
+        (chain, initial_shape, pointers)
     }
 
     #[test]
@@ -6958,15 +7453,20 @@ mod tests {
         with_ringless_poll_context_for_test(1, |owner, cx| {
             let reactor = owner.reactor_ptr();
 
-            for drift in [SctpReadShapeDrift::Growth, SctpReadShapeDrift::Shrink] {
-                let (chain, iov_count, pointers) = sctp_read_shape_drift_chain(drift);
+            for drift in [
+                SctpReadShapeDrift::Growth,
+                SctpReadShapeDrift::Shrink,
+                SctpReadShapeDrift::Total,
+            ] {
+                let (chain, initial_shape, pointers) = sctp_read_shape_drift_chain(drift);
                 let mut recv_state = SctpRecvState::external();
                 let mut future: RecvVectoredFuture<'_, 2> = RecvVectoredFuture {
                     fd: -1,
                     state_ptr: std::ptr::null_mut(),
                     buffer: Some(chain),
-                    iov_count,
-                    input_error: None,
+                    iov_count: initial_shape.0,
+                    writable: initial_shape.1,
+                    invalid_aggregate: false,
                     recv_state: &mut recv_state,
                     _marker: PhantomData,
                 };
@@ -6990,8 +7490,12 @@ mod tests {
                 let expected_shape = match drift {
                     SctpReadShapeDrift::Growth => (2, 8),
                     SctpReadShapeDrift::Shrink => (1, 4),
+                    SctpReadShapeDrift::Total => (2, 7),
                 };
-                assert_eq!(returned.read_iovec_count_and_writable_len(), expected_shape);
+                assert_eq!(
+                    returned.checked_read_iovec_count_and_writable_len(),
+                    Some(expected_shape)
+                );
                 assert!(future.state_ptr.is_null());
                 assert!(
                     Pin::new(&mut future).poll(cx).is_pending(),
@@ -6999,6 +7503,81 @@ mod tests {
                 );
                 drop(future);
                 assert!(recv_state.stashed.state_ptr.is_null());
+                assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                assert_eq!(owner.inflight_op_count_for_test(), 0);
+                drop(returned);
+            }
+
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 3);
+            assert_eq!(stats.pooled_frees, 3);
+        });
+    }
+
+    fn sctp_send_shape_drift_chain() -> (IoBuffVec<2>, [usize; 2]) {
+        let mut first = IoBuffMut::new(0, 3, 0).expect("first SCTP send segment allocation failed");
+        first
+            .payload_append(b"abc")
+            .expect("first SCTP send segment initialization failed");
+        let mut second =
+            IoBuffMut::new(0, 5, 0).expect("second SCTP send segment allocation failed");
+        second
+            .payload_append(b"defgh")
+            .expect("second SCTP send segment initialization failed");
+        let chain = IoBuffVec::from_array([first.freeze(), second.freeze()]);
+        let pointers = std::array::from_fn(|index| {
+            chain
+                .get(index)
+                .expect("SCTP send shape-drift segment missing")
+                .as_ptr() as usize
+        });
+        (chain, pointers)
+    }
+
+    #[test]
+    fn sctp_send_vectored_shape_drift_rejects_before_submission_and_returns_chain() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+
+            for expected_shape in [(1, 8), (2, 7)] {
+                let (chain, pointers) = sctp_send_shape_drift_chain();
+                assert_eq!(
+                    checked_iobuffvec_write_iovec_count_and_len(&chain),
+                    Some((2, 8))
+                );
+                let mut future: SendVectoredFuture<'_, 2> = SendVectoredFuture {
+                    fd: -1,
+                    state_ptr: std::ptr::null_mut(),
+                    buffer: Some(chain),
+                    iov_count: expected_shape.0,
+                    total: expected_shape.1,
+                    invalid_aggregate: false,
+                    sndinfo: raw_sndinfo_from_public(SctpSendInfo::default()),
+                    _marker: PhantomData,
+                };
+
+                let Poll::Ready((result, returned)) = Pin::new(&mut future).poll(cx) else {
+                    panic!("SCTP send shape drift remained pending");
+                };
+                let err = result.expect_err("SCTP send shape drift unexpectedly succeeded");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(err.to_string(), invalid_writev_shape().to_string());
+                let returned_pointers = std::array::from_fn(|index| {
+                    returned
+                        .get(index)
+                        .expect("returned SCTP send shape-drift segment missing")
+                        .as_ptr() as usize
+                });
+                assert_eq!(returned_pointers, pointers);
+                assert_eq!(
+                    checked_iobuffvec_write_iovec_count_and_len(&returned),
+                    Some((2, 8))
+                );
+                assert!(future.state_ptr.is_null());
+                assert!(
+                    Pin::new(&mut future).poll(cx).is_pending(),
+                    "completed SCTP send shape-drift future did not fuse"
+                );
                 assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
                 assert_eq!(owner.inflight_op_count_for_test(), 0);
                 drop(returned);
@@ -7435,11 +8014,18 @@ mod tests {
     }
 
     #[test]
-    fn sctp_cqe_result_maps_error_zero_and_progress() {
-        let err = sctp_cqe_result(-libc::EPIPE).expect_err("negative CQE should map to errno");
+    fn completion_cqe_result_maps_error_zero_and_progress() {
+        let err =
+            completion_cqe_result(-libc::EPIPE).expect_err("negative CQE should map to errno");
         assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
-        assert_eq!(sctp_cqe_result(0).expect("zero CQE should succeed"), 0);
-        assert_eq!(sctp_cqe_result(9).expect("positive CQE should succeed"), 9);
+        assert_eq!(
+            completion_cqe_result(0).expect("zero CQE should succeed"),
+            0
+        );
+        assert_eq!(
+            completion_cqe_result(9).expect("positive CQE should succeed"),
+            9
+        );
     }
 
     fn initialized_control(bytes: &[u8]) -> &[MaybeUninit<u8>] {
@@ -7493,16 +8079,14 @@ mod tests {
         data_slice: &[u8],
         parsed_notification: Option<io::Result<SctpRecvMeta>>,
     ) -> io::Result<SctpRecvMeta> {
-        // SAFETY: this test facade accepts fully initialized control bytes.
-        let rcvinfo = unsafe {
-            parse_completion_rcvinfo(
-                initialized_control(control),
-                controllen,
-                msg_flags,
-                !data_slice.is_empty(),
-            )
-        };
-        recv_state.parse_completion_meta(rcvinfo, msg_flags, data_slice, parsed_notification)
+        parse_initialized_recv_state_meta_for_test(
+            recv_state,
+            control,
+            controllen,
+            msg_flags,
+            data_slice,
+            parsed_notification,
+        )
     }
 
     fn append_test_rcvinfo(control: &mut Vec<u8>) {
@@ -7660,9 +8244,9 @@ mod tests {
             SctpRecvState::configured(SctpSocketConfig::rich(SctpInitConfig::default()));
         let disabled = SctpRecvState::configured(SctpSocketConfig::data(SctpInitConfig::default()));
         let external = SctpRecvState::external();
-        assert!(requested.recv_rcvinfo_requested);
-        assert!(!disabled.recv_rcvinfo_requested);
-        assert!(!external.recv_rcvinfo_requested);
+        assert!(requested.recv_rcvinfo_requested.get());
+        assert!(!disabled.recv_rcvinfo_requested.get());
+        assert!(!external.recv_rcvinfo_requested.get());
 
         let expected_default = SctpRecvMeta::Data(SctpRecvInfo {
             end_of_record: true,
@@ -7786,6 +8370,48 @@ mod tests {
                 assoc_id: 42
             }))
         ));
+    }
+
+    #[test]
+    fn recv_state_receive_policy_refresh_changes_absent_rcvinfo_classification() {
+        let state = SctpRecvState::external();
+        let expected_default = SctpRecvMeta::Data(SctpRecvInfo {
+            end_of_record: true,
+            ..SctpRecvInfo::default()
+        });
+
+        assert_eq!(
+            parse_recv_state_meta_for_test(&state, &[], 0, libc::MSG_EOR, b"payload", None)
+                .expect("external receive policy should initially default absent RCVINFO"),
+            expected_default
+        );
+
+        state.set_receive_policy(SctpNotificationMask::none(), true);
+        assert!(state.recv_rcvinfo_requested.get());
+        assert!(!state.partial_delivery_visible.get());
+        assert!(!state.any_notification_visible.get());
+        let missing =
+            parse_recv_state_meta_for_test(&state, &[], 0, libc::MSG_EOR, b"payload", None)
+                .expect_err("refreshed receive-info request must make absence invalid");
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            missing.to_string(),
+            "SCTP recvmsg omitted requested SCTP_RCVINFO"
+        );
+
+        let visible = SctpNotificationMask {
+            partial_delivery: true,
+            ..SctpNotificationMask::none()
+        };
+        state.set_receive_policy(visible, false);
+        assert!(!state.recv_rcvinfo_requested.get());
+        assert!(state.partial_delivery_visible.get());
+        assert!(state.any_notification_visible.get());
+        assert_eq!(
+            parse_recv_state_meta_for_test(&state, &[], 0, libc::MSG_EOR, b"payload", None)
+                .expect("disabled receive-info policy should restore default metadata"),
+            expected_default
+        );
     }
 
     #[test]
@@ -7947,15 +8573,6 @@ mod tests {
 
     #[test]
     fn connected_sctp_recv_payload_footprints_pin_bounded_ancillary_cost() {
-        assert_eq!(
-            SCTP_RECV_CONTROL_LEN,
-            SOCKET_TIMESTAMP_CONTROL_LEN
-                + SOCKET_TIMESTAMPING_CONTROL_LEN
-                + SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN
-                + SOCKET_RXQ_OVFL_CONTROL_LEN
-                + SCTP_RCVINFO_CONTROL_LEN
-        );
-
         #[cfg(all(target_pointer_width = "64", target_arch = "x86_64"))]
         {
             assert_eq!(SCTP_RCVINFO_CONTROL_LEN, 48);
@@ -8286,12 +8903,18 @@ mod tests {
             .get_mut(2)
             .expect("second writable segment missing")
             .as_mut_ptr();
-        let (iov_count, writable_len) = chain.read_iovec_count_and_writable_len();
+        let (iov_count, writable_len) = chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("vectored receive shape overflowed");
         assert_eq!((iov_count, writable_len), (2, 18));
         let mut buffer = Some(chain);
 
         let payload = unsafe {
-            emplace_retained_sctp_recv_vectored_payload(pool_ptr, &mut buffer, iov_count)
+            emplace_retained_sctp_recv_vectored_payload(
+                pool_ptr,
+                &mut buffer,
+                (iov_count, writable_len),
+            )
         }
         .expect("vectored receive emplacement failed");
         assert!(buffer.is_none(), "constructor did not transfer the chain");
@@ -8354,12 +8977,18 @@ mod tests {
                 .expect("vectored receive segment missing")
                 .as_mut_ptr()
         });
-        let (iov_count, writable_len) = chain.read_iovec_count_and_writable_len();
+        let (iov_count, writable_len) = chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("vectored receive shape overflowed");
         assert_eq!((iov_count, writable_len), (N, N * 8));
         let mut buffer = Some(chain);
 
         let mut payload = unsafe {
-            emplace_retained_sctp_recv_vectored_payload(pool_ptr, &mut buffer, iov_count)
+            emplace_retained_sctp_recv_vectored_payload(
+                pool_ptr,
+                &mut buffer,
+                (iov_count, writable_len),
+            )
         }
         .expect("vectored receive emplacement failed");
         let retained_addr = unsafe { payload.as_mut() as *mut _ as usize };
@@ -8434,15 +9063,13 @@ mod tests {
             IoBuffMut::new(0, 8, 0).expect("retry receive segment allocation failed")
         });
         let retry_chain = IoBuffVecMut::from_array(retry_segments);
-        let (retry_iov_count, _) = retry_chain.read_iovec_count_and_writable_len();
+        let retry_shape = retry_chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("retry vectored receive shape overflowed");
         let mut retry_buffer = Some(retry_chain);
         let pool_ptr = NonNull::from(&mut pool);
         let mut retry = unsafe {
-            emplace_retained_sctp_recv_vectored_payload(
-                pool_ptr,
-                &mut retry_buffer,
-                retry_iov_count,
-            )
+            emplace_retained_sctp_recv_vectored_payload(pool_ptr, &mut retry_buffer, retry_shape)
         }
         .expect("retry vectored receive emplacement failed");
         assert_eq!(
@@ -8493,12 +9120,18 @@ mod tests {
                 .expect("vectored receive segment missing")
                 .as_mut_ptr()
         });
-        let (iov_count, writable_len) = chain.read_iovec_count_and_writable_len();
+        let (iov_count, writable_len) = chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("vectored receive shape overflowed");
         assert_eq!((iov_count, writable_len), (2, 16));
         let mut buffer = Some(chain);
 
         let mut payload = unsafe {
-            emplace_retained_sctp_recv_vectored_payload(pool_ptr, &mut buffer, iov_count)
+            emplace_retained_sctp_recv_vectored_payload(
+                pool_ptr,
+                &mut buffer,
+                (iov_count, writable_len),
+            )
         }
         .expect("vectored receive emplacement failed");
         let retained_addr = unsafe { payload.as_mut() as *mut _ as usize };
@@ -8559,15 +9192,13 @@ mod tests {
             IoBuffMut::new(0, 8, 0).expect("retry receive segment allocation failed")
         });
         let retry_chain = IoBuffVecMut::from_array(retry_segments);
-        let (retry_iov_count, _) = retry_chain.read_iovec_count_and_writable_len();
+        let retry_shape = retry_chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("retry vectored receive shape overflowed");
         let mut retry_buffer = Some(retry_chain);
         let pool_ptr = NonNull::from(&mut pool);
         let mut retry = unsafe {
-            emplace_retained_sctp_recv_vectored_payload(
-                pool_ptr,
-                &mut retry_buffer,
-                retry_iov_count,
-            )
+            emplace_retained_sctp_recv_vectored_payload(pool_ptr, &mut retry_buffer, retry_shape)
         }
         .expect("retry vectored receive emplacement failed");
         assert_eq!(
@@ -8600,6 +9231,9 @@ mod tests {
         let chain = IoBuffVec::from_array([first.freeze(), empty.freeze(), second.freeze()]);
         let first_ptr = chain.get(0).expect("first segment missing").as_ptr();
         let second_ptr = chain.get(2).expect("second segment missing").as_ptr();
+        let expected_shape = checked_iobuffvec_write_iovec_count_and_len(&chain)
+            .expect("SCTP vectored send shape overflowed");
+        assert_eq!(expected_shape, (2, 8));
         let mut buffer = Some(chain);
         let info = SctpSendInfo {
             stream_id: 11,
@@ -8610,9 +9244,15 @@ mod tests {
         };
         let sndinfo = raw_sndinfo_from_public(info);
 
-        let payload =
-            unsafe { emplace_retained_sctp_send_vectored_payload(pool_ptr, &mut buffer, sndinfo) }
-                .expect("SCTP vectored send emplacement failed");
+        let payload = unsafe {
+            emplace_retained_sctp_send_vectored_payload(
+                pool_ptr,
+                &mut buffer,
+                expected_shape,
+                sndinfo,
+            )
+        }
+        .expect("SCTP vectored send emplacement failed");
         assert!(buffer.is_none(), "constructor did not transfer the chain");
 
         let retained = unsafe { payload.as_ref() };
@@ -9068,7 +9708,9 @@ mod tests {
         completion: SyntheticRecvCompletion<'_>,
     ) -> (*mut CompletionState, usize) {
         let (chain, writable_address) = leading_full_rejected_chain();
-        let (iov_count, writable_len) = chain.read_iovec_count_and_writable_len();
+        let (iov_count, writable_len) = chain
+            .checked_read_iovec_count_and_writable_len()
+            .expect("rejected vectored receive shape overflowed");
         assert_eq!((iov_count, writable_len), (1, 32));
         let state_ptr = unsafe { (&mut *reactor).alloc_op() };
         assert!(
@@ -9079,7 +9721,11 @@ mod tests {
         let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
         let mut buffer = Some(chain);
         let mut payload = unsafe {
-            emplace_retained_sctp_recv_vectored_payload(retained_pool, &mut buffer, iov_count)
+            emplace_retained_sctp_recv_vectored_payload(
+                retained_pool,
+                &mut buffer,
+                (iov_count, writable_len),
+            )
         }
         .expect("rejected vectored receive emplacement failed");
         assert!(buffer.is_none(), "vectored chain was not retained");
@@ -9113,7 +9759,8 @@ mod tests {
             state_ptr,
             buffer: None,
             iov_count,
-            input_error: None,
+            writable: writable_len,
+            invalid_aggregate: false,
             recv_state,
             _marker: PhantomData,
         };
@@ -9773,7 +10420,7 @@ mod tests {
         assert!(!explicit.should_consume_for_test(&data, &msg));
         assert!(!explicit.discarding_tail);
 
-        explicit.set_notification_visibility(SctpNotificationMask::none());
+        explicit.set_receive_policy(SctpNotificationMask::none(), true);
         assert!(explicit.should_consume_for_test(&data, &msg));
 
         let mut external = SctpRecvState::external();

@@ -20,11 +20,14 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+#[cfg(all(test, not(miri)))]
+use crate::runtime::executor::poll_ctx_from_waker;
 use crate::runtime::executor::{
-    PollCtx, completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker,
+    PollCtx, completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_or_transient_pending_op,
     refresh_op_waiter_from_waker, submit_tracked_sqe,
 };
 use crate::runtime::op::CompletionState;
+use crate::runtime::reactor::Reactor;
 use io_uring::opcode;
 use std::future::Future;
 use std::io;
@@ -63,8 +66,9 @@ fn poll_nop_op(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
 ) -> Poll<io::Result<i32>> {
-    let pctx = match poll_ctx_from_waker(cx) {
-        Ok(pctx) => pctx,
+    let pctx = match unsafe { poll_ctx_or_transient_pending_op(cx, *state_ptr) } {
+        Ok(Some(pctx)) => pctx,
+        Ok(None) => return Poll::Pending,
         Err(err) => {
             unsafe { drop_op_ptr_unchecked(state_ptr) };
             return Poll::Ready(Err(err));
@@ -93,7 +97,7 @@ fn poll_nop_op(
 
         unsafe {
             if let Err(e) = submit_tracked_sqe(&pctx, sqe) {
-                (*pctx.reactor()).free_op(new_state_ptr);
+                Reactor::free_op_unchecked(pctx.reactor(), new_state_ptr);
                 *state_ptr = std::ptr::null_mut();
                 return Poll::Ready(Err(e));
             }
@@ -334,8 +338,9 @@ mod tests {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            let pctx = match poll_ctx_from_waker(cx) {
-                Ok(pctx) => pctx,
+            let pctx = match unsafe { poll_ctx_or_transient_pending_op(cx, this.state_ptr) } {
+                Ok(Some(pctx)) => pctx,
+                Ok(None) => return Poll::Pending,
                 Err(err) => {
                     unsafe { drop_op_ptr_unchecked(&mut this.state_ptr) };
                     return Poll::Ready(Err(err));
@@ -466,7 +471,7 @@ mod tests {
                     // This state was fabricated without an SQE or retained
                     // payload, so the test may return it after observing the
                     // production branch. Real abandoned states stay leaked.
-                    unsafe { (*pctx.reactor()).free_op(state_ptr) };
+                    unsafe { Reactor::free_op_unchecked(pctx.reactor(), state_ptr) };
                     Poll::Ready(())
                 })
                 .await;
@@ -536,7 +541,7 @@ mod tests {
                 );
                 unsafe {
                     (*replacement_state).attach_retained_payload(replacement_payload);
-                    (*pctx.reactor()).free_op(replacement_state);
+                    Reactor::free_op_unchecked(pctx.reactor(), replacement_state);
                 }
                 let stats = unsafe { (*pctx.reactor()).retained_payload_stats() };
                 assert_eq!(stats.pooled_frees, 2);
@@ -606,7 +611,7 @@ mod tests {
                 };
                 unsafe {
                     (*replacement_state).attach_retained_payload(replacement_payload);
-                    (*pctx.reactor()).free_op(replacement_state);
+                    Reactor::free_op_unchecked(pctx.reactor(), replacement_state);
                 }
                 let stats = unsafe { (*pctx.reactor()).retained_payload_stats() };
                 assert_eq!(stats.heap_fallbacks, 2);

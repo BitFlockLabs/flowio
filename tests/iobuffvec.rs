@@ -296,6 +296,33 @@ fn vec_mut_push_empty_buffers() {
     assert_eq!(chain.writable_len(), 64 + 128 + 256);
 }
 
+#[test]
+fn vec_mut_checked_lengths_cover_public_normal_and_empty_cases() {
+    let mut first = IoBuffMut::new(0, 16, 0);
+    first.payload_append(b"one").unwrap();
+    let mut second = IoBuffMut::new(0, 8, 0);
+    second.payload_append(b"xy").unwrap();
+    let chain = IoBuffVecMut::<2>::from_array([first, second]);
+
+    assert_eq!(chain.checked_len(), Some(5));
+    assert_eq!(chain.len(), 5);
+    assert_eq!(chain.checked_writable_len(), Some(19));
+    assert_eq!(chain.writable_len(), 19);
+    assert!(!chain.is_empty());
+
+    let empty_segments =
+        IoBuffVecMut::<2>::from_array([IoBuffMut::new(0, 16, 0), IoBuffMut::new(0, 8, 0)]);
+    assert_eq!(empty_segments.checked_len(), Some(0));
+    assert_eq!(empty_segments.len(), 0);
+    assert_eq!(empty_segments.checked_writable_len(), Some(24));
+    assert_eq!(empty_segments.writable_len(), 24);
+    assert!(empty_segments.is_empty());
+
+    let empty_chain = IoBuffVecMut::<2>::new();
+    assert_eq!(empty_chain.checked_len(), Some(0));
+    assert_eq!(empty_chain.checked_writable_len(), Some(0));
+}
+
 // ============================================================================
 // IoBuffVec — frozen chain construction
 // ============================================================================

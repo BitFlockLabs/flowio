@@ -1357,7 +1357,7 @@ fn parse_response_query_envelope(
     Ok(envelope)
 }
 
-#[cfg(all(feature = "fuzzing", test))]
+#[cfg(all(feature = "fuzzing", any(test, feature = "test-support")))]
 pub(crate) fn response_reaches_record_parser(
     packet: &[u8],
     query_id: u16,

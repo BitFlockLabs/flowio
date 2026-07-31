@@ -85,9 +85,10 @@
 //! ```
 
 use super::{
-    MsgHdrInit, checked_read_len, checked_send_len, close_fd, current_local_addr, get_sock_opt,
-    new_nonblocking_socket, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
-    socket_domain, write_msghdr,
+    CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, close_fd,
+    completion_cqe_result, current_local_addr, get_sock_opt, new_nonblocking_socket,
+    set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    write_msghdr,
 };
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
@@ -97,6 +98,7 @@ use crate::runtime::executor::{
 };
 use crate::runtime::fd::RuntimeFd;
 use crate::runtime::op::CompletionState;
+use crate::runtime::reactor::Reactor;
 use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
@@ -614,7 +616,7 @@ fn zeroed_sockaddr_storage() -> MaybeUninit<libc::sockaddr_storage> {
 unsafe fn take_completed_udp_payload<T: 'static>(
     cx: &mut Context<'_>,
     state_ptr: &mut *mut CompletionState,
-) -> Option<(i32, T, bool)> {
+) -> Option<CompletionTake<i32, T>> {
     if (*state_ptr).is_null() || unsafe { !(**state_ptr).is_completed() } {
         return None;
     }
@@ -624,7 +626,11 @@ unsafe fn take_completed_udp_payload<T: 'static>(
     let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(*state_ptr) };
     unsafe { op_ctx.free_op_unchecked(*state_ptr) };
     *state_ptr = std::ptr::null_mut();
-    Some((result, payload, op_ctx.context_rejected()))
+    Some(CompletionTake::from_context(
+        result,
+        payload,
+        op_ctx.context_rejected(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -666,17 +672,15 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, payload, context_rejected)) =
+        if let Some(completion) =
             unsafe { take_completed_udp_payload::<RetainedRecvPayload<B>>(cx, &mut this.state_ptr) }
         {
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            let actual = result as usize;
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), buffer)),
+            };
             return Poll::Ready(unsafe {
                 complete_read_with_progress(buffer, this.write_base_len, actual, Ok(actual))
             });
@@ -711,7 +715,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                             .user_data(state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -769,22 +773,20 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, payload, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_udp_payload::<RetainedRecvMsgPayload<B>>(cx, &mut this.state_ptr)
         } {
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), buffer)),
+            };
 
             let msg = unsafe { payload.msghdr.assume_init_ref() };
             // `msg_control` is null, so MSG_CTRUNC is not expected here;
             // keep the check defensive in case a kernel reports
             // inconsistent recvmsg flags.
-            let actual = result as usize;
             let result = if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -834,7 +836,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                         )
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -890,17 +892,11 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, payload, context_rejected)) =
+        if let Some(completion) =
             unsafe { take_completed_udp_payload::<RetainedSendPayload<B>>(cx, &mut this.state_ptr) }
         {
-            let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            return Poll::Ready((Ok(result as usize), buffer));
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
+            return Poll::Ready((result, payload.buffer));
         }
 
         if this.state_ptr.is_null() {
@@ -932,7 +928,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                             .user_data(state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -992,18 +988,15 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, payload, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_udp_payload::<RetainedRecvFromPayload<B>>(cx, &mut this.state_ptr)
         } {
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-
-            let actual = result as usize;
+            let actual = match result {
+                Ok(actual) => actual,
+                Err(err) => return Poll::Ready((Err(err), buffer)),
+            };
 
             let msg = unsafe { payload.msghdr.assume_init_ref() };
             // `msg_control` is null, so MSG_CTRUNC is not expected here;
@@ -1059,7 +1052,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                         )
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }
@@ -1119,17 +1112,11 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
             return Poll::Pending;
         }
 
-        if let Some((result, payload, context_rejected)) = unsafe {
+        if let Some(completion) = unsafe {
             take_completed_udp_payload::<RetainedSendToPayload<B>>(cx, &mut this.state_ptr)
         } {
-            let buffer = payload.buffer;
-            if context_rejected {
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::NotConnected)), buffer));
-            }
-            if result < 0 {
-                return Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buffer));
-            }
-            return Poll::Ready((Ok(result as usize), buffer));
+            let (result, payload) = completion.into_io_result(completion_cqe_result);
+            return Poll::Ready((result, payload.buffer));
         }
 
         if this.state_ptr.is_null() {
@@ -1168,7 +1155,7 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                             .user_data(state_ptr as u64))
                     })
                 {
-                    (*pctx.reactor()).free_op(state_ptr);
+                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
                     this.state_ptr = std::ptr::null_mut();
                     return Poll::Ready((Err(e), payload.buffer));
                 }

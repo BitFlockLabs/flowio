@@ -3,7 +3,9 @@
 
 use crate::runtime::executor::ExecutorOwner;
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool, RetainedPayloadVtable};
-use crate::runtime::task::{TaskHeader, clear_task_ref, replace_task_ref, take_task_ref};
+use crate::runtime::task::{
+    TaskHeader, clear_task_ref, replace_task_ref, retain_task, take_task_ref,
+};
 use crate::utils::memory::pool::InPlaceInit;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
@@ -221,6 +223,15 @@ impl CompletionState {
 
     #[inline(always)]
     pub(crate) fn bind_owner(&mut self, owner: Option<Rc<ExecutorOwner>>, index: u32) {
+        debug_assert!(
+            self.owner.is_none(),
+            "fresh completion state retained a prior owner"
+        );
+        debug_assert_eq!(
+            self.registry_index,
+            u32::MAX,
+            "fresh completion state retained a registry index"
+        );
         self.owner = owner;
         self.registry_index = index;
     }
@@ -235,32 +246,82 @@ impl CompletionState {
         self.owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr)
     }
 
-    /// Replaces this operation's owned waiter reference.
+    /// Asserts that releasing this state's owner cannot destroy the pool whose
+    /// mutable borrow returns this slot.
+    ///
+    /// Production operation reclamation is reached through an active poll,
+    /// completion-drain, shutdown, or future-drop owner pin. Ownerless unit
+    /// fixtures are intentionally permitted.
+    #[inline(always)]
+    pub(crate) fn debug_assert_reclaim_owner_pinned(&self) {
+        #[cfg(debug_assertions)]
+        if let Some(owner) = self.owner.as_ref() {
+            debug_assert!(
+                Rc::strong_count(owner) > 1,
+                "completion-state owner release could re-enter its operation pool"
+            );
+        }
+    }
+
+    /// Registers the initial waiter in a freshly allocated or reset state.
     ///
     /// # Safety
     ///
     /// A non-null `task` must point to a live task on its executor owner thread.
-    /// This completion state must be live and exclusively accessible.
+    /// This completion state must be live and exclusively accessible, and its
+    /// waiter word must be null.
     #[inline(always)]
     pub(crate) unsafe fn register_waiter(&mut self, task: *mut TaskHeader) {
         debug_assert!(!self.is_cancel_pending());
-        unsafe { replace_task_ref(&mut self.waiter, task) };
+        debug_assert!(
+            self.waiter.is_null(),
+            "initial completion waiter was already registered"
+        );
+        if !task.is_null() {
+            unsafe { retain_task(task) };
+        }
+        self.waiter = task;
+    }
+
+    /// Replaces an operation's waiter without retaining a state borrow while
+    /// releasing the prior task reference.
+    ///
+    /// # Safety
+    ///
+    /// `state` must identify a live, exclusively owned completion state, and a
+    /// non-null `task` must identify a live task on its executor owner thread.
+    #[inline(always)]
+    pub(crate) unsafe fn replace_waiter_unchecked(state: *mut Self, task: *mut TaskHeader) {
+        debug_assert!(unsafe { !(*state).is_cancel_pending() });
+        unsafe { replace_task_ref(std::ptr::addr_of_mut!((*state).waiter), task) };
     }
 
     /// Transfers the waiter reference to the caller without releasing it.
     ///
     /// The caller must keep the reference through notification and then call
-    /// `release_task`, or transfer it into another owning slot.
+    /// [`crate::runtime::task::release_task`], or transfer it into another
+    /// owning slot.
+    ///
+    /// # Safety
+    ///
+    /// `state` must identify a live, exclusively owned completion state.
     #[inline(always)]
-    pub(crate) fn take_waiter(&mut self) -> *mut TaskHeader {
-        debug_assert!(!self.is_cancel_pending());
-        unsafe { take_task_ref(&mut self.waiter) }
+    pub(crate) unsafe fn take_waiter_unchecked(state: *mut Self) -> *mut TaskHeader {
+        debug_assert!(unsafe { !(*state).is_cancel_pending() });
+        unsafe { take_task_ref(std::ptr::addr_of_mut!((*state).waiter)) }
     }
 
+    /// Clears the waiter word without retaining a state borrow while releasing
+    /// the task reference.
+    ///
+    /// # Safety
+    ///
+    /// `state` must identify a live, exclusively owned completion state on its
+    /// executor owner thread.
     #[inline(always)]
-    pub(crate) fn clear_waiter(&mut self) {
-        debug_assert!(!self.is_cancel_pending());
-        unsafe { clear_task_ref(&mut self.waiter) };
+    pub(crate) unsafe fn clear_waiter_unchecked(state: *mut Self) {
+        debug_assert!(unsafe { !(*state).is_cancel_pending() });
+        unsafe { clear_task_ref(std::ptr::addr_of_mut!((*state).waiter)) };
     }
 
     /// Attaches a retained payload while preparing this operation.
@@ -416,9 +477,13 @@ impl CompletionState {
             self.cancel_next.is_null(),
             "cannot resubmit a linked completion state"
         );
+        debug_assert!(
+            self.waiter.is_null(),
+            "retry completion state retained a waiter"
+        );
         self.result = 0;
         self.state_flags = 0;
-        self.clear_waiter();
+        self.waiter = std::ptr::null_mut();
         self.cancel_next = std::ptr::null_mut();
     }
 }
@@ -440,7 +505,39 @@ const _: [(); 64] = [(); std::mem::size_of::<CompletionState>()];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::task::release_task;
+    use crate::runtime::task::{TaskVTable, release_task};
+    use std::cell::Cell;
+    use std::task::Poll;
+
+    thread_local! {
+        static REPLACED_WAITER_STATE: Cell<*mut CompletionState> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static EXPECTED_REPLACEMENT: Cell<*mut TaskHeader> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static REPLACED_WAITER_DESTROYS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    unsafe fn inspect_replaced_waiter(_: *mut TaskHeader) {
+        REPLACED_WAITER_DESTROYS.with(|count| count.set(count.get() + 1));
+        let state = REPLACED_WAITER_STATE.with(Cell::get);
+        let expected = EXPECTED_REPLACEMENT.with(Cell::get);
+        assert!(!state.is_null(), "replacement state was not published");
+        unsafe {
+            assert_eq!(
+                (*state).waiter,
+                expected,
+                "replacement waiter was not published before prior destruction"
+            );
+            (*state).result = 37;
+        }
+    }
+
+    static REPLACED_WAITER_VTABLE: TaskVTable = TaskVTable {
+        poll: |_| Poll::Ready(()),
+        finish: |_| {},
+        cancel: |_| {},
+        destroy: inspect_replaced_waiter,
+    };
 
     #[test]
     fn completion_waiter_reference_pairing_is_exact() {
@@ -453,14 +550,19 @@ mod tests {
         unsafe { state.register_waiter(first_ptr) };
         assert_eq!(first.refs.get(), 2);
 
-        unsafe { state.register_waiter(first_ptr) };
+        unsafe {
+            CompletionState::replace_waiter_unchecked(std::ptr::addr_of_mut!(state), first_ptr)
+        };
         assert_eq!(first.refs.get(), 2, "same waiter retained twice");
 
-        unsafe { state.register_waiter(second_ptr) };
+        unsafe {
+            CompletionState::replace_waiter_unchecked(std::ptr::addr_of_mut!(state), second_ptr)
+        };
         assert_eq!(first.refs.get(), 1, "replaced waiter reference leaked");
         assert_eq!(second.refs.get(), 2);
 
-        let transferred = state.take_waiter();
+        let transferred =
+            unsafe { CompletionState::take_waiter_unchecked(std::ptr::addr_of_mut!(state)) };
         assert_eq!(transferred, second_ptr);
         assert!(state.waiter.is_null());
         assert_eq!(second.refs.get(), 2, "taking waiter released ownership");
@@ -468,13 +570,57 @@ mod tests {
         assert_eq!(second.refs.get(), 1);
 
         unsafe { state.register_waiter(first_ptr) };
-        state.clear_waiter();
+        unsafe {
+            CompletionState::clear_waiter_unchecked(std::ptr::addr_of_mut!(state));
+        }
         assert_eq!(first.refs.get(), 1, "clearing waiter did not release it");
 
         unsafe { state.register_waiter(first_ptr) };
+        let transferred =
+            unsafe { CompletionState::take_waiter_unchecked(std::ptr::addr_of_mut!(state)) };
+        unsafe { release_task(transferred) };
         state.set_completed();
         state.reset_for_resubmit();
-        assert_eq!(first.refs.get(), 1, "resubmit reset leaked waiter");
+        assert_eq!(
+            first.refs.get(),
+            1,
+            "resubmit reset changed waiter ownership"
+        );
+    }
+
+    #[test]
+    fn completion_waiter_replacement_publishes_before_reentrant_release() {
+        REPLACED_WAITER_DESTROYS.with(|count| count.set(0));
+        let mut state = CompletionState::empty();
+        let mut prior = TaskHeader::new();
+        prior.vtable = &REPLACED_WAITER_VTABLE;
+        let prior_ptr = std::ptr::addr_of_mut!(prior);
+        let replacement = TaskHeader::new();
+        let replacement_ptr = &replacement as *const TaskHeader as *mut TaskHeader;
+
+        unsafe {
+            state.register_waiter(prior_ptr);
+            release_task(prior_ptr);
+        }
+        assert_eq!(prior.refs.get(), 1);
+
+        let state_ptr = std::ptr::addr_of_mut!(state);
+        REPLACED_WAITER_STATE.with(|stored| stored.set(state_ptr));
+        EXPECTED_REPLACEMENT.with(|stored| stored.set(replacement_ptr));
+        unsafe {
+            CompletionState::replace_waiter_unchecked(state_ptr, replacement_ptr);
+        }
+        REPLACED_WAITER_STATE.with(|stored| stored.set(std::ptr::null_mut()));
+        EXPECTED_REPLACEMENT.with(|stored| stored.set(std::ptr::null_mut()));
+
+        REPLACED_WAITER_DESTROYS.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(state.result, 37);
+        assert_eq!(state.waiter, replacement_ptr);
+        assert_eq!(replacement.refs.get(), 2);
+        unsafe {
+            CompletionState::clear_waiter_unchecked(std::ptr::addr_of_mut!(state));
+        }
+        assert_eq!(replacement.refs.get(), 1);
     }
 
     #[test]

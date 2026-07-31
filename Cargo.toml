@@ -8,7 +8,7 @@ description = "Single-threaded async runtime and TCP/UDP/SCTP/TLS transport libr
 readme = "README.md"
 keywords = ["async", "io-uring", "runtime", "networking"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["tests/", "public-api.txt"]
+exclude = ["fixtures/fuzzing/", "tests/", "public-api.txt"]
 repository = "https://github.com/BitFlockLabs/flowio"
 
 [features]

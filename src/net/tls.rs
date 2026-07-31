@@ -966,7 +966,7 @@ impl TlsClientStream {
         self.connection
             .process_new_packets()
             .map_err(tls_protocol_error)?;
-        Ok(())
+        tls_transport_eof_result(self.connection.wants_read())
     }
 
     // Drain already-generated TLS records to the socket. This is also the
@@ -1059,10 +1059,13 @@ impl TlsClientStream {
             }
 
             if self.transport_read_eof {
-                if self.connection.is_handshaking() {
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
-                }
-                return Poll::Ready(Ok(()));
+                // The preceding wants_read() check established that rustls
+                // still needs transport input. EOF cannot satisfy that demand,
+                // so reporting a successful fill would expose no progress and
+                // make the caller rediscover the terminal state. A clean
+                // close-notify reaches the success branch above because
+                // rustls no longer wants input.
+                return Poll::Ready(tls_transport_eof_result(true));
             }
 
             if self.pending_write_tls.is_some() {
@@ -1120,6 +1123,14 @@ impl TlsClientStream {
             )));
         }
     }
+}
+
+#[inline(always)]
+fn tls_transport_eof_result(wants_read: bool) -> io::Result<()> {
+    if wants_read {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    }
+    Ok(())
 }
 
 impl Drop for TlsClientStream {
@@ -1662,7 +1673,8 @@ mod tests {
     use super::*;
     use super::{
         TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, TlsWriteScratch, allocate_tls_scratch,
-        take_or_reserve_tls_scratch, tls_read_submission_len, tls_userspace_destination,
+        take_or_reserve_tls_scratch, tls_read_submission_len, tls_transport_eof_result,
+        tls_userspace_destination,
     };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
@@ -1739,6 +1751,17 @@ mod tests {
         }
 
         assert_eq!(tls_read_submission_len(127, 128), 127);
+    }
+
+    #[test]
+    fn tls_transport_eof_classifies_remaining_read_demand_as_unexpected_eof() {
+        assert!(
+            tls_transport_eof_result(false).is_ok(),
+            "clean TLS close should not become an error"
+        );
+        let err = tls_transport_eof_result(true)
+            .expect_err("remaining TLS read demand cannot make progress after transport EOF");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

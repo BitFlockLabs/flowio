@@ -110,6 +110,7 @@ pub(crate) struct SlabPageAlloc {
     /// Raw slot pointer returned to the caller.
     pub(crate) ptr: *mut u8,
     /// True when this allocation requested a fresh slab page.
+    #[cfg(any(debug_assertions, test, feature = "test-support"))]
     pub(crate) new_slab: bool,
 }
 
@@ -216,6 +217,7 @@ impl SlabPageChain {
         if let Some(ptr) = unsafe { self.try_alloc_current(obj_size) } {
             return Some(SlabPageAlloc {
                 ptr,
+                #[cfg(any(debug_assertions, test, feature = "test-support"))]
                 new_slab: false,
             });
         }
@@ -227,6 +229,7 @@ impl SlabPageChain {
         let ptr = unsafe { self.alloc_from_new_slab(slab_factory, obj_size) }?;
         Some(SlabPageAlloc {
             ptr,
+            #[cfg(any(debug_assertions, test, feature = "test-support"))]
             new_slab: true,
         })
     }

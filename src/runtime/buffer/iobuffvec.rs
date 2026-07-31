@@ -224,6 +224,22 @@ where
 }
 
 #[inline(always)]
+pub(crate) fn checked_iovec_count_and_length_sum<I>(lengths: I) -> Option<(usize, usize)>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut iov_count = 0;
+    let mut total = 0usize;
+    for len in lengths {
+        total = total.checked_add(len)?;
+        if len != 0 {
+            iov_count += 1;
+        }
+    }
+    Some((iov_count, total))
+}
+
+#[inline(always)]
 fn checked_readable_len<'a, B, I>(iter: I) -> Option<usize>
 where
     B: IoBuffReadOnly + 'a,
@@ -379,41 +395,48 @@ impl<const N: usize> IoBuffVecMut<N> {
     }
 
     /// Returns the total number of active bytes across all segments.
+    ///
+    /// An unrepresentable aggregate saturates at `usize::MAX`.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        iter_inline(&self.buffers, self.count)
-            .map(|buf| buf.len())
-            .sum()
+        self.checked_len().unwrap_or(usize::MAX)
+    }
+
+    /// Returns the exact total active length, or `None` on `usize` overflow.
+    #[inline(always)]
+    pub fn checked_len(&self) -> Option<usize> {
+        checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
     /// Returns `true` if the chain has no segments or all segments are empty.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.count == 0 || self.len() == 0
+        iter_inline(&self.buffers, self.count).all(IoBuffReadOnly::is_empty)
     }
 
     /// Returns the total writable capacity across all segments.
+    ///
+    /// An unrepresentable aggregate saturates at `usize::MAX`.
     #[inline(always)]
     pub fn writable_len(&self) -> usize {
-        iter_inline(&self.buffers, self.count)
-            .map(|buf| buf.payload_remaining())
-            .sum()
+        self.checked_writable_len().unwrap_or(usize::MAX)
+    }
+
+    /// Returns the exact total writable capacity, or `None` on `usize`
+    /// overflow.
+    #[inline(always)]
+    pub fn checked_writable_len(&self) -> Option<usize> {
+        checked_length_sum(
+            iter_inline(&self.buffers, self.count).map(|buf| buf.payload_remaining()),
+        )
     }
 
     /// Returns the number of non-empty read iovecs and their total capacity.
     #[inline(always)]
-    pub(crate) fn read_iovec_count_and_writable_len(&self) -> (usize, usize) {
-        let mut iov_count = 0;
-        let mut total = 0;
-        for buf in iter_inline(&self.buffers, self.count) {
-            let len = buf.payload_remaining();
-            if len == 0 {
-                continue;
-            }
-            iov_count += 1;
-            total += len;
-        }
-        (iov_count, total)
+    pub(crate) fn checked_read_iovec_count_and_writable_len(&self) -> Option<(usize, usize)> {
+        checked_iovec_count_and_length_sum(
+            iter_inline(&self.buffers, self.count).map(|buf| buf.payload_remaining()),
+        )
     }
 
     /// Fills caller-provided `iovec` scratch for `readv`/`recvmsg`.
@@ -446,7 +469,10 @@ impl<const N: usize> IoBuffVecMut<N> {
             });
             iov_count += 1;
         }
-        debug_assert_eq!((iov_count, total), self.read_iovec_count_and_writable_len());
+        debug_assert_eq!(
+            Some((iov_count, total)),
+            self.checked_read_iovec_count_and_writable_len()
+        );
         Ok((iov_count, total))
     }
 
@@ -866,6 +892,33 @@ mod tests {
     }
 
     #[test]
+    fn checked_iovec_sizing_accepts_exact_max_rejects_overflow_and_compacts_zeros() {
+        let half = isize::MAX as usize;
+        assert_eq!(
+            checked_iovec_count_and_length_sum([half, 0, half, 1]),
+            Some((3, usize::MAX))
+        );
+        assert_eq!(checked_iovec_count_and_length_sum([half, half, 2]), None);
+        assert_eq!(checked_iovec_count_and_length_sum([0, 7, 0]), Some((1, 7)));
+    }
+
+    #[test]
+    fn mutable_chain_checked_lengths_match_active_and_writable_bytes() {
+        let mut first = IoBuffMut::new(0, 8, 0).expect("first segment allocation failed");
+        first
+            .payload_append(b"abc")
+            .expect("first segment initialization failed");
+        let second = IoBuffMut::new(0, 5, 0).expect("second segment allocation failed");
+        let chain = IoBuffVecMut::from_array([first, second]);
+
+        assert_eq!(chain.checked_len(), Some(3));
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain.checked_writable_len(), Some(10));
+        assert_eq!(chain.writable_len(), 10);
+        assert!(!chain.is_empty());
+    }
+
+    #[test]
     fn read_iovec_fill_compacts_nonempty_segments_and_preserves_tail() {
         let mut full = IoBuffMut::new(0, 4, 0).expect("full segment allocation failed");
         full.payload_append(b"full")
@@ -880,7 +933,10 @@ mod tests {
         let writable_ptr = writable.as_mut_ptr();
         let partial_ptr = partial.as_mut_ptr();
         let mut chain = IoBuffVecMut::from_array([full, writable, zero, partial]);
-        assert_eq!(chain.read_iovec_count_and_writable_len(), (2, 12));
+        assert_eq!(
+            chain.checked_read_iovec_count_and_writable_len(),
+            Some((2, 12))
+        );
 
         let poison = libc::iovec {
             iov_base: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
@@ -939,6 +995,9 @@ mod tests {
         let initialized = unsafe { scratch[0].assume_init_ref() };
         assert_eq!(initialized.iov_base, first_ptr.cast());
         assert_eq!(initialized.iov_len, 8);
-        assert_eq!(chain.read_iovec_count_and_writable_len(), (2, 16));
+        assert_eq!(
+            chain.checked_read_iovec_count_and_writable_len(),
+            Some((2, 16))
+        );
     }
 }

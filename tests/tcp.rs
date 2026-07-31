@@ -1285,7 +1285,14 @@ fn runtime_tcp_accept_rearms_after_stale_readiness() {
         })
         .expect("stale-readiness run failed");
     #[cfg(debug_assertions)]
-    assert_eq!(executor.last_stats().accept_readiness_rearms, 1);
+    {
+        assert_eq!(executor.last_stats().accept_readiness_rearms, 1);
+        assert_eq!(
+            executor.last_stats().accept_descriptor_exhaustions,
+            0,
+            "ordinary stale readiness must not count descriptor exhaustion"
+        );
+    }
 }
 
 #[test]

@@ -22,12 +22,13 @@ use flowio::runtime::executor::{Executor, ExecutorConfig};
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{TimeoutError, sleep, timeout};
 use flowio::test_support::net::sctp::{
-    SctpSocketOptionSnapshot, capability_unavailable,
+    SctpSocketOptionSnapshot, append_initialized_test_cmsg, capability_unavailable,
     test_accept_slot_drop_cached_state_preserves_unrelated_fd,
     test_accept_slot_drop_future_preserves_unrelated_fd, test_adaptation_indication_type,
     test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
+    test_connect_slot_drop_cached_state_closes_socket_fd,
     test_connect_slot_drop_future_closes_socket_fd, test_parse_notification, test_parse_recv_meta,
-    test_partial_delivery_event_type, test_peer_addr_change_type,
+    test_parse_stream_recv_meta, test_partial_delivery_event_type, test_peer_addr_change_type,
     test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
     test_sctp_socket_receive_options, test_send_failed_error_offset, test_send_failed_event_type,
     test_send_failed_info_offset, test_send_failed_type, test_sender_dry_event_type,
@@ -1421,34 +1422,22 @@ fn notification_buffer(notification_type: libc::c_int, flags: u16, len: usize) -
     buf
 }
 
-fn test_cmsg_align(len: usize) -> usize {
-    let align = std::mem::size_of::<usize>();
-    (len + align - 1) & !(align - 1)
-}
-
-/// Writes an SCTP_RCVINFO control message into a byte slice that may be
-/// intentionally unaligned.
-fn write_rcvinfo_cmsg(control: &mut [u8], info: libc::sctp_rcvinfo) -> usize {
-    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    let data_offset = test_cmsg_align(hdr_len);
+/// Appends an SCTP_RCVINFO fixture after any existing prefix.
+fn append_rcvinfo_cmsg(control: &mut Vec<u8>, info: libc::sctp_rcvinfo) -> usize {
+    let offset = control.len();
     let data_len = std::mem::size_of::<libc::sctp_rcvinfo>();
-    let needed = data_offset + data_len;
-    assert!(control.len() >= needed);
-
-    let hdr = libc::cmsghdr {
-        cmsg_len: hdr_len + data_len,
-        cmsg_level: libc::IPPROTO_SCTP,
-        cmsg_type: libc::SCTP_RCVINFO,
-    };
+    let data_offset =
+        append_initialized_test_cmsg(control, libc::IPPROTO_SCTP, libc::SCTP_RCVINFO, data_len);
+    let cmsg_len = data_offset - offset + data_len;
+    control.truncate(data_offset + data_len);
     unsafe {
-        std::ptr::write_unaligned(control.as_mut_ptr() as *mut libc::cmsghdr, hdr);
         std::ptr::write_unaligned(
             control.as_mut_ptr().add(data_offset) as *mut libc::sctp_rcvinfo,
             info,
         );
     }
 
-    needed
+    cmsg_len
 }
 
 /// Builds raw 127.0.0.1:port sockaddr_storage for notification fixtures.
@@ -1490,6 +1479,13 @@ fn sctp_accept_slot_drop_cached_state_preserves_unrelated_fd() {
 #[test]
 fn sctp_connect_slot_drop_future_closes_socket_fd() {
     test_connect_slot_drop_future_closes_socket_fd().unwrap();
+}
+
+/// Forgotten-future connector teardown closes the cached connect socket and
+/// releases the reusable slot.
+#[test]
+fn sctp_connect_slot_drop_cached_state_closes_socket_fd() {
+    test_connect_slot_drop_cached_state_closes_socket_fd().unwrap();
 }
 
 #[test]
@@ -1651,10 +1647,8 @@ fn parse_recv_meta_accepts_data_without_rcvinfo_control() {
 
 #[test]
 fn parse_recv_meta_rejects_missing_eor_for_non_empty_messages() {
-    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    let needed = test_cmsg_align(hdr_len) + std::mem::size_of::<libc::sctp_rcvinfo>();
-    let mut control = vec![0u8; needed];
-    let controllen = write_rcvinfo_cmsg(
+    let mut control = Vec::new();
+    let controllen = append_rcvinfo_cmsg(
         &mut control,
         libc::sctp_rcvinfo {
             rcv_sid: 3,
@@ -1687,10 +1681,7 @@ fn parse_recv_meta_rejects_missing_eor_for_non_empty_messages() {
 
 #[test]
 fn parse_recv_meta_accepts_unaligned_rcvinfo_cmsg() {
-    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    let needed = test_cmsg_align(hdr_len) + std::mem::size_of::<libc::sctp_rcvinfo>();
-    let mut storage = vec![0u8; needed + 1];
-    let control = &mut storage[1..];
+    let mut storage = vec![0u8];
     let info = libc::sctp_rcvinfo {
         rcv_sid: 3,
         rcv_ssn: 4,
@@ -1701,7 +1692,8 @@ fn parse_recv_meta_accepts_unaligned_rcvinfo_cmsg() {
         rcv_context: 12,
         rcv_assoc_id: 13,
     };
-    let controllen = write_rcvinfo_cmsg(control, info);
+    let controllen = append_rcvinfo_cmsg(&mut storage, info);
+    let control = &storage[1..];
 
     let parsed = test_parse_recv_meta(control, controllen, libc::MSG_EOR, b"ping")
         .expect("rcvinfo parse failed");
@@ -2117,6 +2109,72 @@ fn notification_mask_defaults() {
     );
     assert!(!SctpNotificationMask::none().association);
     assert!(SctpNotificationMask::all().authentication);
+}
+
+#[test]
+fn runtime_sctp_adopted_stream_refreshes_receive_info_policy() {
+    const TEST_NAME: &str = "runtime_sctp_adopted_stream_refreshes_receive_info_policy";
+    let Some(fd) = raw_sctp_socket_or_skip(TEST_NAME, libc::AF_INET) else {
+        return;
+    };
+
+    let mut enabled = SctpSocketConfig::data(SctpInitConfig::default());
+    enabled.recv_rcvinfo = true;
+    test_apply_sctp_socket_options(fd.as_raw_fd(), enabled)
+        .expect("failed to enable SCTP receive-info on adopted socket");
+
+    let stream = SctpStream::from_owned_fd(fd, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    let expected_default = SctpRecvMeta::Data(SctpRecvInfo {
+        end_of_record: true,
+        ..SctpRecvInfo::default()
+    });
+    assert_eq!(
+        test_parse_stream_recv_meta(&stream, &[], 0, libc::MSG_EOR, b"payload")
+            .expect("adoption should initially retain the no-query receive policy"),
+        expected_default
+    );
+
+    stream
+        .set_notification_mask(SctpNotificationMask::none())
+        .expect("failed to refresh enabled receive-info policy");
+    let forced_pdapi = SctpNotificationMask {
+        partial_delivery: true,
+        ..SctpNotificationMask::none()
+    };
+    assert_sctp_receive_options(
+        stream.as_raw_fd(),
+        forced_pdapi,
+        true,
+        "enabled adopted stream",
+    );
+    let missing = test_parse_stream_recv_meta(&stream, &[], 0, libc::MSG_EOR, b"payload")
+        .expect_err("refreshed enabled receive-info policy must reject absent metadata");
+    assert_eq!(missing.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        missing.to_string(),
+        "SCTP recvmsg omitted requested SCTP_RCVINFO"
+    );
+
+    let disabled = SctpSocketConfig::data(SctpInitConfig::default());
+    test_apply_sctp_socket_options(stream.as_raw_fd(), disabled)
+        .expect("failed to disable SCTP receive-info on adopted socket");
+    test_parse_stream_recv_meta(&stream, &[], 0, libc::MSG_EOR, b"payload")
+        .expect_err("external option mutation must not bypass an explicit policy refresh");
+
+    stream
+        .set_notification_mask(SctpNotificationMask::none())
+        .expect("failed to refresh disabled receive-info policy");
+    assert_sctp_receive_options(
+        stream.as_raw_fd(),
+        SctpNotificationMask::none(),
+        false,
+        "disabled adopted stream",
+    );
+    assert_eq!(
+        test_parse_stream_recv_meta(&stream, &[], 0, libc::MSG_EOR, b"payload")
+            .expect("refreshed disabled receive-info policy should default absent metadata"),
+        expected_default
+    );
 }
 
 fn assert_sctp_receive_options(
@@ -3202,6 +3260,16 @@ fn runtime_sctp_recv_msg_discard_state_drop_returns_buffer_once() {
             drop(discard);
             assert_eq!(drops.get(), 0, "stashed discard buffer dropped early");
 
+            let (invalid, invalid_buffer) = server.recv_msg(vec![0u8; 8], 0).await;
+            let err = invalid.expect_err("zero-length metadata receive unexpectedly succeeded");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(invalid_buffer, vec![0u8; 8]);
+            assert_eq!(
+                drops.get(),
+                0,
+                "invalid metadata receive adopted the prior stash"
+            );
+
             let (send_res, _buf) = client
                 .send_msg(b"after".to_vec(), test_send_info(2, 0x0506_0708))
                 .await;
@@ -3351,6 +3419,16 @@ fn runtime_sctp_dropped_recv_msg_vectored_eor_retires_discard_state() {
                 pool.live_slots_for_test(),
                 2,
                 "stashed vectored discard chain dropped early"
+            );
+
+            let (invalid, invalid_chain) = server.recv_msg_vectored(IoBuffVecMut::<1>::new()).await;
+            let err = invalid.expect_err("empty vectored metadata receive unexpectedly succeeded");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(invalid_chain.segments(), 0);
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "invalid vectored metadata receive adopted the prior stash"
             );
 
             let (send_res, _buf) = client
@@ -4731,7 +4809,14 @@ fn runtime_sctp_accept_rearms_after_stale_readiness() {
         })
         .expect("stale SCTP readiness run failed");
     #[cfg(debug_assertions)]
-    assert_eq!(executor.last_stats().accept_readiness_rearms, 1);
+    {
+        assert_eq!(executor.last_stats().accept_readiness_rearms, 1);
+        assert_eq!(
+            executor.last_stats().accept_descriptor_exhaustions,
+            0,
+            "ordinary stale readiness must not count descriptor exhaustion"
+        );
+    }
 }
 
 #[test]
