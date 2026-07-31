@@ -398,6 +398,56 @@ fn pool_freeze_clone_return() {
     assert!(reused.is_empty());
 }
 
+#[test]
+fn pool_shared_make_mut_preserves_advanced_shape_and_pool_ownership() {
+    let mut pool = new_pool(IoBuffPoolConfig {
+        headroom: 4,
+        payload: 8,
+        tailroom: 4,
+        objs_per_slab: 4,
+    });
+    pool.init();
+
+    let mut buf = pool.alloc().unwrap();
+    let slot_ptr = IoBuffReadOnly::as_ptr(&buf);
+    buf.payload_append(b"abcdefgh").unwrap();
+    buf.headroom_prepend(b"WXYZ").unwrap();
+    buf.tailroom_append(b"IJKL").unwrap();
+    buf.advance(6).unwrap();
+
+    let frozen = buf.freeze();
+    let alias = frozen.clone();
+    assert_eq!(pool.live_slots_for_test(), 1);
+
+    let copied = frozen
+        .make_mut()
+        .expect("shared pool COW allocation failed");
+    assert_ne!(IoBuffReadOnly::as_ptr(&copied), alias.bytes().as_ptr());
+    assert_eq!(copied.bytes(), b"cdefghIJKL");
+    assert_eq!(copied.payload_bytes(), b"cdefgh");
+    assert_eq!(copied.headroom_capacity(), 4);
+    assert_eq!(copied.payload_capacity(), 8);
+    assert_eq!(copied.tailroom_capacity(), 4);
+    assert_eq!(copied.headroom_remaining(), 0);
+    assert_eq!(copied.payload_remaining(), 0);
+    assert_eq!(copied.tailroom_remaining(), 0);
+    assert_eq!(pool.live_slots_for_test(), 1);
+
+    drop(copied);
+    assert_eq!(pool.live_slots_for_test(), 1);
+    assert_eq!(alias.bytes(), b"cdefghIJKL");
+    assert_eq!(alias.headroom_len(), 0);
+    assert_eq!(alias.payload_len(), 6);
+    assert_eq!(alias.tailroom_len(), 4);
+
+    drop(alias);
+    assert_eq!(pool.live_slots_for_test(), 0);
+
+    let reused = pool.alloc().unwrap();
+    assert_eq!(IoBuffReadOnly::as_ptr(&reused), slot_ptr);
+    assert!(reused.is_empty());
+}
+
 // ============================================================================
 // IoBuffPool — flat (no headroom/tailroom)
 // ============================================================================

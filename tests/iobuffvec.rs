@@ -1150,6 +1150,7 @@ fn vec_try_mut_all_with_structured_segments() {
     s1.payload_append(b"payload").unwrap();
     s1.headroom_prepend(b"H:").unwrap();
     s1.tailroom_append(b":T").unwrap();
+    s1.advance(3).unwrap();
 
     let mut s2 = IoBuffMut::new(2, 32, 2);
     s2.payload_append(b"data").unwrap();
@@ -1165,8 +1166,9 @@ fn vec_try_mut_all_with_structured_segments() {
         Err((e, _)) => panic!("try_mut_all failed: {:?}", e),
     };
 
-    assert_eq!(seg!(mutable, 0).bytes(), b"H:payload:T");
-    assert_eq!(seg!(mutable, 0).payload_bytes(), b"payload");
+    assert_eq!(seg!(mutable, 0).bytes(), b"ayload:T");
+    assert_eq!(seg!(mutable, 0).payload_bytes(), b"ayload");
+    assert_eq!(seg!(mutable, 0).headroom_remaining(), 0);
     assert_eq!(seg!(mutable, 1).bytes(), b"[data]");
     assert_eq!(seg!(mutable, 1).payload_bytes(), b"data");
 }

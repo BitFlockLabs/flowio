@@ -1288,6 +1288,15 @@ fn buffer_frozen_owned_view_respects_existing_clone_refcount() {
 // IoBuff — try_mut / make_mut (copy-on-write)
 // ============================================================================
 
+fn advanced_structured_frozen(advance: usize) -> IoBuff {
+    let mut buf = IoBuffMut::new(4, 8, 4);
+    buf.payload_append(b"abcdefgh").unwrap();
+    buf.headroom_prepend(b"WXYZ").unwrap();
+    buf.tailroom_append(b"IJKL").unwrap();
+    buf.advance(advance).unwrap();
+    buf.freeze()
+}
+
 #[test]
 fn buffer_frozen_try_mut_sole_owner() {
     println!("--- try_mut on sole owner (zero-copy) ---");
@@ -1389,6 +1398,133 @@ fn buffer_frozen_make_mut_preserves_shape() {
     assert_eq!(copied.payload_bytes(), b"payload");
     assert_eq!(copied.headroom_remaining(), 2);
     assert_eq!(copied.tailroom_remaining(), 2);
+}
+
+#[test]
+fn buffer_frozen_shared_make_mut_matches_unique_advanced_state() {
+    let cases = [
+        (
+            0,
+            b"WXYZabcdefghIJKL".as_slice(),
+            b"abcdefgh".as_slice(),
+            (4, 8, 4),
+        ),
+        (
+            2,
+            b"YZabcdefghIJKL".as_slice(),
+            b"abcdefgh".as_slice(),
+            (2, 8, 4),
+        ),
+        (6, b"cdefghIJKL".as_slice(), b"cdefgh".as_slice(), (0, 6, 4)),
+        (14, b"KL".as_slice(), b"".as_slice(), (0, 0, 2)),
+        (16, b"".as_slice(), b"".as_slice(), (0, 0, 0)),
+    ];
+
+    for (advance, expected_bytes, expected_payload, expected_regions) in cases {
+        let unique = advanced_structured_frozen(advance)
+            .try_mut()
+            .expect("sole frozen buffer must thaw");
+
+        let frozen = advanced_structured_frozen(advance);
+        let alias = frozen.clone();
+        let shared = frozen.make_mut().expect("shared COW allocation failed");
+
+        assert_eq!(unique.bytes(), expected_bytes, "unique advance {advance}");
+        assert_eq!(shared.bytes(), expected_bytes, "shared advance {advance}");
+        assert_eq!(alias.bytes(), expected_bytes, "alias advance {advance}");
+        assert_eq!(unique.payload_bytes(), expected_payload);
+        assert_eq!(shared.payload_bytes(), expected_payload);
+
+        assert_eq!(unique.headroom_capacity(), 4);
+        assert_eq!(shared.headroom_capacity(), 4);
+        assert_eq!(unique.payload_capacity(), 8);
+        assert_eq!(shared.payload_capacity(), 8);
+        assert_eq!(unique.tailroom_capacity(), 4);
+        assert_eq!(shared.tailroom_capacity(), 4);
+        assert_eq!(unique.headroom_remaining(), shared.headroom_remaining());
+        assert_eq!(unique.payload_remaining(), shared.payload_remaining());
+        assert_eq!(unique.tailroom_remaining(), shared.tailroom_remaining());
+
+        let unique = unique.freeze();
+        let shared = shared.freeze();
+        let unique_regions = (
+            unique.headroom_len(),
+            unique.payload_len(),
+            unique.tailroom_len(),
+        );
+        let shared_regions = (
+            shared.headroom_len(),
+            shared.payload_len(),
+            shared.tailroom_len(),
+        );
+        assert_eq!(unique_regions, expected_regions, "unique advance {advance}");
+        assert_eq!(shared_regions, expected_regions, "shared advance {advance}");
+    }
+}
+
+#[test]
+fn buffer_frozen_shared_make_mut_preserves_consumed_capacity_and_reset() {
+    fn source() -> IoBuff {
+        let mut buf = IoBuffMut::new(4, 8, 0);
+        buf.payload_append(b"abcdefgh").unwrap();
+        buf.headroom_prepend(b"WXYZ").unwrap();
+        buf.advance(6).unwrap();
+        buf.freeze()
+    }
+
+    let mut unique = source().try_mut().expect("sole frozen buffer must thaw");
+    let frozen = source();
+    let alias = frozen.clone();
+    let mut shared = frozen.make_mut().expect("shared COW allocation failed");
+
+    for buf in [&mut unique, &mut shared] {
+        assert_eq!(buf.bytes(), b"cdefgh");
+        assert_eq!(buf.payload_bytes(), b"cdefgh");
+        assert_eq!(buf.headroom_remaining(), 0);
+        assert_eq!(buf.payload_remaining(), 0);
+        assert_eq!(buf.headroom_prepend(b"!"), Err(IoBuffError::HeadroomFull));
+        assert_eq!(buf.payload_append(b"!"), Err(IoBuffError::PayloadFull));
+
+        buf.reset();
+        assert_eq!(buf.headroom_remaining(), 4);
+        assert_eq!(buf.payload_remaining(), 8);
+        buf.payload_append(b"xy").unwrap();
+        buf.headroom_prepend(b"H").unwrap();
+        assert_eq!(buf.bytes(), b"Hxy");
+    }
+
+    assert_eq!(alias.bytes(), b"cdefgh");
+    assert_eq!(unique.bytes(), shared.bytes());
+}
+
+#[test]
+fn buffer_frozen_shared_make_mut_preserves_frontier_and_clone_independence() {
+    fn source() -> IoBuff {
+        let mut buf = IoBuffMut::new(4, 8, 0);
+        buf.payload_append(b"abcdef").unwrap();
+        buf.headroom_prepend(b"WXYZ").unwrap();
+        buf.advance(6).unwrap();
+        buf.freeze()
+    }
+
+    let mut unique = source().try_mut().expect("sole frozen buffer must thaw");
+    let frozen = source();
+    let alias = frozen.clone();
+    let mut shared = frozen.make_mut().expect("shared COW allocation failed");
+
+    for buf in [&mut unique, &mut shared] {
+        assert_eq!(buf.payload_bytes(), b"cdef");
+        assert_eq!(buf.payload_remaining(), 2);
+        assert_eq!(
+            buf.payload_set_len(5),
+            Err(IoBuffError::PayloadUninitialized)
+        );
+        buf.payload_append(b"!").unwrap();
+        assert_eq!(buf.payload_bytes(), b"cdef!");
+    }
+
+    assert_eq!(alias.bytes(), b"cdef");
+    assert_eq!(unique.bytes(), shared.bytes());
 }
 
 #[test]

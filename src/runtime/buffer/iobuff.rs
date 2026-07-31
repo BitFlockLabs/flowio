@@ -1271,10 +1271,42 @@ impl IoBuff {
         unsafe { self.header.as_ref().ref_count() }
     }
 
+    /// Copies this frozen buffer into one heap allocation while preserving
+    /// its exact structured position and active region lengths.
+    fn copy_shared_to_mut(&self) -> Result<IoBuffMut, IoBuffError> {
+        let hdr = unsafe { self.header.as_ref() };
+        let (headroom_capacity, payload_capacity, tailroom_capacity) = (
+            hdr.headroom_capacity,
+            hdr.payload_capacity,
+            hdr.tailroom_capacity,
+        );
+        let mut copied = IoBuffMut::new(headroom_capacity, payload_capacity, tailroom_capacity)?;
+
+        let active = self.bytes();
+        if !active.is_empty() {
+            // SAFETY: `active` is the source buffer's initialized active
+            // window. The destination has identical region capacities, so
+            // the preserved offset and active length fit its distinct heap
+            // allocation and the two ranges cannot overlap.
+            unsafe {
+                let destination =
+                    IoBuffHeader::headroom_ptr_from_raw(copied.header.as_ptr()).add(self.offset);
+                std::ptr::copy_nonoverlapping(active.as_ptr(), destination, active.len());
+            }
+        }
+
+        copied.offset = self.offset;
+        copied.payload_len = self.payload_len;
+        copied.payload_initialized_len = self.payload_len;
+        copied.tailroom_len = self.tailroom_len;
+        Ok(copied)
+    }
+
     /// Converts to a mutable buffer.  If this is the sole reference, the
     /// conversion is zero-copy.  If the buffer is shared (refcount > 1),
-    /// the active data is copied into a new heap-allocated buffer
-    /// (copy-on-write).
+    /// the active data and its structured position are copied into a new
+    /// heap-allocated buffer (copy-on-write). Consumed capacity remains
+    /// consumed in either case.
     ///
     /// Avoid the shared path on allocation-sensitive fast paths. Keep the
     /// buffer exclusively mutable, or use [`IoBuff::try_mut`] and handle the
@@ -1295,27 +1327,7 @@ impl IoBuff {
     pub fn make_mut(self) -> Result<IoBuffMut, IoBuffError> {
         match self.try_mut() {
             Ok(buf) => Ok(buf),
-            Err(frozen) => {
-                let hdr = unsafe { frozen.header.as_ref() };
-                let mut new = IoBuffMut::new(
-                    hdr.headroom_capacity,
-                    hdr.payload_capacity,
-                    hdr.tailroom_capacity,
-                )?;
-                if frozen.headroom_len() > 0 {
-                    let head_len = frozen.headroom_len();
-                    new.headroom_prepend(&frozen.bytes()[..head_len])?;
-                }
-                if frozen.payload_len > 0 {
-                    let head_len = frozen.headroom_len();
-                    new.payload_append(&frozen.bytes()[head_len..head_len + frozen.payload_len])?;
-                }
-                if frozen.tailroom_len > 0 {
-                    let tail_start = frozen.headroom_len() + frozen.payload_len;
-                    new.tailroom_append(&frozen.bytes()[tail_start..])?;
-                }
-                Ok(new)
-            }
+            Err(frozen) => frozen.copy_shared_to_mut(),
         }
     }
 }

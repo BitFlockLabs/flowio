@@ -9,12 +9,16 @@ static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
+    static FAIL_NEXT_ALLOCATION: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_SIZE: Cell<usize> = const { Cell::new(0) };
     static COUNT_SIZE_ALLOCS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static COUNT_SIZE_ZEROED_ALLOCS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 fn should_fail(size: usize) -> bool {
+    if FAIL_NEXT_ALLOCATION.with(|target| target.replace(false)) {
+        return true;
+    }
     FAIL_NEXT_SIZE.with(|target| {
         if target.get() != size {
             return false;
@@ -87,22 +91,40 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+/// Makes the next allocation on this thread fail, regardless of its layout.
+#[allow(dead_code)]
+pub fn fail_next_allocation() {
+    FAIL_NEXT_SIZE.with(|target| {
+        assert_eq!(target.get(), 0, "size-specific allocation failure armed");
+    });
+    FAIL_NEXT_ALLOCATION.with(|target| {
+        assert!(!target.replace(true), "allocation failure already armed");
+    });
+}
+
 /// Makes the next allocation of exactly `size` bytes on this thread fail.
 #[allow(dead_code)]
 pub fn fail_next_allocation_of_size(size: usize) {
     assert!(size > 0, "allocation failure size must be nonzero");
+    FAIL_NEXT_ALLOCATION.with(|target| {
+        assert!(!target.get(), "layout-independent allocation failure armed");
+    });
     FAIL_NEXT_SIZE.with(|target| {
         assert_eq!(target.replace(size), 0, "allocation failure already armed");
     });
 }
 
-/// Asserts that a size-specific allocation failure was observed, then disarms
-/// it before reporting a test failure.
+/// Asserts that the armed allocation failure was observed, then disarms any
+/// remaining failure gate before reporting a test failure.
 #[allow(dead_code)]
 pub fn assert_allocation_failure_consumed() {
+    let any_pending = FAIL_NEXT_ALLOCATION.with(|target| target.replace(false));
     FAIL_NEXT_SIZE.with(|target| {
         let pending = target.replace(0);
-        assert_eq!(pending, 0, "armed allocation failure was not consumed");
+        assert!(
+            !any_pending && pending == 0,
+            "armed allocation failure was not consumed"
+        );
     });
 }
 
