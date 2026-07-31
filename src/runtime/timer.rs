@@ -506,6 +506,13 @@ impl TimerWheel {
             }
         }
 
+        if start_bit != 0 {
+            let prefix = self.lvl0_bits[start_word] & ((1u64 << start_bit) - 1);
+            if let Some(bit) = Self::next_set_bit(prefix, 0) {
+                return Some(start_word * 64 + bit);
+            }
+        }
+
         None
     }
 
@@ -2399,6 +2406,199 @@ mod tests {
         let mut entry = TimerEntry::new();
         entry.deadline_tick = deadline_tick;
         entry
+    }
+
+    #[test]
+    fn timer_wheel_level0_bitmap_selection_is_circular_for_every_start_and_bit() {
+        let mut wheel = TimerWheel::new_uninit();
+        init_wheel_at(&mut wheel, 0);
+
+        for start in 0..LVL0_SLOTS {
+            wheel.current_tick = start as u64;
+            wheel.lvl0_bits = [0; LVL0_SLOTS / u64::BITS as usize];
+            assert_eq!(wheel.next_nonempty_lvl0_bucket(), None);
+
+            for occupied in 0..LVL0_SLOTS {
+                wheel.lvl0_bits = [0; LVL0_SLOTS / u64::BITS as usize];
+                wheel.lvl0_bits[occupied / u64::BITS as usize] =
+                    1u64 << (occupied % u64::BITS as usize);
+                assert_eq!(
+                    wheel.next_nonempty_lvl0_bucket(),
+                    Some(occupied),
+                    "start {start}, occupied {occupied}"
+                );
+            }
+
+            wheel.lvl0_bits = [u64::MAX; LVL0_SLOTS / u64::BITS as usize];
+            assert_eq!(
+                wheel.next_nonempty_lvl0_bucket(),
+                Some(start),
+                "dense bitmap at start {start}"
+            );
+        }
+
+        let ordering_cases: &[(usize, &[usize], usize)] = &[
+            (0, &[0, 255], 0),
+            (1, &[0, 63], 63),
+            (63, &[0, 64], 64),
+            (64, &[63, 65], 65),
+            (70, &[65, 80], 80),
+            (81, &[65, 80], 65),
+            (127, &[64, 128], 128),
+            (128, &[127, 129], 129),
+            (191, &[128, 192], 192),
+            (192, &[191, 193], 193),
+            (255, &[0, 254], 0),
+        ];
+        for &(start, occupied, expected) in ordering_cases {
+            wheel.current_tick = start as u64;
+            wheel.lvl0_bits = [0; LVL0_SLOTS / u64::BITS as usize];
+            for &index in occupied {
+                wheel.lvl0_bits[index / u64::BITS as usize] |= 1u64 << (index % u64::BITS as usize);
+            }
+            assert_eq!(
+                wheel.next_nonempty_lvl0_bucket(),
+                Some(expected),
+                "start {start}, occupied {occupied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timer_cancellation_preserves_wrapped_same_word_deadline() {
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        runtime.wheel.current_tick = 70;
+
+        let wrapped = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), 321)
+            .expect("wrapped timer arm failed");
+        let earlier = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), 80)
+            .expect("earlier timer arm failed");
+        assert_eq!(runtime.wheel.next_deadline_tick, Some(80));
+
+        runtime
+            .cancel_sleep(earlier)
+            .expect("earlier timer cancellation failed");
+
+        assert!(runtime.has_pending());
+        assert!(unsafe { (*wrapped).state == TimerState::Armed });
+        assert_eq!(
+            runtime.next_wait_duration(70),
+            Some(Duration::from_nanos(251 * TIMER_TICK_NS))
+        );
+        assert_eq!(runtime.wheel.next_deadline_tick, Some(321));
+
+        runtime
+            .cancel_sleep(wrapped)
+            .expect("wrapped timer cancellation failed");
+    }
+
+    #[test]
+    fn timer_expiry_preserves_wrapped_same_word_deadline() {
+        let mut runtime = TimerRuntime::new().expect("timer runtime construction failed");
+        runtime.init().expect("timer runtime init failed");
+        runtime.wheel.current_tick = 80;
+
+        let wrapped = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), 321)
+            .expect("wrapped timer arm failed");
+        let earlier = runtime
+            .submit_sleep_at_tick(std::ptr::null_mut(), 90)
+            .expect("earlier timer arm failed");
+
+        let mut ready_queue = DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let mut runtime_state = RuntimeState {
+            live_tasks: 0,
+            inflight_ops: 0,
+            #[cfg(debug_assertions)]
+            stats: crate::runtime::executor::RuntimeStats::default(),
+        };
+        let schedule_ctx = ScheduleCtx {
+            ready_queue: std::ptr::addr_of_mut!(ready_queue),
+            runtime_state: std::ptr::addr_of_mut!(runtime_state),
+        };
+
+        assert!(!unsafe {
+            TimerRuntime::collect_expired_unchecked(
+                std::ptr::addr_of_mut!(runtime),
+                90,
+                usize::MAX,
+                schedule_ctx,
+            )
+        });
+        assert!(unsafe { (*earlier).state == TimerState::Fired });
+        assert!(unsafe { (*wrapped).state == TimerState::Armed });
+        assert!(runtime.wheel.next_deadline_dirty);
+        assert_eq!(
+            runtime.next_wait_duration(90),
+            Some(Duration::from_nanos(231 * TIMER_TICK_NS))
+        );
+        assert_eq!(runtime.wheel.next_deadline_tick, Some(321));
+
+        runtime
+            .cancel_sleep(earlier)
+            .expect("fired timer reclamation failed");
+        runtime
+            .cancel_sleep(wrapped)
+            .expect("wrapped timer cancellation failed");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn executor_waits_for_wrapped_timer_after_earlier_cancellation() {
+        let mut executor = Executor::new().expect("failed to construct executor");
+        let mut wrapped: *mut TimerEntry = std::ptr::null_mut();
+        executor
+            .run(std::future::poll_fn(move |cx| {
+                let pctx = poll_ctx_from_waker(cx).expect("executor poll context missing");
+                let timers = pctx.timers();
+
+                if wrapped.is_null() {
+                    // Put the wheel at bit 63 of a future 64-slot word. The
+                    // survivor then wraps to bit 0 of that same level-0 word,
+                    // while the cancelled timer occupies the following word.
+                    let now = unsafe { (*timers).now_tick().expect("timer clock sample failed") };
+                    let current = (now | 63)
+                        .checked_add(64)
+                        .expect("timer tick overflow in regression test");
+                    let wrapped_deadline = current + 193;
+                    let earlier_deadline = current + 1;
+
+                    // SAFETY: this runs inside the active owner task's poll.
+                    // The executor timer wheel is empty, and both entries are
+                    // registered to and reclaimed by this same owner task.
+                    unsafe {
+                        assert!(!(*timers).has_pending());
+                        (*timers).wheel.current_tick = current;
+                        wrapped = (*timers)
+                            .submit_sleep_at_tick(pctx.owner_task(), wrapped_deadline)
+                            .expect("wrapped timer arm failed");
+                        let earlier = (*timers)
+                            .submit_sleep_at_tick(pctx.owner_task(), earlier_deadline)
+                            .expect("earlier timer arm failed");
+                        (*timers)
+                            .cancel_sleep(earlier)
+                            .expect("earlier timer cancellation failed");
+                    }
+                    return Poll::Pending;
+                }
+
+                // SAFETY: the non-null entry remains owned by this executor
+                // and can only have woken the task after transitioning to
+                // Fired. Reclaim it before completing the owner task.
+                unsafe {
+                    assert!((*wrapped).state == TimerState::Fired);
+                    (*timers)
+                        .cancel_sleep(wrapped)
+                        .expect("wrapped timer reclamation failed");
+                }
+                wrapped = std::ptr::null_mut();
+                Poll::Ready(())
+            }))
+            .expect("executor returned before the wrapped timer fired");
     }
 
     #[test]
