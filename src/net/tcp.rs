@@ -721,7 +721,14 @@ impl TcpListener {
         })
     }
 
-    /// Returns the local address currently assigned to the listener.
+    /// Returns the local address captured during successful listener
+    /// construction.
+    ///
+    /// [`Self::bind`] and [`Self::bind_reuse_port`] query `getsockname(2)` once
+    /// after `bind(2)` and `listen(2)` succeed, so a kernel-selected port from
+    /// a port-zero bind is included. This method copies that cached address
+    /// without a syscall, allocation, or runtime-context lookup. It does not
+    /// refresh after changes made through the raw descriptor.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }

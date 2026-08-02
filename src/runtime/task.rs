@@ -350,6 +350,7 @@ pub(crate) unsafe fn take_task_ref(slot: *mut *mut TaskHeader) -> *mut TaskHeade
 /// pointer in that word must own one live task reference on its owner thread.
 /// No Rust reference to the containing object may remain live while releasing
 /// the final task reference.
+#[cfg(any(test, feature = "test-support"))]
 #[inline(always)]
 pub(crate) unsafe fn clear_task_ref(slot: *mut *mut TaskHeader) {
     let task = unsafe { take_task_ref(slot) };

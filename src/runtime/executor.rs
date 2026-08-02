@@ -41,6 +41,8 @@
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::{Reactor, ReactorConfig, ReactorSubmitStatus};
 use crate::runtime::retained::RetainedPayload;
+#[cfg(debug_assertions)]
+use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::task::{
     Task, TaskHeader, TaskVTable, cached_waker_ref, init_cached_waker, release_task,
     task_ptr_from_waker,
@@ -991,6 +993,7 @@ pub(crate) struct CompletionDrainGuard {
 }
 
 impl CompletionDrainGuard {
+    #[cfg(any(test, all(feature = "test-support", not(miri))))]
     #[inline(always)]
     pub(crate) fn enter() -> Self {
         EXECUTOR_CTX.with(|context| {
@@ -1205,6 +1208,7 @@ pub(crate) fn poll_ctx_from_waker(cx: &std::task::Context<'_>) -> io::Result<Pol
 ///
 /// A non-null `state_ptr` must identify the live completion state exclusively
 /// owned by the currently polled future.
+#[cfg(any(test, feature = "test-support"))]
 #[inline(always)]
 pub(crate) unsafe fn poll_ctx_or_transient_pending_op(
     cx: &std::task::Context<'_>,
@@ -2116,7 +2120,11 @@ impl Executor {
                     }
                 };
 
-                let data_ptr = (*slot_ptr).data.as_mut_ptr() as *mut JoinTask<F>;
+                // Keep the long-lived join-field pointers rooted in the whole
+                // task allocation. `data.as_mut_ptr()` would first create a
+                // field-local mutable borrow that a later whole-task vtable
+                // reborrow can invalidate.
+                let data_ptr = std::ptr::addr_of_mut!((*slot_ptr).data).cast::<JoinTask<F>>();
                 // Initialize the join payload directly in its fixed task slot.
                 // Building a by-value JoinTask first would move a future as
                 // large as the slot through a second stack temporary.
@@ -2135,7 +2143,7 @@ impl Executor {
                     .header
                     .flags
                     .set(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED);
-                init_cached_waker(&mut (*slot_ptr).header as *mut _);
+                init_cached_waker(std::ptr::addr_of_mut!((*slot_ptr).header));
                 (*slot_ptr).header.vtable = join_task_vtable_for::<F>();
 
                 (*state_ptr).runtime_state.live_tasks += 1;
@@ -2152,7 +2160,7 @@ impl Executor {
                     .push_back_unchecked(std::ptr::addr_of_mut!((*slot_ptr).header.ready_link));
 
                 Ok(JoinHandle {
-                    task_ptr: &mut (*slot_ptr).header as *mut TaskHeader,
+                    task_ptr: std::ptr::addr_of_mut!((*slot_ptr).header),
                     result_ptr,
                     waker_ptr,
                 })
@@ -2257,6 +2265,9 @@ impl Executor {
                 (*state_ptr).task_pool.reset_provider_debug_counts();
             }
         }
+
+        #[cfg(debug_assertions)]
+        let retained_stats_baseline = unsafe { (*state_ptr).reactor.retained_payload_stats() };
 
         let _ctx_guard = ExecutorCtxGuard::install(owner_ptr)?;
 
@@ -2388,7 +2399,7 @@ impl Executor {
             if drained {
                 #[cfg(debug_assertions)]
                 {
-                    self.snapshot_stats();
+                    self.snapshot_stats(retained_stats_baseline);
                 }
                 return Ok(());
             }
@@ -2405,7 +2416,7 @@ impl Executor {
             if unsafe { (*state_ptr).runtime_state.inflight_ops == 0 } && timer_wait.is_none() {
                 #[cfg(debug_assertions)]
                 {
-                    self.snapshot_stats();
+                    self.snapshot_stats(retained_stats_baseline);
                 }
                 return Err(io::Error::from(ErrorKind::WouldBlock));
             }
@@ -2439,13 +2450,16 @@ impl Executor {
     }
 
     #[cfg(debug_assertions)]
-    fn snapshot_stats(&mut self) {
+    fn snapshot_stats(&mut self, retained_stats_baseline: RetainedPayloadPoolStats) {
         let state = unsafe { &mut *self.owner.state_ptr() };
         let runtime_state = &mut state.runtime_state;
         let provider = state.task_pool.provider_ref();
         runtime_state.stats.task_slab_allocs = provider.request_count;
         runtime_state.stats.task_slab_frees = provider.free_count;
-        let retained = state.reactor.retained_payload_stats();
+        let retained = state
+            .reactor
+            .retained_payload_stats()
+            .saturating_delta_since(retained_stats_baseline);
         runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
         runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
         runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
@@ -2465,6 +2479,10 @@ impl Executor {
 
     /// Returns debug counters from the latest run that drained or reached the
     /// stalled-work `WouldBlock` check.
+    ///
+    /// Retained-payload and vectored-scratch counters are saturating deltas
+    /// from that run's entry. Direct retained-pool test-support snapshots keep
+    /// their lifetime-total semantics.
     ///
     /// In release builds this dev-only accessor returns an empty snapshot
     /// because the counters are not compiled in.
@@ -2500,24 +2518,25 @@ impl Executor {
                 break;
             };
 
-            let header = unsafe { &*task_ptr };
-            if !header.ready_link.is_unlinked() {
+            let ready_link = unsafe { std::ptr::addr_of_mut!((*task_ptr).ready_link) };
+            if unsafe { !(*ready_link).is_unlinked() } {
                 unsafe {
-                    (*state_ptr)
-                        .ready_queue
-                        .remove(std::ptr::addr_of_mut!((*task_ptr).ready_link));
+                    (*state_ptr).ready_queue.remove(ready_link);
                 }
             }
 
-            let flags = header.flags.get();
+            let flags = unsafe { task_flags_unchecked(task_ptr) };
             if task_is_completed(flags) {
-                header.flags.set(
-                    (flags
-                        & !(TaskHeader::FLAG_RUNNING
-                            | TaskHeader::FLAG_NOTIFIED
-                            | TaskHeader::FLAG_QUEUED))
-                        | TaskHeader::FLAG_COMPLETED,
-                );
+                unsafe {
+                    replace_task_flags_unchecked(
+                        task_ptr,
+                        (flags
+                            & !(TaskHeader::FLAG_RUNNING
+                                | TaskHeader::FLAG_NOTIFIED
+                                | TaskHeader::FLAG_QUEUED))
+                            | TaskHeader::FLAG_COMPLETED,
+                    );
+                }
                 continue;
             }
 
@@ -3466,6 +3485,19 @@ unsafe fn task_flags_unchecked(task_ptr: *mut TaskHeader) -> u64 {
 }
 
 #[inline(always)]
+/// Replaces the complete packed scheduler flag word in a live task header.
+///
+/// # Safety
+///
+/// `task_ptr` must be non-null, aligned, and exclusively scheduler-accessible
+/// on the owning executor thread. `flags` must contain the complete next state.
+unsafe fn replace_task_flags_unchecked(task_ptr: *mut TaskHeader, flags: u64) {
+    unsafe {
+        (*std::ptr::addr_of!((*task_ptr).flags)).set(flags);
+    }
+}
+
+#[inline(always)]
 /// Adds one scheduler flag to a live task header.
 ///
 /// # Safety
@@ -3473,8 +3505,10 @@ unsafe fn task_flags_unchecked(task_ptr: *mut TaskHeader) -> u64 {
 /// `task_ptr` must be non-null, aligned, and exclusively scheduler-accessible
 /// on the owning executor thread.
 unsafe fn set_task_flag_unchecked(task_ptr: *mut TaskHeader, flag: u64) {
-    let flags = unsafe { &*std::ptr::addr_of!((*task_ptr).flags) };
-    flags.set(flags.get() | flag);
+    let flags = unsafe { task_flags_unchecked(task_ptr) };
+    unsafe {
+        replace_task_flags_unchecked(task_ptr, flags | flag);
+    }
 }
 
 #[inline(always)]
@@ -3786,6 +3820,62 @@ mod tests {
                 assert_staged_tasks_reclaimed(owner, 2, 2);
             }
         });
+    }
+
+    #[test]
+    fn shutdown_completed_ready_linked_task_drains_without_header_aliasing() {
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let owner_ptr = Rc::as_ptr(&executor.owner);
+        let drops = Rc::new(Cell::new(0));
+        let staged = {
+            let _active = ExecutorCtxGuard::install(owner_ptr)
+                .expect("ringless shutdown test context installation failed");
+            stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("completed task staging failed")
+        };
+        let task = staged.task;
+        let state = executor.owner.state_ptr();
+        unsafe {
+            (*task).flags.set(
+                TaskHeader::FLAG_COMPLETED
+                    | TaskHeader::FLAG_RUNNING
+                    | TaskHeader::FLAG_NOTIFIED
+                    | TaskHeader::FLAG_QUEUED,
+            );
+            (*state)
+                .ready_queue
+                .push_back_unchecked(std::ptr::addr_of_mut!((*task).ready_link));
+        }
+
+        executor.shutdown_owner();
+
+        unsafe {
+            assert!((*state).shutdown_complete);
+            assert!((*state).ready_queue.is_empty());
+            assert!((*state).all_tasks.is_empty());
+            assert!((*task).ready_link.is_unlinked());
+            assert_eq!((*task).flags.get(), TaskHeader::FLAG_COMPLETED);
+        }
+        assert_eq!(
+            drops.get(),
+            0,
+            "escaped task output dropped during shutdown"
+        );
+
+        drop(staged);
+        assert_eq!(drops.get(), 1);
+        unsafe {
+            assert_staged_tasks_reclaimed(&executor.owner, 1, 1);
+        }
     }
 
     unsafe fn runtime_shutdown_output_destroy(_: *mut TaskHeader) {
@@ -6436,6 +6526,188 @@ mod tests {
 
         unsafe { std::ptr::drop_in_place(join_ptr) };
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn try_spawn_ringless_lifecycle_preserves_whole_task_provenance() {
+        struct ReadyTask {
+            captured_waker: Rc<Cell<Option<Waker>>>,
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for ReadyTask {
+            type Output = usize;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                this.polls.set(this.polls.get() + 1);
+                this.captured_waker.set(Some(cx.waker().clone()));
+                Poll::Ready(41)
+            }
+        }
+
+        impl Drop for ReadyTask {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        struct PendingTask {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for PendingTask {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Pending
+            }
+        }
+
+        impl Drop for PendingTask {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        unsafe fn dequeue_for_poll(owner: &ExecutorOwner) -> *mut TaskHeader {
+            let state = owner.state_ptr();
+            let task = unsafe {
+                (*state)
+                    .ready_queue
+                    .pop_front(TaskHeader::READY_LINK_OFFSET)
+            }
+            .expect("spawned task was not queued");
+            let flags = unsafe { (*task).flags.get() };
+            unsafe {
+                (*task).flags.set(
+                    (flags & !(TaskHeader::FLAG_QUEUED | TaskHeader::FLAG_NOTIFIED))
+                        | TaskHeader::FLAG_RUNNING,
+                );
+            }
+            task
+        }
+
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let state = owner.state_ptr();
+            let mut join_cx = Context::from_waker(Waker::noop());
+
+            let ready_polls = Rc::new(Cell::new(0));
+            let ready_drops = Rc::new(Cell::new(0));
+            let captured_waker = Rc::new(Cell::new(None));
+            let mut ready_handle = Executor::try_spawn(ReadyTask {
+                captured_waker: Rc::clone(&captured_waker),
+                polls: Rc::clone(&ready_polls),
+                drops: Rc::clone(&ready_drops),
+            })
+            .expect("ringless ready task admission failed");
+            assert!(!ready_handle.is_finished());
+            assert_eq!(
+                Pin::new(&mut ready_handle).poll(&mut join_cx),
+                Poll::Pending
+            );
+
+            let queued_task = unsafe { dequeue_for_poll(owner) };
+            let ready_task = unsafe {
+                let cached = cached_waker_ref(queued_task);
+                task_ptr_from_waker(cached).expect("cached task waker lost its task pointer")
+            };
+            assert_eq!(ready_task, queued_task);
+            let poll = unsafe { (*ready_task).vtable.poll };
+            assert_eq!(unsafe { poll(ready_task) }, Poll::Ready(()));
+
+            let flags = unsafe { (*ready_task).flags.get() };
+            unsafe {
+                (*ready_task).flags.set(
+                    (flags
+                        & !(TaskHeader::FLAG_RUNNING
+                            | TaskHeader::FLAG_NOTIFIED
+                            | TaskHeader::FLAG_QUEUED))
+                        | TaskHeader::FLAG_COMPLETED,
+                );
+                assert!((*state).runtime_state.live_tasks > 0);
+                (*state).runtime_state.live_tasks -= 1;
+            }
+            let task_ref = ExecutorTaskRefGuard::new(ready_task);
+            let finish = unsafe { (*ready_task).vtable.finish };
+            unsafe { finish(ready_task) };
+            task_ref.release();
+
+            assert_eq!(ready_polls.get(), 1);
+            assert_eq!(ready_drops.get(), 1);
+            assert!(ready_handle.is_finished());
+            assert_eq!(
+                Pin::new(&mut ready_handle).poll(&mut join_cx),
+                Poll::Ready(Ok(41))
+            );
+            drop(ready_handle);
+            assert!(
+                unsafe { !(*state).all_tasks.is_empty() },
+                "captured task waker must retain the completed task"
+            );
+            drop(captured_waker.take());
+            assert!(
+                unsafe { (*state).all_tasks.is_empty() },
+                "final task-waker release did not destroy the ready task"
+            );
+
+            let pending_polls = Rc::new(Cell::new(0));
+            let pending_drops = Rc::new(Cell::new(0));
+            let mut pending_handle = Executor::try_spawn(PendingTask {
+                polls: Rc::clone(&pending_polls),
+                drops: Rc::clone(&pending_drops),
+            })
+            .expect("ringless pending task admission failed");
+            assert!(!pending_handle.is_finished());
+            assert_eq!(
+                Pin::new(&mut pending_handle).poll(&mut join_cx),
+                Poll::Pending
+            );
+            let queued_task = unsafe { dequeue_for_poll(owner) };
+            let pending_task = pending_handle.task_ptr;
+            assert_eq!(pending_task, queued_task);
+            let poll = unsafe { (*pending_task).vtable.poll };
+            assert_eq!(unsafe { poll(pending_task) }, Poll::Pending);
+            let flags = unsafe { (*pending_task).flags.get() };
+            unsafe {
+                (*pending_task).flags.set(flags & !TaskHeader::FLAG_RUNNING);
+            }
+            assert_eq!(
+                Pin::new(&mut pending_handle).poll(&mut join_cx),
+                Poll::Pending
+            );
+
+            let cancel_panic = unsafe {
+                cancel_task_and_release_executor_ref(
+                    pending_task,
+                    std::ptr::addr_of_mut!((*state).runtime_state),
+                )
+            };
+            assert!(cancel_panic.is_none());
+            assert_eq!(pending_polls.get(), 1);
+            assert_eq!(pending_drops.get(), 1);
+            assert!(pending_handle.is_finished());
+            assert_eq!(
+                Pin::new(&mut pending_handle).poll(&mut join_cx),
+                Poll::Ready(Err(JoinError::Cancelled))
+            );
+            assert!(unsafe { !(*state).all_tasks.is_empty() });
+            drop(pending_handle);
+
+            unsafe {
+                assert_eq!((*state).runtime_state.live_tasks, 0);
+                assert!((*state).ready_queue.is_empty());
+                assert!((*state).all_tasks.is_empty());
+                #[cfg(debug_assertions)]
+                {
+                    assert_eq!((*state).runtime_state.stats.task_allocs, 2);
+                    assert_eq!((*state).runtime_state.stats.task_frees, 2);
+                }
+            }
+        });
     }
 
     #[cfg(not(miri))]

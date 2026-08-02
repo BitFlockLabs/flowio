@@ -3,9 +3,9 @@
 
 use crate::runtime::executor::ExecutorOwner;
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool, RetainedPayloadVtable};
-use crate::runtime::task::{
-    TaskHeader, clear_task_ref, replace_task_ref, retain_task, take_task_ref,
-};
+#[cfg(any(test, feature = "test-support"))]
+use crate::runtime::task::clear_task_ref;
+use crate::runtime::task::{TaskHeader, replace_task_ref, retain_task, take_task_ref};
 use crate::utils::memory::pool::InPlaceInit;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
@@ -318,6 +318,7 @@ impl CompletionState {
     ///
     /// `state` must identify a live, exclusively owned completion state on its
     /// executor owner thread.
+    #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     pub(crate) unsafe fn clear_waiter_unchecked(state: *mut Self) {
         debug_assert!(unsafe { !(*state).is_cancel_pending() });

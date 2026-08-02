@@ -1,0 +1,3 @@
+192.0.2.20 before ; hosts-target.flowio.invalid # semicolon is an alias token
+192.0.2.21 hosts-target.flowio.invalid;not-the-query
+192.0.2.22 hosts-target.flowio.invalid # comment ; ignored

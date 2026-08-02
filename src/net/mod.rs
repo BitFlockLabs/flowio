@@ -810,6 +810,7 @@ impl AcceptReadinessSlot {
 
         let mut cached_pctx = None;
         let mut retired_listener = None;
+        let mut pending_rearm = None;
         let readiness = if self.unconsumed_readiness >= 0 {
             debug_assert!(
                 self.state_ptr.is_null(),
@@ -881,13 +882,13 @@ impl AcceptReadinessSlot {
                             // Readiness is only a hint and can be stale. Rearm the
                             // one-shot poll without consuming slot ownership or
                             // replenishing an already-used bare-POLLERR budget.
-                            self.record_rearm(false);
+                            pending_rearm = Some(false);
                         }
                         AcceptFailureDisposition::RearmBarePollError => {
                             // A lone `POLLERR` can be transient. Give it exactly
                             // one additional readiness cycle before surfacing the
                             // unchanged `WouldBlock` result.
-                            self.record_rearm(true);
+                            pending_rearm = Some(true);
                         }
                         AcceptFailureDisposition::PreserveReadiness => {
                             note_accept_descriptor_exhaustion();
@@ -956,6 +957,9 @@ impl AcceptReadinessSlot {
                     self.finish_nonterminal_attempt();
                     return Poll::Ready(Err(err));
                 }
+            }
+            if let Some(consumes_bare_poll_error_budget) = pending_rearm {
+                self.record_rearm(consumes_bare_poll_error_budget);
             }
             return Poll::Pending;
         }
@@ -1780,6 +1784,7 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
 mod tests {
     use super::*;
     use crate::runtime::buffer::IoBuffMut;
+    use std::cell::Cell;
 
     #[test]
     fn completion_take_resolves_rejection_without_running_accepted_mapping() {
@@ -2111,6 +2116,103 @@ mod tests {
             AcceptFailureDisposition::Propagate,
             "POLLERR/POLLIN/POLLERR exceeded the per-future rearm budget"
         );
+    }
+
+    #[test]
+    fn failed_accept_rearms_publish_no_state_or_submission_accounting() {
+        for readiness in [
+            libc::POLLIN as libc::c_short,
+            libc::POLLERR as libc::c_short,
+        ] {
+            for fail_submission in [false, true] {
+                crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
+                    let reactor = owner.reactor_ptr();
+                    let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
+                    let listener_keepalive = Rc::clone(&listener_fd);
+                    let mut slot = AcceptReadinessSlot::new(listener_fd);
+                    slot.prepare()
+                        .expect("fresh accept slot should prepare for fault injection");
+                    slot.unconsumed_readiness = readiness;
+
+                    if fail_submission {
+                        crate::runtime::test_hooks::fail_next_sqe_submit();
+                    } else {
+                        crate::runtime::test_hooks::fail_next_op_alloc();
+                    }
+
+                    let accept_calls = Cell::new(0_usize);
+                    let outcome: Poll<io::Result<()>> = slot.poll_accept_with(
+                        true,
+                        cx,
+                        |_fd, _reassert_nonblocking| {
+                            accept_calls.set(accept_calls.get() + 1);
+                            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+                        },
+                        |_accepted, _provenance, _addr, _addrlen| {
+                            panic!("faulted empty-listener accept unexpectedly succeeded")
+                        },
+                    );
+
+                    assert!(
+                        matches!(
+                            outcome,
+                            Poll::Ready(Err(ref err))
+                                if err.kind() == io::ErrorKind::WouldBlock
+                        ),
+                        "failed rearm did not return its pressure error"
+                    );
+                    assert_eq!(accept_calls.get(), 1);
+                    assert!(slot.state_ptr.is_null());
+                    assert!(!slot.in_use);
+                    assert_eq!(
+                        slot.unconsumed_readiness, NO_UNCONSUMED_ACCEPT_READINESS,
+                        "stale readiness was incorrectly restored after rearm failure"
+                    );
+                    assert_eq!(slot.readiness_state, AcceptReadinessState::Ready);
+                    assert_eq!(slot.bare_poll_error_rearms(), 0);
+                    assert!(!slot.is_terminal());
+                    assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                    assert_eq!(owner.inflight_op_count_for_test(), 0);
+                    assert_eq!(
+                        Rc::strong_count(&listener_keepalive),
+                        2,
+                        "failed rearm leaked or released retained listener ownership"
+                    );
+                    assert_eq!(
+                        crate::runtime::test_hooks::raw_sqe_submit_failures_remaining(),
+                        0,
+                        "failed rearm did not consume the armed submission fault"
+                    );
+
+                    #[cfg(debug_assertions)]
+                    {
+                        let pctx = poll_ctx_from_waker(cx)
+                            .expect("fault regression lost its FlowIO poll context");
+                        let stats = unsafe { (*pctx.runtime_state()).stats };
+                        assert_eq!(stats.accept_readiness_rearms, 0);
+                        assert_eq!(stats.sqe_submits, 0);
+                    }
+
+                    let replacement = unsafe { (&mut *reactor).alloc_op() };
+                    assert!(
+                        !replacement.is_null(),
+                        "failed rearm did not restore operation-slot usability"
+                    );
+                    unsafe { Reactor::free_op_unchecked(reactor, replacement) };
+                    assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+
+                    slot.prepare()
+                        .expect("failed rearm did not restore accept-slot usability");
+                    slot.drop_future();
+                    assert!(slot.state_ptr.is_null());
+                    assert!(!slot.in_use);
+                    assert_eq!(slot.readiness_state, AcceptReadinessState::Ready);
+
+                    drop(slot);
+                    assert_eq!(Rc::strong_count(&listener_keepalive), 1);
+                });
+            }
+        }
     }
 
     #[cfg(not(miri))]

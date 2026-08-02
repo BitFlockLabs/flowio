@@ -9,6 +9,8 @@ use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly};
+#[cfg(debug_assertions)]
+use flowio::runtime::executor::RuntimeStats;
 use flowio::runtime::executor::{Executor, ExecutorConfig, JoinError, JoinHandle, TrySpawnError};
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{Sleep, TimeoutError, sleep, sleep_until, timeout, timeout_at};
@@ -63,6 +65,44 @@ fn new_one_slot_executor() -> Executor {
         ..ExecutorConfig::default()
     })
     .expect("failed to construct one-slot executor")
+}
+
+#[cfg(debug_assertions)]
+fn assert_retained_stats_zero(stats: RuntimeStats, run: &str) {
+    assert_eq!(stats.retained_pooled_allocs, 0, "{run}: pooled allocs");
+    assert_eq!(stats.retained_pooled_reuses, 0, "{run}: pooled reuses");
+    assert_eq!(stats.retained_pooled_frees, 0, "{run}: pooled frees");
+    assert_eq!(stats.retained_slab_allocs, 0, "{run}: slab allocs");
+    assert_eq!(stats.retained_heap_fallbacks, 0, "{run}: heap fallbacks");
+    assert_eq!(stats.retained_heap_frees, 0, "{run}: heap frees");
+    assert_eq!(
+        stats.writev_scratch_inline_allocs, 0,
+        "{run}: inline scratch allocs"
+    );
+    assert_eq!(
+        stats.writev_scratch_pooled_allocs, 0,
+        "{run}: pooled scratch allocs"
+    );
+    assert_eq!(
+        stats.writev_scratch_pooled_reuses, 0,
+        "{run}: pooled scratch reuses"
+    );
+    assert_eq!(
+        stats.writev_scratch_pooled_frees, 0,
+        "{run}: pooled scratch frees"
+    );
+    assert_eq!(
+        stats.writev_scratch_slab_allocs, 0,
+        "{run}: scratch slab allocs"
+    );
+    assert_eq!(
+        stats.writev_scratch_oversize_rejections, 0,
+        "{run}: scratch oversize rejections"
+    );
+    assert_eq!(
+        stats.writev_scratch_alloc_failures, 0,
+        "{run}: scratch allocation failures"
+    );
 }
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
@@ -1748,6 +1788,31 @@ fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
         "completed read buffer released before foreign consumption"
     );
 
+    #[cfg(debug_assertions)]
+    let origin_completion_stats = origin.last_stats();
+    #[cfg(debug_assertions)]
+    assert_retained_stats_zero(
+        origin_completion_stats,
+        "origin completion run with foreign waiter",
+    );
+
+    // `starts_clean` is true here even though the completed operation still
+    // owns its retained payload for the foreign waiter. A clean run must use a
+    // fresh baseline rather than replaying the operation's earlier allocation.
+    origin
+        .run(async {})
+        .expect("origin executor failed with completed foreign-waiter payload");
+    assert_eq!(
+        drops.get(),
+        0,
+        "clean origin run released the foreign waiter's completed buffer"
+    );
+    #[cfg(debug_assertions)]
+    assert_retained_stats_zero(
+        origin.last_stats(),
+        "clean origin run with completed foreign-waiter payload",
+    );
+
     foreign
         .run(async {})
         .expect("foreign executor failed while resuming its waiter");
@@ -1771,15 +1836,14 @@ fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
 
     #[cfg(debug_assertions)]
     {
-        let origin_stats = origin.last_stats();
-        assert_eq!(origin_stats.waiter_wakes, 1);
+        assert_eq!(origin_completion_stats.waiter_wakes, 1);
         assert_eq!(
-            origin_stats.task_schedules, 0,
+            origin_completion_stats.task_schedules, 0,
             "origin runtime was charged for the foreign waiter schedule"
         );
-        assert_eq!(origin_stats.task_allocs, 2);
+        assert_eq!(origin_completion_stats.task_allocs, 2);
         assert_eq!(
-            origin_stats.task_frees, origin_stats.task_allocs,
+            origin_completion_stats.task_frees, origin_completion_stats.task_allocs,
             "origin task reference leaked"
         );
 
@@ -1801,6 +1865,11 @@ fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
             assert_eq!(Nop::new().await.expect("origin reuse NOP failed"), 0);
         })
         .expect("one-slot origin reactor was not reclaimed");
+    #[cfg(debug_assertions)]
+    assert_retained_stats_zero(
+        origin.last_stats(),
+        "origin reuse after foreign payload release",
+    );
     foreign
         .run(async {
             assert_eq!(Nop::new().await.expect("foreign reuse NOP failed"), 0);
@@ -2384,6 +2453,48 @@ fn runtime_clean_runs_reset_generation_task_counters() {
     assert_eq!(second.task_frees, 1);
     assert_eq!(second.task_slab_allocs, 0);
     assert_eq!(second.task_slab_frees, 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_clean_runs_report_retained_payload_counters_per_run() {
+    let mut executor = new_executor();
+    executor
+        .run(async {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let (result, payload) = writer.write(vec![0xA5; 8]).await;
+            assert_eq!(result.expect("retained write failed"), payload.len());
+        })
+        .expect("first retained run failed");
+    let first = executor.last_stats();
+    assert_eq!(first.retained_pooled_allocs, 1);
+    assert_eq!(first.retained_pooled_frees, 1);
+    assert_eq!(first.retained_slab_allocs, 1);
+
+    executor.run(async {}).expect("second clean run failed");
+    assert_retained_stats_zero(executor.last_stats(), "second retained run");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn runtime_clean_runs_report_vectored_scratch_counters_per_run() {
+    let mut executor = new_executor();
+    executor
+        .run(async {
+            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
+            let chain = static_read_only_chain::<17>();
+            let (result, _chain) = writer.writev(chain).await;
+            assert_eq!(result.expect("17-segment writev failed"), 17);
+        })
+        .expect("first vectored run failed");
+    let first = executor.last_stats();
+    assert_eq!(first.writev_scratch_inline_allocs, 0);
+    assert_eq!(first.writev_scratch_pooled_allocs, 1);
+    assert_eq!(first.writev_scratch_pooled_frees, 1);
+    assert_eq!(first.writev_scratch_slab_allocs, 1);
+
+    executor.run(async {}).expect("second clean run failed");
+    assert_retained_stats_zero(executor.last_stats(), "second vectored run");
 }
 
 #[cfg(any(debug_assertions, feature = "test-support"))]

@@ -1,6 +1,7 @@
 # flowio
 
-flowio is a single-threaded Rust async runtime and transport library built on Linux `io_uring`.
+flowio is a single-threaded Rust async runtime and transport library built on
+Linux `io_uring` for x86-64.
 
 It provides an executor, timers, buffer types, and concrete Unix, TCP, UDP,
 SCTP, TLS-client, and DNS helper APIs. I/O uses owned buffers: pass a buffer
@@ -12,14 +13,17 @@ not recommended for production yet.
 
 ## Install
 
-Requires Linux kernel 5.11 or newer and Rust 1.88 or newer. The runtime is
-built on `io_uring` and requires `IORING_ENTER_EXT_ARG`; executor construction
-fails with `Unsupported` when the running kernel does not report that feature.
-This is the binding kernel floor: `IORING_OP_CLOSE` is available since Linux
-5.6, and the 14-byte `SCTP_EVENTS` layout used by FlowIO is available since
-Linux 5.5. Both predate the runtime floor, so supported kernels need no legacy
-13-byte SCTP subscription fallback. The crate does not build or run on
-non-Linux targets.
+Requires an x86-64 Linux system with kernel 5.11 or newer and Rust 1.88 or
+newer. The runtime is built on `io_uring` and requires
+`IORING_ENTER_EXT_ARG`; executor construction fails with `Unsupported` when
+the running kernel does not report that feature. This is the binding kernel
+floor: `IORING_OP_CLOSE` is available since Linux 5.6, and the 14-byte
+`SCTP_EVENTS` layout used by FlowIO is available since Linux 5.5. Both predate
+the runtime floor, so supported kernels need no legacy 13-byte SCTP
+subscription fallback. x86-64 Linux is the only currently supported and
+validated runtime platform. Other CPU architectures, including AArch64, are
+outside the current compatibility contract; the crate also does not build or
+run on non-Linux targets.
 
 ```toml
 [dependencies]
@@ -283,9 +287,10 @@ buffer.payload_append(b"frame").unwrap();
 Task, timer, retained-payload, and buffer pools also acquire backing slabs on
 demand. Warm representative runtime work before measuring allocator behavior.
 Reactor completion-state count is hard-capped by `ring_entries`, and retained
-vectored scratch rejects more than 1024 active iovecs. Task and timer slab
-counts are currently allocator-limited rather than user-configurable hard
-limits.
+vectored scratch rejects more than 1024 active iovecs. Rich SCTP vectored send
+and receive use that same active-entry bound; zero-length segments and unused
+chain capacity do not count toward it. Task and timer slab counts are currently
+allocator-limited rather than user-configurable hard limits.
 
 Complete-buffer APIs remain the intended choice when a protocol requires an
 exact frame. They are “avoid” choices only when the caller already has partial
@@ -391,10 +396,25 @@ returns `InvalidInput`; over-limit input is rejected rather than truncated.
 System configuration reads are bounded to 4 MiB for `/etc/hosts` and 64 KiB
 for `/etc/resolv.conf`. An oversized file or a 65th unique resolved address
 returns `InvalidData`; address order remains first-seen and no result is
-silently truncated. One owned query allocation and one safely returned
+silently truncated. Invalid UTF-8 hosts lines are skipped individually, `#`
+starts a hosts comment, and semicolons remain ordinary alias text;
+`resolv.conf` retains both `#` and `;` comment markers. One owned query
+allocation and one safely returned
 response allocation are reused across sequential A, AAAA, nameserver retry,
 and bounded CNAME-follow-up work; a timed-out kernel-visible response buffer
 is not reused before its target completion.
+Asynchronous upstream work has one five-second aggregate timeout by default,
+configured with `set_total_query_timeout`; `set_query_timeout` remains the
+per-matching-response cap, and the earlier deadline applies. The aggregate
+clock starts only after literal, localhost, and hosts-file lookup miss, spans
+all nameservers, both address families, and the CNAME follow-up, and stops new
+attempts once expired. A completed A address still wins if later AAAA work
+reaches the aggregate deadline. The deadline races async sends and receives;
+an expired send may retain its query allocation until the target CQE, just as
+an expired receive retains its response allocation. It cannot preempt the
+bounded synchronous hosts read or socket syscalls, but checks immediately
+before socket setup, after bind, and after connect prevent later work after an
+observed expiry.
 Query normalization removes surrounding whitespace and at most
 one optional trailing root dot; a second trailing dot remains an empty label
 and returns `InvalidInput` before query allocation or DNS network I/O.
@@ -457,7 +477,9 @@ one-to-one SCTP works through `SctpListener`, `SctpConnector`, and
 
 ## Limitations
 
-- Linux 5.11 or newer only. The runtime is built on `io_uring`.
+- x86-64 Linux with kernel 5.11 or newer only. The runtime is built on
+  `io_uring`; other CPU architectures are outside the current supported and
+  validated scope.
 - Single-threaded task execution. A runtime instance and its tasks, buffers,
   transport handles, and wakers are owner-thread state and are not cross-thread
   APIs; a runtime is used from the one thread that runs it.

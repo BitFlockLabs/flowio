@@ -1719,6 +1719,83 @@ fn runtime_tcp_connector_connect_timeout_success() {
 }
 
 #[test]
+fn runtime_tcp_connector_reuses_slot_for_plain_then_timed_success() {
+    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("std bind failed");
+    let addr = listener.local_addr().expect("local_addr failed");
+
+    let peer = spawn_bounded_tcp_peer("two-connection standard TCP peer", move |deadline| {
+        let (first, first_remote) = deadline.accept(&listener).expect("first std accept failed");
+        assert_eq!(
+            first.local_addr().expect("first std local_addr failed"),
+            addr
+        );
+        assert_eq!(
+            first.peer_addr().expect("first std peer_addr failed"),
+            first_remote
+        );
+
+        let (second, second_remote) = deadline
+            .accept(&listener)
+            .expect("second std accept failed");
+        assert_eq!(
+            second.local_addr().expect("second std local_addr failed"),
+            addr
+        );
+        assert_eq!(
+            second.peer_addr().expect("second std peer_addr failed"),
+            second_remote
+        );
+        assert_ne!(
+            first_remote, second_remote,
+            "two live clients reused one local endpoint"
+        );
+        (first_remote, second_remote)
+    });
+
+    let mut connector = TcpConnector::new();
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let (first, second, first_local, second_local) = run_test_output(&mut executor, async move {
+        let first = connector
+            .connect(addr)
+            .expect("first connect init failed")
+            .await
+            .expect("first connect failed");
+        let first_local = first.local_addr().expect("first local_addr failed");
+        assert_eq!(first.peer_addr().expect("first peer_addr failed"), addr);
+
+        let second = connector
+            .connect_timeout(addr, Duration::from_secs(1))
+            .expect("second connect_timeout init failed")
+            .await
+            .expect("second connect_timeout failed");
+        let second_local = second.local_addr().expect("second local_addr failed");
+        assert_eq!(second.peer_addr().expect("second peer_addr failed"), addr);
+        assert_ne!(
+            first.as_raw_fd(),
+            second.as_raw_fd(),
+            "two live connector results reused one descriptor"
+        );
+        (first, second, first_local, second_local)
+    });
+
+    let (first_remote, second_remote) = peer.finish();
+    assert_eq!(first_local, first_remote);
+    assert_eq!(second_local, second_remote);
+    assert_ne!(first_local, second_local);
+    assert_eq!(
+        first.peer_addr().expect("retained first peer_addr failed"),
+        addr
+    );
+    assert_eq!(
+        second
+            .peer_addr()
+            .expect("retained second peer_addr failed"),
+        addr
+    );
+}
+
+#[test]
 fn runtime_tcp_stream_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 

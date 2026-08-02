@@ -2,13 +2,14 @@
 
 use flowio::fuzzing::test_support::{
     DNS_QUERY_ID_MISMATCH_CONTROL, dns_response_case_reaches_records,
-    observe_dns_parse_received_response_packet, observe_dns_parse_response_packet,
-    observe_dns_response_case_host, observe_dns_response_prefilter, observe_sctp_parse_recv_meta,
-    observe_tls_server_end_point,
+    observe_dns_parse_hosts_bytes, observe_dns_parse_received_response_packet,
+    observe_dns_parse_response_packet, observe_dns_response_case_host,
+    observe_dns_response_prefilter, observe_sctp_parse_recv_meta, observe_tls_server_end_point,
 };
 use flowio::fuzzing::{dns_decode_name, tls_server_end_point};
 use flowio::net::sctp::{SctpNotification, SctpRecvInfo, SctpRecvMeta};
 use flowio::test_support::net::{resolver::decode_name, sctp::append_initialized_test_cmsg};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 fn decode_hex_seed(data: &[u8]) -> Vec<u8> {
     let hex = data
@@ -418,6 +419,45 @@ fn dns_received_length_corpus_pins_full_truncated_and_oversized_inputs() {
     assert_eq!(
         oversized_error.to_string(),
         "DNS receive length exceeded response buffer"
+    );
+}
+
+#[test]
+fn hosts_byte_parser_corpus_pins_line_isolation_and_comment_grammar() {
+    let mixed = include_bytes!("../fixtures/fuzzing/dns_parse_hosts_bytes/valid_invalid_valid");
+    assert_eq!(
+        observe_dns_parse_hosts_bytes(mixed)
+            .expect("valid hosts lines should survive an invalid line"),
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 5432)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x10), 5432,)),
+        ]
+    );
+
+    let invalid = include_bytes!("../fixtures/fuzzing/dns_parse_hosts_bytes/all_invalid");
+    assert!(
+        observe_dns_parse_hosts_bytes(invalid)
+            .expect("invalid hosts lines should be ignored")
+            .is_empty()
+    );
+
+    let semicolon = include_bytes!("../fixtures/fuzzing/dns_parse_hosts_bytes/semicolon_aliases");
+    assert_eq!(
+        observe_dns_parse_hosts_bytes(semicolon)
+            .expect("hosts semicolons should remain ordinary alias bytes"),
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 20), 5432)),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 22), 5432)),
+        ]
+    );
+
+    let address_limit = include_bytes!("../fixtures/fuzzing/dns_parse_hosts_bytes/address_limit");
+    let error = observe_dns_parse_hosts_bytes(address_limit)
+        .expect_err("the 65th unique hosts address should be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "resolver result exceeds 64 unique addresses"
     );
 }
 

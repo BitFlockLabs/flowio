@@ -24,15 +24,17 @@ use flowio::runtime::timer::{TimeoutError, sleep, timeout};
 use flowio::test_support::net::sctp::{
     SctpSocketOptionSnapshot, append_initialized_test_cmsg, capability_unavailable,
     test_accept_slot_drop_cached_state_preserves_unrelated_fd,
-    test_accept_slot_drop_future_preserves_unrelated_fd, test_adaptation_indication_type,
-    test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
-    test_connect_slot_drop_cached_state_closes_socket_fd,
-    test_connect_slot_drop_future_closes_socket_fd, test_parse_notification, test_parse_recv_meta,
-    test_parse_stream_recv_meta, test_partial_delivery_event_type, test_peer_addr_change_type,
+    test_accept_slot_drop_future_preserves_unrelated_fd, test_accept_with_established_config_error,
+    test_adaptation_indication_type, test_apply_sctp_socket_options, test_assoc_change_type,
+    test_assoc_reset_event_type, test_connect_slot_drop_cached_state_closes_socket_fd,
+    test_connect_slot_drop_future_closes_socket_fd, test_fail_notification_mask_after_query,
+    test_parse_notification, test_parse_recv_meta, test_parse_stream_recv_meta,
+    test_partial_delivery_event_type, test_peer_addr_change_type,
     test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
-    test_sctp_socket_receive_options, test_send_failed_error_offset, test_send_failed_event_type,
-    test_send_failed_info_offset, test_send_failed_type, test_sender_dry_event_type,
-    test_shutdown_event_type, test_stream_change_event_type, test_stream_reset_event_type,
+    test_sctp_socket_receive_options, test_sctp_stream_receive_policy,
+    test_send_failed_error_offset, test_send_failed_event_type, test_send_failed_info_offset,
+    test_send_failed_type, test_sender_dry_event_type, test_shutdown_event_type,
+    test_stream_change_event_type, test_stream_reset_event_type,
 };
 use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
@@ -49,6 +51,13 @@ const SCTP_SHUTDOWN_FALLBACK_TEST: &str =
 const SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD_ENV: &str = "FLOWIO_SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD";
 const SCTP_EXTERNAL_ADOPTION_CLOSE_TEST: &str =
     "runtime_sctp_external_adoption_classifies_then_uses_ring_close";
+const SCTP_ACTIVE_IOVEC_REJECTION_CHILD_ENV: &str = "FLOWIO_SCTP_ACTIVE_IOVEC_REJECTION_CHILD";
+const SCTP_ACTIVE_IOVEC_REJECTION_TEST: &str =
+    "runtime_sctp_active_iovec_limit_rejects_before_submission_and_returns_owners";
+const SCTP_ACTIVE_IOVEC_BOUNDARY_CHILD_ENV: &str = "FLOWIO_SCTP_ACTIVE_IOVEC_BOUNDARY_CHILD";
+const SCTP_ACTIVE_IOVEC_BOUNDARY_TEST: &str =
+    "runtime_sctp_active_iovec_boundary_accepts_sparse_and_excess_capacity_chains";
+const SCTP_ACTIVE_IOVEC_TEST_STACK_BYTES: &str = "33554432";
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 struct PointerTrackedReadWrite {
@@ -842,6 +851,31 @@ async fn accepted_sctp_pair(
     let server = server.await.expect("SCTP accept task cancelled");
 
     (client, server)
+}
+
+async fn assert_repeated_lean_rejection(stream: &mut SctpStream, lineage: &str) {
+    for attempt in 1..=2 {
+        let lean = vec![0u8; 16];
+        let lean_ptr = lean.as_ptr();
+        let (lean_result, returned) = timeout(Duration::from_millis(100), stream.recv(lean, 16))
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "lean receive behind {lineage} attempt {attempt} did not reject promptly: {err}"
+                )
+            });
+        assert_eq!(
+            lean_result
+                .expect_err("lean receive bypassed dropped rich receive")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            returned.as_ptr(),
+            lean_ptr,
+            "lean rejection returned a different buffer allocation"
+        );
+    }
 }
 
 fn established_sctp_pair(
@@ -2174,6 +2208,57 @@ fn runtime_sctp_adopted_stream_refreshes_receive_info_policy() {
         test_parse_stream_recv_meta(&stream, &[], 0, libc::MSG_EOR, b"payload")
             .expect("refreshed disabled receive-info policy should default absent metadata"),
         expected_default
+    );
+}
+
+#[test]
+fn runtime_sctp_notification_mask_failure_retains_kernel_and_stream_policy() {
+    const TEST_NAME: &str =
+        "runtime_sctp_notification_mask_failure_retains_kernel_and_stream_policy";
+    let Some(fd) = raw_sctp_socket_or_skip(TEST_NAME, libc::AF_INET) else {
+        return;
+    };
+
+    let config = SctpSocketConfig::rich(SctpInitConfig::default());
+    test_apply_sctp_socket_options(fd.as_raw_fd(), config)
+        .expect("failed to establish the adopted socket's initial receive options");
+    let initial_kernel = test_sctp_socket_receive_options(fd.as_raw_fd())
+        .expect("failed to read the adopted socket's initial receive options");
+
+    let stream = SctpStream::from_owned_fd(fd, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    assert_eq!(
+        test_sctp_stream_receive_policy(&stream),
+        (false, true, true)
+    );
+
+    let requested = SctpNotificationMask::none();
+    let forced_pdapi = SctpNotificationMask {
+        partial_delivery: true,
+        ..SctpNotificationMask::none()
+    };
+    let (result, observed) = test_fail_notification_mask_after_query(&stream, requested, libc::EIO);
+    let err = result.expect_err("request-scoped notification-mask failure unexpectedly succeeded");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    assert_eq!(observed, Some(forced_pdapi));
+    assert_eq!(
+        test_sctp_socket_receive_options(stream.as_raw_fd())
+            .expect("failed to read receive options after the injected failure"),
+        initial_kernel,
+        "failed notification-mask update changed kernel state"
+    );
+    assert_eq!(
+        test_sctp_stream_receive_policy(&stream),
+        (false, true, true),
+        "failed notification-mask update changed stored receive policy"
+    );
+
+    stream
+        .set_notification_mask(requested)
+        .expect("notification-mask retry failed");
+    assert_sctp_receive_options(stream.as_raw_fd(), forced_pdapi, true, "retried stream");
+    assert_eq!(
+        test_sctp_stream_receive_policy(&stream),
+        (true, false, false)
     );
 }
 
@@ -3976,6 +4061,13 @@ fn runtime_sctp_cancelled_recv_msg_retains_buffer_until_cqe() {
                 "sctp recv_msg buffer dropped while original SQE was live"
             );
 
+            assert_repeated_lean_rejection(&mut client, "scalar rich receive").await;
+            assert_eq!(
+                drops.get(),
+                0,
+                "lean rejection retired the dropped rich receive early"
+            );
+
             let (send_res, _buf) = server
                 .send_msg(b"x".to_vec(), test_send_info(1, 0x0102_0304))
                 .await;
@@ -4020,17 +4112,6 @@ fn runtime_sctp_cancelled_recv_msg_vectored_retains_chain_until_cqe() {
     let mut executor = Executor::new().expect("failed to construct executor");
     let (mut client, mut server) =
         run_test_output(&mut executor, accepted_sctp_pair(listener, connector, addr));
-    #[cfg(debug_assertions)]
-    let retained_before = {
-        let stats = executor.last_stats();
-        (
-            stats.retained_pooled_allocs,
-            stats.retained_pooled_frees,
-            stats.retained_heap_fallbacks,
-            stats.retained_heap_frees,
-        )
-    };
-
     executor
         .run(async move {
             let mut pool = IoBuffPool::new(IoBuffPoolConfig {
@@ -4064,6 +4145,13 @@ fn runtime_sctp_cancelled_recv_msg_vectored_retains_chain_until_cqe() {
                 pool.live_slots_for_test(),
                 2,
                 "sctp recv_msg_vectored chain released before original CQE retired"
+            );
+
+            assert_repeated_lean_rejection(&mut client, "vectored rich receive").await;
+            assert_eq!(
+                pool.live_slots_for_test(),
+                2,
+                "lean rejection retired the dropped vectored receive early"
             );
 
             let (send_res, _buf) = server
@@ -4106,23 +4194,19 @@ fn runtime_sctp_cancelled_recv_msg_vectored_retains_chain_until_cqe() {
     {
         let stats = executor.last_stats();
         assert_eq!(
-            stats.retained_pooled_allocs - retained_before.0,
-            4,
+            stats.retained_pooled_allocs, 4,
             "expected one vectored receive, two sends, and one adopting receive"
         );
         assert_eq!(
-            stats.retained_pooled_frees - retained_before.1,
-            4,
+            stats.retained_pooled_frees, 4,
             "all four retained payloads must retire after their target CQEs"
         );
         assert_eq!(
-            stats.retained_heap_fallbacks - retained_before.2,
-            0,
+            stats.retained_heap_fallbacks, 0,
             "known-size SCTP payloads should remain pooled"
         );
         assert_eq!(
-            stats.retained_heap_frees - retained_before.3,
-            0,
+            stats.retained_heap_frees, 0,
             "no heap-backed SCTP payload should require release"
         );
     }
@@ -4187,17 +4271,6 @@ fn runtime_sctp_cancelled_send_msg_retains_buffer_until_cqe() {
     let mut executor = Executor::new().expect("failed to construct executor");
     let (mut client, mut server) =
         run_test_output(&mut executor, accepted_sctp_pair(listener, connector, addr));
-    #[cfg(debug_assertions)]
-    let retained_before = {
-        let stats = executor.last_stats();
-        (
-            stats.retained_pooled_allocs,
-            stats.retained_pooled_frees,
-            stats.retained_heap_fallbacks,
-            stats.retained_heap_frees,
-        )
-    };
-
     executor
         .run(async move {
             let drops = Rc::new(Cell::new(0));
@@ -4230,10 +4303,10 @@ fn runtime_sctp_cancelled_send_msg_retains_buffer_until_cqe() {
     #[cfg(debug_assertions)]
     {
         let stats = executor.last_stats();
-        assert_eq!(stats.retained_pooled_allocs - retained_before.0, 2);
-        assert_eq!(stats.retained_pooled_frees - retained_before.1, 2);
-        assert_eq!(stats.retained_heap_fallbacks - retained_before.2, 0);
-        assert_eq!(stats.retained_heap_frees - retained_before.3, 0);
+        assert_eq!(stats.retained_pooled_allocs, 2);
+        assert_eq!(stats.retained_pooled_frees, 2);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(stats.retained_heap_frees, 0);
     }
 }
 
@@ -4251,17 +4324,6 @@ fn runtime_sctp_cancelled_send_msg_vectored_retains_chain_until_cqe() {
     let mut executor = Executor::new().expect("failed to construct executor");
     let (mut client, mut server) =
         run_test_output(&mut executor, accepted_sctp_pair(listener, connector, addr));
-    #[cfg(debug_assertions)]
-    let retained_before = {
-        let stats = executor.last_stats();
-        (
-            stats.retained_pooled_allocs,
-            stats.retained_pooled_frees,
-            stats.retained_heap_fallbacks,
-            stats.retained_heap_frees,
-        )
-    };
-
     executor
         .run(async move {
             let mut pool = IoBuffPool::new(IoBuffPoolConfig {
@@ -4304,10 +4366,10 @@ fn runtime_sctp_cancelled_send_msg_vectored_retains_chain_until_cqe() {
     #[cfg(debug_assertions)]
     {
         let stats = executor.last_stats();
-        assert_eq!(stats.retained_pooled_allocs - retained_before.0, 2);
-        assert_eq!(stats.retained_pooled_frees - retained_before.1, 2);
-        assert_eq!(stats.retained_heap_fallbacks - retained_before.2, 0);
-        assert_eq!(stats.retained_heap_frees - retained_before.3, 0);
+        assert_eq!(stats.retained_pooled_allocs, 2);
+        assert_eq!(stats.retained_pooled_frees, 2);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(stats.retained_heap_frees, 0);
     }
 }
 
@@ -4602,6 +4664,119 @@ fn runtime_sctp_connect_timeout_success() {
             assert_eq!(stream.peer_addr(), addr);
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_accepted_option_failure_closes_once_and_reaccepts() {
+    const TEST_NAME: &str = "runtime_sctp_accepted_option_failure_closes_once_and_reaccepts";
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(mut listener) = bind_sctp_listener_or_skip(TEST_NAME, config) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let mut connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    let (mut listener, mut connector, first_client) = run_test_output(&mut executor, async move {
+        let first_connect = Executor::spawn(async move {
+            let first_client = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("first connect_timeout init failed")
+                .await
+                .expect("first SCTP connect failed");
+            (connector, first_client)
+        })
+        .expect("first connect spawn failed");
+
+        let (failed_accept, configure_calls) = timeout(
+            Duration::from_secs(1),
+            test_accept_with_established_config_error(&mut listener, libc::EIO),
+        )
+        .await
+        .expect("injected SCTP accept timed out");
+        let err = match failed_accept {
+            Err(err) => err,
+            Ok((server, _remote_addr)) => {
+                drop(server);
+                panic!("injected SCTP accepted-option failure returned a stream")
+            }
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(configure_calls, 1);
+        assert!(!listener.is_terminal());
+
+        let (connector, first_client) = timeout(Duration::from_secs(1), first_connect)
+            .await
+            .expect("first SCTP connect task timed out")
+            .expect("first SCTP connect task was cancelled");
+        (listener, connector, first_client)
+    });
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_ring_fallbacks, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.close_linger_classification_failures, 0);
+        assert_eq!(stats.close_worker_full_fallbacks, 0);
+        assert_eq!(stats.close_worker_disconnected_fallbacks, 0);
+        assert_eq!(stats.close_linger_waivers, 0);
+        assert_eq!(stats.close_linger_waiver_failures, 0);
+        assert_eq!(stats.sqe_submits, stats.cqe_completions);
+    }
+
+    let held = run_test_output(&mut executor, async move {
+        let second_connect = Executor::spawn(async move {
+            let second_client = connector
+                .connect_timeout(addr, Duration::from_secs(1))
+                .expect("second connect_timeout init failed")
+                .await
+                .expect("second SCTP connect failed");
+            (connector, second_client)
+        })
+        .expect("second connect spawn failed");
+
+        let (second_server, remote_addr) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("second SCTP accept timed out")
+            .expect("second SCTP accept failed");
+        let (connector, second_client) = timeout(Duration::from_secs(1), second_connect)
+            .await
+            .expect("second SCTP connect task timed out")
+            .expect("second SCTP connect task was cancelled");
+        assert_eq!(
+            remote_addr,
+            second_client
+                .local_addr()
+                .expect("second SCTP client local_addr failed")
+        );
+        assert!(!listener.is_terminal());
+
+        (
+            listener,
+            connector,
+            first_client,
+            second_client,
+            second_server,
+        )
+    });
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.close_ring_submissions, 0);
+        assert_eq!(stats.close_ring_fallbacks, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+        assert_eq!(stats.close_worker_admissions, 0);
+        assert_eq!(stats.close_linger_queries, 0);
+        assert_eq!(stats.sqe_submits, stats.cqe_completions);
+    }
+
+    drop(held);
+    drop(executor);
 }
 
 /// Dropping an accept future before any association completes leaves the
@@ -5166,6 +5341,261 @@ fn runtime_sctp_send_rejects_oversize_iobuff() {
 // ============================================================================
 // Vectored I/O (send_msg_vectored / recv_msg_vectored) tests
 // ============================================================================
+
+const SCTP_TEST_ACTIVE_IOVEC_LIMIT: usize = 1024;
+const SCTP_TEST_EXCESS_CAPACITY: usize = SCTP_TEST_ACTIVE_IOVEC_LIMIT + 1;
+
+fn make_many_sctp_send_segments<const N: usize>(
+    segments: usize,
+    empty_segment: Option<usize>,
+) -> (IoBuffVec<N>, Vec<u8>) {
+    assert!(segments <= N);
+    let mut chain = IoBuffVecMut::<N>::new();
+    let mut expected = Vec::with_capacity(segments);
+    for index in 0..segments {
+        let empty = empty_segment == Some(index);
+        let mut segment = IoBuffMut::new(0, usize::from(!empty), 0);
+        if !empty {
+            let byte = ((index * 17 + 3) % 251) as u8;
+            segment
+                .payload_append(&[byte])
+                .expect("SCTP boundary send segment initialization failed");
+            expected.push(byte);
+        }
+        chain
+            .push(segment)
+            .expect("SCTP boundary send chain push failed");
+    }
+    (chain.freeze(), expected)
+}
+
+fn make_many_sctp_recv_segments<const N: usize>(
+    segments: usize,
+    empty_segment: Option<usize>,
+) -> IoBuffVecMut<N> {
+    assert!(segments <= N);
+    let mut chain = IoBuffVecMut::<N>::new();
+    for index in 0..segments {
+        let capacity = usize::from(empty_segment != Some(index));
+        chain
+            .push(IoBuffMut::new(0, capacity, 0))
+            .expect("SCTP boundary receive chain push failed");
+    }
+    chain
+}
+
+fn collect_many_sctp_recv_segments<const N: usize>(chain: &IoBuffVecMut<N>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for index in 0..chain.segments() {
+        bytes.extend_from_slice(
+            chain
+                .get(index)
+                .expect("SCTP boundary receive segment missing")
+                .payload_bytes(),
+        );
+    }
+    bytes
+}
+
+#[test]
+fn runtime_sctp_active_iovec_limit_rejects_before_submission_and_returns_owners() {
+    if std::env::var_os(SCTP_ACTIVE_IOVEC_REJECTION_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog_env(
+            SCTP_ACTIVE_IOVEC_REJECTION_TEST,
+            SCTP_ACTIVE_IOVEC_REJECTION_CHILD_ENV,
+            Duration::from_secs(10),
+            &[("RUST_MIN_STACK", SCTP_ACTIVE_IOVEC_TEST_STACK_BYTES)],
+        );
+        return;
+    }
+
+    let (socket, _peer) =
+        std::os::unix::net::UnixStream::pair().expect("Unix socket pair creation failed");
+    socket
+        .set_nonblocking(true)
+        .expect("Unix test socket nonblocking setup failed");
+    let mut stream =
+        SctpStream::from_owned_fd(socket.into(), SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)));
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(Box::pin(async move {
+            let (send_chain, _) = make_many_sctp_send_segments::<SCTP_TEST_EXCESS_CAPACITY>(
+                SCTP_TEST_EXCESS_CAPACITY,
+                None,
+            );
+            let first_send_ptr = send_chain
+                .get(0)
+                .expect("first over-limit send segment missing")
+                .as_ptr();
+            let last_send_ptr = send_chain
+                .get(SCTP_TEST_ACTIVE_IOVEC_LIMIT)
+                .expect("last over-limit send segment missing")
+                .as_ptr();
+            let (send_result, returned_send) =
+                Box::pin(stream.send_msg_vectored(send_chain, SctpSendInfo::default())).await;
+            let send_err = send_result.expect_err("over-limit SCTP send should fail");
+            assert_eq!(send_err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(send_err.raw_os_error(), None);
+            assert_eq!(returned_send.segments(), SCTP_TEST_EXCESS_CAPACITY);
+            assert_eq!(
+                returned_send
+                    .get(0)
+                    .expect("returned first over-limit send segment missing")
+                    .as_ptr(),
+                first_send_ptr
+            );
+            assert_eq!(
+                returned_send
+                    .get(SCTP_TEST_ACTIVE_IOVEC_LIMIT)
+                    .expect("returned last over-limit send segment missing")
+                    .as_ptr(),
+                last_send_ptr
+            );
+            drop(returned_send);
+
+            let mut recv_chain = make_many_sctp_recv_segments::<SCTP_TEST_EXCESS_CAPACITY>(
+                SCTP_TEST_EXCESS_CAPACITY,
+                None,
+            );
+            let first_recv_ptr = recv_chain
+                .get_mut(0)
+                .expect("first over-limit receive segment missing")
+                .as_mut_ptr();
+            let last_recv_ptr = recv_chain
+                .get_mut(SCTP_TEST_ACTIVE_IOVEC_LIMIT)
+                .expect("last over-limit receive segment missing")
+                .as_mut_ptr();
+            let (recv_result, mut returned_recv) =
+                Box::pin(stream.recv_msg_vectored(recv_chain)).await;
+            let recv_err = recv_result.expect_err("over-limit SCTP receive should fail");
+            assert_eq!(recv_err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(recv_err.raw_os_error(), None);
+            assert_eq!(returned_recv.segments(), SCTP_TEST_EXCESS_CAPACITY);
+            assert_eq!(
+                returned_recv
+                    .get_mut(0)
+                    .expect("returned first over-limit receive segment missing")
+                    .as_mut_ptr(),
+                first_recv_ptr
+            );
+            assert_eq!(
+                returned_recv
+                    .get_mut(SCTP_TEST_ACTIVE_IOVEC_LIMIT)
+                    .expect("returned last over-limit receive segment missing")
+                    .as_mut_ptr(),
+                last_recv_ptr
+            );
+            drop(returned_recv);
+            drop(stream);
+        }))
+        .expect("SCTP active-iovec rejection run failed");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, stats.close_ring_submissions);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+    }
+}
+
+#[test]
+fn runtime_sctp_active_iovec_boundary_accepts_sparse_and_excess_capacity_chains() {
+    if std::env::var_os(SCTP_ACTIVE_IOVEC_BOUNDARY_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog_env(
+            SCTP_ACTIVE_IOVEC_BOUNDARY_TEST,
+            SCTP_ACTIVE_IOVEC_BOUNDARY_CHILD_ENV,
+            Duration::from_secs(15),
+            &[("RUST_MIN_STACK", SCTP_ACTIVE_IOVEC_TEST_STACK_BYTES)],
+        );
+        return;
+    }
+
+    let init = SctpInitConfig::diameter_default();
+    let config = SctpSocketConfig {
+        notifications: SctpNotificationMask::none(),
+        ..SctpSocketConfig::rich(init)
+    };
+    let Some(listener) = bind_sctp_listener_or_skip(SCTP_ACTIVE_IOVEC_BOUNDARY_TEST, config) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(Box::pin(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+
+            let (send_chain, expected) = make_many_sctp_send_segments::<SCTP_TEST_EXCESS_CAPACITY>(
+                SCTP_TEST_ACTIVE_IOVEC_LIMIT,
+                None,
+            );
+            let (send_result, returned_send) = timeout(
+                Duration::from_secs(1),
+                Box::pin(client.send_msg_vectored(send_chain, SctpSendInfo::default())),
+            )
+            .await
+            .expect("SCTP excess-capacity boundary send timed out");
+            assert_eq!(
+                send_result.expect("SCTP excess-capacity boundary send failed"),
+                expected.len()
+            );
+            assert_eq!(returned_send.segments(), SCTP_TEST_ACTIVE_IOVEC_LIMIT);
+            drop(returned_send);
+
+            let recv_chain = make_many_sctp_recv_segments::<SCTP_TEST_EXCESS_CAPACITY>(
+                SCTP_TEST_EXCESS_CAPACITY,
+                Some(SCTP_TEST_ACTIVE_IOVEC_LIMIT / 2),
+            );
+            let (recv_result, returned_recv) = timeout(
+                Duration::from_secs(1),
+                Box::pin(server.recv_msg_vectored(recv_chain)),
+            )
+            .await
+            .expect("SCTP sparse boundary receive timed out");
+            let (received, meta) = recv_result.expect("SCTP sparse boundary receive failed");
+            assert_eq!(received, expected.len());
+            assert!(matches!(meta, SctpRecvMeta::Data(_)));
+            assert_eq!(collect_many_sctp_recv_segments(&returned_recv), expected);
+            drop(returned_recv);
+
+            let (send_chain, expected) = make_many_sctp_send_segments::<SCTP_TEST_EXCESS_CAPACITY>(
+                SCTP_TEST_EXCESS_CAPACITY,
+                Some(SCTP_TEST_ACTIVE_IOVEC_LIMIT / 3),
+            );
+            let (send_result, returned_send) = timeout(
+                Duration::from_secs(1),
+                Box::pin(server.send_msg_vectored(send_chain, SctpSendInfo::default())),
+            )
+            .await
+            .expect("SCTP sparse boundary send timed out");
+            assert_eq!(
+                send_result.expect("SCTP sparse boundary send failed"),
+                expected.len()
+            );
+            assert_eq!(returned_send.segments(), SCTP_TEST_EXCESS_CAPACITY);
+            drop(returned_send);
+
+            let recv_chain = make_many_sctp_recv_segments::<SCTP_TEST_EXCESS_CAPACITY>(
+                SCTP_TEST_ACTIVE_IOVEC_LIMIT,
+                None,
+            );
+            let (recv_result, returned_recv) = timeout(
+                Duration::from_secs(1),
+                Box::pin(client.recv_msg_vectored(recv_chain)),
+            )
+            .await
+            .expect("SCTP excess-capacity boundary receive timed out");
+            let (received, meta) =
+                recv_result.expect("SCTP excess-capacity boundary receive failed");
+            assert_eq!(received, expected.len());
+            assert!(matches!(meta, SctpRecvMeta::Data(_)));
+            assert_eq!(collect_many_sctp_recv_segments(&returned_recv), expected);
+        }))
+        .expect("SCTP active-iovec boundary run failed");
+}
 
 /// SCTP ping-pong using vectored send/recv with IoBuffVecMut.
 #[test]

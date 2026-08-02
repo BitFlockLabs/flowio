@@ -30,6 +30,9 @@ pub const DEFAULT_RING_ENTRIES: u32 = 256;
 /// Completion-state records allocated per slab in the internal op pool.
 const OP_POOL_OBJS_PER_SLAB: usize = 256;
 
+/// Largest duration representable by Linux's signed kernel timespec.
+const MAX_KERNEL_TIMESPEC_DURATION: Duration = Duration::new(i64::MAX as u64, 999_999_999);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReactorSubmitStatus {
     Ready,
@@ -39,6 +42,47 @@ pub(crate) enum ReactorSubmitStatus {
 #[inline(always)]
 fn is_raw_os_error(err: &io::Error, code: libc::c_int) -> bool {
     err.raw_os_error() == Some(code)
+}
+
+/// Clamps a Rust duration before `io-uring` casts its seconds to signed
+/// kernel storage.
+#[inline(always)]
+fn bounded_kernel_timespec_duration(duration: Duration) -> Duration {
+    duration.min(MAX_KERNEL_TIMESPEC_DURATION)
+}
+
+#[cfg(test)]
+mod kernel_timespec_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_kernel_timespec_duration_preserves_and_saturates_exactly() {
+        let max_seconds = i64::MAX as u64;
+        let cases = [
+            (
+                Duration::new(max_seconds - 1, 123_456_789),
+                Duration::new(max_seconds - 1, 123_456_789),
+            ),
+            (
+                Duration::new(max_seconds, 456_789_123),
+                Duration::new(max_seconds, 456_789_123),
+            ),
+            (MAX_KERNEL_TIMESPEC_DURATION, MAX_KERNEL_TIMESPEC_DURATION),
+            (
+                Duration::new(max_seconds + 1, 0),
+                MAX_KERNEL_TIMESPEC_DURATION,
+            ),
+            (
+                Duration::new(max_seconds + 1, 123_456_789),
+                MAX_KERNEL_TIMESPEC_DURATION,
+            ),
+            (Duration::MAX, MAX_KERNEL_TIMESPEC_DURATION),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(bounded_kernel_timespec_duration(input), expected);
+        }
+    }
 }
 
 #[inline]
@@ -1318,6 +1362,8 @@ impl Reactor {
 
     /// Waits until at least one completion is available or the optional
     /// timeout expires.
+    /// Durations beyond Linux's signed kernel-timespec range saturate to its
+    /// maximum representable value.
     ///
     /// `EINTR` is retried here because it is not a useful control signal for
     /// callers of the async runtime. Applications that need signal-driven
@@ -1352,7 +1398,7 @@ impl Reactor {
                 } else {
                     remaining
                 };
-                let timespec = types::Timespec::from(timeout);
+                let timespec = types::Timespec::from(bounded_kernel_timespec_duration(timeout));
                 let args = types::SubmitArgs::new().timespec(&timespec);
                 match self.submit_with_args(1, &args) {
                     // `flush_sqes` emptied the userspace SQ before this wait.
@@ -1744,6 +1790,16 @@ impl Drop for Reactor {
                 ManuallyDrop::drop(&mut self.op_pool);
                 ManuallyDrop::drop(&mut self.retained_pool);
             }
+        }
+    }
+}
+
+#[cfg(any(feature = "test-support", all(test, not(miri))))]
+fn submit_and_wait_retry_eintr(reactor: &mut Reactor, min_complete: usize) -> io::Result<usize> {
+    loop {
+        match reactor.submit_and_wait(min_complete) {
+            Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
+            result => return result,
         }
     }
 }
@@ -2178,19 +2234,6 @@ mod completion_drain_probe {
                 } else {
                     resume_unwind(payload);
                 }
-            }
-        }
-    }
-
-    #[cfg(not(miri))]
-    fn submit_and_wait_retry_eintr(
-        reactor: &mut Reactor,
-        min_complete: usize,
-    ) -> io::Result<usize> {
-        loop {
-            match reactor.submit_and_wait(min_complete) {
-                Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
-                result => return result,
             }
         }
     }
@@ -2657,16 +2700,6 @@ impl Drop for CompletionDrainCloseBenchmarkOutput {
     }
 }
 
-#[cfg(feature = "test-support")]
-fn benchmark_submit_and_wait(reactor: &mut Reactor, min_complete: usize) -> io::Result<usize> {
-    loop {
-        match reactor.submit_and_wait(min_complete) {
-            Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
-            result => return result,
-        }
-    }
-}
-
 /// Measures final listener-owner destruction during completion retirement.
 ///
 /// Repository benchmark setup creates and completes one NOP per listener
@@ -2744,7 +2777,7 @@ pub fn benchmark_completion_drain_close(
                         raw_fds.push(raw);
                     }
 
-                    benchmark_submit_and_wait(unsafe { &mut *reactor }, batch)?;
+                    submit_and_wait_retry_eintr(unsafe { &mut *reactor }, batch)?;
                     let started = Instant::now();
                     let completions = unsafe {
                         Reactor::poll_io_unchecked(reactor, batch, runtime_state, ready_queue)
@@ -2805,7 +2838,7 @@ pub fn benchmark_completion_drain_close(
                     }
 
                     if close_ops > 0 {
-                        benchmark_submit_and_wait(unsafe { &mut *reactor }, close_ops)?;
+                        submit_and_wait_retry_eintr(unsafe { &mut *reactor }, close_ops)?;
                         let close_completions = unsafe {
                             Reactor::poll_io_unchecked(
                                 reactor,
@@ -4615,6 +4648,10 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::rc::Rc;
 
+    const KERNEL_TIMESPEC_CHILD_ENV: &str = "FLOWIO_KERNEL_TIMESPEC_WAIT_CHILD";
+    const KERNEL_TIMESPEC_CHILD_TEST: &str =
+        "runtime::reactor::tests::wait_for_events_duration_max_uses_bounded_kernel_timespec";
+
     fn runtime_state_with_inflight(inflight_ops: usize) -> RuntimeState {
         RuntimeState {
             live_tasks: 0,
@@ -5183,6 +5220,96 @@ mod tests {
             crate::runtime::test_hooks::ring_wait_failures_remaining(),
             0
         );
+    }
+
+    #[test]
+    fn wait_for_events_duration_max_uses_bounded_kernel_timespec() {
+        if std::env::var_os(KERNEL_TIMESPEC_CHILD_ENV).is_none() {
+            use std::process::{Command, Stdio};
+
+            let current_exe = std::env::current_exe().expect("current unit-test executable");
+            let mut child = Command::new(current_exe)
+                .args(["--exact", KERNEL_TIMESPEC_CHILD_TEST, "--nocapture"])
+                .env(KERNEL_TIMESPEC_CHILD_ENV, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn bounded-timespec child");
+            let deadline = Instant::now() + Duration::from_secs(8);
+
+            loop {
+                if child
+                    .try_wait()
+                    .expect("poll bounded-timespec child")
+                    .is_some()
+                {
+                    let output = child
+                        .wait_with_output()
+                        .expect("collect bounded-timespec child output");
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        output.status.success(),
+                        "bounded-timespec child failed: status={:?}, stdout={}, stderr={}",
+                        output.status,
+                        stdout,
+                        stderr
+                    );
+                    assert!(
+                        stdout.contains("1 passed;"),
+                        "bounded-timespec child did not run exactly one test: stdout={}, stderr={}",
+                        stdout,
+                        stderr
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("reap timed-out bounded-timespec child");
+                    panic!(
+                        "bounded-timespec child exceeded watchdog; stdout={}, stderr={}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        const TIMEOUT_USER_DATA: u64 = u64::MAX - 200;
+        let short_duration = bounded_kernel_timespec_duration(Duration::from_millis(250));
+        let short_timespec = types::Timespec::from(short_duration);
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+        reactor
+            .submit_sqe(
+                opcode::Timeout::new(&short_timespec)
+                    .count(1)
+                    .build()
+                    .user_data(TIMEOUT_USER_DATA),
+            )
+            .expect("short timeout submission failed");
+
+        assert_eq!(
+            reactor
+                .wait_for_events(Some(Duration::MAX))
+                .expect("saturated kernel wait failed"),
+            ReactorSubmitStatus::Ready
+        );
+
+        let mut completions = reactor
+            .ring
+            .as_mut()
+            .expect("initialized reactor missing ring")
+            .completion();
+        completions.sync();
+        let completion = completions.next().expect("short timeout CQE missing");
+        assert_eq!(completion.user_data(), TIMEOUT_USER_DATA);
+        assert_eq!(completion.result(), -libc::ETIME);
+        assert!(completions.next().is_none(), "unexpected extra completion");
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]

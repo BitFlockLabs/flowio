@@ -458,10 +458,23 @@ where
 /// bounded deadline expires.
 #[allow(dead_code)]
 pub fn run_exact_test_child_with_watchdog(test_name: &str, child_env: &str, timeout: Duration) {
+    run_exact_test_child_with_watchdog_env(test_name, child_env, timeout, &[]);
+}
+
+/// Runs one exact integration test in a bounded subprocess with additional
+/// environment entries applied only to that child.
+#[allow(dead_code)]
+pub fn run_exact_test_child_with_watchdog_env(
+    test_name: &str,
+    child_env: &str,
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+) {
     let current_exe = std::env::current_exe().expect("current integration-test executable");
     let mut child = Command::new(current_exe)
         .args(["--exact", test_name, "--nocapture"])
         .env(child_env, "1")
+        .envs(extra_env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

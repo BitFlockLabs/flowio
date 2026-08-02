@@ -170,6 +170,23 @@ pub fn dns_parse_received_response_packet(data: &[u8]) {
     let _ = std::hint::black_box(observe_dns_parse_received_response_packet(data));
 }
 
+fn observe_dns_parse_hosts_bytes(data: &[u8]) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let data = maybe_decode_hex_seed(data);
+    let mut addrs = Vec::new();
+    crate::net::resolver::parse_hosts_bytes(
+        data.as_ref(),
+        "hosts-target.flowio.invalid",
+        5432,
+        &mut addrs,
+    )?;
+    Ok(addrs)
+}
+
+/// Fuzz entry: parse arbitrary hosts-file bytes without filesystem I/O.
+pub fn dns_parse_hosts_bytes(data: &[u8]) {
+    let _ = std::hint::black_box(observe_dns_parse_hosts_bytes(data));
+}
+
 /// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
 pub fn sctp_parse_notification(data: &[u8]) {
     let data = maybe_decode_hex_seed(data);
@@ -310,6 +327,11 @@ pub mod test_support {
     /// Returns the received-length DNS parser's exact result.
     pub fn observe_dns_parse_received_response_packet(data: &[u8]) -> io::Result<()> {
         super::observe_dns_parse_received_response_packet(data)
+    }
+
+    /// Returns the hosts byte parser's exact result for a fuzz-wrapper input.
+    pub fn observe_dns_parse_hosts_bytes(data: &[u8]) -> io::Result<Vec<std::net::SocketAddr>> {
+        super::observe_dns_parse_hosts_bytes(data)
     }
 
     /// Returns the SCTP metadata parser's exact result.

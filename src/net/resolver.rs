@@ -12,6 +12,8 @@
 //! - only A and AAAA lookups are issued
 //! - one linear CNAME chain is followed with independent per-response,
 //!   cross-response, and name-compression bounds
+//! - upstream asynchronous work has one five-second aggregate deadline by
+//!   default, while each matching-response wait retains its independent cap
 //! - search domains and TCP fallback for truncated replies are not yet
 //!   implemented
 //!
@@ -57,12 +59,12 @@ use crate::net::udp::UdpSocket;
 use crate::runtime::buffer::bytes::{
     BufferCursorMut, BufferRangeError, read_u16_be_at, write_u16_be_at,
 };
-use crate::runtime::timer::{TimeoutError, timeout};
+use crate::runtime::timer::{Timeout, TimeoutError, timeout, timeout_at};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DNS_PORT: u16 = 53;
 const DNS_CLASS_IN: u16 = 1;
@@ -87,6 +89,7 @@ const DNS_MIN_RR_LEN: usize = 1 + DNS_RR_FIXED_FIELDS_LEN;
 const DNS_MAX_QUERY_PACKET_LEN: usize =
     DNS_HEADER_LEN + DNS_MAX_NAME_WIRE_LEN + DNS_QUESTION_FIXED_FIELDS_LEN;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_TOTAL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const HOSTS_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
 const MAX_NAMESERVERS: usize = 8;
@@ -104,16 +107,211 @@ static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
 enum QueryAttemptError {
     Io(io::Error),
     Timeout(TimeoutError),
+    Terminal(io::Error),
+    TotalTimeout,
 }
 
 impl QueryAttemptError {
     fn into_io_error(self) -> io::Error {
         match self {
-            Self::Io(err) | Self::Timeout(TimeoutError::Runtime(err)) => err,
+            Self::Io(err) | Self::Terminal(err) | Self::Timeout(TimeoutError::Runtime(err)) => err,
             Self::Timeout(TimeoutError::Elapsed) => {
                 io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
             }
+            Self::TotalTimeout => total_query_timeout_error(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct TotalQueryTimeout;
+
+impl std::fmt::Display for TotalQueryTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DNS total query timed out")
+    }
+}
+
+impl std::error::Error for TotalQueryTimeout {}
+
+fn total_query_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, TotalQueryTimeout)
+}
+
+#[cfg(test)]
+fn is_total_query_timeout(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<TotalQueryTimeout>())
+        .is_some()
+}
+
+enum DnsLookupError {
+    Recoverable(io::Error),
+    Terminal(io::Error),
+    TotalTimeout,
+}
+
+impl DnsLookupError {
+    fn classify(err: io::Error) -> Self {
+        if matches!(
+            err.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected | io::ErrorKind::OutOfMemory
+        ) {
+            Self::Terminal(err)
+        } else {
+            Self::Recoverable(err)
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Recoverable(err) | Self::Terminal(err) => err,
+            Self::TotalTimeout => total_query_timeout_error(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DnsDeadlineCheckpoint {
+    Start,
+    BeforeSocketSetup,
+    AfterSocketBind,
+    AfterSocketConnect,
+    BeforeSend,
+    BeforeReceive,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DnsDeadlineClock {
+    #[cfg(test)]
+    sample: Option<fn(DnsDeadlineCheckpoint) -> Instant>,
+}
+
+impl DnsDeadlineClock {
+    fn sample(self, checkpoint: DnsDeadlineCheckpoint) -> Instant {
+        #[cfg(test)]
+        {
+            self.sample
+                .map_or_else(Instant::now, |sample| sample(checkpoint))
+        }
+
+        #[cfg(not(test))]
+        {
+            let _ = checkpoint;
+            Instant::now()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DnsWaitDeadline {
+    Absolute(Instant),
+    Relative(Duration),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DnsWaitPlan {
+    deadline: DnsWaitDeadline,
+    total_limited: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DnsQueryDeadline {
+    started_at: Instant,
+    expires_at: Option<Instant>,
+    timeout: Duration,
+    clock: DnsDeadlineClock,
+}
+
+#[cfg(test)]
+type DnsQueryHook =
+    fn(SocketAddr, &[u8], u16) -> Option<Result<(Vec<u8>, usize), QueryAttemptError>>;
+
+impl DnsQueryDeadline {
+    fn new(timeout: Duration, clock: DnsDeadlineClock) -> Self {
+        let started_at = clock.sample(DnsDeadlineCheckpoint::Start);
+        Self {
+            started_at,
+            expires_at: started_at.checked_add(timeout),
+            timeout,
+            clock,
+        }
+    }
+
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
+        if let Some(expires_at) = self.expires_at {
+            return (now < expires_at).then(|| expires_at.duration_since(now));
+        }
+
+        let elapsed = now.saturating_duration_since(self.started_at);
+        (elapsed < self.timeout).then(|| self.timeout - elapsed)
+    }
+
+    fn ensure_remaining(self, checkpoint: DnsDeadlineCheckpoint) -> Result<(), QueryAttemptError> {
+        self.remaining_at(self.clock.sample(checkpoint))
+            .map(|_| ())
+            .ok_or(QueryAttemptError::TotalTimeout)
+    }
+
+    fn wait_plan_at(self, now: Instant, per_attempt: Option<Duration>) -> Option<DnsWaitPlan> {
+        let remaining = self.remaining_at(now)?;
+        let (duration, total_limited) = match per_attempt {
+            Some(per_attempt) if per_attempt < remaining => (per_attempt, false),
+            Some(_) | None => (remaining, true),
+        };
+
+        let deadline = if total_limited {
+            self.expires_at
+                .map(DnsWaitDeadline::Absolute)
+                .or_else(|| now.checked_add(duration).map(DnsWaitDeadline::Absolute))
+                .unwrap_or(DnsWaitDeadline::Relative(duration))
+        } else {
+            now.checked_add(duration)
+                .map(DnsWaitDeadline::Absolute)
+                .unwrap_or(DnsWaitDeadline::Relative(duration))
+        };
+
+        Some(DnsWaitPlan {
+            deadline,
+            total_limited,
+        })
+    }
+
+    fn timeout<F: std::future::Future>(
+        self,
+        checkpoint: DnsDeadlineCheckpoint,
+        per_attempt: Option<Duration>,
+        future: F,
+    ) -> Result<(Timeout<F>, bool), QueryAttemptError> {
+        let plan = self
+            .wait_plan_at(self.clock.sample(checkpoint), per_attempt)
+            .ok_or(QueryAttemptError::TotalTimeout)?;
+        let timed = match plan.deadline {
+            DnsWaitDeadline::Absolute(deadline) => timeout_at(deadline, future),
+            DnsWaitDeadline::Relative(duration) => timeout(duration, future),
+        };
+        Ok((timed, plan.total_limited))
+    }
+}
+
+fn finish_dns_socket_setup<T>(
+    deadline: DnsQueryDeadline,
+    checkpoint: DnsDeadlineCheckpoint,
+    result: io::Result<T>,
+) -> Result<T, QueryAttemptError> {
+    deadline.ensure_remaining(checkpoint)?;
+    result.map_err(QueryAttemptError::Io)
+}
+
+fn classify_dns_timeout<T>(
+    result: Result<T, TimeoutError>,
+    total_limited: bool,
+) -> Result<T, QueryAttemptError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(TimeoutError::Elapsed) if total_limited => Err(QueryAttemptError::TotalTimeout),
+        Err(TimeoutError::Runtime(err)) if total_limited => Err(QueryAttemptError::Terminal(err)),
+        Err(err) => Err(QueryAttemptError::Timeout(err)),
     }
 }
 
@@ -126,7 +324,9 @@ impl QueryAttemptError {
 /// its sequential A, AAAA, and CNAME-follow-up work, attempts create UDP
 /// sockets, and non-literal names inspect `/etc/hosts` for each call. A receive
 /// that times out after submission retains its buffer until the target CQE, so
-/// a later attempt allocates a replacement.
+/// a later attempt allocates a replacement. An aggregate timeout during send
+/// likewise leaves the query owner retained until its target CQE, but starts no
+/// later attempt.
 ///
 /// # Example
 /// ```
@@ -135,6 +335,7 @@ impl QueryAttemptError {
 ///
 /// let mut resolver = DnsResolver::new(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 53))])?;
 /// resolver.set_query_timeout(std::time::Duration::from_secs(1));
+/// resolver.set_total_query_timeout(std::time::Duration::from_secs(2));
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[derive(Clone, Debug)]
@@ -144,6 +345,13 @@ pub struct DnsResolver {
     /// Timeout for waiting on a matching response after each UDP query send
     /// completes.
     query_timeout: Duration,
+    /// Aggregate budget for all asynchronous upstream work in one resolution.
+    total_query_timeout: Duration,
+    /// Monotonic deadline source; zero-sized in production builds.
+    deadline_clock: DnsDeadlineClock,
+    /// Deterministic attempt replacement used only by in-module tests.
+    #[cfg(test)]
+    query_hook: Option<DnsQueryHook>,
 }
 
 impl DnsResolver {
@@ -201,14 +409,41 @@ impl DnsResolver {
         Ok(Self {
             nameservers: nameservers.into_boxed_slice(),
             query_timeout: DEFAULT_QUERY_TIMEOUT,
+            total_query_timeout: DEFAULT_TOTAL_QUERY_TIMEOUT,
+            deadline_clock: DnsDeadlineClock::default(),
+            #[cfg(test)]
+            query_hook: None,
         })
     }
 
     /// Sets the matching-response wait timeout after each UDP query is sent.
     ///
-    /// This does not bound socket creation or the preceding async UDP send.
+    /// This per-attempt setting does not itself bound socket creation or the
+    /// preceding async UDP send. [`Self::set_total_query_timeout`] separately
+    /// bounds all asynchronous upstream work in the complete resolution.
     pub fn set_query_timeout(&mut self, query_timeout: Duration) -> &mut Self {
         self.query_timeout = query_timeout;
+        self
+    }
+
+    /// Sets the aggregate timeout for asynchronous upstream DNS work.
+    ///
+    /// The default is five seconds. This budget starts only after IP-literal,
+    /// `localhost`, and `/etc/hosts` lookup produce no result, then spans all
+    /// sequential A, AAAA, nameserver-failover, and CNAME-follow-up work. Each
+    /// response wait is still capped by [`Self::set_query_timeout`], so its
+    /// effective deadline is the earlier of the per-attempt and aggregate
+    /// deadlines. A zero duration prevents upstream network I/O while leaving
+    /// local resolution unaffected.
+    ///
+    /// The aggregate timeout bounds asynchronous sends and receives. It cannot
+    /// preempt the bounded synchronous `/etc/hosts` read or a synchronous UDP
+    /// socket syscall; expiry is checked immediately around socket setup so no
+    /// later asynchronous attempt starts after the budget is exhausted.
+    /// Aggregate expiry returns [`io::ErrorKind::TimedOut`] with the diagnostic
+    /// `DNS total query timed out`.
+    pub fn set_total_query_timeout(&mut self, total_query_timeout: Duration) -> &mut Self {
+        self.total_query_timeout = total_query_timeout;
         self
     }
 
@@ -216,7 +451,10 @@ impl DnsResolver {
     ///
     /// This first handles IP literals, `localhost`, and `/etc/hosts`, then
     /// falls back to UDP DNS queries if needed. Local aliases compare
-    /// case-insensitively and treat a trailing root dot as equivalent.
+    /// case-insensitively and treat a trailing root dot as equivalent. A
+    /// hosts line that is not valid UTF-8 is ignored as a whole without
+    /// suppressing valid lines before or after it. Only `#` starts a hosts
+    /// comment; `;` remains ordinary alias text.
     ///
     /// # Execution and failover
     ///
@@ -230,6 +468,26 @@ impl DnsResolver {
     /// buffer until target-CQE retirement, so a later attempt allocates a
     /// replacement. Timer `OutOfMemory` stops that family lookup without
     /// attempting another server.
+    ///
+    /// One aggregate deadline starts only after literal, `localhost`, and
+    /// hosts-file lookup miss. Its default is five seconds and it spans every
+    /// asynchronous send/receive across A, AAAA, nameserver failover, and the
+    /// CNAME follow-up. Each matching-response wait ends at the earlier of its
+    /// per-attempt deadline and that aggregate deadline. When both deadlines
+    /// are equal, expiry is aggregate and no later attempt begins. A response
+    /// completion wins the timer when both become ready in the same poll,
+    /// following FlowIO's general timeout contract. A completed address also
+    /// keeps the existing result precedence over a later family's aggregate
+    /// expiry.
+    ///
+    /// The aggregate deadline cannot preempt the bounded synchronous hosts
+    /// read or the synchronous socket, bind, and connect syscalls. It is
+    /// sampled immediately before socket setup, after bind, and after connect;
+    /// expiry observed at one of those boundaries takes precedence over that
+    /// setup result and prevents the next operation. Configure the budget with
+    /// [`Self::set_total_query_timeout`]. Aggregate expiry returns
+    /// [`io::ErrorKind::TimedOut`] with the diagnostic
+    /// `DNS total query timed out`.
     ///
     /// A and AAAA remain sequential, in that order. Their outcomes are
     /// combined as: any address, a terminal local/runtime error, an A-first
@@ -249,7 +507,10 @@ impl DnsResolver {
     ///
     /// # Response validation
     ///
-    /// A matching-ID response must be marked as a response and use the QUERY
+    /// A full receive buffer is attributed to the active query only after its
+    /// transaction ID matches; unrelated full datagrams are drained, while a
+    /// matching-ID full datagram is rejected as anomalously truncated. A
+    /// matching-ID response must be marked as a response and use the QUERY
     /// opcode. The allocation-free UDP candidate gate drains other opcodes;
     /// full parsing rejects them with `InvalidData` before question,
     /// response-code, or resource-record handling. Every present echoed
@@ -294,7 +555,8 @@ impl DnsResolver {
     /// The synchronous `/etc/hosts` read is limited to 4 MiB, and the final
     /// first-seen unique result is limited to 64 socket addresses. Either
     /// over-limit condition returns `InvalidData`; results are never
-    /// truncated.
+    /// truncated. Invalid hosts lines still count toward the raw file-size
+    /// limit.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.resolve_host_with_hosts_path(HOSTS_PATH, host, port)
             .await
@@ -317,6 +579,7 @@ impl DnsResolver {
             return Ok(addrs);
         }
 
+        let deadline = DnsQueryDeadline::new(self.total_query_timeout, self.deadline_clock);
         let mut current = host.to_owned();
         let mut cname_followup_queries = 0usize;
         let mut total_cname_hops = 0usize;
@@ -330,6 +593,7 @@ impl DnsResolver {
                     &mut addrs,
                     remaining_cname_hops,
                     &mut query_storage,
+                    deadline,
                 )
                 .await?
             {
@@ -355,9 +619,11 @@ impl DnsResolver {
         qtype: u16,
         remaining_cname_hops: usize,
         query_storage: &mut DnsQueryStorage,
-    ) -> io::Result<LookupResult> {
+        deadline: DnsQueryDeadline,
+    ) -> Result<LookupResult, DnsLookupError> {
         let query_id = next_query_id();
-        patch_query_packet(&mut query_storage.packet, query_id, qtype)?;
+        patch_query_packet(&mut query_storage.packet, query_id, qtype)
+            .map_err(DnsLookupError::classify)?;
         let mut last_err = None;
 
         for nameserver in self.nameservers.iter().copied() {
@@ -367,6 +633,7 @@ impl DnsResolver {
                     &mut query_storage.packet,
                     &mut query_storage.response_buffer,
                     query_id,
+                    deadline,
                 )
                 .await
             {
@@ -379,29 +646,35 @@ impl DnsResolver {
                             return Ok(result);
                         }
                         Ok(_) => {
-                            return Err(io::Error::new(
+                            return Err(DnsLookupError::Recoverable(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "DNS resolution exceeded maximum total CNAME hop count",
-                            ));
+                            )));
                         }
                         Err(err) => last_err = Some(err),
                     }
                 }
+                Err(QueryAttemptError::TotalTimeout) => {
+                    return Err(DnsLookupError::TotalTimeout);
+                }
+                Err(QueryAttemptError::Terminal(err)) => {
+                    return Err(DnsLookupError::Terminal(err));
+                }
                 Err(QueryAttemptError::Timeout(TimeoutError::Runtime(err)))
                     if err.kind() == io::ErrorKind::OutOfMemory =>
                 {
-                    return Err(err);
+                    return Err(DnsLookupError::Terminal(err));
                 }
                 Err(err) => last_err = Some(err.into_io_error()),
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
+        Err(DnsLookupError::classify(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "DNS resolution failed without a nameserver response",
             )
-        }))
+        })))
     }
 
     async fn query_nameserver(
@@ -410,55 +683,81 @@ impl DnsResolver {
         packet: &mut Vec<u8>,
         response_buffer: &mut Option<Vec<u8>>,
         query_id: u16,
+        deadline: DnsQueryDeadline,
     ) -> Result<(Vec<u8>, usize), QueryAttemptError> {
-        let mut socket =
-            UdpSocket::bind(unspecified_addr(nameserver)).map_err(QueryAttemptError::Io)?;
-        socket.connect(nameserver).map_err(QueryAttemptError::Io)?;
+        deadline.ensure_remaining(DnsDeadlineCheckpoint::BeforeSocketSetup)?;
+        #[cfg(test)]
+        if let Some(result) = self
+            .query_hook
+            .and_then(|query_hook| query_hook(nameserver, packet, query_id))
+        {
+            return result;
+        }
+        let mut socket = finish_dns_socket_setup(
+            deadline,
+            DnsDeadlineCheckpoint::AfterSocketBind,
+            UdpSocket::bind(unspecified_addr(nameserver)),
+        )?;
+        let connected = socket.connect(nameserver);
+        finish_dns_socket_setup(
+            deadline,
+            DnsDeadlineCheckpoint::AfterSocketConnect,
+            connected,
+        )?;
 
         let owned_packet = std::mem::take(packet);
-        let (send_result, returned_packet) = socket.send(owned_packet).await;
+        let (send, _) = deadline.timeout(
+            DnsDeadlineCheckpoint::BeforeSend,
+            None,
+            socket.send(owned_packet),
+        )?;
+        let (send_result, returned_packet) = classify_dns_timeout(send.await, true)?;
         // Restore ownership before propagating a send error so a later
         // nameserver attempt receives the same encoded query allocation.
         *packet = returned_packet;
         send_result.map_err(QueryAttemptError::Io)?;
-        match timeout(self.query_timeout, async {
-            let mut recv = response_buffer
-                .take()
-                .unwrap_or_else(new_dns_response_buffer);
-            loop {
-                let (recv_result, returned) = socket.recv(recv, DNS_UDP_RESPONSE_BUFFER_SIZE).await;
-                recv = returned;
-                let recv_len = match recv_result {
-                    Ok(recv_len) => recv_len,
-                    Err(err) => {
+        let (receive, total_limited) = deadline.timeout(
+            DnsDeadlineCheckpoint::BeforeReceive,
+            Some(self.query_timeout),
+            async {
+                let mut recv = response_buffer
+                    .take()
+                    .unwrap_or_else(new_dns_response_buffer);
+                loop {
+                    let (recv_result, returned) =
+                        socket.recv(recv, DNS_UDP_RESPONSE_BUFFER_SIZE).await;
+                    recv = returned;
+                    let recv_len = match recv_result {
+                        Ok(recv_len) => recv_len,
+                        Err(err) => {
+                            *response_buffer = Some(recv);
+                            return Err(err);
+                        }
+                    };
+                    let response = &recv[..recv_len];
+                    if recv_len == DNS_UDP_RESPONSE_BUFFER_SIZE {
+                        if !response_matches_query_id(response, query_id) {
+                            continue;
+                        }
+                        // This resolver does not advertise EDNS0, so conforming
+                        // UDP responses fit the legacy DNS payload size and set
+                        // TC when truncated. Connected UDP recv does not expose
+                        // MSG_TRUNC, so a matching-query full scratch buffer is
+                        // the reliable signal for anomalous truncation.
+                        let err = io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS UDP response filled the receive buffer",
+                        );
                         *response_buffer = Some(recv);
                         return Err(err);
                     }
-                };
-                if recv_len == DNS_UDP_RESPONSE_BUFFER_SIZE {
-                    // This resolver does not advertise EDNS0, so conforming
-                    // UDP responses fit the legacy DNS payload size and set
-                    // TC when truncated. Connected UDP recv does not expose
-                    // MSG_TRUNC, so a full scratch buffer is the reliable
-                    // signal for anomalous truncation.
-                    let err = io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "DNS UDP response filled the receive buffer",
-                    );
-                    *response_buffer = Some(recv);
-                    return Err(err);
+                    if response_is_decodable_candidate(response, query_id) {
+                        return Ok((recv, recv_len));
+                    }
                 }
-                let response = &recv[..recv_len];
-                if response_is_decodable_candidate(response, query_id) {
-                    return Ok((recv, recv_len));
-                }
-            }
-        })
-        .await
-        {
-            Ok(result) => result.map_err(QueryAttemptError::Io),
-            Err(err) => Err(QueryAttemptError::Timeout(err)),
-        }
+            },
+        )?;
+        classify_dns_timeout(receive.await, total_limited)?.map_err(QueryAttemptError::Io)
     }
 
     async fn gather_dns_addresses(
@@ -468,35 +767,42 @@ impl DnsResolver {
         addrs: &mut Vec<SocketAddr>,
         remaining_cname_hops: usize,
         query_storage: &mut DnsQueryStorage,
+        deadline: DnsQueryDeadline,
     ) -> io::Result<ResolveHostStep> {
         encode_query_packet(&mut query_storage.packet, current)?;
         let a = match self
-            .lookup_name(current, DNS_TYPE_A, remaining_cname_hops, query_storage)
+            .lookup_name(
+                current,
+                DNS_TYPE_A,
+                remaining_cname_hops,
+                query_storage,
+                deadline,
+            )
             .await
         {
-            Err(err) if is_terminal_family_lookup_error(&err) => return Err(err),
+            Err(DnsLookupError::Terminal(err)) => return Err(err),
+            Err(DnsLookupError::TotalTimeout) => return Err(total_query_timeout_error()),
             outcome => outcome,
         };
         let aaaa = self
-            .lookup_name(current, DNS_TYPE_AAAA, remaining_cname_hops, query_storage)
+            .lookup_name(
+                current,
+                DNS_TYPE_AAAA,
+                remaining_cname_hops,
+                query_storage,
+                deadline,
+            )
             .await;
         finish_dns_family_lookups(current, port, addrs, a, aaaa)
     }
-}
-
-fn is_terminal_family_lookup_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected | io::ErrorKind::OutOfMemory
-    )
 }
 
 fn finish_dns_family_lookups(
     current: &str,
     port: u16,
     addrs: &mut Vec<SocketAddr>,
-    a: io::Result<LookupResult>,
-    aaaa: io::Result<LookupResult>,
+    a: Result<LookupResult, DnsLookupError>,
+    aaaa: Result<LookupResult, DnsLookupError>,
 ) -> io::Result<ResolveHostStep> {
     let mut cname = None;
     let mut saw_nx_domain = false;
@@ -515,13 +821,14 @@ fn finish_dns_family_lookups(
                     cname = result.cname.map(|next| (next, result.cname_hops));
                 }
             }
-            Err(err) => {
-                if is_terminal_family_lookup_error(&err) {
-                    if terminal_error.is_none() {
-                        terminal_error = Some(err);
-                    }
-                } else if first_error.is_none() {
+            Err(DnsLookupError::Recoverable(err)) => {
+                if first_error.is_none() {
                     first_error = Some(err);
+                }
+            }
+            Err(err @ (DnsLookupError::Terminal(_) | DnsLookupError::TotalTimeout)) => {
+                if terminal_error.is_none() {
+                    terminal_error = Some(err);
                 }
             }
         }
@@ -531,7 +838,7 @@ fn finish_dns_family_lookups(
         return Ok(ResolveHostStep::Resolved);
     }
     if let Some(err) = terminal_error {
-        return Err(err);
+        return Err(err.into_io_error());
     }
     if let Some((next, cname_hops)) = cname {
         return Ok(ResolveHostStep::FollowCname { next, cname_hops });
@@ -763,7 +1070,6 @@ fn read_hosts_file(
     let mut reader = BufReader::new(file.take(max_read as u64));
     let mut line_bytes = Vec::with_capacity(256);
     let mut total_bytes = 0usize;
-    let mut utf8_error = None;
     let mut result_error = None;
 
     loop {
@@ -790,19 +1096,33 @@ fn read_hosts_file(
             ));
         }
 
-        let line = match std::str::from_utf8(&line_bytes) {
-            Ok(line) => line,
-            Err(err) => {
-                if utf8_error.is_none() {
-                    utf8_error = Some(io::Error::new(io::ErrorKind::InvalidData, err));
-                }
-                continue;
-            }
-        };
-        if utf8_error.is_some() || result_error.is_some() {
-            continue;
+        if result_error.is_none()
+            && let Err(err) = parse_hosts_bytes(&line_bytes, host, port, addrs)
+        {
+            result_error = Some(err);
         }
-        let line = strip_comment(line);
+        if reached_eof {
+            break;
+        }
+    }
+
+    if let Some(err) = result_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_hosts_bytes(
+    contents: &[u8],
+    host: &str,
+    port: u16,
+    addrs: &mut Vec<SocketAddr>,
+) -> io::Result<()> {
+    for line_bytes in contents.split(|byte| *byte == b'\n') {
+        let Ok(line) = std::str::from_utf8(line_bytes) else {
+            continue;
+        };
+        let line = strip_hosts_comment(line);
         if line.is_empty() {
             continue;
         }
@@ -816,22 +1136,10 @@ fn read_hosts_file(
         };
 
         if parts.any(|name| dns_name_eq(name, host)) {
-            let socket = SocketAddr::new(ip, port);
-            if let Err(err) = push_unique_resolved_addr(addrs, socket) {
-                result_error = Some(err);
-            }
-        }
-        if reached_eof {
-            break;
+            push_unique_resolved_addr(addrs, SocketAddr::new(ip, port))?;
         }
     }
 
-    if let Some(err) = utf8_error {
-        return Err(err);
-    }
-    if let Some(err) = result_error {
-        return Err(err);
-    }
     Ok(())
 }
 
@@ -844,7 +1152,7 @@ fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
     let mut nameservers = Vec::new();
 
     for line in contents.lines() {
-        let line = strip_comment(line);
+        let line = strip_resolv_conf_comment(line);
         if line.is_empty() {
             continue;
         }
@@ -924,7 +1232,13 @@ fn max_read_with_over_limit_sentinel(max_bytes: usize) -> io::Result<usize> {
     })
 }
 
-fn strip_comment(line: &str) -> &str {
+fn strip_hosts_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map(|(head, _)| head.trim())
+        .unwrap_or_else(|| line.trim())
+}
+
+fn strip_resolv_conf_comment(line: &str) -> &str {
     line.split_once(['#', ';'])
         .map(|(head, _)| head.trim())
         .unwrap_or_else(|| line.trim())
@@ -952,14 +1266,7 @@ fn byte_range_eof(err: BufferRangeError) -> io::Error {
 /// question structure to decide whether full parsing is useful; it does not
 /// authenticate or fully validate the response packet.
 pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
-    if packet.len() < DNS_HEADER_LEN {
-        return false;
-    }
-
-    let Some(response_id) = read_u16_be_candidate(packet, 0) else {
-        return false;
-    };
-    if response_id != query_id {
+    if !response_matches_query_id(packet, query_id) {
         return false;
     }
 
@@ -991,6 +1298,12 @@ pub(crate) fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> b
         }
         _ => false,
     }
+}
+
+/// Checks the minimum DNS header and transaction-ID gates without allocating.
+fn response_matches_query_id(packet: &[u8], query_id: u16) -> bool {
+    packet.len() >= DNS_HEADER_LEN
+        && read_u16_be_candidate(packet, 0).is_some_and(|response_id| response_id == query_id)
 }
 
 /// Validated DNS header counts plus the optional echoed question.
@@ -1860,9 +2173,11 @@ pub(crate) mod test_support {
                 super::DNS_TYPE_A,
                 super::MAX_CNAME_TOTAL_HOPS,
                 &mut query_storage,
+                super::DnsQueryDeadline::new(resolver.total_query_timeout, resolver.deadline_clock),
             )
             .await
             .map(|result| result.addresses)
+            .map_err(super::DnsLookupError::into_io_error)
     }
 
     /// Repository-only seam for the resolver deduplication allocation fixture.
@@ -1881,6 +2196,17 @@ pub(crate) mod test_support {
         port: u16,
     ) -> std::io::Result<Vec<SocketAddr>> {
         super::resolve_local_host_with_hosts_path(path, host, port)
+    }
+
+    /// Repository-only seam for hosts byte-parser fixtures.
+    pub fn parse_hosts_bytes(
+        contents: &[u8],
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<Vec<SocketAddr>> {
+        let mut addrs = Vec::new();
+        super::parse_hosts_bytes(contents, host, port, &mut addrs)?;
+        Ok(addrs)
     }
 
     /// Repository-only seam for full resolver lookup with a hosts fixture.
@@ -1918,6 +2244,290 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(miri))]
+    use crate::runtime::executor::Executor;
+    #[cfg(not(miri))]
+    use std::cell::RefCell;
+    #[cfg(not(miri))]
+    use std::collections::VecDeque;
+    #[cfg(not(miri))]
+    use std::net::UdpSocket as StdUdpSocket;
+    #[cfg(not(miri))]
+    use std::rc::Rc;
+
+    #[cfg(not(miri))]
+    struct DeadlineClockScript {
+        base: Instant,
+        samples: VecDeque<(DnsDeadlineCheckpoint, Duration)>,
+    }
+
+    #[cfg(not(miri))]
+    enum ScriptedQueryOutcome {
+        Address(IpAddr),
+        Cname(&'static str),
+        Empty,
+        AttemptTimeout,
+        TerminalRuntime(i32),
+    }
+
+    #[cfg(not(miri))]
+    struct ScriptedQueryStep {
+        nameserver: SocketAddr,
+        host: &'static str,
+        qtype: u16,
+        outcome: ScriptedQueryOutcome,
+    }
+
+    #[cfg(not(miri))]
+    thread_local! {
+        static DEADLINE_CLOCK_SCRIPT: RefCell<Option<DeadlineClockScript>> = const {
+            RefCell::new(None)
+        };
+        static DNS_QUERY_SCRIPT: RefCell<Option<VecDeque<ScriptedQueryStep>>> = const {
+            RefCell::new(None)
+        };
+    }
+
+    #[cfg(not(miri))]
+    fn scripted_deadline_clock(checkpoint: DnsDeadlineCheckpoint) -> Instant {
+        DEADLINE_CLOCK_SCRIPT.with(|script| {
+            let mut script = script.borrow_mut();
+            let script = script
+                .as_mut()
+                .expect("DNS deadline clock was sampled without a script");
+            let (expected, offset) = script
+                .samples
+                .pop_front()
+                .expect("DNS deadline clock consumed more samples than expected");
+            assert_eq!(checkpoint, expected, "unexpected DNS deadline checkpoint");
+            script
+                .base
+                .checked_add(offset)
+                .expect("test DNS deadline offset should fit in Instant")
+        })
+    }
+
+    #[cfg(not(miri))]
+    fn scripted_query_hook(
+        nameserver: SocketAddr,
+        packet: &[u8],
+        query_id: u16,
+    ) -> Option<Result<(Vec<u8>, usize), QueryAttemptError>> {
+        let step = DNS_QUERY_SCRIPT.with(|script| {
+            script
+                .borrow_mut()
+                .as_mut()
+                .expect("DNS query hook was called without a script")
+                .pop_front()
+                .expect("DNS query hook consumed more steps than expected")
+        });
+        assert_eq!(nameserver, step.nameserver, "unexpected DNS nameserver");
+        assert_eq!(
+            read_u16_be_at(packet, 0).expect("scripted query ID should fit"),
+            query_id,
+            "scripted query ID did not match its packet"
+        );
+        let (host, name_len) =
+            decode_name(packet, DNS_HEADER_LEN, 0).expect("scripted query name should decode");
+        assert_eq!(host, step.host, "unexpected scripted DNS query name");
+        let qtype = read_u16_be_at(packet, DNS_HEADER_LEN + name_len)
+            .expect("scripted query type should fit");
+        assert_eq!(qtype, step.qtype, "unexpected scripted DNS query type");
+
+        if matches!(&step.outcome, ScriptedQueryOutcome::AttemptTimeout) {
+            return Some(Err(QueryAttemptError::Timeout(TimeoutError::Elapsed)));
+        }
+        if let ScriptedQueryOutcome::TerminalRuntime(errno) = &step.outcome {
+            return Some(Err(QueryAttemptError::Terminal(
+                io::Error::from_raw_os_error(*errno),
+            )));
+        }
+
+        let mut response = packet.to_vec();
+        let flags = read_u16_be_at(&response, 2).expect("scripted query flags should fit");
+        write_u16_be_at(&mut response, 2, flags | DNS_FLAG_QR)
+            .expect("scripted response flags should fit");
+        match step.outcome {
+            ScriptedQueryOutcome::Address(address) => {
+                write_u16_be_at(&mut response, 6, 1).expect("scripted Answer count should fit");
+                response.extend_from_slice(&0xC00Cu16.to_be_bytes());
+                response.extend_from_slice(&qtype.to_be_bytes());
+                response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+                response.extend_from_slice(&0u32.to_be_bytes());
+                match address {
+                    IpAddr::V4(address) => {
+                        response.extend_from_slice(&4u16.to_be_bytes());
+                        response.extend_from_slice(&address.octets());
+                    }
+                    IpAddr::V6(address) => {
+                        response.extend_from_slice(&16u16.to_be_bytes());
+                        response.extend_from_slice(&address.octets());
+                    }
+                }
+            }
+            ScriptedQueryOutcome::Cname(target) => {
+                let mut encoded_target = Vec::new();
+                push_test_wire_name(&mut encoded_target, target);
+                write_u16_be_at(&mut response, 6, 1).expect("scripted Answer count should fit");
+                response.extend_from_slice(&0xC00Cu16.to_be_bytes());
+                response.extend_from_slice(&DNS_TYPE_CNAME.to_be_bytes());
+                response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+                response.extend_from_slice(&0u32.to_be_bytes());
+                response.extend_from_slice(
+                    &u16::try_from(encoded_target.len())
+                        .expect("scripted CNAME should fit")
+                        .to_be_bytes(),
+                );
+                response.extend_from_slice(&encoded_target);
+            }
+            ScriptedQueryOutcome::Empty => {}
+            ScriptedQueryOutcome::AttemptTimeout | ScriptedQueryOutcome::TerminalRuntime(_) => {
+                unreachable!()
+            }
+        }
+        let response_len = response.len();
+        Some(Ok((response, response_len)))
+    }
+
+    #[cfg(not(miri))]
+    struct DeadlineClockGuard;
+
+    #[cfg(not(miri))]
+    impl DeadlineClockGuard {
+        fn install(samples: Vec<(DnsDeadlineCheckpoint, Duration)>) -> Self {
+            DEADLINE_CLOCK_SCRIPT.with(|script| {
+                let mut script = script.borrow_mut();
+                assert!(
+                    script.is_none(),
+                    "DNS deadline clock script was already active"
+                );
+                *script = Some(DeadlineClockScript {
+                    base: Instant::now(),
+                    samples: samples.into(),
+                });
+            });
+            Self
+        }
+
+        fn assert_exhausted(&self) {
+            DEADLINE_CLOCK_SCRIPT.with(|script| {
+                let script = script.borrow();
+                let remaining = script
+                    .as_ref()
+                    .expect("DNS deadline clock script disappeared")
+                    .samples
+                    .len();
+                assert_eq!(remaining, 0, "DNS deadline clock left unused samples");
+            });
+        }
+    }
+
+    #[cfg(not(miri))]
+    struct QueryScriptGuard;
+
+    #[cfg(not(miri))]
+    impl QueryScriptGuard {
+        fn install(steps: Vec<ScriptedQueryStep>) -> Self {
+            DNS_QUERY_SCRIPT.with(|script| {
+                let mut script = script.borrow_mut();
+                assert!(script.is_none(), "DNS query script was already active");
+                *script = Some(steps.into());
+            });
+            Self
+        }
+
+        fn assert_exhausted(&self) {
+            DNS_QUERY_SCRIPT.with(|script| {
+                let script = script.borrow();
+                let remaining = script.as_ref().expect("DNS query script disappeared").len();
+                assert_eq!(remaining, 0, "DNS query script left unused steps");
+            });
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for QueryScriptGuard {
+        fn drop(&mut self) {
+            DNS_QUERY_SCRIPT.with(|script| {
+                *script.borrow_mut() = None;
+            });
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for DeadlineClockGuard {
+        fn drop(&mut self) {
+            DEADLINE_CLOCK_SCRIPT.with(|script| {
+                *script.borrow_mut() = None;
+            });
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn resolver_with_scripted_clock(nameservers: Vec<SocketAddr>) -> DnsResolver {
+        let mut resolver =
+            DnsResolver::new(nameservers).expect("test resolver construction failed");
+        resolver.deadline_clock = DnsDeadlineClock {
+            sample: Some(scripted_deadline_clock),
+        };
+        resolver
+    }
+
+    #[cfg(not(miri))]
+    fn resolver_with_scripted_queries(nameservers: Vec<SocketAddr>) -> DnsResolver {
+        let mut resolver = resolver_with_scripted_clock(nameservers);
+        resolver.query_hook = Some(scripted_query_hook);
+        resolver
+    }
+
+    #[cfg(not(miri))]
+    fn run_scripted_resolution(
+        resolver: DnsResolver,
+        host: &'static str,
+    ) -> io::Result<Vec<SocketAddr>> {
+        let mut executor = Executor::new().expect("test executor construction failed");
+        let result = Rc::new(RefCell::new(None));
+        let task_result = Rc::clone(&result);
+        executor
+            .run(async move {
+                task_result.replace(Some(
+                    resolver
+                        .resolve_host_with_hosts_path(
+                            "/flowio-test-hosts-file-does-not-exist",
+                            host,
+                            5432,
+                        )
+                        .await,
+                ));
+            })
+            .expect("test executor run failed");
+        result
+            .borrow_mut()
+            .take()
+            .expect("test resolver task did not publish its result")
+    }
+
+    #[test]
+    fn response_query_id_gate_covers_short_and_full_datagrams() {
+        const QUERY_ID: u16 = 0x1234;
+
+        assert!(!response_matches_query_id(
+            &QUERY_ID.to_be_bytes(),
+            QUERY_ID
+        ));
+
+        let mut header = [0u8; DNS_HEADER_LEN];
+        header[..2].copy_from_slice(&QUERY_ID.wrapping_add(1).to_be_bytes());
+        assert!(!response_matches_query_id(&header, QUERY_ID));
+        header[..2].copy_from_slice(&QUERY_ID.to_be_bytes());
+        assert!(response_matches_query_id(&header, QUERY_ID));
+
+        let mut full = vec![0u8; DNS_UDP_RESPONSE_BUFFER_SIZE];
+        full[..2].copy_from_slice(&QUERY_ID.wrapping_add(1).to_be_bytes());
+        assert!(!response_matches_query_id(&full, QUERY_ID));
+        full[..2].copy_from_slice(&QUERY_ID.to_be_bytes());
+        assert!(response_matches_query_id(&full, QUERY_ID));
+    }
 
     #[test]
     fn fresh_dns_response_buffer_exposes_capacity_without_initializing_bytes() {
@@ -1981,6 +2591,500 @@ mod tests {
             err.to_string(),
             "resolver supports at most eight unique nameservers"
         );
+    }
+
+    #[test]
+    fn resolver_timeout_defaults_and_setters_are_independent() {
+        let nameserver = SocketAddr::from((Ipv4Addr::LOCALHOST, 53));
+        let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver construction");
+
+        assert_eq!(resolver.query_timeout, Duration::from_secs(3));
+        assert_eq!(resolver.total_query_timeout, Duration::from_secs(5));
+
+        let returned = resolver
+            .set_query_timeout(Duration::from_secs(7))
+            .set_total_query_timeout(Duration::from_secs(11));
+        assert!(std::ptr::eq(returned, &resolver));
+        assert_eq!(resolver.query_timeout, Duration::from_secs(7));
+        assert_eq!(resolver.total_query_timeout, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn dns_wait_plans_choose_per_attempt_then_equal_or_shorter_total_budget() {
+        let started_at = Instant::now();
+        let deadline = DnsQueryDeadline {
+            started_at,
+            expires_at: started_at.checked_add(Duration::from_secs(5)),
+            timeout: Duration::from_secs(5),
+            clock: DnsDeadlineClock::default(),
+        };
+        let now = started_at
+            .checked_add(Duration::from_secs(1))
+            .expect("test instant should fit");
+
+        let shorter_attempt = deadline
+            .wait_plan_at(now, Some(Duration::from_secs(3)))
+            .expect("in-budget per-attempt wait");
+        assert_eq!(
+            shorter_attempt,
+            DnsWaitPlan {
+                deadline: DnsWaitDeadline::Absolute(
+                    now.checked_add(Duration::from_secs(3))
+                        .expect("test instant should fit")
+                ),
+                total_limited: false,
+            }
+        );
+
+        for per_attempt in [Duration::from_secs(4), Duration::from_secs(9)] {
+            let total_limited = deadline
+                .wait_plan_at(now, Some(per_attempt))
+                .expect("in-budget total wait");
+            assert_eq!(
+                total_limited,
+                DnsWaitPlan {
+                    deadline: DnsWaitDeadline::Absolute(
+                        started_at
+                            .checked_add(Duration::from_secs(5))
+                            .expect("test instant should fit")
+                    ),
+                    total_limited: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dns_deadline_zero_and_exact_boundary_are_expired() {
+        let started_at = Instant::now();
+        let zero = DnsQueryDeadline {
+            started_at,
+            expires_at: Some(started_at),
+            timeout: Duration::ZERO,
+            clock: DnsDeadlineClock::default(),
+        };
+        assert_eq!(zero.remaining_at(started_at), None);
+        assert_eq!(zero.wait_plan_at(started_at, None), None);
+
+        let expires_at = started_at
+            .checked_add(Duration::from_secs(5))
+            .expect("test instant should fit");
+        let bounded = DnsQueryDeadline {
+            started_at,
+            expires_at: Some(expires_at),
+            timeout: Duration::from_secs(5),
+            clock: DnsDeadlineClock::default(),
+        };
+        let immediately_before = expires_at
+            .checked_sub(Duration::from_nanos(1))
+            .expect("test instant should fit");
+        assert_eq!(
+            bounded.remaining_at(immediately_before),
+            Some(Duration::from_nanos(1))
+        );
+        assert_eq!(
+            bounded.wait_plan_at(immediately_before, Some(Duration::from_secs(3))),
+            Some(DnsWaitPlan {
+                deadline: DnsWaitDeadline::Absolute(expires_at),
+                total_limited: true,
+            })
+        );
+        assert_eq!(bounded.remaining_at(expires_at), None);
+        assert_eq!(
+            bounded.remaining_at(
+                expires_at
+                    .checked_add(Duration::from_nanos(1))
+                    .expect("test instant should fit")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn dns_deadline_maximum_duration_uses_safe_relative_fallback() {
+        let deadline = DnsQueryDeadline::new(Duration::MAX, DnsDeadlineClock::default());
+        assert_eq!(deadline.expires_at, None);
+        assert_eq!(
+            deadline.remaining_at(deadline.started_at),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            deadline.wait_plan_at(deadline.started_at, None),
+            Some(DnsWaitPlan {
+                deadline: DnsWaitDeadline::Relative(Duration::MAX),
+                total_limited: true,
+            })
+        );
+    }
+
+    #[test]
+    fn dns_timeout_classification_keeps_total_and_attempt_outcomes_distinct() {
+        assert!(matches!(classify_dns_timeout(Ok(7u8), true), Ok(7)));
+        assert!(matches!(
+            classify_dns_timeout::<()>(Err(TimeoutError::Elapsed), true),
+            Err(QueryAttemptError::TotalTimeout)
+        ));
+        assert!(matches!(
+            classify_dns_timeout::<()>(Err(TimeoutError::Elapsed), false),
+            Err(QueryAttemptError::Timeout(TimeoutError::Elapsed))
+        ));
+
+        let total_runtime = classify_dns_timeout::<()>(
+            Err(TimeoutError::Runtime(io::Error::from(
+                io::ErrorKind::OutOfMemory,
+            ))),
+            true,
+        );
+        assert!(matches!(
+            total_runtime,
+            Err(QueryAttemptError::Terminal(err))
+                if err.kind() == io::ErrorKind::OutOfMemory
+        ));
+
+        let attempt_runtime = classify_dns_timeout::<()>(
+            Err(TimeoutError::Runtime(io::Error::from(
+                io::ErrorKind::NotConnected,
+            ))),
+            false,
+        );
+        assert!(matches!(
+            attempt_runtime,
+            Err(QueryAttemptError::Timeout(TimeoutError::Runtime(err)))
+                if err.kind() == io::ErrorKind::NotConnected
+        ));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn dns_socket_setup_boundary_gives_expiry_precedence_over_syscall_error() {
+        let total = Duration::from_secs(5);
+        {
+            let clock = DeadlineClockGuard::install(vec![
+                (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+                (DnsDeadlineCheckpoint::AfterSocketBind, total),
+            ]);
+            let deadline = DnsQueryDeadline::new(
+                total,
+                DnsDeadlineClock {
+                    sample: Some(scripted_deadline_clock),
+                },
+            );
+            let outcome = finish_dns_socket_setup::<()>(
+                deadline,
+                DnsDeadlineCheckpoint::AfterSocketBind,
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            );
+            assert!(matches!(outcome, Err(QueryAttemptError::TotalTimeout)));
+            clock.assert_exhausted();
+        }
+
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (
+                DnsDeadlineCheckpoint::AfterSocketBind,
+                total - Duration::from_nanos(1),
+            ),
+        ]);
+        let deadline = DnsQueryDeadline::new(
+            total,
+            DnsDeadlineClock {
+                sample: Some(scripted_deadline_clock),
+            },
+        );
+        let outcome = finish_dns_socket_setup::<()>(
+            deadline,
+            DnsDeadlineCheckpoint::AfterSocketBind,
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+        );
+        match outcome {
+            Err(QueryAttemptError::Io(err)) => {
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused)
+            }
+            _ => panic!("in-budget socket error did not retain its classification"),
+        }
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_after_bind_prevents_later_setup_or_send() {
+        let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("test DNS bind failed");
+        server
+            .set_nonblocking(true)
+            .expect("test DNS nonblocking setup failed");
+        let nameserver = server.local_addr().expect("test DNS local addr failed");
+        let total = Duration::from_secs(5);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketBind, total),
+        ]);
+        let resolver = resolver_with_scripted_clock(vec![nameserver]);
+
+        let err = run_scripted_resolution(resolver, "setup-delay.flowio.invalid")
+            .expect_err("expired socket setup should fail");
+        assert!(is_total_query_timeout(&err));
+        let mut query = [0u8; DNS_MAX_QUERY_PACKET_LEN];
+        let recv_err = server
+            .recv_from(&mut query)
+            .expect_err("expired socket setup unexpectedly sent a query");
+        assert_eq!(recv_err.kind(), io::ErrorKind::WouldBlock);
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_after_connect_prevents_send() {
+        let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("test DNS bind failed");
+        server
+            .set_nonblocking(true)
+            .expect("test DNS nonblocking setup failed");
+        let nameserver = server.local_addr().expect("test DNS local addr failed");
+        let total = Duration::from_secs(5);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketBind, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketConnect, total),
+        ]);
+        let resolver = resolver_with_scripted_clock(vec![nameserver]);
+
+        let err = run_scripted_resolution(resolver, "connect-delay.flowio.invalid")
+            .expect_err("expired connect should fail before send");
+        assert!(is_total_query_timeout(&err));
+        let mut query = [0u8; DNS_MAX_QUERY_PACKET_LEN];
+        let recv_err = server
+            .recv_from(&mut query)
+            .expect_err("expired connect unexpectedly sent a query");
+        assert_eq!(recv_err.kind(), io::ErrorKind::WouldBlock);
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_before_send_emits_no_datagram() {
+        let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("test DNS bind failed");
+        server
+            .set_nonblocking(true)
+            .expect("test DNS nonblocking setup failed");
+        let nameserver = server.local_addr().expect("test DNS local addr failed");
+        let total = Duration::from_secs(5);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketBind, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketConnect, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSend, total),
+        ]);
+        let resolver = resolver_with_scripted_clock(vec![nameserver]);
+
+        let err = run_scripted_resolution(resolver, "send-cutoff.flowio.invalid")
+            .expect_err("expired send budget should stop before submission");
+        assert!(is_total_query_timeout(&err));
+        let mut query = [0u8; DNS_MAX_QUERY_PACKET_LEN];
+        let recv_err = server
+            .recv_from(&mut query)
+            .expect_err("expired send budget unexpectedly emitted a query");
+        assert_eq!(recv_err.kind(), io::ErrorKind::WouldBlock);
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_after_completed_send_stops_before_receive_or_retry() {
+        let first = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("first test DNS bind failed");
+        first
+            .set_nonblocking(true)
+            .expect("first test DNS nonblocking setup failed");
+        let first_nameserver = first.local_addr().expect("first DNS local addr failed");
+        let second = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("second test DNS bind failed");
+        second
+            .set_nonblocking(true)
+            .expect("second test DNS nonblocking setup failed");
+        let second_nameserver = second.local_addr().expect("second DNS local addr failed");
+        let total = Duration::from_secs(5);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketBind, Duration::ZERO),
+            (DnsDeadlineCheckpoint::AfterSocketConnect, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSend, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeReceive, total),
+        ]);
+        let resolver = resolver_with_scripted_clock(vec![first_nameserver, second_nameserver]);
+
+        let err = run_scripted_resolution(resolver, "send-delay.flowio.invalid")
+            .expect_err("expiry after the completed send should stop before receive");
+        assert!(is_total_query_timeout(&err));
+        let mut query = [0u8; DNS_MAX_QUERY_PACKET_LEN];
+        let (len, _) = first
+            .recv_from(&mut query)
+            .expect("the bounded send should have emitted exactly one query");
+        assert!(len >= DNS_HEADER_LEN);
+        let recv_err = first
+            .recv_from(&mut query)
+            .expect_err("expiry unexpectedly started another family query");
+        assert_eq!(recv_err.kind(), io::ErrorKind::WouldBlock);
+        let recv_err = second
+            .recv_from(&mut query)
+            .expect_err("expiry unexpectedly started nameserver failover");
+        assert_eq!(recv_err.kind(), io::ErrorKind::WouldBlock);
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_keeps_a_answer_immediately_before_aaaa_expiry() {
+        let nameserver = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        let total = Duration::from_secs(5);
+        let before_expiry = total - Duration::from_nanos(1);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, before_expiry),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, total),
+        ]);
+        let queries = QueryScriptGuard::install(vec![ScriptedQueryStep {
+            nameserver,
+            host: "family-deadline.flowio.invalid",
+            qtype: DNS_TYPE_A,
+            outcome: ScriptedQueryOutcome::Address(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 209))),
+        }]);
+        let resolver = resolver_with_scripted_queries(vec![nameserver]);
+
+        let addrs = run_scripted_resolution(resolver, "family-deadline.flowio.invalid")
+            .expect("completed A address should win later AAAA aggregate expiry");
+        assert_eq!(
+            addrs,
+            [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 209), 5432))]
+        );
+        queries.assert_exhausted();
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_survives_attempt_timeout_and_reaches_aaaa() {
+        let first = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        let second = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 54), DNS_PORT));
+        let total = Duration::from_secs(5);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            (
+                DnsDeadlineCheckpoint::BeforeSocketSetup,
+                Duration::from_secs(1),
+            ),
+            (
+                DnsDeadlineCheckpoint::BeforeSocketSetup,
+                total - Duration::from_nanos(1),
+            ),
+        ]);
+        let queries = QueryScriptGuard::install(vec![
+            ScriptedQueryStep {
+                nameserver: first,
+                host: "failover-deadline.flowio.invalid",
+                qtype: DNS_TYPE_A,
+                outcome: ScriptedQueryOutcome::AttemptTimeout,
+            },
+            ScriptedQueryStep {
+                nameserver: second,
+                host: "failover-deadline.flowio.invalid",
+                qtype: DNS_TYPE_A,
+                outcome: ScriptedQueryOutcome::Empty,
+            },
+            ScriptedQueryStep {
+                nameserver: first,
+                host: "failover-deadline.flowio.invalid",
+                qtype: DNS_TYPE_AAAA,
+                outcome: ScriptedQueryOutcome::Address(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            },
+        ]);
+        let mut resolver = resolver_with_scripted_queries(vec![first, second]);
+        resolver.set_query_timeout(Duration::from_millis(500));
+
+        let addrs = run_scripted_resolution(resolver, "failover-deadline.flowio.invalid")
+            .expect("ordinary attempt expiry should preserve aggregate-budget failover");
+        assert_eq!(addrs, [SocketAddr::from((Ipv6Addr::LOCALHOST, 5432))]);
+        queries.assert_exhausted();
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_terminal_timer_runtime_error_stops_before_aaaa() {
+        let nameserver = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+        ]);
+        let queries = QueryScriptGuard::install(vec![ScriptedQueryStep {
+            nameserver,
+            host: "runtime-error.flowio.invalid",
+            qtype: DNS_TYPE_A,
+            outcome: ScriptedQueryOutcome::TerminalRuntime(libc::ECANCELED),
+        }]);
+        let resolver = resolver_with_scripted_queries(vec![nameserver]);
+
+        let err = run_scripted_resolution(resolver, "runtime-error.flowio.invalid")
+            .expect_err("terminal timer runtime error should stop before AAAA");
+        assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+        queries.assert_exhausted();
+        clock.assert_exhausted();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_total_deadline_reaches_cname_followup_before_expiry() {
+        let nameserver = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        let total = Duration::from_secs(5);
+        let clock = DeadlineClockGuard::install(vec![
+            (DnsDeadlineCheckpoint::Start, Duration::ZERO),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            (
+                DnsDeadlineCheckpoint::BeforeSocketSetup,
+                Duration::from_secs(1),
+            ),
+            (
+                DnsDeadlineCheckpoint::BeforeSocketSetup,
+                total - Duration::from_nanos(1),
+            ),
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, total),
+        ]);
+        let queries = QueryScriptGuard::install(vec![
+            ScriptedQueryStep {
+                nameserver,
+                host: "cname-deadline.flowio.invalid",
+                qtype: DNS_TYPE_A,
+                outcome: ScriptedQueryOutcome::Cname("target-deadline.flowio.invalid"),
+            },
+            ScriptedQueryStep {
+                nameserver,
+                host: "cname-deadline.flowio.invalid",
+                qtype: DNS_TYPE_AAAA,
+                outcome: ScriptedQueryOutcome::Empty,
+            },
+            ScriptedQueryStep {
+                nameserver,
+                host: "target-deadline.flowio.invalid",
+                qtype: DNS_TYPE_A,
+                outcome: ScriptedQueryOutcome::Address(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 210))),
+            },
+        ]);
+        let resolver = resolver_with_scripted_queries(vec![nameserver]);
+
+        let addrs = run_scripted_resolution(resolver, "cname-deadline.flowio.invalid")
+            .expect("completed CNAME follow-up address should win later family expiry");
+        assert_eq!(
+            addrs,
+            [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 210), 5432))]
+        );
+        queries.assert_exhausted();
+        clock.assert_exhausted();
     }
 
     #[test]
@@ -3408,14 +4512,14 @@ mod tests {
             "db.example.test",
             5432,
             &mut addrs,
-            Err(io::Error::new(
+            Err(DnsLookupError::Recoverable(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "A lookup failed",
-            )),
-            Err(io::Error::new(
+            ))),
+            Err(DnsLookupError::Recoverable(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "AAAA lookup timed out",
-            )),
+            ))),
         );
 
         let err = match result {
@@ -3502,7 +4606,7 @@ mod tests {
             "db.example.test",
             5432,
             &mut addrs,
-            Err(io::Error::other("A SERVFAIL")),
+            Err(DnsLookupError::Recoverable(io::Error::other("A SERVFAIL"))),
             Ok(nx_domain_result),
         );
 
@@ -3557,10 +4661,10 @@ mod tests {
             5432,
             &mut addrs,
             Ok(cname_result),
-            Err(io::Error::new(
+            Err(DnsLookupError::Terminal(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "timer allocation failed",
-            )),
+            ))),
         );
 
         let err = match result {
@@ -3584,14 +4688,56 @@ mod tests {
                 cname_hops: 0,
                 nx_domain: false,
             }),
-            Err(io::Error::new(
+            Err(DnsLookupError::Terminal(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "timer allocation failed",
-            )),
+            ))),
         )
         .expect("usable address should survive a later terminal family error");
 
         assert!(matches!(step, ResolveHostStep::Resolved));
         assert_eq!(addrs, vec![SocketAddr::new(address, 5432)]);
+    }
+
+    #[test]
+    fn dns_family_outcomes_keep_address_ahead_of_later_total_expiry() {
+        let address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 209));
+        let mut addrs = Vec::new();
+        let step = finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Ok(LookupResult {
+                addresses: vec![address],
+                cname: None,
+                cname_hops: 0,
+                nx_domain: false,
+            }),
+            Err(DnsLookupError::TotalTimeout),
+        )
+        .expect("completed A address should survive later aggregate expiry");
+
+        assert!(matches!(step, ResolveHostStep::Resolved));
+        assert_eq!(addrs, vec![SocketAddr::new(address, 5432)]);
+    }
+
+    #[test]
+    fn dns_family_outcomes_make_total_expiry_terminal_without_an_address() {
+        let mut addrs = Vec::new();
+        let err = match finish_dns_family_lookups(
+            "db.example.test",
+            5432,
+            &mut addrs,
+            Err(DnsLookupError::Recoverable(io::Error::other(
+                "A lookup failed",
+            ))),
+            Err(DnsLookupError::TotalTimeout),
+        ) {
+            Ok(_) => panic!("aggregate expiry should beat an earlier recoverable error"),
+            Err(err) => err,
+        };
+
+        assert!(is_total_query_timeout(&err));
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }

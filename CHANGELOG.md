@@ -62,6 +62,12 @@ Alpha prereleases carry no compatibility guarantee.
   timer allocation or runtime failure. The former unit `Elapsed` error type is
   removed. TCP/SCTP connect-timeout helpers preserve runtime errors and map
   only actual expiry to `TimedOut`.
+- DNS resolution now applies one five-second aggregate timeout to asynchronous
+  upstream A, AAAA, nameserver-failover, and CNAME-follow-up work. The additive
+  `DnsResolver::set_total_query_timeout` method configures that budget, while
+  `set_query_timeout` remains the per-response-attempt cap. Local resolution
+  remains outside the budget, and a completed address still wins over a later
+  family timeout.
 - TLS transport-read scratch is now capped at one 18,437-byte wire record after
   validating the original option. Values below or equal to the cap are
   unchanged; exceptional read-scratch recovery uses the same cap, and write
@@ -82,10 +88,12 @@ Alpha prereleases carry no compatibility guarantee.
   complete with `Ok(0)`; legal zero-length UDP datagrams are unaffected.
 - Runtime dependencies have been refreshed while retaining the existing
   feature set and minimum supported Rust version.
-- Compatibility documentation now consistently states the binding Linux 5.11
-  runtime floor imposed by `IORING_ENTER_EXT_ARG`. The older
-  `IORING_OP_CLOSE` and 14-byte `SCTP_EVENTS` requirements do not lower that
-  floor or require a legacy SCTP subscription fallback.
+- Compatibility documentation now consistently states that x86-64 Linux is
+  the currently supported runtime platform and that Linux 5.11 is its binding
+  kernel floor, imposed by `IORING_ENTER_EXT_ARG`. Other CPU architectures are
+  outside the current compatibility and validation contract. The older
+  `IORING_OP_CLOSE` and 14-byte `SCTP_EVENTS` requirements do not lower the
+  kernel floor or require a legacy SCTP subscription fallback.
 - Rich SCTP message operations now construct kernel-visible iovecs,
   control storage, and self-referential message headers directly in their
   retained completion payloads. Vectored receive and send futures no longer

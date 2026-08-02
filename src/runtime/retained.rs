@@ -114,6 +114,44 @@ pub(crate) struct RetainedPayloadPoolStats {
     pub(crate) writev_scratch_alloc_failures: usize,
 }
 
+#[cfg(any(debug_assertions, test))]
+impl RetainedPayloadPoolStats {
+    /// Returns counter activity observed since `baseline` without mutating the
+    /// retained pools. Saturating subtraction preserves debug bookkeeping if a
+    /// counter has already saturated or a synthetic test baseline is newer.
+    pub(crate) fn saturating_delta_since(self, baseline: Self) -> Self {
+        Self {
+            pooled_allocs: self.pooled_allocs.saturating_sub(baseline.pooled_allocs),
+            pooled_reuses: self.pooled_reuses.saturating_sub(baseline.pooled_reuses),
+            pooled_frees: self.pooled_frees.saturating_sub(baseline.pooled_frees),
+            slab_allocs: self.slab_allocs.saturating_sub(baseline.slab_allocs),
+            heap_fallbacks: self.heap_fallbacks.saturating_sub(baseline.heap_fallbacks),
+            heap_frees: self.heap_frees.saturating_sub(baseline.heap_frees),
+            writev_scratch_inline_allocs: self
+                .writev_scratch_inline_allocs
+                .saturating_sub(baseline.writev_scratch_inline_allocs),
+            writev_scratch_pooled_allocs: self
+                .writev_scratch_pooled_allocs
+                .saturating_sub(baseline.writev_scratch_pooled_allocs),
+            writev_scratch_pooled_reuses: self
+                .writev_scratch_pooled_reuses
+                .saturating_sub(baseline.writev_scratch_pooled_reuses),
+            writev_scratch_pooled_frees: self
+                .writev_scratch_pooled_frees
+                .saturating_sub(baseline.writev_scratch_pooled_frees),
+            writev_scratch_slab_allocs: self
+                .writev_scratch_slab_allocs
+                .saturating_sub(baseline.writev_scratch_slab_allocs),
+            writev_scratch_oversize_rejections: self
+                .writev_scratch_oversize_rejections
+                .saturating_sub(baseline.writev_scratch_oversize_rejections),
+            writev_scratch_alloc_failures: self
+                .writev_scratch_alloc_failures
+                .saturating_sub(baseline.writev_scratch_alloc_failures),
+        }
+    }
+}
+
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[inline(always)]
 fn record_class_allocation(
@@ -1404,6 +1442,59 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: len,
         }
+    }
+
+    #[test]
+    fn retained_stats_delta_is_field_complete_and_saturating() {
+        let baseline = RetainedPayloadPoolStats {
+            pooled_allocs: usize::MAX - 1,
+            pooled_reuses: 20,
+            pooled_frees: 30,
+            slab_allocs: 40,
+            heap_fallbacks: 50,
+            heap_frees: 60,
+            writev_scratch_inline_allocs: 70,
+            writev_scratch_pooled_allocs: 80,
+            writev_scratch_pooled_reuses: 90,
+            writev_scratch_pooled_frees: 100,
+            writev_scratch_slab_allocs: 110,
+            writev_scratch_oversize_rejections: 120,
+            writev_scratch_alloc_failures: 130,
+        };
+        let current = RetainedPayloadPoolStats {
+            pooled_allocs: usize::MAX,
+            pooled_reuses: 22,
+            pooled_frees: 33,
+            slab_allocs: 44,
+            heap_fallbacks: 55,
+            heap_frees: 66,
+            writev_scratch_inline_allocs: 77,
+            writev_scratch_pooled_allocs: 88,
+            writev_scratch_pooled_reuses: 99,
+            writev_scratch_pooled_frees: 110,
+            writev_scratch_slab_allocs: 121,
+            writev_scratch_oversize_rejections: 132,
+            writev_scratch_alloc_failures: 143,
+        };
+        let expected = RetainedPayloadPoolStats {
+            pooled_allocs: 1,
+            pooled_reuses: 2,
+            pooled_frees: 3,
+            slab_allocs: 4,
+            heap_fallbacks: 5,
+            heap_frees: 6,
+            writev_scratch_inline_allocs: 7,
+            writev_scratch_pooled_allocs: 8,
+            writev_scratch_pooled_reuses: 9,
+            writev_scratch_pooled_frees: 10,
+            writev_scratch_slab_allocs: 11,
+            writev_scratch_oversize_rejections: 12,
+            writev_scratch_alloc_failures: 13,
+        };
+
+        assert_eq!(current.saturating_delta_since(baseline), expected);
+        assert_eq!(baseline.saturating_delta_since(current), Default::default());
+        assert_eq!(current.saturating_delta_since(current), Default::default());
     }
 
     #[test]

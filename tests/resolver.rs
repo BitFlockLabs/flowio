@@ -2,7 +2,8 @@ use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
 use flowio::test_support::net::resolver::{
-    lookup_ipv4, read_resolv_conf, resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
+    lookup_ipv4, parse_hosts_bytes, read_resolv_conf, resolve_host_with_hosts_path,
+    resolve_local_host_with_hosts_path,
 };
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
@@ -199,6 +200,7 @@ enum NegativeRcode {
 #[derive(Clone, Copy)]
 enum FirstDnsDatagram {
     StaleQueryId,
+    FullStaleQueryId,
     Undersized,
     MalformedMatchingQueryId,
     MalformedQuestionPointerLoop,
@@ -285,6 +287,82 @@ fn dns_resolver_requires_nameserver() {
     let err = DnsResolver::new(Vec::new()).expect_err("empty nameserver list should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(err.to_string(), "resolver requires at least one nameserver");
+}
+
+#[test]
+fn resolver_zero_total_timeout_preserves_local_results_and_skips_upstream() {
+    let hosts = TempResolverFile::padded(
+        "hosts-zero-total",
+        b"192.0.2.209 local-deadline.flowio.invalid\n",
+        45,
+    );
+    let hosts_path = hosts.path().to_owned();
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind no-query DNS socket");
+    server
+        .set_nonblocking(true)
+        .expect("failed to make no-query DNS socket nonblocking");
+    let nameserver = server
+        .local_addr()
+        .expect("failed to read no-query DNS socket address");
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_total_query_timeout(Duration::ZERO);
+
+            let literal = resolver
+                .resolve_host("192.0.2.208", 5432)
+                .await
+                .expect("a zero total timeout must not affect literal resolution");
+            assert_eq!(
+                literal,
+                [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 208), 5432))]
+            );
+
+            let localhost = resolve_host_with_hosts_path(&resolver, &hosts_path, "localhost", 5432)
+                .await
+                .expect("a zero total timeout must not affect built-in localhost resolution");
+            assert_eq!(
+                localhost,
+                [
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)),
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, 5432)),
+                ]
+            );
+
+            let local = resolve_host_with_hosts_path(
+                &resolver,
+                &hosts_path,
+                "local-deadline.flowio.invalid",
+                5432,
+            )
+            .await
+            .expect("a zero total timeout must not affect hosts resolution");
+            assert_eq!(
+                local,
+                [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 209), 5432))]
+            );
+
+            let err = resolve_host_with_hosts_path(
+                &resolver,
+                &hosts_path,
+                "upstream-deadline.flowio.invalid",
+                5432,
+            )
+            .await
+            .expect_err("a zero total timeout should reject upstream DNS");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(err.to_string(), "DNS total query timed out");
+        })
+        .expect("executor run failed");
+
+    let mut packet = [0u8; 512];
+    let err = server
+        .recv_from(&mut packet)
+        .expect_err("a zero total timeout should not emit a DNS packet");
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 }
 
 #[test]
@@ -390,6 +468,76 @@ fn resolver_fully_qualified_hosts_entry_resolves_locally_without_dns() {
 }
 
 #[test]
+fn resolver_hosts_parser_skips_only_invalid_lines_and_preserves_order() {
+    let contents = b"192.0.2.40 HOSTS-MIXED.FLOWIO.INVALID.\n\
+\xff malformed hosts-mixed.flowio.invalid\n\
+2001:db8::40 other hosts-mixed.flowio.invalid\n\
+192.0.2.41 unrelated.flowio.invalid\n";
+
+    let addrs = parse_hosts_bytes(contents, "hosts-mixed.flowio.invalid", 5432)
+        .expect("valid hosts lines should survive an invalid line");
+    assert_eq!(
+        addrs,
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 40), 5432)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x40), 5432,)),
+        ]
+    );
+}
+
+#[test]
+fn resolver_hosts_parser_uses_hash_comments_and_keeps_semicolon_aliases() {
+    let contents = b"192.0.2.50 preceding ; hosts-comments.flowio.invalid # kept\n\
+192.0.2.50 hosts-comments.flowio.invalid hosts-comments.flowio.invalid\n\
+192.0.2.51 preceding # hosts-comments.flowio.invalid\n\
+192.0.2.52 hosts-comments.flowio.invalid;not-the-query\n\
+2001:db8::50 HOSTS-COMMENTS.FLOWIO.INVALID.\n\
+2001:db8::51 unrelated.flowio.invalid\n";
+
+    let addrs = parse_hosts_bytes(contents, "hosts-comments.flowio.invalid", 6543)
+        .expect("hosts comments and aliases should parse");
+    assert_eq!(
+        addrs,
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 50), 6543)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x50), 6543,)),
+        ]
+    );
+}
+
+#[test]
+fn resolver_all_invalid_hosts_lines_continue_to_upstream_dns() {
+    let host = "all-invalid-hosts.flowio.invalid";
+    let hosts = TempResolverFile::padded("hosts-all-invalid", b"\xff\n\xc0\xaf\n", 5);
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let expected = Ipv4Addr::new(192, 0, 2, 60);
+    let thread = thread::spawn(move || {
+        serve_dns_queries(server, 2, |name, qtype| match (name, qtype) {
+            ("all-invalid-hosts.flowio.invalid", 1) => TestAnswer::A(expected),
+            ("all-invalid-hosts.flowio.invalid", 28) => TestAnswer::Empty,
+            _ => TestAnswer::NxDomain,
+        })
+    });
+    let hosts_path = hosts.path().to_owned();
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolve_host_with_hosts_path(&resolver, &hosts_path, host, 5432)
+                .await
+                .expect("all-invalid hosts input should fall through to DNS");
+            assert_eq!(addrs, [SocketAddr::from((expected, 5432))]);
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
 fn resolver_hosts_file_accepts_four_mib_and_rejects_the_next_byte() {
     let host = "hosts-boundary.flowio.invalid";
     let prefix = format!("192.0.2.10 {host}\n");
@@ -412,13 +560,12 @@ fn resolver_hosts_file_accepts_four_mib_and_rejects_the_next_byte() {
 }
 
 #[test]
-fn resolver_hosts_file_size_and_utf8_errors_keep_existing_precedence() {
+fn resolver_hosts_invalid_lines_are_ignored_but_size_limit_still_applies() {
     let invalid = TempResolverFile::padded("hosts-invalid-utf8", &[0xff, b'\n'], 2);
-    let err =
+    let addrs =
         resolve_local_host_with_hosts_path(invalid.path(), "invalid-utf8.flowio.invalid", 5432)
-            .expect_err("invalid hosts UTF-8 should be rejected");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("invalid utf-8"));
+            .expect("an invalid hosts line should be skipped");
+    assert!(addrs.is_empty());
 
     let invalid_over = TempResolverFile::padded(
         "hosts-invalid-over",
@@ -430,7 +577,7 @@ fn resolver_hosts_file_size_and_utf8_errors_keep_existing_precedence() {
         "invalid-over.flowio.invalid",
         5432,
     )
-    .expect_err("the hosts size bound must win over an earlier UTF-8 error");
+    .expect_err("the hosts size bound must include invalid input bytes");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         err.to_string(),
@@ -456,6 +603,22 @@ fn resolver_resolv_conf_accepts_64_kib_and_rejects_the_next_byte() {
     assert_eq!(
         err.to_string(),
         "/etc/resolv.conf exceeds the 64 KiB resolver configuration limit"
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_retains_hash_and_semicolon_comment_grammar() {
+    let contents = b"nameserver 192.0.2.53; legacy comment\n\
+nameserver 2001:db8::53# inline comment\n";
+    let fixture = TempResolverFile::padded("resolv-conf-comments", contents, contents.len());
+
+    let nameservers = read_resolv_conf(fixture.path()).expect("resolv.conf comments should parse");
+    assert_eq!(
+        nameservers,
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x53), 53,)),
+        ]
     );
 }
 
@@ -490,20 +653,56 @@ fn resolver_hosts_result_accepts_64_unique_addresses_and_rejects_the_65th() {
 }
 
 #[test]
-fn resolver_hosts_utf8_validation_precedes_the_address_result_bound() {
+fn resolver_hosts_invalid_line_does_not_mask_the_address_result_bound() {
     let host = "address-utf8-precedence.flowio.invalid";
+    let mut bytes = vec![0xff, b'\n'];
+    for octet in 1..=65 {
+        bytes.extend_from_slice(format!("192.0.2.{octet} {host}\n").as_bytes());
+    }
+    let invalid = TempResolverFile::padded("hosts-address-invalid", &bytes, bytes.len());
+
+    let err = resolve_local_host_with_hosts_path(invalid.path(), host, 5432)
+        .expect_err("an invalid line must not suppress the address cap");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "resolver result exceeds 64 unique addresses"
+    );
+}
+
+#[test]
+fn resolver_hosts_file_size_limit_precedes_deferred_address_result_bound() {
+    let host = "address-size-precedence.flowio.invalid";
     let mut contents = String::new();
     for octet in 1..=65 {
         contents.push_str(&format!("192.0.2.{octet} {host}\n"));
     }
-    let mut bytes = contents.into_bytes();
-    bytes.push(0xff);
-    let invalid = TempResolverFile::padded("hosts-address-invalid", &bytes, bytes.len());
 
-    let err = resolve_local_host_with_hosts_path(invalid.path(), host, 5432)
-        .expect_err("whole-file UTF-8 validation should precede the address cap");
+    let exact = TempResolverFile::padded(
+        "hosts-address-size-exact",
+        contents.as_bytes(),
+        HOSTS_FILE_MAX_BYTES,
+    );
+    let err = resolve_local_host_with_hosts_path(exact.path(), host, 5432)
+        .expect_err("the exact-size file should report its 65th unique result");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("invalid utf-8"));
+    assert_eq!(
+        err.to_string(),
+        "resolver result exceeds 64 unique addresses"
+    );
+
+    let over = TempResolverFile::padded(
+        "hosts-address-size-over",
+        contents.as_bytes(),
+        HOSTS_FILE_MAX_BYTES + 1,
+    );
+    let err = resolve_local_host_with_hosts_path(over.path(), host, 5432)
+        .expect_err("the raw file-size bound must win over a deferred result error");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "/etc/hosts exceeds the 4 MiB resolver configuration limit"
+    );
 }
 
 #[test]
@@ -1252,6 +1451,45 @@ fn resolve_host_drains_multiple_stale_responses_before_matching_query() {
             assert_eq!(
                 addrs,
                 vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 50), 5432))]
+            );
+        })
+        .expect("executor run failed");
+
+    thread.join().expect("dns thread panicked");
+}
+
+#[test]
+fn resolve_host_drains_full_stale_response_before_matching_query() {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let thread = thread::spawn(move || {
+        serve_dns_queries_with_first_datagrams(
+            server,
+            2,
+            &[FirstDnsDatagram::FullStaleQueryId],
+            |name, qtype| {
+                Some(match (name, qtype) {
+                    ("db.example.test", 1) => TestAnswer::A(Ipv4Addr::new(192, 0, 2, 51)),
+                    ("db.example.test", 28) => TestAnswer::Empty,
+                    _ => TestAnswer::NxDomain,
+                })
+            },
+        )
+    });
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            let addrs = resolver
+                .resolve_host("db.example.test", 5432)
+                .await
+                .expect("resolver should drain a full stale response");
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from((Ipv4Addr::new(192, 0, 2, 51), 5432))]
             );
         })
         .expect("executor run failed");
@@ -2589,6 +2827,18 @@ fn send_first_dns_datagram(
             socket
                 .send_to(&stale, peer)
                 .expect("dns send_to stale response failed");
+        }
+        FirstDnsDatagram::FullStaleQueryId => {
+            let mut stale = response.to_vec();
+            let query_id = read_u16_be_at(&stale, 0).expect("test response query ID should exist");
+            stale
+                .write_u16_be_at(0, query_id.wrapping_add(1))
+                .expect("test stale query ID rewrite should fit");
+            stale.resize(2048, 0xA5);
+            assert_eq!(stale.len(), 2048);
+            socket
+                .send_to(&stale, peer)
+                .expect("dns send_to full stale response failed");
         }
         FirstDnsDatagram::Undersized => {
             socket
