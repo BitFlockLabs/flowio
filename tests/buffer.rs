@@ -982,6 +982,24 @@ fn buffer_mut_reset() {
     assert_eq!(buf.payload_remaining(), 64);
 }
 
+#[test]
+fn buffer_mut_reset_preserves_transferred_region_geometry() {
+    let mut buf = IoBuffMut::new(4, 8, 4);
+    buf.payload_extend_from_tailroom(3).unwrap();
+    buf.payload_append(b"data").unwrap();
+    buf.headroom_prepend(b"H").unwrap();
+    buf.tailroom_append(b"T").unwrap();
+
+    buf.reset();
+
+    assert!(buf.is_empty());
+    assert_eq!(buf.headroom_remaining(), 4);
+    assert_eq!(buf.payload_capacity(), 11);
+    assert_eq!(buf.payload_remaining(), 11);
+    assert_eq!(buf.tailroom_capacity(), 1);
+    assert_eq!(buf.tailroom_remaining(), 1);
+}
+
 // ============================================================================
 // IoBuffMut — payload_bytes_mut
 // ============================================================================

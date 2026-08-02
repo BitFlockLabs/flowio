@@ -723,6 +723,7 @@ fn runtime_udp_recv_from_rejects_truncated_datagram() {
             let (res, buf) = socket.recv_from(recv, 4).await;
             let err = res.expect_err("truncated datagram should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "UDP recv_from message was truncated");
             assert_eq!(&buf[..], b"over");
         })
         .expect("executor run failed");
@@ -774,6 +775,7 @@ fn runtime_udp_recv_msg_rejects_truncated_datagram() {
             let (res, buf) = socket.recv_msg(recv, 4).await;
             let err = res.expect_err("truncated datagram should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "UDP recv_msg message was truncated");
             assert_eq!(&buf[..], b"over");
         })
         .expect("executor run failed");

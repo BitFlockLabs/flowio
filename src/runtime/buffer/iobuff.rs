@@ -999,9 +999,29 @@ impl IoBuffMut {
         Ok(())
     }
 
-    /// Resets the buffer to its initial state: offset = headroom_capacity,
-    /// payload_len = 0, tailroom_len = 0.  All written data (headroom,
-    /// payload, tailroom) is logically discarded.
+    /// Clears all active lengths and the initialized payload frontier, then
+    /// restores the cursor to the current headroom boundary.
+    ///
+    /// Current region capacities are preserved. In particular, any payload
+    /// capacity acquired through [`Self::payload_extend_from_tailroom`] remains
+    /// payload capacity after the reset. All written headroom, payload, and
+    /// tailroom data is logically discarded; the backing storage is not
+    /// zeroed.
+    ///
+    /// # Example
+    /// ```
+    /// use flowio::runtime::buffer::IoBuffMut;
+    ///
+    /// let mut buf = IoBuffMut::new(4, 8, 4).unwrap();
+    /// buf.payload_extend_from_tailroom(3).unwrap();
+    /// buf.payload_append(b"data").unwrap();
+    /// buf.reset();
+    ///
+    /// assert!(buf.is_empty());
+    /// assert_eq!(buf.headroom_remaining(), 4);
+    /// assert_eq!(buf.payload_remaining(), 11);
+    /// assert_eq!(buf.tailroom_remaining(), 1);
+    /// ```
     pub fn reset(&mut self) {
         let headroom = unsafe { self.header.as_ref().headroom_capacity };
         self.offset = headroom;

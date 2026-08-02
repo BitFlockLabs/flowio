@@ -282,7 +282,9 @@ unsafe fn drop_initialized_inline<T>(storage: &mut [MaybeUninit<T>], count: usiz
 ///     IoBuffMut::new(0, 8, 0).unwrap(),
 ///     IoBuffMut::new(0, 8, 0).unwrap(),
 /// ]);
+/// assert!(chain.is_empty()); // no readable bytes yet
 /// assert_eq!(chain.segments(), 2);
+/// assert_eq!(chain.len(), 0);
 /// assert_eq!(chain.writable_len(), 16);
 /// ```
 pub struct IoBuffVecMut<const N: usize> {
@@ -408,7 +410,11 @@ impl<const N: usize> IoBuffVecMut<N> {
         checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
-    /// Returns `true` if the chain has no segments or all segments are empty.
+    /// Returns `true` if the chain contains zero readable bytes.
+    ///
+    /// This does not describe segment presence or writable capacity: an empty
+    /// mutable chain may still contain segments and accept data. Use
+    /// [`Self::segments`] and [`Self::writable_len`] to query those properties.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         iter_inline(&self.buffers, self.count).all(IoBuffReadOnly::is_empty)
@@ -598,7 +604,10 @@ impl<const N: usize> IoBuffVec<N> {
         checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
-    /// Returns `true` if the chain has no segments or all segments are empty.
+    /// Returns `true` if the chain contains zero readable bytes.
+    ///
+    /// A chain may still contain zero-length segments; use [`Self::segments`]
+    /// to query segment presence.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         iter_inline(&self.buffers, self.count).all(IoBuffReadOnly::is_empty)
@@ -786,7 +795,10 @@ impl<B: IoBuffReadOnly, const N: usize> IoBuffReadOnlyVec<B, N> {
         checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
-    /// Returns `true` if the chain has no segments or all segments are empty.
+    /// Returns `true` if the chain contains zero readable bytes.
+    ///
+    /// A chain may still contain zero-length segments; use [`Self::segments`]
+    /// to query segment presence.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         iter_inline(&self.buffers, self.count).all(IoBuffReadOnly::is_empty)

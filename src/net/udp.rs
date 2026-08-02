@@ -607,6 +607,11 @@ fn zeroed_sockaddr_storage() -> MaybeUninit<libc::sockaddr_storage> {
 }
 
 #[inline(always)]
+fn udp_datagram_is_truncated(msg_flags: libc::c_int) -> bool {
+    (msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0
+}
+
+#[inline(always)]
 /// Takes a completed datagram payload through its origin reactor.
 ///
 /// # Safety
@@ -787,7 +792,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             // `msg_control` is null, so MSG_CTRUNC is not expected here;
             // keep the check defensive in case a kernel reports
             // inconsistent recvmsg flags.
-            let result = if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
+            let result = if udp_datagram_is_truncated(msg.msg_flags) {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "UDP recv_msg message was truncated",
@@ -1002,7 +1007,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             // `msg_control` is null, so MSG_CTRUNC is not expected here;
             // keep the check defensive in case a kernel reports
             // inconsistent recvmsg flags.
-            let result = if (msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0 {
+            let result = if udp_datagram_is_truncated(msg.msg_flags) {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "UDP recv_from message was truncated",
@@ -1177,6 +1182,20 @@ impl<B: IoBuffReadOnly> Drop for SendToFuture<'_, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_datagram_truncation_flag_predicate_covers_supported_combinations() {
+        for (flags, expected) in [
+            (0, false),
+            (libc::MSG_TRUNC, true),
+            (libc::MSG_CTRUNC, true),
+            (libc::MSG_TRUNC | libc::MSG_CTRUNC, true),
+            (libc::MSG_PEEK, false),
+            (libc::MSG_PEEK | libc::MSG_TRUNC, true),
+        ] {
+            assert_eq!(udp_datagram_is_truncated(flags), expected, "flags={flags}");
+        }
+    }
 
     #[test]
     fn recv_from_addr_storage_starts_zeroed() {

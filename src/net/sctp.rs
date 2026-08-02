@@ -5724,6 +5724,8 @@ fn apply_sctp_init_config(fd: RawFd, config: SctpInitConfig) -> io::Result<()> {
 }
 
 fn configure_sctp_socket(fd: RawFd, config: SctpSocketConfig) -> io::Result<()> {
+    // Association and default-peer settings are association-scoped, so the
+    // accept/connect continuations apply them after establishment.
     apply_sctp_init_config(fd, config.init)?;
     apply_sctp_socket_options(fd, config.socket_options())
 }
