@@ -4152,6 +4152,49 @@ mod tests {
         items: [ShapeDriftingWriteItem; 2],
     }
 
+    struct MaterializationCountingWriteChain {
+        items: [MaterializationCountingWriteItem; 2],
+        fill_calls: Rc<Cell<usize>>,
+    }
+
+    struct MaterializationCountingWriteItem(Box<[u8; 2]>);
+
+    impl WriteBufferItem for MaterializationCountingWriteItem {
+        fn write_ptr(&self) -> *const u8 {
+            self.0.as_ptr()
+        }
+
+        fn write_len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl MaterializationCountingWriteChain {
+        fn new(fill_calls: &Rc<Cell<usize>>) -> Self {
+            Self {
+                items: [
+                    MaterializationCountingWriteItem(Box::new(*b"ab")),
+                    MaterializationCountingWriteItem(Box::new(*b"cd")),
+                ],
+                fill_calls: Rc::clone(fill_calls),
+            }
+        }
+    }
+
+    impl write_buffer_chain_sealed::Sealed<2> for MaterializationCountingWriteChain {
+        fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+            checked_write_iovec_count_and_len(self.items.iter())
+        }
+
+        fn fill_write_iovecs(
+            &self,
+            dst: &mut [MaybeUninit<libc::iovec>],
+        ) -> io::Result<(usize, usize)> {
+            self.fill_calls.set(self.fill_calls.get() + 1);
+            fill_write_iovecs(self.items.iter(), dst)
+        }
+    }
+
     impl ShapeDriftingWriteChain {
         fn new(shape: WritevShape, drops: &Rc<Cell<usize>>) -> Self {
             Self {
@@ -4194,6 +4237,29 @@ mod tests {
             dst: &mut [MaybeUninit<libc::iovec>],
         ) -> io::Result<(usize, usize)> {
             fill_write_iovecs(self.items.iter(), dst)
+        }
+    }
+
+    #[test]
+    fn sealed_writev_counter_observes_actual_iovec_materialization() {
+        let fill_calls = Rc::new(Cell::new(0));
+        let chain = MaterializationCountingWriteChain::new(&fill_calls);
+        let expected_ptrs = chain.items.each_ref().map(WriteBufferItem::write_ptr);
+        let mut scratch: [MaybeUninit<libc::iovec>; 2] =
+            std::array::from_fn(|_| MaybeUninit::uninit());
+
+        for expected_calls in 1..=2 {
+            assert_eq!(
+                write_buffer_chain_sealed::Sealed::fill_write_iovecs(&chain, &mut scratch)
+                    .expect("counting chain materialization failed"),
+                (2, 4)
+            );
+            assert_eq!(fill_calls.get(), expected_calls);
+            for (index, expected_ptr) in expected_ptrs.iter().enumerate() {
+                let iovec = unsafe { scratch[index].assume_init_ref() };
+                assert_eq!(iovec.iov_base, expected_ptr.cast_mut().cast());
+                assert_eq!(iovec.iov_len, 2);
+            }
         }
     }
 
@@ -4285,6 +4351,34 @@ mod tests {
                 }
             })
             .expect("first-poll sizing executor run failed");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn repeated_one_shot_writev_submissions_rematerialize_iovecs() {
+        let mut executor = Executor::new().expect("executor creation failed");
+        executor
+            .run(async move {
+                let fill_calls = Rc::new(Cell::new(0));
+                let mut chain = MaterializationCountingWriteChain::new(&fill_calls);
+
+                for expected_calls in 1..=3 {
+                    let (result, returned) = WritevFuture::<_, 2, ()>::new(-1, chain).await;
+                    assert_eq!(
+                        result
+                            .expect_err("invalid descriptor should fail the write submission")
+                            .raw_os_error(),
+                        Some(libc::EBADF)
+                    );
+                    assert_eq!(
+                        fill_calls.get(),
+                        expected_calls,
+                        "each one-shot writev submission must rebuild its actual iovec view"
+                    );
+                    chain = returned;
+                }
+            })
+            .expect("repeated writev materialization executor run failed");
     }
 
     #[test]

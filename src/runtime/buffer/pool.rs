@@ -34,6 +34,28 @@ use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
+/// Alignment required while one pool slot alternates between a live buffer
+/// header and an intrusive free-list link.
+const IOBUFF_POOL_SLOT_ALIGN: usize =
+    if std::mem::align_of::<IoBuffHeader>() > std::mem::align_of::<SListLink>() {
+        std::mem::align_of::<IoBuffHeader>()
+    } else {
+        std::mem::align_of::<SListLink>()
+    };
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+const _: () = {
+    assert!(std::mem::size_of::<IoBuffHeader>() == 40);
+    assert!(std::mem::align_of::<IoBuffHeader>() == 8);
+    assert!(std::mem::size_of::<SListLink>() == 8);
+    assert!(std::mem::align_of::<SListLink>() == 8);
+    assert!(IOBUFF_POOL_SLOT_ALIGN == 8);
+};
+
 /// Configuration for [`IoBuffPool`] buffer layout.
 ///
 /// This is setup-time configuration. Create and initialize pools before the
@@ -164,8 +186,8 @@ pub(crate) struct IoBuffPoolInner {
     free_list: SList<u8>,
     /// Move-safe chain of all allocated slab pages.
     slab_pages: SlabPageChain,
-    /// Size of each slot in bytes: `sizeof(IoBuffHeader) + headroom +
-    /// payload + tailroom`, rounded up for alignment.
+    /// Size of each slot: the maximum live-buffer/free-link footprint, rounded
+    /// up to the maximum alignment of `IoBuffHeader` and `SListLink`.
     slot_size: usize,
     /// Headroom size for each buffer produced by this pool.
     headroom: usize,
@@ -197,9 +219,10 @@ impl IoBuffPoolInner {
         let slot_raw_size = std::mem::size_of::<IoBuffHeader>()
             .checked_add(total_data)
             .ok_or(IoBuffPoolConfigError::LayoutOverflow)?;
-        // Ensure slots are at least large enough for the free-list link and
-        // properly aligned.
-        let slot_align = std::mem::align_of::<IoBuffHeader>();
+        // A checked-out slot contains an IoBuffHeader; an inactive slot
+        // contains an overlaid free-list link. Construct the allocation for
+        // both states instead of relying on their current alignments matching.
+        let slot_align = IOBUFF_POOL_SLOT_ALIGN;
         let link_size = std::mem::size_of::<SListLink>();
         let slot_min = std::cmp::max(slot_raw_size, link_size);
         let slot_size = crate::utils::size_up(slot_min, slot_align)
@@ -415,6 +438,104 @@ impl Drop for IoBuffPool {
         if unsafe { (*inner_ptr).live_slots == 0 } {
             unsafe { IoBuffPoolInner::destroy(inner_ptr) };
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn slot_ptr(buffer: &IoBuffMut) -> *mut u8 {
+        buffer.header.as_ptr().cast::<u8>()
+    }
+
+    fn assert_slot_alignment(slot: *mut u8) {
+        assert_eq!(
+            slot.align_offset(std::mem::align_of::<IoBuffHeader>()),
+            0,
+            "pool slot must satisfy IoBuffHeader alignment"
+        );
+        assert_eq!(
+            slot.align_offset(std::mem::align_of::<SListLink>()),
+            0,
+            "pool slot must satisfy free-list Link alignment"
+        );
+    }
+
+    #[test]
+    fn iobuff_pool_slot_alignment_covers_both_overlay_states() {
+        assert_eq!(
+            IOBUFF_POOL_SLOT_ALIGN,
+            std::cmp::max(
+                std::mem::align_of::<IoBuffHeader>(),
+                std::mem::align_of::<SListLink>()
+            )
+        );
+        assert!(IOBUFF_POOL_SLOT_ALIGN.is_power_of_two());
+    }
+
+    #[test]
+    fn iobuff_pool_slots_remain_aligned_across_adjacency_growth_and_reuse() {
+        let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+            headroom: 0,
+            payload: 1,
+            tailroom: 0,
+            objs_per_slab: 2,
+        })
+        .expect("pool geometry should be valid");
+        let (slot_size, slab_align) = unsafe {
+            let inner = &*pool.inner.as_ptr();
+            (inner.slot_size, inner.slab_factory.get_slab_alignment())
+        };
+        assert_eq!(
+            slot_size,
+            crate::utils::size_up(
+                std::cmp::max(
+                    std::mem::size_of::<IoBuffHeader>() + 1,
+                    std::mem::size_of::<SListLink>()
+                ),
+                IOBUFF_POOL_SLOT_ALIGN
+            )
+            .expect("supported pool geometry should not overflow")
+        );
+        assert!(
+            slab_align >= IOBUFF_POOL_SLOT_ALIGN,
+            "slab alignment must cover every slot alignment"
+        );
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        {
+            assert_eq!(slot_size, 48, "supported pool slot geometry changed");
+            assert_eq!(slab_align, 8, "supported slab alignment changed");
+        }
+        pool.init();
+
+        let first = pool.alloc().expect("first pool allocation failed");
+        let second = pool.alloc().expect("adjacent pool allocation failed");
+        let third = pool
+            .alloc()
+            .expect("first allocation from the next slab failed");
+        let first_ptr = slot_ptr(&first);
+        let second_ptr = slot_ptr(&second);
+        let third_ptr = slot_ptr(&third);
+
+        assert_slot_alignment(first_ptr);
+        assert_slot_alignment(second_ptr);
+        assert_slot_alignment(third_ptr);
+        assert_eq!(
+            unsafe { second_ptr.offset_from(first_ptr) },
+            slot_size as isize,
+            "the two slots in the first slab must retain exact slot spacing"
+        );
+
+        drop(third);
+        let reused = pool.alloc().expect("free-list reuse failed");
+        let reused_ptr = slot_ptr(&reused);
+        assert_eq!(reused_ptr, third_ptr, "the returned slot must be reused");
+        assert_slot_alignment(reused_ptr);
     }
 }
 

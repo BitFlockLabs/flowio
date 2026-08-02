@@ -25,6 +25,11 @@ use std::time::Duration;
 const UDP_PUBLIC_RAW_CLOSE_CHILD_ENV: &str = "FLOWIO_UDP_PUBLIC_RAW_CLOSE_CHILD";
 const UDP_PUBLIC_RAW_CLOSE_TEST: &str =
     "runtime_udp_public_raw_exposure_classifies_then_uses_ring_close";
+const UDP_SILENT_PEER_CHILD_ENV: &str = "FLOWIO_UDP_SILENT_PEER_CHILD";
+const UDP_SILENT_PEER_TEST: &str = "runtime_udp_silent_peer_times_out_under_watchdog";
+const UDP_MISSING_REPLY_CHILD_ENV: &str = "FLOWIO_UDP_MISSING_REPLY_CHILD";
+const UDP_MISSING_REPLY_TEST: &str = "runtime_udp_missing_peer_reply_times_out_under_watchdog";
+const UDP_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn prefilled_udp_buffer(writable: usize) -> flowio::runtime::buffer::IoBuffMut {
     let mut buffer = IoBuffMut::new(0, 4 + writable, 0);
@@ -42,6 +47,23 @@ fn connected_udp_pair() -> (UdpSocket, StdUdpSocket, SocketAddr) {
     socket.connect(peer_addr).expect("runtime connect failed");
     peer.connect(local_addr).expect("std peer connect failed");
     (socket, peer, peer_addr)
+}
+
+fn configure_std_udp_peer_timeouts(peer: &StdUdpSocket) {
+    peer.set_read_timeout(Some(UDP_TEST_TIMEOUT))
+        .expect("failed to set standard UDP peer read timeout");
+    peer.set_write_timeout(Some(UDP_TEST_TIMEOUT))
+        .expect("failed to set standard UDP peer write timeout");
+}
+
+fn assert_udp_timeout_elapsed<T>(result: Result<T, TimeoutError>, context: &str) {
+    match result {
+        Err(TimeoutError::Elapsed) => {}
+        Err(TimeoutError::Runtime(err)) => {
+            panic!("{context} timer failed instead of expiring: {err}")
+        }
+        Ok(_) => panic!("{context} unexpectedly completed before its timeout"),
+    }
 }
 
 #[test]
@@ -293,6 +315,97 @@ fn runtime_udp_public_raw_exposure_classifies_then_uses_ring_close() {
 }
 
 #[test]
+fn runtime_udp_silent_peer_times_out_under_watchdog() {
+    if std::env::var_os(UDP_SILENT_PEER_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            UDP_SILENT_PEER_TEST,
+            UDP_SILENT_PEER_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind silent-peer FlowIO socket");
+    let local_addr = socket
+        .local_addr()
+        .expect("failed to read silent-peer FlowIO address");
+    let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind silent standard UDP peer");
+    configure_std_udp_peer_timeouts(&peer);
+    let mut executor = Executor::new().expect("failed to construct silent-peer executor");
+
+    executor
+        .run(async move {
+            let drops = Rc::new(Cell::new(0));
+            let buffer = DropTrackedReadWrite::zeroed(1, &drops);
+            let result = timeout(UDP_TEST_TIMEOUT, async {
+                let (result, _buffer) = socket.recv_from(buffer, 1).await;
+                result
+            })
+            .await;
+            assert_udp_timeout_elapsed(result, "silent UDP peer receive");
+            assert_eq!(
+                drops.get(),
+                0,
+                "timed-out UDP receive buffer dropped before its CQE"
+            );
+
+            assert_eq!(
+                peer.send_to(b"x", local_addr)
+                    .expect("failed to retire silent-peer receive"),
+                1
+            );
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("silent-peer executor run failed");
+}
+
+#[test]
+fn runtime_udp_missing_peer_reply_times_out_under_watchdog() {
+    if std::env::var_os(UDP_MISSING_REPLY_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            UDP_MISSING_REPLY_TEST,
+            UDP_MISSING_REPLY_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let (mut socket, peer, _peer_addr) = connected_udp_pair();
+    configure_std_udp_peer_timeouts(&peer);
+    let mut executor = Executor::new().expect("failed to construct missing-reply executor");
+
+    executor
+        .run(async move {
+            let (result, request) = socket.send(b"request".to_vec()).await;
+            assert_eq!(result.expect("FlowIO request send failed"), request.len());
+
+            let drops = Rc::new(Cell::new(0));
+            let buffer = DropTrackedReadWrite::zeroed(1, &drops);
+            let result = timeout(UDP_TEST_TIMEOUT, async {
+                let (result, _buffer) = socket.recv(buffer, 1).await;
+                result
+            })
+            .await;
+            assert_udp_timeout_elapsed(result, "missing UDP peer reply");
+            assert_eq!(
+                drops.get(),
+                0,
+                "timed-out UDP reply buffer dropped before its CQE"
+            );
+
+            assert_eq!(
+                peer.send(b"x")
+                    .expect("failed to retire missing-reply receive"),
+                1
+            );
+            wait_for_drop_count(&drops, 1).await;
+        })
+        .expect("missing-reply executor run failed");
+}
+
+#[test]
 fn runtime_udp_ping_pong() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
@@ -305,6 +418,7 @@ fn runtime_udp_ping_pong() {
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
 
     socket.connect(peer_addr).expect("runtime connect failed");
+    configure_std_udp_peer_timeouts(&peer);
 
     let peer_thread = std::thread::spawn(move || {
         peer.connect(local_addr).expect("std peer connect failed");
@@ -320,13 +434,17 @@ fn runtime_udp_ping_pong() {
 
     executor
         .run(async move {
-            let (res, _buf) = socket.send(b"ping".to_vec()).await;
-            assert_eq!(res.expect("send failed"), 4);
+            timeout(UDP_TEST_TIMEOUT, async move {
+                let (res, _buf) = socket.send(b"ping".to_vec()).await;
+                assert_eq!(res.expect("send failed"), 4);
 
-            let recv = vec![0u8; 4];
-            let (res, buf) = socket.recv(recv, 4).await;
-            assert_eq!(res.expect("recv failed"), 4);
-            assert_eq!(&buf[..4], b"pong");
+                let recv = vec![0u8; 4];
+                let (res, buf) = socket.recv(recv, 4).await;
+                assert_eq!(res.expect("recv failed"), 4);
+                assert_eq!(&buf[..4], b"pong");
+            })
+            .await
+            .expect("connected UDP Vec exchange timed out");
         })
         .expect("executor run failed");
 
@@ -379,7 +497,7 @@ fn runtime_udp_ipv6_connected_bidirectional_ping_pong() {
     let mut executor = Executor::new().expect("failed to construct IPv6 UDP executor");
     executor
         .run(async move {
-            timeout(Duration::from_secs(2), async move {
+            timeout(UDP_TEST_TIMEOUT, async move {
                 let (send_result, sent) = left.send(FORWARD.to_vec()).await;
                 assert_eq!(
                     send_result.expect("left IPv6 UDP send failed"),
@@ -484,7 +602,7 @@ fn runtime_udp_send_to_zero_datagram_submits_and_delivers() {
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind peer UDP socket");
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
-    peer.set_read_timeout(Some(Duration::from_secs(2)))
+    peer.set_read_timeout(Some(UDP_TEST_TIMEOUT))
         .expect("failed to bound peer receive");
     let mut executor = Executor::new().expect("failed to construct runtime executor");
     let empty = Vec::with_capacity(1);
@@ -531,6 +649,7 @@ fn runtime_udp_send_to_recv_from_ping_pong() {
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    configure_std_udp_peer_timeouts(&peer);
 
     let peer_thread = std::thread::spawn(move || {
         let send_len = peer
@@ -547,15 +666,19 @@ fn runtime_udp_send_to_recv_from_ping_pong() {
 
     executor
         .run(async move {
-            let recv = vec![0u8; 4];
-            let (res, buf) = socket.recv_from(recv, 4).await;
-            let (recv_len, from) = res.expect("recv_from failed");
-            assert_eq!(recv_len, 4);
-            assert_eq!(from, peer_addr);
-            assert_eq!(&buf[..4], b"ping");
+            timeout(UDP_TEST_TIMEOUT, async move {
+                let recv = vec![0u8; 4];
+                let (res, buf) = socket.recv_from(recv, 4).await;
+                let (recv_len, from) = res.expect("recv_from failed");
+                assert_eq!(recv_len, 4);
+                assert_eq!(from, peer_addr);
+                assert_eq!(&buf[..4], b"ping");
 
-            let (res, _buf) = socket.send_to(b"pong".to_vec(), peer_addr).await;
-            assert_eq!(res.expect("send_to failed"), 4);
+                let (res, _buf) = socket.send_to(b"pong".to_vec(), peer_addr).await;
+                assert_eq!(res.expect("send_to failed"), 4);
+            })
+            .await
+            .expect("unconnected UDP Vec exchange timed out");
         })
         .expect("executor run failed");
 
@@ -965,6 +1088,7 @@ fn runtime_udp_ping_pong_iobuff() {
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
 
     socket.connect(peer_addr).expect("runtime connect failed");
+    configure_std_udp_peer_timeouts(&peer);
 
     let peer_thread = std::thread::spawn(move || {
         peer.connect(local_addr).expect("std peer connect failed");
@@ -980,15 +1104,19 @@ fn runtime_udp_ping_pong_iobuff() {
 
     executor
         .run(async move {
-            let mut send_buf = IoBuffMut::new(0, 4, 0);
-            send_buf.payload_append(b"ping").unwrap();
-            let (res, _buf) = socket.send(send_buf).await;
-            assert_eq!(res.expect("send failed"), 4);
+            timeout(UDP_TEST_TIMEOUT, async move {
+                let mut send_buf = IoBuffMut::new(0, 4, 0);
+                send_buf.payload_append(b"ping").unwrap();
+                let (res, _buf) = socket.send(send_buf).await;
+                assert_eq!(res.expect("send failed"), 4);
 
-            let recv_buf = IoBuffMut::new(0, 64, 0);
-            let (res, buf) = socket.recv(recv_buf, 4).await;
-            assert_eq!(res.expect("recv failed"), 4);
-            assert_eq!(buf.payload_bytes(), b"pong");
+                let recv_buf = IoBuffMut::new(0, 64, 0);
+                let (res, buf) = socket.recv(recv_buf, 4).await;
+                assert_eq!(res.expect("recv failed"), 4);
+                assert_eq!(buf.payload_bytes(), b"pong");
+            })
+            .await
+            .expect("connected UDP IoBuff exchange timed out");
         })
         .expect("executor run failed");
 
@@ -1007,6 +1135,7 @@ fn runtime_udp_send_to_recv_from_iobuff() {
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    configure_std_udp_peer_timeouts(&peer);
 
     let peer_thread = std::thread::spawn(move || {
         let send_len = peer
@@ -1023,18 +1152,22 @@ fn runtime_udp_send_to_recv_from_iobuff() {
 
     executor
         .run(async move {
-            let recv_buf = IoBuffMut::new(0, 64, 0);
-            let (res, buf) = socket.recv_from(recv_buf, 4).await;
-            let (recv_len, from) = res.expect("recv_from failed");
-            assert_eq!(recv_len, 4);
-            assert_eq!(from, peer_addr);
-            assert_eq!(buf.payload_bytes(), b"ping");
+            timeout(UDP_TEST_TIMEOUT, async move {
+                let recv_buf = IoBuffMut::new(0, 64, 0);
+                let (res, buf) = socket.recv_from(recv_buf, 4).await;
+                let (recv_len, from) = res.expect("recv_from failed");
+                assert_eq!(recv_len, 4);
+                assert_eq!(from, peer_addr);
+                assert_eq!(buf.payload_bytes(), b"ping");
 
-            let mut send_buf = IoBuffMut::new(0, 4, 0);
-            send_buf.payload_append(b"pong").unwrap();
-            let frozen = send_buf.freeze();
-            let (res, _buf) = socket.send_to(frozen, peer_addr).await;
-            assert_eq!(res.expect("send_to failed"), 4);
+                let mut send_buf = IoBuffMut::new(0, 4, 0);
+                send_buf.payload_append(b"pong").unwrap();
+                let frozen = send_buf.freeze();
+                let (res, _buf) = socket.send_to(frozen, peer_addr).await;
+                assert_eq!(res.expect("send_to failed"), 4);
+            })
+            .await
+            .expect("unconnected UDP IoBuff exchange timed out");
         })
         .expect("executor run failed");
 

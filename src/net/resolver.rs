@@ -359,13 +359,17 @@ impl DnsResolver {
     ///
     /// This performs a synchronous filesystem read. Call it during setup, then
     /// store the resulting nameserver list for reuse across lookups. The file
-    /// read is limited to 64 KiB.
+    /// read is limited to 64 KiB. UTF-8 is validated per directive after the
+    /// earliest `#` or `;` comment marker, so a malformed directive line is
+    /// skipped without suppressing valid siblings, while malformed comment
+    /// bytes are ignored.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidData`] when `/etc/resolv.conf` exceeds
-    /// 64 KiB. Other file and resolver-construction errors retain their
-    /// existing classifications.
+    /// 64 KiB and [`io::ErrorKind::NotFound`] when no valid nameserver remains.
+    /// Other file and resolver-construction errors retain their existing
+    /// classifications.
     pub fn from_system() -> io::Result<Self> {
         let nameservers = read_resolv_conf(RESOLV_CONF_PATH)?;
         Self::new(nameservers)
@@ -1144,15 +1148,26 @@ pub(crate) fn parse_hosts_bytes(
 }
 
 fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
-    let contents = read_bounded_utf8_file(
+    let contents = read_bounded_file_bytes(
         path,
         RESOLV_CONF_MAX_BYTES,
         "/etc/resolv.conf exceeds the 64 KiB resolver configuration limit",
     )?;
+    parse_resolv_conf_bytes(&contents)
+}
+
+pub(crate) fn parse_resolv_conf_bytes(contents: &[u8]) -> io::Result<Vec<SocketAddr>> {
     let mut nameservers = Vec::new();
 
-    for line in contents.lines() {
-        let line = strip_resolv_conf_comment(line);
+    for line_bytes in contents.split(|byte| *byte == b'\n') {
+        let directive_end = line_bytes
+            .iter()
+            .position(|byte| matches!(*byte, b'#' | b';'))
+            .unwrap_or(line_bytes.len());
+        let Ok(line) = std::str::from_utf8(&line_bytes[..directive_end]) else {
+            continue;
+        };
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
@@ -1183,11 +1198,11 @@ fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
     Ok(nameservers)
 }
 
-fn read_bounded_utf8_file(
+fn read_bounded_file_bytes(
     path: &str,
     max_bytes: usize,
     over_limit_message: &'static str,
-) -> io::Result<String> {
+) -> io::Result<Vec<u8>> {
     let mut file = fs::File::open(path)?;
     let max_read = max_read_with_over_limit_sentinel(max_bytes)?;
     let initial_capacity = file
@@ -1220,7 +1235,7 @@ fn read_bounded_utf8_file(
         ));
     }
 
-    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    Ok(bytes)
 }
 
 fn max_read_with_over_limit_sentinel(max_bytes: usize) -> io::Result<usize> {
@@ -1234,12 +1249,6 @@ fn max_read_with_over_limit_sentinel(max_bytes: usize) -> io::Result<usize> {
 
 fn strip_hosts_comment(line: &str) -> &str {
     line.split_once('#')
-        .map(|(head, _)| head.trim())
-        .unwrap_or_else(|| line.trim())
-}
-
-fn strip_resolv_conf_comment(line: &str) -> &str {
-    line.split_once(['#', ';'])
         .map(|(head, _)| head.trim())
         .unwrap_or_else(|| line.trim())
 }
@@ -2224,6 +2233,11 @@ pub(crate) mod test_support {
     /// Repository-only seam for bounded `/etc/resolv.conf` fixtures.
     pub fn read_resolv_conf(path: &str) -> std::io::Result<Vec<SocketAddr>> {
         super::read_resolv_conf(path)
+    }
+
+    /// Repository-only seam for raw-byte `/etc/resolv.conf` fixtures.
+    pub fn parse_resolv_conf_bytes(contents: &[u8]) -> std::io::Result<Vec<SocketAddr>> {
+        super::parse_resolv_conf_bytes(contents)
     }
 
     /// Repository-only seam for the DNS candidate allocation fixture.

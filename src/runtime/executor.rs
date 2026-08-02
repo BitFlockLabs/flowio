@@ -99,6 +99,17 @@ macro_rules! define_runtime_stats {
         /// its counters exist only when debug assertions are enabled. It is not
         /// a supported production observability API.
         ///
+        /// Counter scopes intentionally differ. Scheduler, task/provider,
+        /// poll-context, SQE/CQE, timer, accept, close, and partial-write
+        /// counters accumulate across one uninterrupted execution generation.
+        /// A generation begins when [`Executor::run`] enters with no live task,
+        /// in-flight operation, ready task, or pending timer; a stalled
+        /// `WouldBlock` return followed by a resumed run stays in the same
+        /// generation. Only the `retained_*` and `writev_scratch_*` fields are
+        /// saturating deltas from the latest `run()` entry. In particular,
+        /// `writev_partial_continuations` is generation-cumulative despite its
+        /// prefix.
+        ///
         /// # Example
         /// ```
         /// # #[cfg(feature = "test-support")]
@@ -260,6 +271,9 @@ define_runtime_stats!(pub);
 
 #[cfg(all(debug_assertions, not(any(test, feature = "test-support"))))]
 define_runtime_stats!(pub(crate));
+
+#[cfg(all(not(debug_assertions), any(test, feature = "test-support")))]
+const _: [(); 0] = [(); size_of::<RuntimeStats>()];
 
 struct ExecutorTaskMemProvider {
     /// Minimum alignment guaranteed for task slab allocations.
@@ -1448,6 +1462,36 @@ unsafe fn init_join_task_at<F: Future>(dst: *mut JoinTask<F>, future: F) {
     }
 }
 
+/// Initializes the shared header of one freshly allocated task slot.
+///
+/// # Safety
+///
+/// `task` must point to stable, writable `TaskHeader` storage in a checked-out
+/// task slot whose prior task lifetime, if any, has been fully destroyed.
+/// `owner` must be a live executor owner on the current owner thread. `refs`
+/// and `flags` must describe every initial owner and scheduler state, and
+/// `vtable` must match the payload already initialized in the slot. This
+/// function must be called exactly once for the new task lifetime before the
+/// task is published, read, or released.
+#[inline(always)]
+unsafe fn init_task_slot_header(
+    task: *mut TaskHeader,
+    owner: *const ExecutorOwner,
+    refs: usize,
+    flags: u64,
+    vtable: &'static TaskVTable,
+) {
+    unsafe {
+        (*task).ready_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
+        (*task).all_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
+        (*task).owner = Some(ExecutorOwner::clone_rc(owner));
+        (*task).refs.set(refs);
+        (*task).flags.set(flags);
+        init_cached_waker(task);
+        (*task).vtable = vtable;
+    }
+}
+
 /// Owns the setup reference for one already-completed benchmark task.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) struct StagedCompletedTaskOutput<T: 'static> {
@@ -1536,13 +1580,13 @@ pub(crate) fn stage_completed_task_output_for_benchmark<T: 'static>(
         };
 
         unsafe {
-            (*slot).header.ready_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
-            (*slot).header.all_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
-            (*slot).header.owner = Some(ExecutorOwner::clone_rc(owner));
-            (*slot).header.refs.set(1);
-            (*slot).header.flags.set(TaskHeader::FLAG_COMPLETED);
-            init_cached_waker(std::ptr::addr_of_mut!((*slot).header));
-            (*slot).header.vtable = join_task_vtable_for::<CompletedFuture<T>>();
+            init_task_slot_header(
+                std::ptr::addr_of_mut!((*slot).header),
+                owner,
+                1,
+                TaskHeader::FLAG_COMPLETED,
+                join_task_vtable_for::<CompletedFuture<T>>(),
+            );
             #[cfg(debug_assertions)]
             {
                 let stats = &mut (*state).runtime_state.stats;
@@ -2132,19 +2176,14 @@ impl Executor {
                 let result_ptr = std::ptr::addr_of_mut!((*data_ptr).result);
                 let waker_ptr = std::ptr::addr_of_mut!((*data_ptr).join_waker);
 
-                (*slot_ptr).header.ready_link =
-                    crate::utils::list::intrusive::dlist::Link::new_unlinked();
-                (*slot_ptr).header.all_link =
-                    crate::utils::list::intrusive::dlist::Link::new_unlinked();
-                (*slot_ptr).header.owner = Some(ExecutorOwner::clone_rc(owner_ptr));
                 // Start with refcount 2: one for the executor, one for the JoinHandle.
-                (*slot_ptr).header.refs.set(2);
-                (*slot_ptr)
-                    .header
-                    .flags
-                    .set(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED);
-                init_cached_waker(std::ptr::addr_of_mut!((*slot_ptr).header));
-                (*slot_ptr).header.vtable = join_task_vtable_for::<F>();
+                init_task_slot_header(
+                    std::ptr::addr_of_mut!((*slot_ptr).header),
+                    owner_ptr,
+                    2,
+                    TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED,
+                    join_task_vtable_for::<F>(),
+                );
 
                 (*state_ptr).runtime_state.live_tasks += 1;
                 #[cfg(debug_assertions)]
@@ -2477,12 +2516,17 @@ impl Executor {
         self.last_stats = runtime_state.stats;
     }
 
-    /// Returns debug counters from the latest run that drained or reached the
-    /// stalled-work `WouldBlock` check.
+    /// Returns the debug snapshot captured by the latest run that drained or
+    /// reached the stalled-work `WouldBlock` check.
     ///
-    /// Retained-payload and vectored-scratch counters are saturating deltas
-    /// from that run's entry. Direct retained-pool test-support snapshots keep
-    /// their lifetime-total semantics.
+    /// All fields except `retained_*` and `writev_scratch_*` are cumulative
+    /// across the current uninterrupted execution generation. A
+    /// `WouldBlock` return with unfinished work and the later run that resumes
+    /// it therefore share those totals. Retained-payload and vectored-scratch
+    /// fields are instead saturating deltas from the latest run's entry, so
+    /// pool activity between two calls is part of the later baseline rather
+    /// than that invocation's result. Direct retained-pool test-support
+    /// snapshots keep their lifetime-total semantics.
     ///
     /// In release builds this dev-only accessor returns an empty snapshot
     /// because the counters are not compiled in.
@@ -4910,6 +4954,106 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotConnected);
         assert_eq!(polls.get(), 0, "rejected post-shutdown root was polled");
         assert_eq!(drops.get(), 1, "rejected post-shutdown root drop count");
+    }
+
+    #[cfg(all(debug_assertions, not(miri)))]
+    #[test]
+    fn last_stats_separates_generation_totals_from_latest_run_pool_deltas() {
+        let mut executor = Executor::new().expect("executor construction failed");
+        let release = Rc::new(Cell::new(false));
+        let completed = Rc::new(Cell::new(false));
+        let stalled_waker = Rc::new(RefCell::new(None::<Waker>));
+        let scratch = Rc::new(RefCell::new(None));
+
+        let first_result = executor.run({
+            let release = Rc::clone(&release);
+            let completed = Rc::clone(&completed);
+            let stalled_waker = Rc::clone(&stalled_waker);
+            let scratch = Rc::clone(&scratch);
+            std::future::poll_fn(move |cx| {
+                if release.get() {
+                    completed.set(true);
+                    return Poll::Ready(());
+                }
+                if scratch.borrow().is_none() {
+                    let pctx = poll_ctx_from_waker(cx)
+                        .expect("scratch stats probe lost its FlowIO context");
+                    // SAFETY: the validated poll context identifies this
+                    // currently polling task's live owner reactor; the borrow
+                    // ends when the allocation call returns, and the returned
+                    // scratch owns its pool handle independently.
+                    let allocated = unsafe { (&mut *pctx.reactor()).alloc_iovec_scratch(17) }
+                        .expect("scratch stats allocation failed");
+                    *scratch.borrow_mut() = Some(allocated);
+                }
+                *stalled_waker.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            })
+        });
+        assert_eq!(
+            first_result
+                .expect_err("parked stats task should stall the first run")
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let first = executor.last_stats();
+        assert_eq!(first.task_slab_allocs, 1);
+        assert_eq!(first.task_allocs, 1);
+        assert_eq!(first.task_frees, 0);
+        assert_eq!(first.task_polls, 1);
+        assert_eq!(first.task_schedules, 0);
+        assert_eq!(first.poll_context_extractions, 1);
+        assert_eq!(first.writev_scratch_pooled_allocs, 1);
+        assert_eq!(first.writev_scratch_pooled_frees, 0);
+        assert_eq!(first.writev_scratch_slab_allocs, 1);
+
+        drop(
+            scratch
+                .borrow_mut()
+                .take()
+                .expect("first run did not retain its scratch allocation"),
+        );
+        // SAFETY: the executor and its heap-stable owner reactor remain live,
+        // no run or reactor borrow is active, and this test stays on the owner
+        // thread.
+        let lifetime_pool_stats =
+            unsafe { (&*executor.owner.reactor_ptr()).retained_payload_stats() };
+        assert_eq!(lifetime_pool_stats.writev_scratch_pooled_allocs, 1);
+        assert_eq!(lifetime_pool_stats.writev_scratch_pooled_frees, 1);
+
+        release.set(true);
+        stalled_waker
+            .borrow_mut()
+            .take()
+            .expect("stalled task did not publish its waker")
+            .wake();
+
+        executor
+            .run(async {})
+            .expect("resumed stats generation did not drain");
+        assert!(completed.get(), "stalled task did not resume");
+
+        let resumed = executor.last_stats();
+        assert_eq!(resumed.task_slab_allocs, 1);
+        assert_eq!(resumed.task_allocs, 2);
+        assert_eq!(resumed.task_frees, 2);
+        assert_eq!(resumed.task_polls, 3);
+        assert_eq!(resumed.task_schedules, 1);
+        assert_eq!(resumed.poll_context_extractions, 1);
+        assert_eq!(resumed.retained_pooled_allocs, 0);
+        assert_eq!(resumed.retained_pooled_reuses, 0);
+        assert_eq!(resumed.retained_pooled_frees, 0);
+        assert_eq!(resumed.retained_slab_allocs, 0);
+        assert_eq!(resumed.retained_heap_fallbacks, 0);
+        assert_eq!(resumed.retained_heap_frees, 0);
+        assert_eq!(resumed.writev_scratch_inline_allocs, 0);
+        assert_eq!(resumed.writev_scratch_pooled_allocs, 0);
+        assert_eq!(resumed.writev_scratch_pooled_reuses, 0);
+        assert_eq!(resumed.writev_scratch_pooled_frees, 0);
+        assert_eq!(resumed.writev_scratch_slab_allocs, 0);
+        assert_eq!(resumed.writev_scratch_oversize_rejections, 0);
+        assert_eq!(resumed.writev_scratch_alloc_failures, 0);
     }
 
     #[cfg(not(miri))]

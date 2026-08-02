@@ -2,8 +2,8 @@ use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
 use flowio::test_support::net::resolver::{
-    lookup_ipv4, parse_hosts_bytes, read_resolv_conf, resolve_host_with_hosts_path,
-    resolve_local_host_with_hosts_path,
+    lookup_ipv4, parse_hosts_bytes, parse_resolv_conf_bytes, read_resolv_conf,
+    resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
 };
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
@@ -586,8 +586,70 @@ fn resolver_hosts_invalid_lines_are_ignored_but_size_limit_still_applies() {
 }
 
 #[test]
+fn resolver_resolv_conf_parser_skips_only_invalid_directive_lines() {
+    let contents = b"nameserver 192.0.2.53\n\
+nameserver 198.51.\xff.1\n\
+nameserver 2001:db8::53\n";
+
+    let nameservers = parse_resolv_conf_bytes(contents)
+        .expect("one malformed directive line should not suppress valid siblings");
+    assert_eq!(
+        nameservers,
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x53), 53,)),
+        ]
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_ignores_invalid_comment_bytes() {
+    let contents = b"nameserver 192.0.2.53 # invalid: \xff\n\
+nameserver 2001:db8::53; invalid: \xfe\n";
+
+    let nameservers = parse_resolv_conf_bytes(contents)
+        .expect("invalid bytes after either comment marker should be ignored");
+    assert_eq!(
+        nameservers,
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x53), 53,)),
+        ]
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_preserves_crlf_order_and_deduplication() {
+    let contents = b"nameserver 192.0.2.53\r\n\
+nameserver 2001:db8::53\r\n\
+nameserver 192.0.2.53\r\n";
+
+    let nameservers = parse_resolv_conf_bytes(contents)
+        .expect("CRLF directives and duplicate removal should remain supported");
+    assert_eq!(
+        nameservers,
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x53), 53,)),
+        ]
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_all_invalid_keeps_not_found_contract() {
+    let contents = b"search example.test\n\
+nameserver 198.51.\xff.1\n\
+\xfe # malformed directive\n";
+
+    let err = parse_resolv_conf_bytes(contents)
+        .expect_err("input without a valid nameserver should remain NotFound");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert_eq!(err.to_string(), "no nameservers found in /etc/resolv.conf");
+}
+
+#[test]
 fn resolver_resolv_conf_accepts_64_kib_and_rejects_the_next_byte() {
-    let prefix = b"nameserver 192.0.2.53\n";
+    let prefix = b"nameserver 192.0.2.53 # invalid comment: \xff\n";
     let exact = TempResolverFile::padded("resolv-conf-exact", prefix, RESOLV_CONF_MAX_BYTES);
     let nameservers =
         read_resolv_conf(exact.path()).expect("a 64 KiB resolv.conf should be accepted");

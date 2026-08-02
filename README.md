@@ -397,8 +397,11 @@ System configuration reads are bounded to 4 MiB for `/etc/hosts` and 64 KiB
 for `/etc/resolv.conf`. An oversized file or a 65th unique resolved address
 returns `InvalidData`; address order remains first-seen and no result is
 silently truncated. Invalid UTF-8 hosts lines are skipped individually, `#`
-starts a hosts comment, and semicolons remain ordinary alias text;
-`resolv.conf` retains both `#` and `;` comment markers. One owned query
+starts a hosts comment, and semicolons remain ordinary alias text.
+`resolv.conf` strips its earliest `#` or `;` comment marker at the byte level,
+then validates only the directive as UTF-8. A malformed directive line is
+skipped without suppressing valid siblings, and malformed comment bytes are
+ignored. One owned query
 allocation and one safely returned
 response allocation are reused across sequential A, AAAA, nameserver retry,
 and bounded CNAME-follow-up work; a timed-out kernel-visible response buffer

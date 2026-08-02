@@ -82,8 +82,9 @@ pub mod net {
     pub mod resolver {
         pub use crate::net::resolver::test_support::{
             decode_name, extend_unique_socket_addrs, lookup_ipv4, parse_hosts_bytes,
-            parse_ipv4_response, read_resolv_conf, resolve_host_with_hosts_path,
-            resolve_local_host_with_hosts_path, response_is_decodable_candidate,
+            parse_ipv4_response, parse_resolv_conf_bytes, read_resolv_conf,
+            resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
+            response_is_decodable_candidate,
         };
     }
 

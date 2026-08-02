@@ -54,6 +54,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dns_parse_resolv_conf_bytes"
+path = "fuzz_targets/dns_parse_resolv_conf_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sctp_parse_recv_meta"
 path = "fuzz_targets/sctp_parse_recv_meta.rs"
 test = false

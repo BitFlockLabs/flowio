@@ -6356,20 +6356,180 @@ fn send_info_from_sndinfo(info: libc::sctp_sndinfo) -> SctpSendInfo {
     }
 }
 
-// Linux UAPI `struct sctp_send_failed` and `struct sctp_send_failed_event`
-// begin with the common 8-byte notification header, followed by a u32 error
-// at byte 8 and the kernel send-info payload at byte 12. The association id
-// follows that payload. Keep these offsets named so parser and tests pin the
-// ABI layout instead of rebuilding offsets independently.
-const SCTP_SEND_FAILED_ERROR_OFFSET: usize = 8;
-const SCTP_SEND_FAILED_INFO_OFFSET: usize = 12;
-const _: () =
+// Linux UAPI notification layouts. These constants deliberately describe the
+// byte protocol consumed below instead of shadowing kernel structs with
+// `repr(C)` types. The compile-time relationships keep field ends and minimum
+// record lengths synchronized while the parser retains checked byte reads and
+// unaligned access.
+const SCTP_NOTIFICATION_TYPE_OFFSET: usize = 0;
+const SCTP_NOTIFICATION_FLAGS_OFFSET: usize = SCTP_NOTIFICATION_TYPE_OFFSET + size_of::<u16>();
+const SCTP_NOTIFICATION_LENGTH_OFFSET: usize = SCTP_NOTIFICATION_FLAGS_OFFSET + size_of::<u16>();
+const SCTP_NOTIFICATION_HEADER_LEN: usize = SCTP_NOTIFICATION_LENGTH_OFFSET + size_of::<u32>();
+
+const SCTP_ASSOC_CHANGE_STATE_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_ASSOC_CHANGE_ERROR_OFFSET: usize = SCTP_ASSOC_CHANGE_STATE_OFFSET + size_of::<u16>();
+const SCTP_ASSOC_CHANGE_OUTBOUND_STREAMS_OFFSET: usize =
+    SCTP_ASSOC_CHANGE_ERROR_OFFSET + size_of::<u16>();
+const SCTP_ASSOC_CHANGE_INBOUND_STREAMS_OFFSET: usize =
+    SCTP_ASSOC_CHANGE_OUTBOUND_STREAMS_OFFSET + size_of::<u16>();
+const SCTP_ASSOC_CHANGE_ASSOC_ID_OFFSET: usize =
+    SCTP_ASSOC_CHANGE_INBOUND_STREAMS_OFFSET + size_of::<u16>();
+const SCTP_ASSOC_CHANGE_MIN_LEN: usize =
+    SCTP_ASSOC_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_PEER_ADDR_CHANGE_ADDRESS_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_PEER_ADDR_CHANGE_ADDRESS_LEN: usize = size_of::<libc::sockaddr_storage>();
+const SCTP_PEER_ADDR_CHANGE_STATE_OFFSET: usize =
+    SCTP_PEER_ADDR_CHANGE_ADDRESS_OFFSET + SCTP_PEER_ADDR_CHANGE_ADDRESS_LEN;
+const SCTP_PEER_ADDR_CHANGE_ERROR_OFFSET: usize =
+    SCTP_PEER_ADDR_CHANGE_STATE_OFFSET + size_of::<i32>();
+const SCTP_PEER_ADDR_CHANGE_ASSOC_ID_OFFSET: usize =
+    SCTP_PEER_ADDR_CHANGE_ERROR_OFFSET + size_of::<i32>();
+const SCTP_PEER_ADDR_CHANGE_MIN_LEN: usize =
+    SCTP_PEER_ADDR_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_SEND_FAILED_ERROR_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_SEND_FAILED_INFO_OFFSET: usize = SCTP_SEND_FAILED_ERROR_OFFSET + size_of::<u32>();
+const SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET: usize =
+    SCTP_SEND_FAILED_INFO_OFFSET + size_of::<libc::sctp_sndrcvinfo>();
+const SCTP_LEGACY_SEND_FAILED_MIN_LEN: usize =
+    SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+const SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET: usize =
+    SCTP_SEND_FAILED_INFO_OFFSET + size_of::<libc::sctp_sndinfo>();
+const SCTP_SEND_FAILED_EVENT_MIN_LEN: usize =
+    SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_REMOTE_ERROR_ERROR_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_REMOTE_ERROR_ASSOC_ID_PADDING_LEN: usize = size_of::<u16>();
+const SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET: usize =
+    SCTP_REMOTE_ERROR_ERROR_OFFSET + size_of::<u16>() + SCTP_REMOTE_ERROR_ASSOC_ID_PADDING_LEN;
+const SCTP_REMOTE_ERROR_MIN_LEN: usize =
+    SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_SHUTDOWN_ASSOC_ID_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_SHUTDOWN_MIN_LEN: usize =
+    SCTP_SHUTDOWN_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_ADAPTATION_INDICATION_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_ADAPTATION_ASSOC_ID_OFFSET: usize = SCTP_ADAPTATION_INDICATION_OFFSET + size_of::<u32>();
+const SCTP_ADAPTATION_MIN_LEN: usize =
+    SCTP_ADAPTATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_PARTIAL_DELIVERY_ASSOC_ID_OFFSET: usize =
+    SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET + size_of::<u32>();
+const SCTP_PARTIAL_DELIVERY_STREAM_OFFSET: usize =
+    SCTP_PARTIAL_DELIVERY_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+const SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET: usize =
+    SCTP_PARTIAL_DELIVERY_STREAM_OFFSET + size_of::<u32>();
+const SCTP_PARTIAL_DELIVERY_MIN_LEN: usize =
+    SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET + size_of::<u32>();
+
+const SCTP_SENDER_DRY_ASSOC_ID_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_SENDER_DRY_MIN_LEN: usize =
+    SCTP_SENDER_DRY_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_STREAM_RESET_ASSOC_ID_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_STREAM_RESET_MIN_LEN: usize =
+    SCTP_STREAM_RESET_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
+const SCTP_ASSOC_RESET_ASSOC_ID_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_ASSOC_RESET_LOCAL_TSN_OFFSET: usize =
+    SCTP_ASSOC_RESET_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+const SCTP_ASSOC_RESET_REMOTE_TSN_OFFSET: usize =
+    SCTP_ASSOC_RESET_LOCAL_TSN_OFFSET + size_of::<u32>();
+const SCTP_ASSOC_RESET_MIN_LEN: usize = SCTP_ASSOC_RESET_REMOTE_TSN_OFFSET + size_of::<u32>();
+
+const SCTP_STREAM_CHANGE_ASSOC_ID_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_STREAM_CHANGE_INBOUND_STREAMS_OFFSET: usize =
+    SCTP_STREAM_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+const SCTP_STREAM_CHANGE_OUTBOUND_STREAMS_OFFSET: usize =
+    SCTP_STREAM_CHANGE_INBOUND_STREAMS_OFFSET + size_of::<u16>();
+const SCTP_STREAM_CHANGE_MIN_LEN: usize =
+    SCTP_STREAM_CHANGE_OUTBOUND_STREAMS_OFFSET + size_of::<u16>();
+
+const _: () = {
+    assert!(size_of::<libc::sctp_assoc_t>() == size_of::<i32>());
+    assert!(SCTP_NOTIFICATION_FLAGS_OFFSET == SCTP_NOTIFICATION_TYPE_OFFSET + size_of::<u16>());
+    assert!(SCTP_NOTIFICATION_LENGTH_OFFSET == SCTP_NOTIFICATION_FLAGS_OFFSET + size_of::<u16>());
+    assert!(SCTP_NOTIFICATION_HEADER_LEN == SCTP_NOTIFICATION_LENGTH_OFFSET + size_of::<u32>());
     assert!(SCTP_SEND_FAILED_INFO_OFFSET == SCTP_SEND_FAILED_ERROR_OFFSET + size_of::<u32>());
+    assert!(
+        SCTP_ASSOC_CHANGE_MIN_LEN
+            == SCTP_ASSOC_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_PEER_ADDR_CHANGE_MIN_LEN
+            == SCTP_PEER_ADDR_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_LEGACY_SEND_FAILED_MIN_LEN
+            == SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_SEND_FAILED_EVENT_MIN_LEN
+            == SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET
+            == SCTP_REMOTE_ERROR_ERROR_OFFSET
+                + size_of::<u16>()
+                + SCTP_REMOTE_ERROR_ASSOC_ID_PADDING_LEN
+    );
+    assert!(
+        SCTP_REMOTE_ERROR_MIN_LEN
+            == SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_SHUTDOWN_MIN_LEN == SCTP_SHUTDOWN_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_ADAPTATION_MIN_LEN
+            == SCTP_ADAPTATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_PARTIAL_DELIVERY_MIN_LEN == SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET + size_of::<u32>()
+    );
+    assert!(
+        SCTP_SENDER_DRY_MIN_LEN
+            == SCTP_SENDER_DRY_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
+        SCTP_STREAM_RESET_MIN_LEN
+            == SCTP_STREAM_RESET_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(SCTP_ASSOC_RESET_MIN_LEN == SCTP_ASSOC_RESET_REMOTE_TSN_OFFSET + size_of::<u32>());
+    assert!(
+        SCTP_STREAM_CHANGE_MIN_LEN == SCTP_STREAM_CHANGE_OUTBOUND_STREAMS_OFFSET + size_of::<u16>()
+    );
+};
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+const _: () = {
+    assert!(size_of::<libc::sockaddr_storage>() == 128);
+    assert!(size_of::<libc::sctp_sndrcvinfo>() == 32);
+    assert!(size_of::<libc::sctp_sndinfo>() == 16);
+    assert!(SCTP_NOTIFICATION_HEADER_LEN == 8);
+    assert!(SCTP_ASSOC_CHANGE_MIN_LEN == 20);
+    assert!(SCTP_PEER_ADDR_CHANGE_MIN_LEN == 148);
+    assert!(SCTP_LEGACY_SEND_FAILED_MIN_LEN == 48);
+    assert!(SCTP_SEND_FAILED_EVENT_MIN_LEN == 32);
+    assert!(SCTP_REMOTE_ERROR_MIN_LEN == 16);
+    assert!(SCTP_SHUTDOWN_MIN_LEN == 12);
+    assert!(SCTP_ADAPTATION_MIN_LEN == 16);
+    assert!(SCTP_PARTIAL_DELIVERY_MIN_LEN == 24);
+    assert!(SCTP_SENDER_DRY_MIN_LEN == 12);
+    assert!(SCTP_STREAM_RESET_MIN_LEN == 12);
+    assert!(SCTP_ASSOC_RESET_MIN_LEN == 20);
+    assert!(SCTP_STREAM_CHANGE_MIN_LEN == 16);
+};
 
 fn parse_legacy_send_failed_notification(buffer: &[u8]) -> io::Result<SctpNotification> {
-    let sndrcvinfo_len = std::mem::size_of::<libc::sctp_sndrcvinfo>();
-    let min_len = SCTP_SEND_FAILED_INFO_OFFSET + sndrcvinfo_len + 4;
-    if buffer.len() < min_len {
+    if buffer.len() < SCTP_LEGACY_SEND_FAILED_MIN_LEN {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
@@ -6379,8 +6539,8 @@ fn parse_legacy_send_failed_notification(buffer: &[u8]) -> io::Result<SctpNotifi
         buffer.as_ptr().add(SCTP_SEND_FAILED_INFO_OFFSET) as *const libc::sctp_sndrcvinfo
     };
     let sndrcvinfo = unsafe { std::ptr::read_unaligned(sndrcvinfo_ptr) };
-    let assoc_base = SCTP_SEND_FAILED_INFO_OFFSET + sndrcvinfo_len;
-    let assoc_id = read_i32_at(buffer, assoc_base).map_err(byte_range_invalid_data)?;
+    let assoc_id = read_i32_at(buffer, SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET)
+        .map_err(byte_range_invalid_data)?;
     Ok(send_failed_notification(
         error,
         send_info_from_sndrcvinfo(sndrcvinfo),
@@ -6389,9 +6549,7 @@ fn parse_legacy_send_failed_notification(buffer: &[u8]) -> io::Result<SctpNotifi
 }
 
 fn parse_send_failed_event_notification(buffer: &[u8]) -> io::Result<SctpNotification> {
-    let sndinfo_len = std::mem::size_of::<libc::sctp_sndinfo>();
-    let min_len = SCTP_SEND_FAILED_INFO_OFFSET + sndinfo_len + 4;
-    if buffer.len() < min_len {
+    if buffer.len() < SCTP_SEND_FAILED_EVENT_MIN_LEN {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
@@ -6400,8 +6558,8 @@ fn parse_send_failed_event_notification(buffer: &[u8]) -> io::Result<SctpNotific
     let sndinfo_ptr =
         unsafe { buffer.as_ptr().add(SCTP_SEND_FAILED_INFO_OFFSET) as *const libc::sctp_sndinfo };
     let sndinfo = unsafe { std::ptr::read_unaligned(sndinfo_ptr) };
-    let assoc_base = SCTP_SEND_FAILED_INFO_OFFSET + sndinfo_len;
-    let assoc_id = read_i32_at(buffer, assoc_base).map_err(byte_range_invalid_data)?;
+    let assoc_id = read_i32_at(buffer, SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET)
+        .map_err(byte_range_invalid_data)?;
     Ok(send_failed_notification(
         error,
         send_info_from_sndinfo(sndinfo),
@@ -6410,135 +6568,160 @@ fn parse_send_failed_event_notification(buffer: &[u8]) -> io::Result<SctpNotific
 }
 
 pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
-    if buffer.len() < 8 {
+    if buffer.len() < SCTP_NOTIFICATION_HEADER_LEN {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
-    let sn_type = read_u16_at(buffer, 0).map_err(byte_range_invalid_data)?;
-    let sn_flags = read_u16_at(buffer, 2).map_err(byte_range_invalid_data)?;
-    let sn_length = read_u32_at(buffer, 4).map_err(byte_range_invalid_data)?;
-    if sn_length < 8 || sn_length as usize > buffer.len() {
+    let sn_type =
+        read_u16_at(buffer, SCTP_NOTIFICATION_TYPE_OFFSET).map_err(byte_range_invalid_data)?;
+    let sn_flags =
+        read_u16_at(buffer, SCTP_NOTIFICATION_FLAGS_OFFSET).map_err(byte_range_invalid_data)?;
+    let sn_length =
+        read_u32_at(buffer, SCTP_NOTIFICATION_LENGTH_OFFSET).map_err(byte_range_invalid_data)?;
+    if sn_length < SCTP_NOTIFICATION_HEADER_LEN as u32 || sn_length as usize > buffer.len() {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
     let buffer = &buffer[..sn_length as usize];
 
     let notification = match sn_type as libc::c_int {
         x if x == LOCAL_SCTP_ASSOC_CHANGE => {
-            if buffer.len() < 20 {
+            if buffer.len() < SCTP_ASSOC_CHANGE_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::AssocChange {
-                state: read_u16_at(buffer, 8).map_err(byte_range_invalid_data)?,
-                error: read_u16_at(buffer, 10).map_err(byte_range_invalid_data)?,
-                outbound_streams: read_u16_at(buffer, 12).map_err(byte_range_invalid_data)?,
-                inbound_streams: read_u16_at(buffer, 14).map_err(byte_range_invalid_data)?,
-                assoc_id: read_i32_at(buffer, 16).map_err(byte_range_invalid_data)?,
+                state: read_u16_at(buffer, SCTP_ASSOC_CHANGE_STATE_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                error: read_u16_at(buffer, SCTP_ASSOC_CHANGE_ERROR_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                outbound_streams: read_u16_at(buffer, SCTP_ASSOC_CHANGE_OUTBOUND_STREAMS_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                inbound_streams: read_u16_at(buffer, SCTP_ASSOC_CHANGE_INBOUND_STREAMS_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_ASSOC_CHANGE_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_PEER_ADDR_CHANGE => {
-            let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
-            let min_len = 8 + storage_len + 12;
-            if buffer.len() < min_len {
+            if buffer.len() < SCTP_PEER_ADDR_CHANGE_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
 
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    buffer.as_ptr().add(8),
+                    buffer.as_ptr().add(SCTP_PEER_ADDR_CHANGE_ADDRESS_OFFSET),
                     &mut storage as *mut _ as *mut u8,
-                    storage_len,
+                    SCTP_PEER_ADDR_CHANGE_ADDRESS_LEN,
                 );
             }
             let addr = socket_addr_from_c(
                 &storage,
-                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                SCTP_PEER_ADDR_CHANGE_ADDRESS_LEN as libc::socklen_t,
             )?;
-            let base = 8 + storage_len;
             SctpNotification::PeerAddrChange {
                 addr,
-                state: read_i32_at(buffer, base).map_err(byte_range_invalid_data)?,
-                error: read_i32_at(buffer, base + 4).map_err(byte_range_invalid_data)?,
-                assoc_id: read_i32_at(buffer, base + 8).map_err(byte_range_invalid_data)?,
+                state: read_i32_at(buffer, SCTP_PEER_ADDR_CHANGE_STATE_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                error: read_i32_at(buffer, SCTP_PEER_ADDR_CHANGE_ERROR_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_PEER_ADDR_CHANGE_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         // Defensive only: FlowIO configures sctp_send_failure_event=0, but
         // untrusted/test notification bytes can still exercise this legacy layout.
         x if x == LOCAL_SCTP_SEND_FAILED => parse_legacy_send_failed_notification(buffer)?,
         x if x == LOCAL_SCTP_REMOTE_ERROR => {
-            if buffer.len() < 16 {
+            if buffer.len() < SCTP_REMOTE_ERROR_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::RemoteError {
-                error: read_u16_be_at(buffer, 8).map_err(byte_range_invalid_data)?,
-                assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
+                error: read_u16_be_at(buffer, SCTP_REMOTE_ERROR_ERROR_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_SHUTDOWN_EVENT => {
-            if buffer.len() < 12 {
+            if buffer.len() < SCTP_SHUTDOWN_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::Shutdown {
-                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_SHUTDOWN_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_ADAPTATION_INDICATION => {
-            if buffer.len() < 16 {
+            if buffer.len() < SCTP_ADAPTATION_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::Adaptation {
-                indication: read_u32_at(buffer, 8).map_err(byte_range_invalid_data)?,
-                assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
+                indication: read_u32_at(buffer, SCTP_ADAPTATION_INDICATION_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_ADAPTATION_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_PARTIAL_DELIVERY_EVENT => {
-            if buffer.len() < 24 {
+            if buffer.len() < SCTP_PARTIAL_DELIVERY_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::PartialDelivery {
-                indication: read_u32_at(buffer, 8).map_err(byte_range_invalid_data)?,
-                assoc_id: read_i32_at(buffer, 12).map_err(byte_range_invalid_data)?,
-                stream: read_u32_at(buffer, 16).map_err(byte_range_invalid_data)?,
-                sequence: read_u32_at(buffer, 20).map_err(byte_range_invalid_data)?,
+                indication: read_u32_at(buffer, SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_PARTIAL_DELIVERY_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                stream: read_u32_at(buffer, SCTP_PARTIAL_DELIVERY_STREAM_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                sequence: read_u32_at(buffer, SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_SENDER_DRY_EVENT => {
-            if buffer.len() < 12 {
+            if buffer.len() < SCTP_SENDER_DRY_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::SenderDry {
-                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_SENDER_DRY_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_STREAM_RESET_EVENT => {
-            if buffer.len() < 12 {
+            if buffer.len() < SCTP_STREAM_RESET_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::StreamReset {
                 flags: sn_flags,
-                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_STREAM_RESET_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_ASSOC_RESET_EVENT => {
-            if buffer.len() < 20 {
+            if buffer.len() < SCTP_ASSOC_RESET_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::AssocReset {
                 flags: sn_flags,
-                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
-                local_tsn: read_u32_at(buffer, 12).map_err(byte_range_invalid_data)?,
-                remote_tsn: read_u32_at(buffer, 16).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_ASSOC_RESET_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                local_tsn: read_u32_at(buffer, SCTP_ASSOC_RESET_LOCAL_TSN_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                remote_tsn: read_u32_at(buffer, SCTP_ASSOC_RESET_REMOTE_TSN_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_STREAM_CHANGE_EVENT => {
-            if buffer.len() < 16 {
+            if buffer.len() < SCTP_STREAM_CHANGE_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             SctpNotification::StreamChange {
                 flags: sn_flags,
-                assoc_id: read_i32_at(buffer, 8).map_err(byte_range_invalid_data)?,
-                inbound_streams: read_u16_at(buffer, 12).map_err(byte_range_invalid_data)?,
-                outbound_streams: read_u16_at(buffer, 14).map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_STREAM_CHANGE_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                inbound_streams: read_u16_at(buffer, SCTP_STREAM_CHANGE_INBOUND_STREAMS_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                outbound_streams: read_u16_at(buffer, SCTP_STREAM_CHANGE_OUTBOUND_STREAMS_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
             }
         }
         x if x == LOCAL_SCTP_SEND_FAILED_EVENT => parse_send_failed_event_notification(buffer)?,
@@ -9818,6 +10001,10 @@ mod tests {
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
 
+    fn write_i32_ne(bytes: &mut [u8], offset: usize, value: i32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
     fn test_msghdr_with_flags(msg_flags: libc::c_int) -> libc::msghdr {
         libc::msghdr {
             msg_name: std::ptr::null_mut(),
@@ -9836,16 +10023,323 @@ mod tests {
 
     fn test_notification_buffer(notification_type: libc::c_int, len: usize) -> Vec<u8> {
         let mut bytes = vec![0u8; len];
-        write_u16_ne(&mut bytes, 0, notification_type as u16);
-        write_u16_ne(&mut bytes, 2, 0);
-        write_u32_ne(&mut bytes, 4, len as u32);
+        write_u16_ne(
+            &mut bytes,
+            SCTP_NOTIFICATION_TYPE_OFFSET,
+            notification_type as u16,
+        );
+        write_u16_ne(&mut bytes, SCTP_NOTIFICATION_FLAGS_OFFSET, 0);
+        write_u32_ne(&mut bytes, SCTP_NOTIFICATION_LENGTH_OFFSET, len as u32);
         bytes
     }
 
     fn test_partial_delivery_notification(indication: u32) -> Vec<u8> {
-        let mut bytes = test_notification_buffer(LOCAL_SCTP_PARTIAL_DELIVERY_EVENT, 24);
-        write_u32_ne(&mut bytes, 8, indication);
+        let mut bytes = test_notification_buffer(
+            LOCAL_SCTP_PARTIAL_DELIVERY_EVENT,
+            SCTP_PARTIAL_DELIVERY_MIN_LEN,
+        );
+        write_u32_ne(
+            &mut bytes,
+            SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET,
+            indication,
+        );
         bytes
+    }
+
+    fn notification_layout_cases() -> Vec<(&'static str, Vec<u8>, SctpRecvMeta)> {
+        let mut cases = Vec::new();
+
+        let mut assoc =
+            test_notification_buffer(LOCAL_SCTP_ASSOC_CHANGE, SCTP_ASSOC_CHANGE_MIN_LEN);
+        write_u16_ne(&mut assoc, SCTP_ASSOC_CHANGE_STATE_OFFSET, 0x0102);
+        write_u16_ne(&mut assoc, SCTP_ASSOC_CHANGE_ERROR_OFFSET, 0x0304);
+        write_u16_ne(
+            &mut assoc,
+            SCTP_ASSOC_CHANGE_OUTBOUND_STREAMS_OFFSET,
+            0x0506,
+        );
+        write_u16_ne(&mut assoc, SCTP_ASSOC_CHANGE_INBOUND_STREAMS_OFFSET, 0x0708);
+        write_i32_ne(&mut assoc, SCTP_ASSOC_CHANGE_ASSOC_ID_OFFSET, -9);
+        cases.push((
+            "association change",
+            assoc,
+            SctpRecvMeta::Notification(SctpNotification::AssocChange {
+                state: 0x0102,
+                error: 0x0304,
+                outbound_streams: 0x0506,
+                inbound_streams: 0x0708,
+                assoc_id: -9,
+            }),
+        ));
+
+        let peer_addr = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 25), 3868));
+        let mut peer =
+            test_notification_buffer(LOCAL_SCTP_PEER_ADDR_CHANGE, SCTP_PEER_ADDR_CHANGE_MIN_LEN);
+        let sockaddr_base = SCTP_PEER_ADDR_CHANGE_ADDRESS_OFFSET;
+        write_u16_ne(
+            &mut peer,
+            sockaddr_base + std::mem::offset_of!(libc::sockaddr_in, sin_family),
+            libc::AF_INET as u16,
+        );
+        write_u16_be(
+            &mut peer,
+            sockaddr_base + std::mem::offset_of!(libc::sockaddr_in, sin_port),
+            peer_addr.port(),
+        );
+        let address_offset = sockaddr_base
+            + std::mem::offset_of!(libc::sockaddr_in, sin_addr)
+            + std::mem::offset_of!(libc::in_addr, s_addr);
+        peer[address_offset..address_offset + 4]
+            .copy_from_slice(&Ipv4Addr::new(192, 0, 2, 25).octets());
+        write_i32_ne(&mut peer, SCTP_PEER_ADDR_CHANGE_STATE_OFFSET, -10);
+        write_i32_ne(&mut peer, SCTP_PEER_ADDR_CHANGE_ERROR_OFFSET, -11);
+        write_i32_ne(&mut peer, SCTP_PEER_ADDR_CHANGE_ASSOC_ID_OFFSET, -12);
+        cases.push((
+            "peer address change",
+            peer,
+            SctpRecvMeta::Notification(SctpNotification::PeerAddrChange {
+                addr: peer_addr,
+                state: -10,
+                error: -11,
+                assoc_id: -12,
+            }),
+        ));
+
+        let mut legacy =
+            test_notification_buffer(LOCAL_SCTP_SEND_FAILED, SCTP_LEGACY_SEND_FAILED_MIN_LEN);
+        write_u32_ne(&mut legacy, SCTP_SEND_FAILED_ERROR_OFFSET, 0x1314_1516);
+        let legacy_info = SCTP_SEND_FAILED_INFO_OFFSET;
+        write_u16_ne(
+            &mut legacy,
+            legacy_info + std::mem::offset_of!(libc::sctp_sndrcvinfo, sinfo_stream),
+            0x1718,
+        );
+        write_u16_ne(
+            &mut legacy,
+            legacy_info + std::mem::offset_of!(libc::sctp_sndrcvinfo, sinfo_flags),
+            0x191a,
+        );
+        write_u32_ne(
+            &mut legacy,
+            legacy_info + std::mem::offset_of!(libc::sctp_sndrcvinfo, sinfo_ppid),
+            0x1b1c_1d1e_u32.to_be(),
+        );
+        write_u32_ne(
+            &mut legacy,
+            legacy_info + std::mem::offset_of!(libc::sctp_sndrcvinfo, sinfo_context),
+            0x1f20_2122,
+        );
+        write_i32_ne(
+            &mut legacy,
+            legacy_info + std::mem::offset_of!(libc::sctp_sndrcvinfo, sinfo_assoc_id),
+            -23,
+        );
+        write_i32_ne(&mut legacy, SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET, -24);
+        cases.push((
+            "legacy send failed",
+            legacy,
+            SctpRecvMeta::Notification(SctpNotification::SendFailed {
+                error: 0x1314_1516,
+                info: SctpSendInfo {
+                    stream_id: 0x1718,
+                    flags: 0x191a,
+                    ppid: 0x1b1c_1d1e,
+                    context: 0x1f20_2122,
+                    assoc_id: -23,
+                },
+                assoc_id: -24,
+            }),
+        ));
+
+        let mut remote =
+            test_notification_buffer(LOCAL_SCTP_REMOTE_ERROR, SCTP_REMOTE_ERROR_MIN_LEN);
+        write_u16_be(&mut remote, SCTP_REMOTE_ERROR_ERROR_OFFSET, 0x2526);
+        write_i32_ne(&mut remote, SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET, -27);
+        cases.push((
+            "remote error",
+            remote,
+            SctpRecvMeta::Notification(SctpNotification::RemoteError {
+                error: 0x2526,
+                assoc_id: -27,
+            }),
+        ));
+
+        let mut shutdown =
+            test_notification_buffer(LOCAL_SCTP_SHUTDOWN_EVENT, SCTP_SHUTDOWN_MIN_LEN);
+        write_i32_ne(&mut shutdown, SCTP_SHUTDOWN_ASSOC_ID_OFFSET, -28);
+        cases.push((
+            "shutdown",
+            shutdown,
+            SctpRecvMeta::Notification(SctpNotification::Shutdown { assoc_id: -28 }),
+        ));
+
+        let mut adaptation =
+            test_notification_buffer(LOCAL_SCTP_ADAPTATION_INDICATION, SCTP_ADAPTATION_MIN_LEN);
+        write_u32_ne(
+            &mut adaptation,
+            SCTP_ADAPTATION_INDICATION_OFFSET,
+            0x292a_2b2c,
+        );
+        write_i32_ne(&mut adaptation, SCTP_ADAPTATION_ASSOC_ID_OFFSET, -29);
+        cases.push((
+            "adaptation indication",
+            adaptation,
+            SctpRecvMeta::Notification(SctpNotification::Adaptation {
+                indication: 0x292a_2b2c,
+                assoc_id: -29,
+            }),
+        ));
+
+        let mut partial = test_notification_buffer(
+            LOCAL_SCTP_PARTIAL_DELIVERY_EVENT,
+            SCTP_PARTIAL_DELIVERY_MIN_LEN,
+        );
+        write_u32_ne(
+            &mut partial,
+            SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET,
+            0x3031_3233,
+        );
+        write_i32_ne(&mut partial, SCTP_PARTIAL_DELIVERY_ASSOC_ID_OFFSET, -34);
+        write_u32_ne(
+            &mut partial,
+            SCTP_PARTIAL_DELIVERY_STREAM_OFFSET,
+            0x3536_3738,
+        );
+        write_u32_ne(
+            &mut partial,
+            SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET,
+            0x393a_3b3c,
+        );
+        cases.push((
+            "partial delivery",
+            partial,
+            SctpRecvMeta::Notification(SctpNotification::PartialDelivery {
+                indication: 0x3031_3233,
+                assoc_id: -34,
+                stream: 0x3536_3738,
+                sequence: 0x393a_3b3c,
+            }),
+        ));
+
+        let mut sender_dry =
+            test_notification_buffer(LOCAL_SCTP_SENDER_DRY_EVENT, SCTP_SENDER_DRY_MIN_LEN);
+        write_i32_ne(&mut sender_dry, SCTP_SENDER_DRY_ASSOC_ID_OFFSET, -61);
+        cases.push((
+            "sender dry",
+            sender_dry,
+            SctpRecvMeta::Notification(SctpNotification::SenderDry { assoc_id: -61 }),
+        ));
+
+        let mut stream_reset =
+            test_notification_buffer(LOCAL_SCTP_STREAM_RESET_EVENT, SCTP_STREAM_RESET_MIN_LEN);
+        write_u16_ne(&mut stream_reset, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x3e3f);
+        write_i32_ne(&mut stream_reset, SCTP_STREAM_RESET_ASSOC_ID_OFFSET, -64);
+        cases.push((
+            "stream reset",
+            stream_reset,
+            SctpRecvMeta::Notification(SctpNotification::StreamReset {
+                flags: 0x3e3f,
+                assoc_id: -64,
+            }),
+        ));
+
+        let mut assoc_reset =
+            test_notification_buffer(LOCAL_SCTP_ASSOC_RESET_EVENT, SCTP_ASSOC_RESET_MIN_LEN);
+        write_u16_ne(&mut assoc_reset, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x4142);
+        write_i32_ne(&mut assoc_reset, SCTP_ASSOC_RESET_ASSOC_ID_OFFSET, -67);
+        write_u32_ne(
+            &mut assoc_reset,
+            SCTP_ASSOC_RESET_LOCAL_TSN_OFFSET,
+            0x4445_4647,
+        );
+        write_u32_ne(
+            &mut assoc_reset,
+            SCTP_ASSOC_RESET_REMOTE_TSN_OFFSET,
+            0x4849_4a4b,
+        );
+        cases.push((
+            "association reset",
+            assoc_reset,
+            SctpRecvMeta::Notification(SctpNotification::AssocReset {
+                flags: 0x4142,
+                assoc_id: -67,
+                local_tsn: 0x4445_4647,
+                remote_tsn: 0x4849_4a4b,
+            }),
+        ));
+
+        let mut stream_change =
+            test_notification_buffer(LOCAL_SCTP_STREAM_CHANGE_EVENT, SCTP_STREAM_CHANGE_MIN_LEN);
+        write_u16_ne(&mut stream_change, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x4c4d);
+        write_i32_ne(&mut stream_change, SCTP_STREAM_CHANGE_ASSOC_ID_OFFSET, -78);
+        write_u16_ne(
+            &mut stream_change,
+            SCTP_STREAM_CHANGE_INBOUND_STREAMS_OFFSET,
+            0x4f50,
+        );
+        write_u16_ne(
+            &mut stream_change,
+            SCTP_STREAM_CHANGE_OUTBOUND_STREAMS_OFFSET,
+            0x5152,
+        );
+        cases.push((
+            "stream change",
+            stream_change,
+            SctpRecvMeta::Notification(SctpNotification::StreamChange {
+                flags: 0x4c4d,
+                assoc_id: -78,
+                inbound_streams: 0x4f50,
+                outbound_streams: 0x5152,
+            }),
+        ));
+
+        let mut modern =
+            test_notification_buffer(LOCAL_SCTP_SEND_FAILED_EVENT, SCTP_SEND_FAILED_EVENT_MIN_LEN);
+        write_u32_ne(&mut modern, SCTP_SEND_FAILED_ERROR_OFFSET, 0x5354_5556);
+        let modern_info = SCTP_SEND_FAILED_INFO_OFFSET;
+        write_u16_ne(
+            &mut modern,
+            modern_info + std::mem::offset_of!(libc::sctp_sndinfo, snd_sid),
+            0x5758,
+        );
+        write_u16_ne(
+            &mut modern,
+            modern_info + std::mem::offset_of!(libc::sctp_sndinfo, snd_flags),
+            0x595a,
+        );
+        write_u32_ne(
+            &mut modern,
+            modern_info + std::mem::offset_of!(libc::sctp_sndinfo, snd_ppid),
+            0x5b5c_5d5e_u32.to_be(),
+        );
+        write_u32_ne(
+            &mut modern,
+            modern_info + std::mem::offset_of!(libc::sctp_sndinfo, snd_context),
+            0x5f60_6162,
+        );
+        write_i32_ne(
+            &mut modern,
+            modern_info + std::mem::offset_of!(libc::sctp_sndinfo, snd_assoc_id),
+            -99,
+        );
+        write_i32_ne(&mut modern, SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET, -100);
+        cases.push((
+            "modern send failed",
+            modern,
+            SctpRecvMeta::Notification(SctpNotification::SendFailed {
+                error: 0x5354_5556,
+                info: SctpSendInfo {
+                    stream_id: 0x5758,
+                    flags: 0x595a,
+                    ppid: 0x5b5c_5d5e,
+                    context: 0x5f60_6162,
+                    assoc_id: -99,
+                },
+                assoc_id: -100,
+            }),
+        ));
+
+        cases
     }
 
     struct RejectedContextRecvBuffer {
@@ -10871,6 +11365,184 @@ mod tests {
         assert!(
             !live.discarding_tail,
             "a complete PDAPI abort retires discard even without MSG_EOR"
+        );
+    }
+
+    #[test]
+    fn notification_layouts_decode_exact_minimum_from_unaligned_storage() {
+        #[repr(align(64))]
+        struct AlignedNotificationStorage([u8; SCTP_PEER_ADDR_CHANGE_MIN_LEN + 1]);
+
+        let cases = notification_layout_cases();
+        assert_eq!(
+            cases.len(),
+            12,
+            "every supported notification arm is pinned"
+        );
+
+        for (name, bytes, expected) in cases {
+            assert_eq!(
+                read_u32_at(&bytes, SCTP_NOTIFICATION_LENGTH_OFFSET),
+                Ok(bytes.len() as u32),
+                "{name} fixture must declare its exact minimum"
+            );
+            assert_eq!(
+                parse_notification(&bytes).unwrap_or_else(|err| panic!("{name}: {err}")),
+                expected,
+                "{name} aligned decoding"
+            );
+
+            let mut unaligned =
+                AlignedNotificationStorage([0xa5; SCTP_PEER_ADDR_CHANGE_MIN_LEN + 1]);
+            unaligned.0[1..bytes.len() + 1].copy_from_slice(&bytes);
+            let unaligned = &unaligned.0[1..bytes.len() + 1];
+            assert_ne!(
+                unaligned
+                    .as_ptr()
+                    .align_offset(std::mem::align_of::<libc::sctp_sndrcvinfo>()),
+                0,
+                "{name} fixture must be unaligned for legacy send info"
+            );
+            assert_ne!(
+                unaligned
+                    .as_ptr()
+                    .align_offset(std::mem::align_of::<libc::sctp_sndinfo>()),
+                0,
+                "{name} fixture must be unaligned for modern send info"
+            );
+            assert_eq!(
+                parse_notification(unaligned)
+                    .unwrap_or_else(|err| panic!("unaligned {name}: {err}")),
+                expected,
+                "{name} unaligned decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_layouts_reject_each_one_byte_short_form() {
+        let layouts = [
+            (
+                "association change",
+                LOCAL_SCTP_ASSOC_CHANGE,
+                SCTP_ASSOC_CHANGE_MIN_LEN,
+            ),
+            (
+                "peer address change",
+                LOCAL_SCTP_PEER_ADDR_CHANGE,
+                SCTP_PEER_ADDR_CHANGE_MIN_LEN,
+            ),
+            (
+                "legacy send failed",
+                LOCAL_SCTP_SEND_FAILED,
+                SCTP_LEGACY_SEND_FAILED_MIN_LEN,
+            ),
+            (
+                "remote error",
+                LOCAL_SCTP_REMOTE_ERROR,
+                SCTP_REMOTE_ERROR_MIN_LEN,
+            ),
+            ("shutdown", LOCAL_SCTP_SHUTDOWN_EVENT, SCTP_SHUTDOWN_MIN_LEN),
+            (
+                "adaptation indication",
+                LOCAL_SCTP_ADAPTATION_INDICATION,
+                SCTP_ADAPTATION_MIN_LEN,
+            ),
+            (
+                "partial delivery",
+                LOCAL_SCTP_PARTIAL_DELIVERY_EVENT,
+                SCTP_PARTIAL_DELIVERY_MIN_LEN,
+            ),
+            (
+                "sender dry",
+                LOCAL_SCTP_SENDER_DRY_EVENT,
+                SCTP_SENDER_DRY_MIN_LEN,
+            ),
+            (
+                "stream reset",
+                LOCAL_SCTP_STREAM_RESET_EVENT,
+                SCTP_STREAM_RESET_MIN_LEN,
+            ),
+            (
+                "association reset",
+                LOCAL_SCTP_ASSOC_RESET_EVENT,
+                SCTP_ASSOC_RESET_MIN_LEN,
+            ),
+            (
+                "stream change",
+                LOCAL_SCTP_STREAM_CHANGE_EVENT,
+                SCTP_STREAM_CHANGE_MIN_LEN,
+            ),
+            (
+                "modern send failed",
+                LOCAL_SCTP_SEND_FAILED_EVENT,
+                SCTP_SEND_FAILED_EVENT_MIN_LEN,
+            ),
+        ];
+        assert_eq!(layouts.len(), 12, "every supported arm needs one boundary");
+
+        for (name, notification_type, min_len) in layouts {
+            let actual_short = test_notification_buffer(notification_type, min_len - 1);
+            let err = parse_notification(&actual_short)
+                .expect_err("a one-byte-short backing buffer must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name} backing");
+
+            let mut declared_short = test_notification_buffer(notification_type, min_len);
+            write_u32_ne(
+                &mut declared_short,
+                SCTP_NOTIFICATION_LENGTH_OFFSET,
+                (min_len - 1) as u32,
+            );
+            let err = parse_notification(&declared_short)
+                .expect_err("trailing backing bytes cannot extend the declared record");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name} declared");
+        }
+    }
+
+    #[test]
+    fn notification_common_header_bounds_and_unknown_layout_are_exact() {
+        let err = parse_notification(&[0u8; SCTP_NOTIFICATION_HEADER_LEN - 1])
+            .expect_err("a short common header must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let unknown_type = 0x7ffe;
+        let mut declared_short =
+            test_notification_buffer(unknown_type, SCTP_NOTIFICATION_HEADER_LEN);
+        write_u32_ne(
+            &mut declared_short,
+            SCTP_NOTIFICATION_LENGTH_OFFSET,
+            (SCTP_NOTIFICATION_HEADER_LEN - 1) as u32,
+        );
+        assert_eq!(
+            parse_notification(&declared_short)
+                .expect_err("a declared short header must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut declared_long =
+            test_notification_buffer(unknown_type, SCTP_NOTIFICATION_HEADER_LEN);
+        write_u32_ne(
+            &mut declared_long,
+            SCTP_NOTIFICATION_LENGTH_OFFSET,
+            (SCTP_NOTIFICATION_HEADER_LEN + 1) as u32,
+        );
+        assert_eq!(
+            parse_notification(&declared_long)
+                .expect_err("a declared length beyond backing storage must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut unknown = test_notification_buffer(unknown_type, SCTP_NOTIFICATION_HEADER_LEN);
+        write_u16_ne(&mut unknown, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x1234);
+        assert_eq!(
+            parse_notification(&unknown).expect("an unknown exact header should remain visible"),
+            SctpRecvMeta::Notification(SctpNotification::Other {
+                kind: unknown_type as u16,
+                flags: 0x1234,
+                length: SCTP_NOTIFICATION_HEADER_LEN as u32,
+            })
         );
     }
 

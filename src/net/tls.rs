@@ -156,6 +156,18 @@ fn tls_internal_error(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
 
+/// Converts the plaintext progress recorded before the final TLS flush into
+/// the public write result without masking an impossible missing count.
+#[inline(always)]
+fn tls_write_progress_result(written: Option<usize>) -> io::Result<usize> {
+    match written {
+        Some(written) => Ok(written),
+        None => Err(tls_internal_error(
+            "tls write completed without an accepted plaintext count",
+        )),
+    }
+}
+
 /// Validates one live public TLS future poll before any local completion,
 /// staged raw-operation poll, or rustls-state mutation.
 #[inline(always)]
@@ -437,6 +449,12 @@ pub struct TlsClientOptions {
 /// still drain already-decrypted plaintext and continue reading the transport
 /// until EOF; if a read requires a TLS transport write to make progress after
 /// the write latch is set, that read returns `BrokenPipe`.
+///
+/// After the underlying TCP write side has completed shutdown, a read, flush,
+/// or repeated shutdown that encounters staged or newly requested TLS output
+/// returns `BrokenPipe` without polling or consuming that output. Reads of
+/// already-decrypted plaintext and quiescent repeated flush or shutdown calls
+/// remain available.
 ///
 /// Ordinary TLS operations reuse the two reserved ciphertext buffers. If an
 /// earlier exceptional path leaves one unavailable, the operation that needs
@@ -749,7 +767,8 @@ impl TlsClientStream {
     /// A clean TLS close returns `Ok(0)`.
     /// After an outbound TLS write failure, already-decrypted plaintext may
     /// still be returned; if a read needs to emit TLS records to make progress
-    /// after that latch is set, it returns `BrokenPipe`.
+    /// after that latch is set or after the transport write side has completed
+    /// shutdown, it returns `BrokenPipe`.
     ///
     /// Preferred when the caller tracks plaintext framing. This returns after
     /// one plaintext read instead of looping to fill `len`; obtaining that
@@ -773,7 +792,8 @@ impl TlsClientStream {
     /// caller buffer remains published in that returned buffer.
     /// After an outbound TLS write failure, already-decrypted plaintext may
     /// still be returned; if a read needs to emit TLS records to make progress
-    /// after that latch is set, it returns `BrokenPipe`.
+    /// after that latch is set or after the transport write side has completed
+    /// shutdown, it returns `BrokenPipe`.
     ///
     /// This complete-buffer API loops until the requested plaintext length is
     /// filled. Avoid that loop when exact-length semantics are unnecessary;
@@ -844,7 +864,8 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` when polled without its active FlowIO executor
     /// task context and `BrokenPipe` if a prior outbound ciphertext drain
-    /// failed.
+    /// failed, or if TLS output is pending after the transport write side has
+    /// completed shutdown.
     ///
     /// This is primarily a control-path API for callers that need an explicit
     /// flush boundary.
@@ -861,7 +882,9 @@ impl TlsClientStream {
     /// Returns `NotConnected` when polled without its active FlowIO executor
     /// task context. If the transport write side has previously failed,
     /// shutdown returns `BrokenPipe` while reads can still drain plaintext
-    /// that does not require emitting more TLS records.
+    /// that does not require emitting more TLS records. After transport write
+    /// shutdown completes, a repeated shutdown returns `BrokenPipe` if rustls
+    /// has newly requested output, and otherwise remains successful.
     /// This is a shutdown-path API rather than a steady-state fast-path API.
     pub fn shutdown(&mut self) -> TlsShutdownFuture<'_> {
         TlsShutdownFuture { stream: self }
@@ -979,6 +1002,14 @@ impl TlsClientStream {
                 "tls transport write failed",
             )));
         }
+        if self.transport_write_shutdown
+            && (self.pending_write_tls.is_some() || self.connection.wants_write())
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls transport write side already shut down",
+            )));
+        }
 
         loop {
             if let Some(future) = self.pending_write_tls.as_mut() {
@@ -1022,7 +1053,7 @@ impl TlsClientStream {
                     }
                 };
 
-            debug_assert_eq!(written, buffer.len());
+            debug_assert!(written > 0);
             debug_assert!(buffer.len() <= chunk_limit);
             self.pending_write_tls =
                 Some(stream::WriteAllFuture::new(self.stream.as_raw_fd(), buffer));
@@ -1501,7 +1532,7 @@ impl<B: IoBuffReadOnly> Future for TlsWriteFuture<'_, B> {
             }
             Poll::Ready(Ok(())) => {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
-                Poll::Ready((Ok(this.written.unwrap_or(0)), buffer))
+                Poll::Ready((tls_write_progress_result(this.written), buffer))
             }
         }
     }
@@ -1674,7 +1705,7 @@ mod tests {
     use super::{
         TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, TlsWriteScratch, allocate_tls_scratch,
         take_or_reserve_tls_scratch, tls_read_submission_len, tls_transport_eof_result,
-        tls_userspace_destination,
+        tls_userspace_destination, tls_write_progress_result,
     };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
@@ -1682,12 +1713,119 @@ mod tests {
     #[cfg(not(miri))]
     use crate::runtime::executor::Executor;
     #[cfg(not(miri))]
-    use rustls::RootCertStore;
+    use rcgen::generate_simple_self_signed;
+    #[cfg(not(miri))]
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    #[cfg(not(miri))]
+    use rustls::{RootCertStore, ServerConfig, ServerConnection};
     use std::io::{self, Write};
     #[cfg(not(miri))]
     use std::net::{Ipv4Addr, SocketAddr};
     #[cfg(not(miri))]
     use std::task::Waker;
+
+    #[cfg(not(miri))]
+    fn handshaken_tls_for_shutdown_tests() -> (TlsClientStream, std::net::TcpStream) {
+        let certified = generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("failed to generate self-signed test certificate");
+        let certificate = certified.cert.der().clone();
+        let private_key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(certificate.clone())
+            .expect("failed to install test root certificate");
+        let client_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate], private_key.into())
+                .expect("failed to build test server configuration"),
+        );
+
+        let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("std bind failed");
+        let client = std::net::TcpStream::connect(
+            listener.local_addr().expect("listener local_addr failed"),
+        )
+        .expect("std connect failed");
+        let (peer, _) = listener.accept().expect("std accept failed");
+        let mut tls = TlsClientStream::new(
+            TcpStream::from_owned_fd(client.into()),
+            client_config,
+            ServerName::try_from("localhost").expect("invalid test server name"),
+            TlsClientOptions {
+                rustls_buffer_limit: Some(1024),
+                transport_read_buffer_size: 128,
+                transport_write_buffer_size: 128,
+            },
+        )
+        .expect("tls stream init failed");
+        let mut server =
+            ServerConnection::new(server_config).expect("test server connection failed");
+
+        for _ in 0..64 {
+            if tls.connection.wants_write() {
+                let mut wire = Vec::new();
+                while tls.connection.wants_write() {
+                    let written = tls
+                        .connection
+                        .write_tls(&mut wire)
+                        .expect("client handshake write failed");
+                    assert!(written > 0, "client handshake write made no progress");
+                }
+                let mut cursor = Cursor::new(wire.as_slice());
+                while (cursor.position() as usize) < wire.len() {
+                    let read = server
+                        .read_tls(&mut cursor)
+                        .expect("server handshake read failed");
+                    assert!(read > 0, "server handshake read made no progress");
+                }
+                server
+                    .process_new_packets()
+                    .expect("server handshake packet processing failed");
+            }
+
+            if server.wants_write() {
+                let mut wire = Vec::new();
+                while server.wants_write() {
+                    let written = server
+                        .write_tls(&mut wire)
+                        .expect("server handshake write failed");
+                    assert!(written > 0, "server handshake write made no progress");
+                }
+                let mut cursor = Cursor::new(wire.as_slice());
+                while (cursor.position() as usize) < wire.len() {
+                    let read = tls
+                        .connection
+                        .read_tls(&mut cursor)
+                        .expect("client handshake read failed");
+                    assert!(read > 0, "client handshake read made no progress");
+                }
+                tls.connection
+                    .process_new_packets()
+                    .expect("client handshake packet processing failed");
+            }
+
+            if !tls.connection.is_handshaking()
+                && !server.is_handshaking()
+                && !tls.connection.wants_write()
+                && !server.wants_write()
+            {
+                assert_eq!(
+                    tls.connection.protocol_version(),
+                    Some(rustls::ProtocolVersion::TLSv1_3)
+                );
+                return (tls, peer);
+            }
+        }
+
+        panic!("in-memory TLS handshake did not converge");
+    }
 
     #[test]
     fn tls_scratch_sizes_reject_zero_and_impossible_geometry() {
@@ -1702,6 +1840,20 @@ mod tests {
                 assert!(err.to_string().contains(field));
             }
         }
+    }
+
+    #[test]
+    fn tls_write_progress_requires_an_explicit_accepted_count() {
+        assert_eq!(tls_write_progress_result(Some(0)).unwrap(), 0);
+        assert_eq!(tls_write_progress_result(Some(37)).unwrap(), 37);
+
+        let err = tls_write_progress_result(None)
+            .expect_err("missing TLS write progress unexpectedly became success");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            err.to_string(),
+            "tls write completed without an accepted plaintext count"
+        );
     }
 
     #[test]
@@ -2144,6 +2296,145 @@ mod tests {
                 .expect("test rustls write drain failed");
             assert!(written > 0, "rustls wanted write but emitted no bytes");
         }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_shutdown_drains_logical_close_and_resumes_after_future_drop() {
+        let (mut tls, _peer) = handshaken_tls_for_shutdown_tests();
+        let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+        executor
+            .run(async move {
+                let mut first_shutdown = Box::pin(tls.shutdown());
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        first_shutdown.as_mut().poll(cx).is_pending(),
+                        "initial shutdown poll should stage close_notify"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(first_shutdown);
+
+                assert!(tls.write_shutdown, "close_notify was not queued");
+                assert!(
+                    !tls.transport_write_shutdown,
+                    "transport write side shut down before close_notify completed"
+                );
+                assert!(
+                    tls.pending_write_tls.is_some() || tls.connection.wants_write(),
+                    "logical shutdown did not retain close_notify output"
+                );
+
+                tls.shutdown()
+                    .await
+                    .expect("resumed shutdown failed to drain close_notify");
+                assert!(tls.transport_write_shutdown);
+                tls.shutdown()
+                    .await
+                    .expect("quiescent repeated shutdown should succeed");
+                tls.flush()
+                    .await
+                    .expect("quiescent post-shutdown flush should succeed");
+            })
+            .expect("executor run failed");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_read_after_physical_shutdown_preserves_an_already_staged_raw_write() {
+        let (mut tls, _peer) = handshaken_tls_for_shutdown_tests();
+        tls.stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("transport write shutdown failed");
+        tls.write_shutdown = true;
+        tls.transport_write_shutdown = true;
+
+        let staged = b"staged tls ciphertext".to_vec();
+        tls.write_tls_buffer = None;
+        tls.pending_write_tls = Some(stream::WriteAllFuture::new(tls.stream.as_raw_fd(), staged));
+        let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+        executor
+            .run(async move {
+                let pending_address = tls
+                    .pending_write_tls
+                    .as_ref()
+                    .map(std::ptr::from_ref)
+                    .expect("staged write was not installed");
+                let destination = Vec::with_capacity(1);
+                let (result, destination) = tls.read(destination, 1).await;
+                let err = result.expect_err("read unexpectedly flushed after physical shutdown");
+
+                assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(
+                    err.to_string(),
+                    "tls transport write side already shut down"
+                );
+                assert!(destination.is_empty());
+                assert_eq!(destination.capacity(), 1);
+                assert_eq!(
+                    tls.pending_write_tls.as_ref().map(std::ptr::from_ref),
+                    Some(pending_address),
+                    "read rejection detached or replaced the staged raw write"
+                );
+                assert!(tls.write_tls_buffer.is_none());
+                assert!(!tls.transport_write_failed);
+            })
+            .expect("executor run failed");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_physical_shutdown_rejects_key_update_without_draining_state() {
+        let (mut tls, _peer) = handshaken_tls_for_shutdown_tests();
+        let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+        executor
+            .run(async move {
+                tls.shutdown().await.expect("initial shutdown failed");
+                assert!(tls.write_shutdown);
+                assert!(tls.transport_write_shutdown);
+                tls.flush()
+                    .await
+                    .expect("quiescent post-shutdown flush should succeed");
+
+                tls.connection
+                    .refresh_traffic_keys()
+                    .expect("TLS 1.3 traffic-key refresh failed");
+                assert!(tls.connection.wants_write());
+                let scratch = tls
+                    .write_tls_buffer
+                    .as_ref()
+                    .expect("reusable write scratch is missing");
+                let scratch_state = (scratch.as_ptr(), scratch.len(), scratch.capacity());
+
+                let err = tls
+                    .flush()
+                    .await
+                    .expect_err("post-shutdown KeyUpdate unexpectedly flushed");
+                assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(
+                    err.to_string(),
+                    "tls transport write side already shut down"
+                );
+                assert!(
+                    tls.connection.wants_write(),
+                    "rejection consumed queued KeyUpdate output"
+                );
+                let scratch = tls
+                    .write_tls_buffer
+                    .as_ref()
+                    .expect("rejection lost the reusable write scratch");
+                assert_eq!(
+                    (scratch.as_ptr(), scratch.len(), scratch.capacity()),
+                    scratch_state
+                );
+                assert!(tls.pending_write_tls.is_none());
+                assert!(!tls.transport_write_failed);
+            })
+            .expect("executor run failed");
     }
 
     #[test]

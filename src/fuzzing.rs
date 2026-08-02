@@ -187,6 +187,16 @@ pub fn dns_parse_hosts_bytes(data: &[u8]) {
     let _ = std::hint::black_box(observe_dns_parse_hosts_bytes(data));
 }
 
+fn observe_dns_parse_resolv_conf_bytes(data: &[u8]) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let data = maybe_decode_hex_seed(data);
+    crate::net::resolver::parse_resolv_conf_bytes(data.as_ref())
+}
+
+/// Fuzz entry: parse arbitrary `resolv.conf` bytes without filesystem I/O.
+pub fn dns_parse_resolv_conf_bytes(data: &[u8]) {
+    let _ = std::hint::black_box(observe_dns_parse_resolv_conf_bytes(data));
+}
+
 /// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
 pub fn sctp_parse_notification(data: &[u8]) {
     let data = maybe_decode_hex_seed(data);
@@ -332,6 +342,13 @@ pub mod test_support {
     /// Returns the hosts byte parser's exact result for a fuzz-wrapper input.
     pub fn observe_dns_parse_hosts_bytes(data: &[u8]) -> io::Result<Vec<std::net::SocketAddr>> {
         super::observe_dns_parse_hosts_bytes(data)
+    }
+
+    /// Returns the `resolv.conf` byte parser's exact result for a fuzz input.
+    pub fn observe_dns_parse_resolv_conf_bytes(
+        data: &[u8],
+    ) -> io::Result<Vec<std::net::SocketAddr>> {
+        super::observe_dns_parse_resolv_conf_bytes(data)
     }
 
     /// Returns the SCTP metadata parser's exact result.

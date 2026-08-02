@@ -9,7 +9,6 @@ use flowio::net::{WritevPieces, WritevProjection};
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly};
-#[cfg(debug_assertions)]
 use flowio::runtime::executor::RuntimeStats;
 use flowio::runtime::executor::{Executor, ExecutorConfig, JoinError, JoinHandle, TrySpawnError};
 use flowio::runtime::reactor::ReactorConfig;
@@ -2453,6 +2452,18 @@ fn runtime_clean_runs_reset_generation_task_counters() {
     assert_eq!(second.task_frees, 1);
     assert_eq!(second.task_slab_allocs, 0);
     assert_eq!(second.task_slab_frees, 0);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn optimized_test_support_keeps_runtime_stats_storage_empty() {
+    assert_eq!(std::mem::size_of::<RuntimeStats>(), 0);
+
+    let mut executor = new_executor();
+    executor
+        .run(async {})
+        .expect("optimized empty stats run failed");
+    assert_eq!(std::mem::size_of_val(&executor.last_stats()), 0);
 }
 
 #[cfg(debug_assertions)]

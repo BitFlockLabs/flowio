@@ -3,8 +3,9 @@
 use flowio::fuzzing::test_support::{
     DNS_QUERY_ID_MISMATCH_CONTROL, dns_response_case_reaches_records,
     observe_dns_parse_hosts_bytes, observe_dns_parse_received_response_packet,
-    observe_dns_parse_response_packet, observe_dns_response_case_host,
-    observe_dns_response_prefilter, observe_sctp_parse_recv_meta, observe_tls_server_end_point,
+    observe_dns_parse_resolv_conf_bytes, observe_dns_parse_response_packet,
+    observe_dns_response_case_host, observe_dns_response_prefilter, observe_sctp_parse_recv_meta,
+    observe_tls_server_end_point,
 };
 use flowio::fuzzing::{dns_decode_name, tls_server_end_point};
 use flowio::net::sctp::{SctpNotification, SctpRecvInfo, SctpRecvMeta};
@@ -458,6 +459,56 @@ fn hosts_byte_parser_corpus_pins_line_isolation_and_comment_grammar() {
     assert_eq!(
         error.to_string(),
         "resolver result exceeds 64 unique addresses"
+    );
+}
+
+#[test]
+fn resolv_conf_byte_parser_corpus_pins_line_and_comment_isolation() {
+    let all_invalid = include_bytes!("../fixtures/fuzzing/dns_parse_resolv_conf_bytes/all_invalid");
+    let err = observe_dns_parse_resolv_conf_bytes(all_invalid)
+        .expect_err("input without a valid nameserver should remain NotFound");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(err.to_string(), "no nameservers found in /etc/resolv.conf");
+
+    let hash =
+        include_bytes!("../fixtures/fuzzing/dns_parse_resolv_conf_bytes/invalid_hash_comment");
+    assert_eq!(
+        observe_dns_parse_resolv_conf_bytes(hash)
+            .expect("invalid bytes after the first hash marker should be ignored"),
+        [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 54), 53))]
+    );
+
+    let semicolon =
+        include_bytes!("../fixtures/fuzzing/dns_parse_resolv_conf_bytes/invalid_semicolon_comment");
+    assert_eq!(
+        observe_dns_parse_resolv_conf_bytes(semicolon)
+            .expect("invalid bytes after the first semicolon marker should be ignored"),
+        [SocketAddr::from((
+            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x54),
+            53,
+        ))]
+    );
+
+    let mixed =
+        include_bytes!("../fixtures/fuzzing/dns_parse_resolv_conf_bytes/valid_invalid_valid");
+    assert_eq!(
+        observe_dns_parse_resolv_conf_bytes(mixed)
+            .expect("valid siblings should survive one malformed directive"),
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x53), 53,)),
+        ]
+    );
+
+    let crlf = include_bytes!("../fixtures/fuzzing/dns_parse_resolv_conf_bytes/crlf_duplicates");
+    assert_eq!(
+        observe_dns_parse_resolv_conf_bytes(crlf)
+            .expect("CRLF directives should retain first-seen unique addresses"),
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 55), 53)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x55), 53,)),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 56), 53)),
+        ]
     );
 }
 
