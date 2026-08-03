@@ -396,8 +396,9 @@ returns `InvalidInput`; over-limit input is rejected rather than truncated.
 System configuration reads are bounded to 4 MiB for `/etc/hosts` and 64 KiB
 for `/etc/resolv.conf`. An oversized file or a 65th unique resolved address
 returns `InvalidData`; address order remains first-seen and no result is
-silently truncated. Invalid UTF-8 hosts lines are skipped individually, `#`
-starts a hosts comment, and semicolons remain ordinary alias text.
+silently truncated. Each hosts entry prefix before the first raw `#` is
+validated as UTF-8; an invalid prefix is skipped individually, invalid comment
+bytes are ignored, and semicolons remain ordinary alias text.
 `resolv.conf` strips its earliest `#` or `;` comment marker at the byte level,
 then validates only the directive as UTF-8. A malformed directive line is
 skipped without suppressing valid siblings, and malformed comment bytes are

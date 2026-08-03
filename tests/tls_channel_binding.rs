@@ -203,16 +203,39 @@ fn tls_server_end_point_rejects_trailing_bytes() {
 
 #[test]
 fn tls_server_end_point_accepts_long_form_der_lengths() {
-    let padding = vec![0u8; 130];
-    let first = encode_sequence(&[&padding]);
-    let third = [0x03, 0x01, 0x00];
-    let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
-    let cert = encode_sequence(&[&first, &algorithm, &third]);
+    for body_len in [128, 130] {
+        let padding = vec![0u8; body_len];
+        let first = encode_sequence(&[&padding]);
+        let third = [0x03, 0x01, 0x00];
+        let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
+        let cert = encode_sequence(&[&first, &algorithm, &third]);
 
-    assert_eq!(
-        tls_server_end_point(&cert),
-        Some(Sha256::digest(&cert).to_vec())
-    );
+        assert_eq!(
+            tls_server_end_point(&cert),
+            Some(Sha256::digest(&cert).to_vec()),
+            "minimal long-form length {body_len} was rejected"
+        );
+    }
+}
+
+#[test]
+fn tls_server_end_point_rejects_noncanonical_der_lengths() {
+    let canonical = certificate_with_algorithm(RSA_PKCS1_SHA256.as_ref());
+    assert_eq!(canonical[0], 0x30);
+    assert!(canonical[1] < 0x80);
+
+    let mut nonminimal_outer = Vec::with_capacity(canonical.len() + 1);
+    nonminimal_outer.extend_from_slice(&[0x30, 0x81, canonical[1]]);
+    nonminimal_outer.extend_from_slice(&canonical[2..]);
+    assert_eq!(tls_server_end_point(&nonminimal_outer), None);
+
+    let mut zero_padded_first = Vec::with_capacity(132);
+    zero_padded_first.extend_from_slice(&[0x30, 0x82, 0x00, 0x80]);
+    zero_padded_first.resize(132, 0);
+    let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
+    let signature = [0x03, 0x01, 0x00];
+    let zero_padded_child = encode_sequence(&[&zero_padded_first, &algorithm, &signature]);
+    assert_eq!(tls_server_end_point(&zero_padded_child), None);
 }
 
 #[test]

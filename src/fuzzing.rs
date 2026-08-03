@@ -182,7 +182,8 @@ fn observe_dns_parse_hosts_bytes(data: &[u8]) -> std::io::Result<Vec<std::net::S
     Ok(addrs)
 }
 
-/// Fuzz entry: parse arbitrary hosts-file bytes without filesystem I/O.
+/// Fuzz entry: parse arbitrary hosts-file bytes, including non-UTF-8 comments,
+/// without filesystem I/O.
 pub fn dns_parse_hosts_bytes(data: &[u8]) {
     let _ = std::hint::black_box(observe_dns_parse_hosts_bytes(data));
 }

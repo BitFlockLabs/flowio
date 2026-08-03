@@ -442,6 +442,22 @@ fn hosts_byte_parser_corpus_pins_line_isolation_and_comment_grammar() {
             .is_empty()
     );
 
+    let invalid_hash_comment =
+        include_bytes!("../fixtures/fuzzing/dns_parse_hosts_bytes/invalid_hash_comment");
+    let decoded_hash_comment = decode_hex_seed(invalid_hash_comment);
+    assert!(
+        !decoded_hash_comment.ends_with(b"\n"),
+        "the final valid entry must exercise an unterminated line"
+    );
+    assert_eq!(
+        observe_dns_parse_hosts_bytes(invalid_hash_comment)
+            .expect("invalid UTF-8 confined to hosts comments should be ignored"),
+        [
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5432)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x30), 5432,)),
+        ]
+    );
+
     let semicolon = include_bytes!("../fixtures/fuzzing/dns_parse_hosts_bytes/semicolon_aliases");
     assert_eq!(
         observe_dns_parse_hosts_bytes(semicolon)
@@ -805,4 +821,25 @@ fn tls_server_end_point_wrapper_reaches_valid_and_malformed_der() {
         include_bytes!("../fixtures/fuzzing/tls_server_end_point/malformed_truncated_long_length");
     assert_eq!(decode_hex_seed(truncated_length), &[0x30, 0x82, 0x01, 0x00]);
     assert!(!tls_server_end_point(truncated_length));
+
+    let nonminimal_outer = include_bytes!(
+        "../fixtures/fuzzing/tls_server_end_point/malformed_nonminimal_outer_length"
+    );
+    let mut expected_nonminimal_outer = vec![0x30, 0x81, 0x14];
+    expected_nonminimal_outer.extend_from_slice(&decode_hex_seed(rsa)[2..]);
+    assert_eq!(decode_hex_seed(nonminimal_outer), expected_nonminimal_outer);
+    assert!(!tls_server_end_point(nonminimal_outer));
+
+    let zero_padded_child = include_bytes!(
+        "../fixtures/fuzzing/tls_server_end_point/malformed_zero_padded_child_length"
+    );
+    let zero_padded_child_der = decode_hex_seed(zero_padded_child);
+    assert_eq!(zero_padded_child_der.len(), 153);
+    assert_eq!(
+        &zero_padded_child_der[..7],
+        &[0x30, 0x81, 0x96, 0x30, 0x82, 0x00, 0x80]
+    );
+    assert!(zero_padded_child_der[7..135].iter().all(|byte| *byte == 0));
+    assert_eq!(&zero_padded_child_der[135..], &decode_hex_seed(rsa)[4..]);
+    assert!(!tls_server_end_point(zero_padded_child));
 }

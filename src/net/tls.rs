@@ -503,10 +503,13 @@ fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]])
 ///
 /// The outer certificate sequence must consume the complete input and contain
 /// exactly a `TBSCertificate` sequence, a `signatureAlgorithm` sequence, and a
-/// `signatureValue` bit string, in that order. Returns `None` when this
-/// structure is malformed or the signature algorithm is unsupported for this
-/// derivation. Unsupported cases include algorithms without a defined binding
-/// digest, such as Ed25519 and Ed448.
+/// `signatureValue` bit string, in that order. Those four parsed TLV headers
+/// must use canonical DER length encoding: short form below 128 bytes and a
+/// minimally encoded, non-zero-prefixed long form otherwise. This does not
+/// recursively validate the contents of `TBSCertificate`. Returns `None` when
+/// the parsed structure is malformed or the signature algorithm is unsupported
+/// for this derivation. Unsupported cases include algorithms without a defined
+/// binding digest, such as Ed25519 and Ed448.
 ///
 /// This allocates the returned channel-binding bytes. Call it after the TLS
 /// handshake when a protocol needs the binding value; it is not steady-state
@@ -631,9 +634,15 @@ fn read_tlv(bytes: &[u8], offset: usize) -> Option<(u8, usize, usize)> {
     let len_start = offset.checked_add(2)?;
     let len_end = len_start.checked_add(len_octets)?;
     let len_bytes = bytes.get(len_start..len_end)?;
+    if len_bytes.first().copied() == Some(0) {
+        return None;
+    }
 
     for &octet in len_bytes {
         body_len = body_len.checked_shl(8)? | octet as usize;
+    }
+    if body_len < 128 {
+        return None;
     }
 
     let header_len = 2usize.checked_add(len_octets)?;
@@ -921,7 +930,7 @@ impl TlsClientStream {
                 "tls transport write failed",
             ));
         }
-        if self.write_shutdown {
+        if self.write_shutdown || self.transport_write_shutdown {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "tls write side already shut down",
@@ -2433,6 +2442,90 @@ mod tests {
                 );
                 assert!(tls.pending_write_tls.is_none());
                 assert!(!tls.transport_write_failed);
+            })
+            .expect("executor run failed");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_physical_only_shutdown_rejects_plaintext_before_state_mutation() {
+        let (mut tls, _peer) = handshaken_tls_for_shutdown_tests();
+        assert!(!tls.write_shutdown);
+        assert!(!tls.transport_write_shutdown);
+        assert!(!tls.connection.wants_write());
+        assert!(tls.pending_write_tls.is_none());
+
+        tls.transport_write_shutdown = true;
+        let scratch = tls
+            .write_tls_buffer
+            .as_ref()
+            .expect("reusable write scratch is missing");
+        let scratch_state = (scratch.as_ptr(), scratch.len(), scratch.capacity());
+        let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+        executor
+            .run(async move {
+                let partial_source = b"partial physical-only shutdown".to_vec();
+                let partial_owner = (
+                    partial_source.as_ptr(),
+                    partial_source.len(),
+                    partial_source.capacity(),
+                );
+                let (result, partial_source) = tls.write(partial_source).await;
+                let err = result.expect_err("partial write crossed physical-only shutdown");
+                assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(err.to_string(), "tls write side already shut down");
+                assert_eq!(
+                    (
+                        partial_source.as_ptr(),
+                        partial_source.len(),
+                        partial_source.capacity(),
+                    ),
+                    partial_owner
+                );
+                assert_eq!(partial_source, b"partial physical-only shutdown");
+                assert!(!tls.connection.wants_write());
+
+                let complete_source = b"complete physical-only shutdown".to_vec();
+                let complete_owner = (
+                    complete_source.as_ptr(),
+                    complete_source.len(),
+                    complete_source.capacity(),
+                );
+                let (result, complete_source) = tls.write_all(complete_source).await;
+                let err = result.expect_err("write_all crossed physical-only shutdown");
+                assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(err.to_string(), "tls write side already shut down");
+                assert_eq!(
+                    (
+                        complete_source.as_ptr(),
+                        complete_source.len(),
+                        complete_source.capacity(),
+                    ),
+                    complete_owner
+                );
+                assert_eq!(complete_source, b"complete physical-only shutdown");
+
+                assert!(!tls.connection.wants_write());
+                assert!(tls.pending_write_tls.is_none());
+                let scratch = tls
+                    .write_tls_buffer
+                    .as_ref()
+                    .expect("rejection lost the reusable write scratch");
+                assert_eq!(
+                    (scratch.as_ptr(), scratch.len(), scratch.capacity()),
+                    scratch_state
+                );
+                assert!(!tls.transport_write_failed);
+                assert!(!tls.write_shutdown);
+                assert!(tls.transport_write_shutdown);
+
+                tls.transport_write_failed = true;
+                let err = tls
+                    .ensure_writable()
+                    .expect_err("transport failure should retain precedence");
+                assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(err.to_string(), "tls transport write failed");
             })
             .expect("executor run failed");
     }

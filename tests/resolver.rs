@@ -506,6 +506,30 @@ fn resolver_hosts_parser_uses_hash_comments_and_keeps_semicolon_aliases() {
 }
 
 #[test]
+fn resolver_hosts_comment_prefix_utf8_matches_streaming_and_borrowed_paths() {
+    let host = "hosts-comment-prefix.flowio.invalid";
+    let contents = b"192.0.2.70 hosts-comment-prefix.flowio.invalid # \xff ignored\n\
+192.0.2.71 hosts-comment-prefix.flowio.invalid \xff # invalid before comment\n\
+192.0.2.72 preceding ; hosts-comment-prefix.flowio.invalid\r\n\
+2001:db8::72 HOSTS-COMMENT-PREFIX.FLOWIO.INVALID. # \xc0\xaf";
+    let expected = [
+        SocketAddr::from((Ipv4Addr::new(192, 0, 2, 70), 5432)),
+        SocketAddr::from((Ipv4Addr::new(192, 0, 2, 72), 5432)),
+        SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x72), 5432)),
+    ];
+
+    let borrowed = parse_hosts_bytes(contents, host, 5432)
+        .expect("invalid UTF-8 confined to hosts comments should be ignored");
+    assert_eq!(borrowed, expected);
+
+    let hosts = TempResolverFile::padded("hosts-comment-prefix", contents, contents.len());
+    let streamed = resolve_local_host_with_hosts_path(hosts.path(), host, 5432)
+        .expect("the streaming hosts reader should share comment-prefix semantics");
+    assert_eq!(streamed, expected);
+    assert_eq!(streamed, borrowed);
+}
+
+#[test]
 fn resolver_all_invalid_hosts_lines_continue_to_upstream_dns() {
     let host = "all-invalid-hosts.flowio.invalid";
     let hosts = TempResolverFile::padded("hosts-all-invalid", b"\xff\n\xc0\xaf\n", 5);

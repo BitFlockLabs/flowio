@@ -309,8 +309,8 @@ fn classify_dns_timeout<T>(
 ) -> Result<T, QueryAttemptError> {
     match result {
         Ok(output) => Ok(output),
+        Err(TimeoutError::Runtime(err)) => Err(QueryAttemptError::Terminal(err)),
         Err(TimeoutError::Elapsed) if total_limited => Err(QueryAttemptError::TotalTimeout),
-        Err(TimeoutError::Runtime(err)) if total_limited => Err(QueryAttemptError::Terminal(err)),
         Err(err) => Err(QueryAttemptError::Timeout(err)),
     }
 }
@@ -456,9 +456,10 @@ impl DnsResolver {
     /// This first handles IP literals, `localhost`, and `/etc/hosts`, then
     /// falls back to UDP DNS queries if needed. Local aliases compare
     /// case-insensitively and treat a trailing root dot as equivalent. A
-    /// hosts line that is not valid UTF-8 is ignored as a whole without
-    /// suppressing valid lines before or after it. Only `#` starts a hosts
-    /// comment; `;` remains ordinary alias text.
+    /// hosts entry prefix before the first raw `#` byte is validated as UTF-8;
+    /// an invalid prefix is ignored without suppressing valid sibling lines,
+    /// while invalid bytes confined to the comment are ignored. Only `#`
+    /// starts a hosts comment; `;` remains ordinary alias text.
     ///
     /// # Execution and failover
     ///
@@ -470,8 +471,9 @@ impl DnsResolver {
     /// attempt creates a connected UDP socket. A true query expiry advances
     /// to the next nameserver; a submitted timed-out receive retains its
     /// buffer until target-CQE retirement, so a later attempt allocates a
-    /// replacement. Timer `OutOfMemory` stops that family lookup without
-    /// attempting another server.
+    /// replacement. A timer-runtime failure preserves its exact `io::Error`
+    /// and stops that family lookup without attempting another server;
+    /// ordinary UDP I/O errors retain nameserver failover.
     ///
     /// One aggregate deadline starts only after literal, `localhost`, and
     /// hosts-file lookup miss. Its default is five seconds and it spans every
@@ -664,11 +666,6 @@ impl DnsResolver {
                 Err(QueryAttemptError::Terminal(err)) => {
                     return Err(DnsLookupError::Terminal(err));
                 }
-                Err(QueryAttemptError::Timeout(TimeoutError::Runtime(err)))
-                    if err.kind() == io::ErrorKind::OutOfMemory =>
-                {
-                    return Err(DnsLookupError::Terminal(err));
-                }
                 Err(err) => last_err = Some(err.into_io_error()),
             }
         }
@@ -710,12 +707,12 @@ impl DnsResolver {
         )?;
 
         let owned_packet = std::mem::take(packet);
-        let (send, _) = deadline.timeout(
+        let (send, total_limited) = deadline.timeout(
             DnsDeadlineCheckpoint::BeforeSend,
             None,
             socket.send(owned_packet),
         )?;
-        let (send_result, returned_packet) = classify_dns_timeout(send.await, true)?;
+        let (send_result, returned_packet) = classify_dns_timeout(send.await, total_limited)?;
         // Restore ownership before propagating a send error so a later
         // nameserver attempt receives the same encoded query allocation.
         *packet = returned_packet;
@@ -1101,7 +1098,7 @@ fn read_hosts_file(
         }
 
         if result_error.is_none()
-            && let Err(err) = parse_hosts_bytes(&line_bytes, host, port, addrs)
+            && let Err(err) = parse_hosts_line_bytes(&line_bytes, host, port, addrs)
         {
             result_error = Some(err);
         }
@@ -1116,6 +1113,7 @@ fn read_hosts_file(
     Ok(())
 }
 
+#[cfg(any(feature = "fuzzing", feature = "test-support"))]
 pub(crate) fn parse_hosts_bytes(
     contents: &[u8],
     host: &str,
@@ -1123,27 +1121,41 @@ pub(crate) fn parse_hosts_bytes(
     addrs: &mut Vec<SocketAddr>,
 ) -> io::Result<()> {
     for line_bytes in contents.split(|byte| *byte == b'\n') {
-        let Ok(line) = std::str::from_utf8(line_bytes) else {
-            continue;
-        };
-        let line = strip_hosts_comment(line);
-        if line.is_empty() {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let Some(addr) = parts.next() else {
-            continue;
-        };
-        let Ok(ip) = addr.parse::<IpAddr>() else {
-            continue;
-        };
-
-        if parts.any(|name| dns_name_eq(name, host)) {
-            push_unique_resolved_addr(addrs, SocketAddr::new(ip, port))?;
-        }
+        parse_hosts_line_bytes(line_bytes, host, port, addrs)?;
     }
 
+    Ok(())
+}
+
+fn parse_hosts_line_bytes(
+    line_bytes: &[u8],
+    host: &str,
+    port: u16,
+    addrs: &mut Vec<SocketAddr>,
+) -> io::Result<()> {
+    let entry_end = line_bytes
+        .iter()
+        .position(|byte| *byte == b'#')
+        .unwrap_or(line_bytes.len());
+    let Ok(line) = std::str::from_utf8(&line_bytes[..entry_end]) else {
+        return Ok(());
+    };
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    let mut parts = line.split_whitespace();
+    let Some(addr) = parts.next() else {
+        return Ok(());
+    };
+    let Ok(ip) = addr.parse::<IpAddr>() else {
+        return Ok(());
+    };
+
+    if parts.any(|name| dns_name_eq(name, host)) {
+        push_unique_resolved_addr(addrs, SocketAddr::new(ip, port))?;
+    }
     Ok(())
 }
 
@@ -1245,12 +1257,6 @@ fn max_read_with_over_limit_sentinel(max_bytes: usize) -> io::Result<usize> {
             "resolver file limit cannot represent an over-limit sentinel",
         )
     })
-}
-
-fn strip_hosts_comment(line: &str) -> &str {
-    line.split_once('#')
-        .map(|(head, _)| head.trim())
-        .unwrap_or_else(|| line.trim())
 }
 
 fn unspecified_addr(nameserver: SocketAddr) -> SocketAddr {
@@ -2732,8 +2738,9 @@ mod tests {
     }
 
     #[test]
-    fn dns_timeout_classification_keeps_total_and_attempt_outcomes_distinct() {
+    fn dns_timeout_classification_keeps_elapsed_distinct_and_runtime_terminal() {
         assert!(matches!(classify_dns_timeout(Ok(7u8), true), Ok(7)));
+        assert!(matches!(classify_dns_timeout(Ok(7u8), false), Ok(7)));
         assert!(matches!(
             classify_dns_timeout::<()>(Err(TimeoutError::Elapsed), true),
             Err(QueryAttemptError::TotalTimeout)
@@ -2743,29 +2750,28 @@ mod tests {
             Err(QueryAttemptError::Timeout(TimeoutError::Elapsed))
         ));
 
-        let total_runtime = classify_dns_timeout::<()>(
-            Err(TimeoutError::Runtime(io::Error::from(
-                io::ErrorKind::OutOfMemory,
-            ))),
-            true,
-        );
-        assert!(matches!(
-            total_runtime,
-            Err(QueryAttemptError::Terminal(err))
-                if err.kind() == io::ErrorKind::OutOfMemory
-        ));
-
-        let attempt_runtime = classify_dns_timeout::<()>(
-            Err(TimeoutError::Runtime(io::Error::from(
+        for total_limited in [false, true] {
+            for kind in [
                 io::ErrorKind::NotConnected,
-            ))),
-            false,
-        );
-        assert!(matches!(
-            attempt_runtime,
-            Err(QueryAttemptError::Timeout(TimeoutError::Runtime(err)))
-                if err.kind() == io::ErrorKind::NotConnected
-        ));
+                io::ErrorKind::OutOfMemory,
+                io::ErrorKind::Interrupted,
+            ] {
+                let outcome = classify_dns_timeout::<()>(
+                    Err(TimeoutError::Runtime(io::Error::new(
+                        kind,
+                        "injected DNS timer-runtime failure",
+                    ))),
+                    total_limited,
+                );
+                match outcome {
+                    Err(QueryAttemptError::Terminal(err)) => {
+                        assert_eq!(err.kind(), kind);
+                        assert_eq!(err.to_string(), "injected DNS timer-runtime failure");
+                    }
+                    _ => panic!("timer-runtime failure was not terminal"),
+                }
+            }
+        }
     }
 
     #[cfg(not(miri))]
