@@ -7,6 +7,7 @@ const RSA_PKCS1_SHA1: &[u8] = &[
 ];
 const ECDSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01];
 const UNKNOWN_SIGNATURE_ALGORITHM: &[u8] = &[0x06, 0x03, 0x2a, 0x03, 0x04];
+const MINIMAL_SIGNATURE_TLV: [u8; 4] = [0x03, 0x02, 0x00, 0xa5];
 
 const RSA_SHA256_CERT_HEX: &str = include_str!("fixtures/tls_channel_binding/rsa_sha256.der.hex");
 const ECDSA_SHA256_CERT_HEX: &str =
@@ -131,12 +132,12 @@ fn tls_server_end_point_rejects_malformed_certificate_der() {
 fn tls_server_end_point_requires_exact_certificate_children() {
     let first = encode_sequence(&[]);
     let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
-    let signature = [0x03, 0x01, 0x00];
+    let signature = MINIMAL_SIGNATURE_TLV;
     let wrong_first = encode_tlv(0x02, &[0x00]);
     let wrong_second = encode_tlv(0x04, &[]);
     let wrong_third = encode_tlv(0x04, &[0x00]);
     let extra_sequence = encode_sequence(&[]);
-    let extra_signature = [0x03, 0x01, 0x00];
+    let extra_signature = MINIMAL_SIGNATURE_TLV;
 
     let malformed = [
         (
@@ -190,7 +191,7 @@ fn tls_server_end_point_requires_exact_certificate_children() {
 fn tls_server_end_point_rejects_trailing_bytes() {
     let first = encode_sequence(&[]);
     let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
-    let signature = [0x03, 0x01, 0x00];
+    let signature = MINIMAL_SIGNATURE_TLV;
     let trailing = [0x05, 0x00];
 
     let trailing_inside_outer = encode_sequence(&[&first, &algorithm, &signature, &trailing]);
@@ -206,7 +207,7 @@ fn tls_server_end_point_accepts_long_form_der_lengths() {
     for body_len in [128, 130] {
         let padding = vec![0u8; body_len];
         let first = encode_sequence(&[&padding]);
-        let third = [0x03, 0x01, 0x00];
+        let third = MINIMAL_SIGNATURE_TLV;
         let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
         let cert = encode_sequence(&[&first, &algorithm, &third]);
 
@@ -233,9 +234,63 @@ fn tls_server_end_point_rejects_noncanonical_der_lengths() {
     zero_padded_first.extend_from_slice(&[0x30, 0x82, 0x00, 0x80]);
     zero_padded_first.resize(132, 0);
     let algorithm = encode_sequence(&[RSA_PKCS1_SHA256.as_ref()]);
-    let signature = [0x03, 0x01, 0x00];
+    let signature = MINIMAL_SIGNATURE_TLV;
     let zero_padded_child = encode_sequence(&[&zero_padded_first, &algorithm, &signature]);
     assert_eq!(tls_server_end_point(&zero_padded_child), None);
+}
+
+#[test]
+fn tls_server_end_point_validates_signature_bit_string_envelope() {
+    let missing_unused_bits = certificate_with_signature_body(RSA_PKCS1_SHA256.as_ref(), &[]);
+    assert_eq!(
+        tls_server_end_point(&missing_unused_bits),
+        None,
+        "BIT STRING without an unused-bit-count octet was accepted"
+    );
+
+    for unused_bits in 1..=7 {
+        let no_signature_bytes = [unused_bits];
+        let with_signature_byte = [unused_bits, 0x80];
+        for (shape, signature_body) in [
+            ("without signature bytes", no_signature_bytes.as_slice()),
+            ("with a signature byte", with_signature_byte.as_slice()),
+        ] {
+            let certificate =
+                certificate_with_signature_body(RSA_PKCS1_SHA256.as_ref(), signature_body);
+            assert_eq!(
+                tls_server_end_point(&certificate),
+                None,
+                "unused-bit count {unused_bits} {shape} was accepted"
+            );
+        }
+    }
+
+    for unused_bits in [8, u8::MAX] {
+        let certificate =
+            certificate_with_signature_body(RSA_PKCS1_SHA256.as_ref(), &[unused_bits, 0x00]);
+        assert_eq!(
+            tls_server_end_point(&certificate),
+            None,
+            "out-of-range unused-bit count {unused_bits} was accepted"
+        );
+    }
+
+    let certificate = certificate_with_signature_body(RSA_PKCS1_SHA256.as_ref(), &[0, 0xa5]);
+    assert_eq!(
+        tls_server_end_point(&certificate),
+        Some(Sha256::digest(&certificate).to_vec()),
+        "octet-aligned nonempty signature BIT STRING was rejected"
+    );
+}
+
+#[test]
+fn tls_server_end_point_rejects_empty_signature_payload() {
+    let certificate = certificate_with_signature_body(RSA_PKCS1_SHA256.as_ref(), &[0]);
+    assert_eq!(
+        tls_server_end_point(&certificate),
+        None,
+        "BIT STRING without a signature payload octet was accepted"
+    );
 }
 
 #[test]
@@ -279,8 +334,12 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 /// Minimal stub certificate DER where only signatureAlgorithm is meaningful
 /// for tls_server_end_point.
 fn certificate_with_algorithm(algorithm_oid: &[u8]) -> Vec<u8> {
+    certificate_with_signature_body(algorithm_oid, &[0, 0xa5])
+}
+
+fn certificate_with_signature_body(algorithm_oid: &[u8], signature_body: &[u8]) -> Vec<u8> {
     let first = [0x30, 0x00];
-    let third = [0x03, 0x01, 0x00];
     let algorithm = encode_sequence(&[algorithm_oid]);
-    encode_sequence(&[&first, &algorithm, &third])
+    let signature = encode_tlv(0x03, signature_body);
+    encode_sequence(&[&first, &algorithm, &signature])
 }

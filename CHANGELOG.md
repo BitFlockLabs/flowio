@@ -124,6 +124,27 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- Metadata-free UDP `recv_msg` and `recv_from` now reject only payload
+  truncation. Discarded ancillary metadata no longer turns a complete datagram
+  into `InvalidData` when those APIs requested and return no control data.
+- A DNS timer-runtime failure now preserves its exact `io::Error` and stops
+  the affected address family's remaining nameserver and CNAME-follow-up work.
+  Ordinary UDP I/O errors and true per-attempt expiry retain failover. An
+  A-side terminal error stops before the AAAA query. An already completed A
+  address retains precedence over a later AAAA-side terminal error.
+- `/etc/hosts` parsing now validates UTF-8 only in the entry prefix before the
+  first raw `#`. Invalid bytes confined to a comment no longer suppress an
+  otherwise valid entry; a line whose entry prefix is not valid UTF-8 is
+  skipped individually, and semicolons remain ordinary alias text.
+- TLS `write` and `write_all` now reject both logical write shutdown and
+  completed physical transport-write shutdown with `BrokenPipe` before
+  plaintext admission or scratch mutation. They return the exact source
+  owner, while an earlier transport-write failure retains precedence over
+  either shutdown state.
+- System resolver parsing now retains at most eight unique valid nameservers
+  from `/etc/resolv.conf`. Later nameserver directives are ignored; duplicates
+  do not consume the bound and first-seen retry order is retained. Explicit
+  `DnsResolver::new` input remains strict and rejects a ninth unique entry.
 - DNS resolution now stops retrying other nameservers when a successfully
   parsed CNAME chain exceeds the remaining total-hop budget. This local policy
   failure still allows the sibling address family to supply a usable address.
@@ -170,8 +191,13 @@ Alpha prereleases carry no compatibility guarantee.
 - `tls_server_end_point` now derives a channel-binding digest only after the
   certificate DER is consumed exactly as the ordered `TBSCertificate`,
   `signatureAlgorithm`, and `signatureValue` outer fields. Malformed, missing,
-  reordered, extra, or trailing certificate structure returns `None`; the
-  existing supported digest mapping is unchanged.
+  reordered, extra, or trailing certificate structure returns `None`. The
+  outer certificate header and its three immediate child headers accept only
+  definite, canonical DER lengths, and the `signatureValue` BIT STRING must
+  contain an unused-bit-count octet of zero followed by at least one signature
+  payload octet. A missing or nonzero count, or an empty `03 01 00` payload,
+  returns `None`. The helper still does not validate the signature payload, and
+  the existing supported digest mapping is unchanged.
 - TLS client scratch sizes are validated before allocation. Zero or
   unrepresentable capacities return `InvalidInput`, initial reservation
   failure returns `OutOfMemory`, and the exceptional missing-scratch recovery

@@ -44,6 +44,8 @@ const COMPLETION_DRAIN_REENTRANCY_CHILD_TEST: &str =
 const COMPLETION_DRAIN_DESCRIPTOR_CHILD_ENV: &str = "FLOWIO_COMPLETION_DRAIN_DESCRIPTOR_CHILD";
 const COMPLETION_DRAIN_DESCRIPTOR_CHILD_TEST: &str =
     "runtime_real_completion_drain_closes_payload_descriptor_without_ring_reentry";
+const CANCEL_WRITE_ALL_CHILD_ENV: &str = "FLOWIO_CANCEL_WRITE_ALL_CHILD";
+const CANCEL_WRITE_ALL_CHILD_TEST: &str = "runtime_cancel_write_all_mid_flight";
 
 fn new_executor() -> Executor {
     Executor::new().expect("failed to construct runtime executor")
@@ -3927,46 +3929,90 @@ fn runtime_cancel_in_flight_write_on_drop() {
         .expect("executor run failed");
 }
 
-/// Multiple concurrent futures can be cancelled independently.
+/// Multiple concurrent futures can be cancelled together without releasing
+/// their buffers before the original target CQEs retire.
 #[test]
 fn runtime_cancel_multiple_concurrent() {
     let mut executor = new_executor();
 
     executor
         .run(async move {
-            let (mut s1, _r1) = UnixStream::pair().expect("pair 1");
-            let (mut s2, _r2) = UnixStream::pair().expect("pair 2");
-            let (mut s3, _r3) = UnixStream::pair().expect("pair 3");
+            let (mut s1, r1) = UnixStream::pair().expect("pair 1");
+            let (mut s2, r2) = UnixStream::pair().expect("pair 2");
+            let (mut s3, r3) = UnixStream::pair().expect("pair 3");
+            let drops = Rc::new(Cell::new(0));
 
-            // Start 3 reads that will never complete, cancel all via timeout.
-            let t1 = timeout(Duration::from_millis(5), async {
-                let buf = vec![0u8; 8];
-                s1.read(buf, 8).await
-            });
-            let t2 = timeout(Duration::from_millis(5), async {
-                let buf = vec![0u8; 8];
-                s2.read(buf, 8).await
-            });
-            let t3 = timeout(Duration::from_millis(5), async {
-                let buf = vec![0u8; 8];
-                s3.read(buf, 8).await
-            });
+            {
+                // Keep the `pin!` backing temporaries in this scope so all
+                // three timed reads are dropped before the health check.
+                // Start three reads that will never complete, then cancel all
+                // of them together through their timeouts.
+                let mut t1 = std::pin::pin!(timeout(Duration::from_millis(5), async {
+                    let buf = DropTrackedReadWrite::zeroed(8, &drops);
+                    let (result, _buf) = s1.read(buf, 8).await;
+                    result
+                }));
+                let mut t2 = std::pin::pin!(timeout(Duration::from_millis(5), async {
+                    let buf = DropTrackedReadWrite::zeroed(8, &drops);
+                    let (result, _buf) = s2.read(buf, 8).await;
+                    result
+                }));
+                let mut t3 = std::pin::pin!(timeout(Duration::from_millis(5), async {
+                    let buf = DropTrackedReadWrite::zeroed(8, &drops);
+                    let (result, _buf) = s3.read(buf, 8).await;
+                    result
+                }));
+                let mut result1 = None;
+                let mut result2 = None;
+                let mut result3 = None;
 
-            let result1 = t1.await;
-            assert!(
-                matches!(result1, Err(TimeoutError::Elapsed)),
-                "first concurrent read should time out: {result1:?}"
+                fn poll_slot<F: Future>(
+                    future: Pin<&mut F>,
+                    result: &mut Option<F::Output>,
+                    cx: &mut Context<'_>,
+                ) {
+                    if result.is_none()
+                        && let Poll::Ready(output) = future.poll(cx)
+                    {
+                        *result = Some(output);
+                    }
+                }
+
+                poll_fn(|cx| {
+                    poll_slot(t1.as_mut(), &mut result1, cx);
+                    poll_slot(t2.as_mut(), &mut result2, cx);
+                    poll_slot(t3.as_mut(), &mut result3, cx);
+
+                    if result1.is_some() && result2.is_some() && result3.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+
+                assert!(
+                    matches!(result1, Some(Err(TimeoutError::Elapsed))),
+                    "first concurrent read should time out: {result1:?}"
+                );
+                assert!(
+                    matches!(result2, Some(Err(TimeoutError::Elapsed))),
+                    "second concurrent read should time out: {result2:?}"
+                );
+                assert!(
+                    matches!(result3, Some(Err(TimeoutError::Elapsed))),
+                    "third concurrent read should time out: {result3:?}"
+                );
+            }
+
+            assert_eq!(
+                drops.get(),
+                0,
+                "concurrent read payloads dropped before their target CQEs"
             );
-            let result2 = t2.await;
-            assert!(
-                matches!(result2, Err(TimeoutError::Elapsed)),
-                "second concurrent read should time out: {result2:?}"
-            );
-            let result3 = t3.await;
-            assert!(
-                matches!(result3, Err(TimeoutError::Elapsed)),
-                "third concurrent read should time out: {result3:?}"
-            );
+
+            drop((r1, r2, r3));
+            wait_for_drop_count(&drops, 3).await;
 
             // Executor is still healthy.
             sleep(Duration::from_millis(5))
@@ -3982,22 +4028,49 @@ fn runtime_cancel_multiple_concurrent() {
 /// progress then blocks.
 #[test]
 fn runtime_cancel_write_all_mid_flight() {
+    if std::env::var_os(CANCEL_WRITE_ALL_CHILD_ENV).is_none() {
+        let started = Instant::now();
+        run_exact_test_child_with_watchdog(
+            CANCEL_WRITE_ALL_CHILD_TEST,
+            CANCEL_WRITE_ALL_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancelled write_all regression took {elapsed:?}; expected explicit release well below the old ten-second floor"
+        );
+        return;
+    }
+
     let mut executor = new_executor();
 
     executor
         .run(async move {
             let (mut writer, mut reader) = UnixStream::pair().expect("socketpair failed");
+            let reader_release = Rc::new(Cell::new(false));
+            let reader_released = Rc::new(Cell::new(false));
+            let reader_waker = Rc::new(RefCell::new(None::<Waker>));
 
-            // Spawn a slow reader that drains a little then stops.
-            Executor::spawn(async move {
-                // Read 64KB then stop — this gives write_all room for one
-                // partial write but not enough for the full 1MB.
-                let buf = vec![0u8; 65536];
-                let (res, _buf) = reader.read(buf, 65536).await;
-                let _ = res;
-                // Reader hangs here — never reads again.  The write side
-                // will block once the socket buffer refills.
-                sleep(Duration::from_secs(10)).await.unwrap();
+            // Drain once, then retain the peer until the test explicitly
+            // releases it after observing the cancelled partial write.
+            let reader_handle = Executor::spawn({
+                let reader_release = Rc::clone(&reader_release);
+                let reader_released = Rc::clone(&reader_released);
+                let reader_waker = Rc::clone(&reader_waker);
+                async move {
+                    // Read 64KB then stop — this gives write_all room for one
+                    // partial write but not enough for the full 1MB.
+                    let buf = vec![0u8; 65536];
+                    let (res, _buf) = reader.read(buf, 65536).await;
+                    let _ = res;
+                    ExternalWakeFuture {
+                        release: reader_release,
+                        completed: reader_released,
+                        waker: reader_waker,
+                    }
+                    .await;
+                }
             })
             .expect("spawn reader failed");
 
@@ -4006,7 +4079,8 @@ fn runtime_cancel_write_all_mid_flight() {
 
             // write_all with 1MB — will make partial progress (socket buffer
             // + 64KB drained by reader), then block on resubmission.
-            let big = vec![0xCCu8; 1024 * 1024];
+            let drops = Rc::new(Cell::new(0));
+            let big = DropTrackedReadOnly::new(vec![0xCCu8; 1024 * 1024], &drops);
             let result = timeout(Duration::from_millis(50), async {
                 let (res, _buf) = writer.write_all(big).await;
                 res
@@ -4017,6 +4091,32 @@ fn runtime_cancel_write_all_mid_flight() {
                 matches!(result, Err(TimeoutError::Elapsed)),
                 "write_all should have timed out: {result:?}"
             );
+            assert_eq!(
+                drops.get(),
+                0,
+                "partial write_all payload dropped before its target CQE"
+            );
+            assert!(
+                reader_waker.borrow().is_some(),
+                "reader did not retain the peer after its single drain"
+            );
+            assert!(
+                !reader_released.get(),
+                "reader release gate opened before the cancellation proof"
+            );
+
+            reader_release.set(true);
+            reader_waker
+                .borrow()
+                .as_ref()
+                .expect("reader release waker missing")
+                .wake_by_ref();
+            drop(reader_waker.borrow_mut().take());
+            reader_handle
+                .await
+                .expect("explicitly released reader task was cancelled");
+            assert!(reader_released.get(), "reader release gate did not open");
+            wait_for_drop_count(&drops, 1).await;
 
             // Executor continues to function after the mid-flight cancel.
             sleep(Duration::from_millis(5))

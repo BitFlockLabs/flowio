@@ -106,21 +106,9 @@ static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
 
 enum QueryAttemptError {
     Io(io::Error),
-    Timeout(TimeoutError),
+    AttemptTimeout,
     Terminal(io::Error),
     TotalTimeout,
-}
-
-impl QueryAttemptError {
-    fn into_io_error(self) -> io::Error {
-        match self {
-            Self::Io(err) | Self::Terminal(err) | Self::Timeout(TimeoutError::Runtime(err)) => err,
-            Self::Timeout(TimeoutError::Elapsed) => {
-                io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
-            }
-            Self::TotalTimeout => total_query_timeout_error(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -309,9 +297,9 @@ fn classify_dns_timeout<T>(
 ) -> Result<T, QueryAttemptError> {
     match result {
         Ok(output) => Ok(output),
-        Err(TimeoutError::Runtime(err)) => Err(QueryAttemptError::Terminal(err)),
         Err(TimeoutError::Elapsed) if total_limited => Err(QueryAttemptError::TotalTimeout),
-        Err(err) => Err(QueryAttemptError::Timeout(err)),
+        Err(TimeoutError::Elapsed) => Err(QueryAttemptError::AttemptTimeout),
+        Err(TimeoutError::Runtime(err)) => Err(QueryAttemptError::Terminal(err)),
     }
 }
 
@@ -359,17 +347,19 @@ impl DnsResolver {
     ///
     /// This performs a synchronous filesystem read. Call it during setup, then
     /// store the resulting nameserver list for reuse across lookups. The file
-    /// read is limited to 64 KiB. UTF-8 is validated per directive after the
-    /// earliest `#` or `;` comment marker, so a malformed directive line is
-    /// skipped without suppressing valid siblings, while malformed comment
-    /// bytes are ignored.
+    /// read is limited to 64 KiB. The earliest raw `#` or `;` comment marker is
+    /// removed before only the preceding directive is validated as UTF-8, so a
+    /// malformed directive line is skipped without suppressing valid siblings,
+    /// while malformed comment bytes are ignored. At most eight unique valid
+    /// nameservers are retained; duplicates do not consume that bound and
+    /// first-seen retry order is preserved.
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidData`] when `/etc/resolv.conf` exceeds
+    /// Later valid nameserver directives after the first eight unique entries
+    /// are ignored. Returns [`io::ErrorKind::InvalidData`] when the file exceeds
     /// 64 KiB and [`io::ErrorKind::NotFound`] when no valid nameserver remains.
-    /// Other file and resolver-construction errors retain their existing
-    /// classifications.
+    /// Other file errors retain their existing classifications.
     pub fn from_system() -> io::Result<Self> {
         let nameservers = read_resolv_conf(RESOLV_CONF_PATH)?;
         Self::new(nameservers)
@@ -400,10 +390,7 @@ impl DnsResolver {
                 continue;
             }
             if unique_len == MAX_NAMESERVERS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "resolver supports at most eight unique nameservers",
-                ));
+                return Err(nameserver_limit_error());
             }
             nameservers[unique_len] = nameserver;
             unique_len += 1;
@@ -457,7 +444,7 @@ impl DnsResolver {
     /// falls back to UDP DNS queries if needed. Local aliases compare
     /// case-insensitively and treat a trailing root dot as equivalent. A
     /// hosts entry prefix before the first raw `#` byte is validated as UTF-8;
-    /// an invalid prefix is ignored without suppressing valid sibling lines,
+    /// a line whose entry prefix is not valid UTF-8 is skipped individually,
     /// while invalid bytes confined to the comment are ignored. Only `#`
     /// starts a hosts comment; `;` remains ordinary alias text.
     ///
@@ -468,12 +455,12 @@ impl DnsResolver {
     /// Non-literal names synchronously inspect `/etc/hosts`; each upstream DNS
     /// resolution creates one owned query and reusable response buffer shared
     /// across its sequential A, AAAA, and CNAME-follow-up work, and each
-    /// attempt creates a connected UDP socket. A true query expiry advances
-    /// to the next nameserver; a submitted timed-out receive retains its
-    /// buffer until target-CQE retirement, so a later attempt allocates a
-    /// replacement. A timer-runtime failure preserves its exact `io::Error`
-    /// and stops that family lookup without attempting another server;
-    /// ordinary UDP I/O errors retain nameserver failover.
+    /// attempt creates a connected UDP socket. A true per-attempt response
+    /// expiry advances to the next nameserver; a submitted timed-out receive
+    /// retains its buffer until target-CQE retirement, so a later attempt
+    /// allocates a replacement. A timer-runtime failure preserves its exact
+    /// `io::Error` and stops that family lookup without attempting another
+    /// server; ordinary UDP I/O errors retain nameserver failover.
     ///
     /// One aggregate deadline starts only after literal, `localhost`, and
     /// hosts-file lookup miss. Its default is five seconds and it spans every
@@ -484,7 +471,7 @@ impl DnsResolver {
     /// completion wins the timer when both become ready in the same poll,
     /// following FlowIO's general timeout contract. A completed address also
     /// keeps the existing result precedence over a later family's aggregate
-    /// expiry.
+    /// expiry or timer-runtime failure.
     ///
     /// The aggregate deadline cannot preempt the bounded synchronous hosts
     /// read or the synchronous socket, bind, and connect syscalls. It is
@@ -666,7 +653,13 @@ impl DnsResolver {
                 Err(QueryAttemptError::Terminal(err)) => {
                     return Err(DnsLookupError::Terminal(err));
                 }
-                Err(err) => last_err = Some(err.into_io_error()),
+                Err(QueryAttemptError::Io(err)) => last_err = Some(err),
+                Err(QueryAttemptError::AttemptTimeout) => {
+                    last_err = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS query timed out",
+                    ));
+                }
             }
         }
 
@@ -796,6 +789,13 @@ impl DnsResolver {
             .await;
         finish_dns_family_lookups(current, port, addrs, a, aaaa)
     }
+}
+
+fn nameserver_limit_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "resolver supports at most eight unique nameservers",
+    )
 }
 
 fn finish_dns_family_lookups(
@@ -1127,23 +1127,29 @@ pub(crate) fn parse_hosts_bytes(
     Ok(())
 }
 
+/// Returns the trimmed UTF-8 prefix before the first raw comment-boundary byte.
+///
+/// Only bytes before the boundary are validated as UTF-8; comment bytes are
+/// ignored. An invalid, empty, or whitespace-only prefix returns `None`.
+fn config_line_prefix(line_bytes: &[u8], is_comment: impl Fn(u8) -> bool) -> Option<&str> {
+    let prefix_end = line_bytes
+        .iter()
+        .copied()
+        .position(is_comment)
+        .unwrap_or(line_bytes.len());
+    let line = std::str::from_utf8(&line_bytes[..prefix_end]).ok()?.trim();
+    if line.is_empty() { None } else { Some(line) }
+}
+
 fn parse_hosts_line_bytes(
     line_bytes: &[u8],
     host: &str,
     port: u16,
     addrs: &mut Vec<SocketAddr>,
 ) -> io::Result<()> {
-    let entry_end = line_bytes
-        .iter()
-        .position(|byte| *byte == b'#')
-        .unwrap_or(line_bytes.len());
-    let Ok(line) = std::str::from_utf8(&line_bytes[..entry_end]) else {
+    let Some(line) = config_line_prefix(line_bytes, |byte| byte == b'#') else {
         return Ok(());
     };
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(());
-    }
 
     let mut parts = line.split_whitespace();
     let Some(addr) = parts.next() else {
@@ -1169,20 +1175,12 @@ fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
 }
 
 pub(crate) fn parse_resolv_conf_bytes(contents: &[u8]) -> io::Result<Vec<SocketAddr>> {
-    let mut nameservers = Vec::new();
+    let mut nameservers = Vec::with_capacity(MAX_NAMESERVERS);
 
     for line_bytes in contents.split(|byte| *byte == b'\n') {
-        let directive_end = line_bytes
-            .iter()
-            .position(|byte| matches!(*byte, b'#' | b';'))
-            .unwrap_or(line_bytes.len());
-        let Ok(line) = std::str::from_utf8(&line_bytes[..directive_end]) else {
+        let Some(line) = config_line_prefix(line_bytes, |byte| matches!(byte, b'#' | b';')) else {
             continue;
         };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
 
         let mut parts = line.split_whitespace();
         if parts.next() != Some("nameserver") {
@@ -1197,7 +1195,9 @@ pub(crate) fn parse_resolv_conf_bytes(contents: &[u8]) -> io::Result<Vec<SocketA
         };
 
         let socket = SocketAddr::new(ip, DNS_PORT);
-        push_unique_socket_addr(&mut nameservers, socket);
+        if nameservers.len() < MAX_NAMESERVERS {
+            push_unique_socket_addr(&mut nameservers, socket);
+        }
     }
 
     if nameservers.is_empty() {
@@ -2355,7 +2355,7 @@ mod tests {
         assert_eq!(qtype, step.qtype, "unexpected scripted DNS query type");
 
         if matches!(&step.outcome, ScriptedQueryOutcome::AttemptTimeout) {
-            return Some(Err(QueryAttemptError::Timeout(TimeoutError::Elapsed)));
+            return Some(Err(QueryAttemptError::AttemptTimeout));
         }
         if let ScriptedQueryOutcome::TerminalRuntime(errno) = &step.outcome {
             return Some(Err(QueryAttemptError::Terminal(
@@ -2525,6 +2525,94 @@ mod tests {
             .borrow_mut()
             .take()
             .expect("test resolver task did not publish its result")
+    }
+
+    #[test]
+    fn config_line_prefix_preserves_exact_hosts_and_resolv_conf_grammar() {
+        struct Case {
+            line: &'static [u8],
+            hosts: Option<&'static str>,
+            resolv_conf: Option<&'static str>,
+        }
+
+        const CASES: &[Case] = &[
+            Case {
+                line: b"",
+                hosts: None,
+                resolv_conf: None,
+            },
+            Case {
+                line: b"  nameserver 192.0.2.1 \r\n",
+                hosts: Some("nameserver 192.0.2.1"),
+                resolv_conf: Some("nameserver 192.0.2.1"),
+            },
+            Case {
+                line: b"\t\r\n",
+                hosts: None,
+                resolv_conf: None,
+            },
+            Case {
+                line: b"# \xff comment",
+                hosts: None,
+                resolv_conf: None,
+            },
+            Case {
+                line: b"; \xff comment",
+                hosts: None,
+                resolv_conf: None,
+            },
+            Case {
+                line: b"value # \xff comment",
+                hosts: Some("value"),
+                resolv_conf: Some("value"),
+            },
+            Case {
+                line: b"value ; \xff comment",
+                hosts: None,
+                resolv_conf: Some("value"),
+            },
+            Case {
+                line: b"\xff value # comment",
+                hosts: None,
+                resolv_conf: None,
+            },
+            Case {
+                line: b"value ; first # second",
+                hosts: Some("value ; first"),
+                resolv_conf: Some("value"),
+            },
+            Case {
+                line: b"value # first ; second",
+                hosts: Some("value"),
+                resolv_conf: Some("value"),
+            },
+            Case {
+                line: b";hosts-alias",
+                hosts: Some(";hosts-alias"),
+                resolv_conf: None,
+            },
+        ];
+
+        for case in CASES {
+            assert_eq!(
+                config_line_prefix(case.line, |byte| byte == b'#'),
+                case.hosts,
+                "hosts grammar drifted for {:?}",
+                case.line
+            );
+            assert_eq!(
+                config_line_prefix(case.line, |byte| matches!(byte, b'#' | b';')),
+                case.resolv_conf,
+                "resolv.conf grammar drifted for {:?}",
+                case.line
+            );
+        }
+
+        let line = b"  borrowed-prefix # comment";
+        let prefix = config_line_prefix(line, |byte| byte == b'#')
+            .expect("valid nonempty prefix should be retained");
+        assert_eq!(prefix, "borrowed-prefix");
+        assert_eq!(prefix.as_ptr(), line[2..].as_ptr());
     }
 
     #[test]
@@ -2747,7 +2835,7 @@ mod tests {
         ));
         assert!(matches!(
             classify_dns_timeout::<()>(Err(TimeoutError::Elapsed), false),
-            Err(QueryAttemptError::Timeout(TimeoutError::Elapsed))
+            Err(QueryAttemptError::AttemptTimeout)
         ));
 
         for total_limited in [false, true] {

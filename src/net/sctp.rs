@@ -12360,24 +12360,33 @@ mod tests {
     #[test]
     fn parse_assoc_addrs_rejects_non_kernel_compact_and_padded_layouts() {
         let compact_ipv4 = assoc_ipv4_entry([192, 0, 2, 10], 1234, 8);
-        let mut legacy_compact_dense = assoc_ipv4_entry([1, 2, 3, 4], 1111, 8);
-        legacy_compact_dense.extend_from_slice(&assoc_ipv4_entry(
-            [5, 6, 7, 8],
-            2222,
-            std::mem::size_of::<libc::sockaddr_in>(),
-        ));
+        let mut two_compact_ipv4 = assoc_ipv4_entry([1, 2, 3, 4], 1111, 8);
+        two_compact_ipv4.extend_from_slice(&assoc_ipv4_entry([5, 6, 7, 8], 2222, 8));
         let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
         let ipv6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let padded_ipv4 = assoc_ipv4_entry([192, 0, 2, 10], 1234, storage_len);
         let padded_ipv6 = assoc_ipv6_entry(ipv6, 4321, 7, 9, storage_len);
 
-        for (payload, addr_count, label) in [
-            (compact_ipv4, 1, "compact IPv4"),
-            (legacy_compact_dense, 2, "legacy compact-plus-dense IPv4"),
-            (padded_ipv4, 1, "storage-padded IPv4"),
-            (padded_ipv6, 1, "storage-padded IPv6"),
+        let dense_error = parse_assoc_addrs(&two_compact_ipv4, 2)
+            .expect_err("two compact IPv4 entries must not satisfy two kernel-sized entries");
+        assert_eq!(dense_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            dense_error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<BufferRangeError>()),
+            Some(&BufferRangeError {
+                offset: 0,
+                width: 2,
+                len: 0,
+            })
+        );
+
+        for (payload, label) in [
+            (compact_ipv4, "compact IPv4"),
+            (padded_ipv4, "storage-padded IPv4"),
+            (padded_ipv6, "storage-padded IPv6"),
         ] {
-            let err = parse_assoc_addrs(&payload, addr_count).expect_err(label);
+            let err = parse_assoc_addrs(&payload, 1).expect_err(label);
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{label}");
         }
     }

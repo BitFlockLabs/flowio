@@ -382,6 +382,7 @@ fn resolver_deduplicates_silent_nameserver_attempts() {
                 .await
                 .expect_err("silent nameserver should time out");
             assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(err.to_string(), "DNS query timed out");
         })
         .expect("executor run failed");
 
@@ -656,6 +657,56 @@ nameserver 192.0.2.53\r\n";
             SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
             SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x53), 53,)),
         ]
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_accepts_eight_unique_nameservers_and_duplicate_at_capacity() {
+    let contents = b"nameserver 192.0.2.1\n\
+nameserver 192.0.2.2\n\
+nameserver 192.0.2.3\n\
+nameserver 192.0.2.4\n\
+nameserver 192.0.2.5\n\
+nameserver 192.0.2.6\n\
+nameserver 192.0.2.7\n\
+nameserver 192.0.2.8\n\
+nameserver 192.0.2.1\n";
+
+    let nameservers = parse_resolv_conf_bytes(contents)
+        .expect("eight unique nameservers plus a duplicate should be accepted");
+    assert_eq!(
+        nameservers,
+        (1..=8)
+            .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 53)))
+            .collect::<Vec<_>>(),
+        "the parser must preserve first-seen order and DNS port 53"
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_retains_the_first_eight_unique_nameservers() {
+    let contents = b"nameserver 192.0.2.4\n\
+nameserver 192.0.2.1\n\
+nameserver 192.0.2.4\n\
+nameserver 192.0.2.7\n\
+nameserver 192.0.2.2\n\
+nameserver 192.0.2.8\n\
+nameserver 192.0.2.3\n\
+nameserver 192.0.2.6\n\
+nameserver 192.0.2.5\n\
+nameserver 192.0.2.1\n\
+nameserver 192.0.2.9\n\
+nameserver 2001:db8::10\n\
+nameserver 198.51.\xff.1\n\
+search ignored.example\n";
+
+    let nameservers = parse_resolv_conf_bytes(contents)
+        .expect("later nameserver directives should be ignored after eight unique entries");
+    assert_eq!(
+        nameservers,
+        [4, 1, 7, 2, 8, 3, 6, 5]
+            .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 53))),
+        "system parsing must retain exactly the first eight unique addresses in retry order"
     );
 }
 

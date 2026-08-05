@@ -1,6 +1,7 @@
 #![no_main]
 //! TLS certificate DER parser and channel-binding derivation over arbitrary
-//! bytes. Property: malformed tags, noncanonical or truncated lengths, and
+//! bytes. Property: malformed tags, noncanonical or truncated lengths, missing
+//! or nonzero signature unused-bit counts, empty signature payloads, and
 //! certificate elements never panic or read out of bounds; supported signature
 //! algorithms remain reachable from the curated corpus.
 use libfuzzer_sys::fuzz_target;

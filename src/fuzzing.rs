@@ -198,11 +198,15 @@ pub fn dns_parse_resolv_conf_bytes(data: &[u8]) {
     let _ = std::hint::black_box(observe_dns_parse_resolv_conf_bytes(data));
 }
 
-/// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
-pub fn sctp_parse_notification(data: &[u8]) {
+fn observe_sctp_parse_notification(data: &[u8]) -> std::io::Result<crate::net::sctp::SctpRecvMeta> {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
-    let _ = crate::net::sctp::parse_notification(data);
+    crate::net::sctp::parse_notification(data)
+}
+
+/// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
+pub fn sctp_parse_notification(data: &[u8]) {
+    let _ = std::hint::black_box(observe_sctp_parse_notification(data));
 }
 
 fn observe_sctp_parse_recv_meta(data: &[u8]) -> std::io::Result<crate::net::sctp::SctpRecvMeta> {
@@ -249,13 +253,17 @@ pub fn sctp_parse_recv_meta(data: &[u8]) {
     let _ = std::hint::black_box(observe_sctp_parse_recv_meta(data));
 }
 
-/// Fuzz entry: parse packed SCTP association-address payloads.
-pub fn sctp_parse_assoc_addrs(data: &[u8]) {
+fn observe_sctp_parse_assoc_addrs(data: &[u8]) -> std::io::Result<Vec<std::net::SocketAddr>> {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
     let (addr_count, payload) = sctp_assoc_addrs_case(data);
 
-    let _ = crate::net::sctp::parse_assoc_addrs(payload, addr_count);
+    crate::net::sctp::parse_assoc_addrs(payload, addr_count)
+}
+
+/// Fuzz entry: parse packed SCTP association-address payloads.
+pub fn sctp_parse_assoc_addrs(data: &[u8]) {
+    let _ = std::hint::black_box(observe_sctp_parse_assoc_addrs(data));
 }
 
 fn sctp_assoc_addrs_case(data: &[u8]) -> (usize, &[u8]) {
@@ -355,6 +363,16 @@ pub mod test_support {
     /// Returns the SCTP metadata parser's exact result.
     pub fn observe_sctp_parse_recv_meta(data: &[u8]) -> io::Result<SctpRecvMeta> {
         super::observe_sctp_parse_recv_meta(data)
+    }
+
+    /// Returns the SCTP notification parser's exact result.
+    pub fn observe_sctp_parse_notification(data: &[u8]) -> io::Result<SctpRecvMeta> {
+        super::observe_sctp_parse_notification(data)
+    }
+
+    /// Returns the SCTP association-address parser's exact result.
+    pub fn observe_sctp_parse_assoc_addrs(data: &[u8]) -> io::Result<Vec<std::net::SocketAddr>> {
+        super::observe_sctp_parse_assoc_addrs(data)
     }
 
     /// Returns the DNS response prefilter's decision.

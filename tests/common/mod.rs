@@ -544,6 +544,30 @@ pub fn set_positive_linger(fd: std::os::fd::RawFd) {
     assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
 }
 
+/// Enables nanosecond receive timestamps so tests can exercise ancillary
+/// control handling on a public raw socket descriptor.
+#[allow(dead_code)]
+pub fn enable_socket_timestampns(fd: std::os::fd::RawFd) {
+    let enabled: libc::c_int = 1;
+    // SAFETY: `enabled` is initialized and borrowed for the exact socket-
+    // option byte count during this call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            std::ptr::addr_of!(enabled).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "setsockopt(SO_TIMESTAMPNS) failed: {}",
+        io::Error::last_os_error()
+    );
+}
+
 #[allow(dead_code)]
 pub async fn assert_poll_after_ready_parks<F>(future: F)
 where

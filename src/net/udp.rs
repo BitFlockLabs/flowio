@@ -310,11 +310,13 @@ impl UdpSocket {
     /// Starts one connected `recvmsg` receive into the provided buffer.
     ///
     /// This uses the connected socket peer like [`UdpSocket::recv`], but asks
-    /// the kernel for message flags and rejects truncated datagrams with
-    /// [`io::ErrorKind::InvalidData`]. Use it when a fixed-peer caller needs
-    /// truncation detection; use [`UdpSocket::recv`] when protocol sizing
-    /// guarantees the buffer is large enough and the extra `msghdr`/`iovec`
-    /// metadata is unnecessary.
+    /// the kernel for message flags and rejects payload-truncated datagrams
+    /// with [`io::ErrorKind::InvalidData`]. This metadata-free API requests no
+    /// ancillary control data, so discarded ancillary metadata is not part of
+    /// its result and does not make a complete payload fail. Use it when a
+    /// fixed-peer caller needs payload-truncation detection; use
+    /// [`UdpSocket::recv`] when protocol sizing guarantees the buffer is large
+    /// enough and the extra `msghdr`/`iovec` metadata is unnecessary.
     /// Positive progress follows the same relative-publication contract as
     /// [`UdpSocket::recv`]. If truncation is reported, the copied prefix is
     /// still published before `InvalidData` is returned.
@@ -366,8 +368,10 @@ impl UdpSocket {
     /// Use this instead of [`UdpSocket::recv`] when peer addresses vary per
     /// datagram or when the sender address is needed by the caller.
     /// Positive progress follows the same relative-publication contract as
-    /// [`UdpSocket::recv`]. Truncation or address-decoding errors still publish
-    /// the bytes the kernel copied before the error is returned.
+    /// [`UdpSocket::recv`]. Payload truncation or address-decoding errors still
+    /// publish the bytes the kernel copied before the error is returned. This
+    /// metadata-free API requests no ancillary control data, so discarded
+    /// ancillary metadata does not make a complete payload fail.
     pub fn recv_from<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
@@ -607,8 +611,10 @@ fn zeroed_sockaddr_storage() -> MaybeUninit<libc::sockaddr_storage> {
 }
 
 #[inline(always)]
-fn udp_datagram_is_truncated(msg_flags: libc::c_int) -> bool {
-    (msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC)) != 0
+fn udp_payload_is_truncated(msg_flags: libc::c_int) -> bool {
+    // These metadata-free receive APIs provide no control buffer. MSG_CTRUNC
+    // therefore reports discarded ancillary metadata, not payload loss.
+    (msg_flags & libc::MSG_TRUNC) != 0
 }
 
 #[inline(always)]
@@ -789,10 +795,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             };
 
             let msg = unsafe { payload.msghdr.assume_init_ref() };
-            // `msg_control` is null, so MSG_CTRUNC is not expected here;
-            // keep the check defensive in case a kernel reports
-            // inconsistent recvmsg flags.
-            let result = if udp_datagram_is_truncated(msg.msg_flags) {
+            let result = if udp_payload_is_truncated(msg.msg_flags) {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "UDP recv_msg message was truncated",
@@ -1004,10 +1007,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             };
 
             let msg = unsafe { payload.msghdr.assume_init_ref() };
-            // `msg_control` is null, so MSG_CTRUNC is not expected here;
-            // keep the check defensive in case a kernel reports
-            // inconsistent recvmsg flags.
-            let result = if udp_datagram_is_truncated(msg.msg_flags) {
+            let result = if udp_payload_is_truncated(msg.msg_flags) {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "UDP recv_from message was truncated",
@@ -1184,16 +1184,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn udp_datagram_truncation_flag_predicate_covers_supported_combinations() {
+    fn udp_payload_truncation_flag_predicate_covers_supported_combinations() {
         for (flags, expected) in [
             (0, false),
             (libc::MSG_TRUNC, true),
-            (libc::MSG_CTRUNC, true),
+            (libc::MSG_CTRUNC, false),
             (libc::MSG_TRUNC | libc::MSG_CTRUNC, true),
             (libc::MSG_PEEK, false),
+            (libc::MSG_PEEK | libc::MSG_CTRUNC, false),
             (libc::MSG_PEEK | libc::MSG_TRUNC, true),
         ] {
-            assert_eq!(udp_datagram_is_truncated(flags), expected, "flags={flags}");
+            assert_eq!(udp_payload_is_truncated(flags), expected, "flags={flags}");
         }
     }
 

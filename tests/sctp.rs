@@ -1,9 +1,9 @@
 mod common;
 
 use common::{
-    DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut, make_payload_chain,
-    make_read_chain, poll_once_pending, run_test_output, set_positive_linger, wait_for_drop_count,
-    wait_for_live_slots,
+    DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
+    enable_socket_timestampns, make_payload_chain, make_read_chain, poll_once_pending,
+    run_test_output, set_positive_linger, wait_for_drop_count, wait_for_live_slots,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
@@ -166,25 +166,6 @@ fn raw_sctp_stream_or_skip(test_name: &str) -> Option<(SctpStream, std::os::fd::
         SctpStream::from_owned_fd(fd, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
         raw,
     ))
-}
-
-fn enable_socket_timestampns(fd: std::os::fd::RawFd) {
-    let enabled: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TIMESTAMPNS,
-            std::ptr::addr_of!(enabled).cast::<libc::c_void>(),
-            std::mem::size_of_val(&enabled) as libc::socklen_t,
-        )
-    };
-    assert_eq!(
-        rc,
-        0,
-        "failed to enable SO_TIMESTAMPNS on SCTP receiver: {}",
-        std::io::Error::last_os_error()
-    );
 }
 
 #[cfg(any(debug_assertions, feature = "test-support"))]

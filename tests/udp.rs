@@ -2,8 +2,8 @@ mod common;
 
 use common::{
     DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
-    assert_poll_after_ready_parks, ipv6_loopback_capability_unavailable, poll_once_pending,
-    run_test_output, set_positive_linger, wait_for_drop_count,
+    assert_poll_after_ready_parks, enable_socket_timestampns, ipv6_loopback_capability_unavailable,
+    poll_once_pending, run_test_output, set_positive_linger, wait_for_drop_count,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
@@ -711,6 +711,7 @@ fn runtime_udp_recv_from_rejects_truncated_datagram() {
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
     let local_addr = socket.local_addr().expect("runtime local_addr failed");
+    enable_socket_timestampns(socket.as_raw_fd());
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");
@@ -725,6 +726,38 @@ fn runtime_udp_recv_from_rejects_truncated_datagram() {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(err.to_string(), "UDP recv_from message was truncated");
             assert_eq!(&buf[..], b"over");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_udp_recv_from_accepts_complete_payload_when_ancillary_metadata_is_truncated() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime udp socket");
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
+    enable_socket_timestampns(socket.as_raw_fd());
+
+    let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind std udp socket");
+    let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    assert_eq!(
+        peer.send_to(b"exact", local_addr)
+            .expect("std send_to failed"),
+        5
+    );
+
+    executor
+        .run(async move {
+            let recv = vec![0u8; 5];
+            let (result, buffer) = timeout(UDP_TEST_TIMEOUT, socket.recv_from(recv, 5))
+                .await
+                .expect("timestamped recv_from timed out");
+            let (received, from) = result.expect("complete recv_from payload was rejected");
+            assert_eq!(received, 5);
+            assert_eq!(from, peer_addr);
+            assert_eq!(&buffer[..received], b"exact");
         })
         .expect("executor run failed");
 }
@@ -755,12 +788,42 @@ fn runtime_udp_recv_msg_ping_pong() {
 }
 
 #[test]
+fn runtime_udp_recv_msg_accepts_complete_payload_when_ancillary_metadata_is_truncated() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind runtime udp socket");
+    let local_addr = socket.local_addr().expect("runtime local_addr failed");
+    enable_socket_timestampns(socket.as_raw_fd());
+
+    let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind std udp socket");
+    let peer_addr = peer.local_addr().expect("peer local_addr failed");
+    socket.connect(peer_addr).expect("runtime connect failed");
+    peer.connect(local_addr).expect("std peer connect failed");
+    assert_eq!(peer.send(b"exact").expect("std send failed"), 5);
+
+    executor
+        .run(async move {
+            let recv = vec![0u8; 5];
+            let (result, buffer) = timeout(UDP_TEST_TIMEOUT, socket.recv_msg(recv, 5))
+                .await
+                .expect("timestamped recv_msg timed out");
+            let received = result.expect("complete recv_msg payload was rejected");
+            assert_eq!(received, 5);
+            assert_eq!(&buffer[..received], b"exact");
+        })
+        .expect("executor run failed");
+}
+
+#[test]
 fn runtime_udp_recv_msg_rejects_truncated_datagram() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime udp socket");
     let local_addr = socket.local_addr().expect("runtime local_addr failed");
+    enable_socket_timestampns(socket.as_raw_fd());
 
     let peer = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind std udp socket");

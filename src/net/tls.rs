@@ -505,11 +505,14 @@ fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]])
 /// exactly a `TBSCertificate` sequence, a `signatureAlgorithm` sequence, and a
 /// `signatureValue` bit string, in that order. Those four parsed TLV headers
 /// must use canonical DER length encoding: short form below 128 bytes and a
-/// minimally encoded, non-zero-prefixed long form otherwise. This does not
-/// recursively validate the contents of `TBSCertificate`. Returns `None` when
-/// the parsed structure is malformed or the signature algorithm is unsupported
-/// for this derivation. Unsupported cases include algorithms without a defined
-/// binding digest, such as Ed25519 and Ed448.
+/// minimally encoded, non-zero-prefixed long form otherwise. The
+/// `signatureValue` BIT STRING body must contain an unused-bit-count octet of
+/// zero followed by at least one signature payload octet; a missing or
+/// nonzero count, or an empty payload (`03 01 00`), returns `None`. This does
+/// not recursively validate `TBSCertificate` or the signature bytes.
+/// Returns `None` when the parsed structure is malformed or the signature
+/// algorithm is unsupported for this derivation. Unsupported cases include
+/// algorithms without a defined binding digest, such as Ed25519 and Ed448.
 ///
 /// This allocates the returned channel-binding bytes. Call it after the TLS
 /// handshake when a protocol needs the binding value; it is not steady-state
@@ -591,26 +594,32 @@ fn extract_certificate_signature_algorithm(certificate_der: &[u8]) -> Option<&[u
     }
 
     let second_body_start = first_end.checked_add(second_header_len)?;
-    let second_end = first_end
-        .checked_add(second_header_len)?
-        .checked_add(second_body_len)?;
+    let second_end = second_body_start.checked_add(second_body_len)?;
 
     let (third_tag, third_header_len, third_body_len) = read_tlv(certificate_der, second_end)?;
     if third_tag != DER_BIT_STRING_TAG {
         return None;
     }
-    let third_end = second_end
-        .checked_add(third_header_len)?
-        .checked_add(third_body_len)?;
-    if third_end != body_end {
+    let third_body_start = second_end.checked_add(third_header_len)?;
+    let third_end = third_body_start.checked_add(third_body_len)?;
+    if third_end != body_end || third_body_len == 0 {
+        return None;
+    }
+    if certificate_der.get(third_body_start).copied()? != 0 {
+        return None;
+    }
+    if third_body_len < 2 {
         return None;
     }
 
     certificate_der.get(second_body_start..second_end)
 }
 
-/// Reads one DER tag-length-value header and returns its tag, header length,
-/// and body length.
+/// Reads a one-octet tag plus a definite, canonically encoded DER length and
+/// returns the tag, header length, and body length after proving the complete
+/// body is within `bytes`. Indefinite length and nonminimal or zero-prefixed
+/// long forms are rejected. This validates only that header shape and body
+/// bound; callers remain responsible for tag-specific body structure.
 fn read_tlv(bytes: &[u8], offset: usize) -> Option<(u8, usize, usize)> {
     let tag = *bytes.get(offset)?;
     let first_len = *bytes.get(offset + 1)?;
@@ -825,8 +834,11 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` if called before handshake completion or polled
     /// without its active FlowIO executor task context, and `BrokenPipe` if
-    /// the TLS write side has already been shut down or a prior outbound
-    /// ciphertext drain failed.
+    /// logical TLS write shutdown has begun, physical transport-write shutdown
+    /// has completed, or a prior outbound ciphertext drain failed. Within
+    /// these write-state checks, a prior transport-write failure retains
+    /// precedence over either shutdown state. Shutdown rejection returns the
+    /// exact source owner before plaintext admission or scratch mutation.
     /// If rustls accepts plaintext but the following TLS-record flush fails,
     /// this future returns an error without a progress count; the stream is
     /// failed and callers must not retry the same plaintext on it.
@@ -846,8 +858,11 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` if called before handshake completion or polled
     /// without its active FlowIO executor task context, and `BrokenPipe` if
-    /// the TLS write side has already been shut down or a prior outbound
-    /// ciphertext drain failed.
+    /// logical TLS write shutdown has begun, physical transport-write shutdown
+    /// has completed, or a prior outbound ciphertext drain failed. Within
+    /// these write-state checks, a prior transport-write failure retains
+    /// precedence over either shutdown state. Shutdown rejection returns the
+    /// exact source owner before plaintext admission or scratch mutation.
     /// If rustls accepts plaintext but a later TLS-record flush fails, this
     /// future returns an error even though some plaintext may already be queued
     /// as TLS records; the stream is failed and callers must not retry the

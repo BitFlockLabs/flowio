@@ -397,14 +397,17 @@ System configuration reads are bounded to 4 MiB for `/etc/hosts` and 64 KiB
 for `/etc/resolv.conf`. An oversized file or a 65th unique resolved address
 returns `InvalidData`; address order remains first-seen and no result is
 silently truncated. Each hosts entry prefix before the first raw `#` is
-validated as UTF-8; an invalid prefix is skipped individually, invalid comment
-bytes are ignored, and semicolons remain ordinary alias text.
+validated as UTF-8; a line whose entry prefix is not valid UTF-8 is skipped
+individually, invalid comment bytes are ignored, and semicolons remain ordinary
+alias text.
 `resolv.conf` strips its earliest `#` or `;` comment marker at the byte level,
 then validates only the directive as UTF-8. A malformed directive line is
 skipped without suppressing valid siblings, and malformed comment bytes are
-ignored. One owned query
-allocation and one safely returned
-response allocation are reused across sequential A, AAAA, nameserver retry,
+ignored. At most eight unique valid nameservers are retained; after the eighth
+unique nameserver, all later nameserver directives are ignored. Duplicates do
+not consume the bound, and first-seen retry order is retained. One owned query
+allocation and one safely returned response allocation are reused across
+sequential A, AAAA, nameserver retry,
 and bounded CNAME-follow-up work; a timed-out kernel-visible response buffer
 is not reused before its target completion.
 Asynchronous upstream work has one five-second aggregate timeout by default,
@@ -419,6 +422,12 @@ an expired receive retains its response allocation. It cannot preempt the
 bounded synchronous hosts read or socket syscalls, but checks immediately
 before socket setup, after bind, and after connect prevent later work after an
 observed expiry.
+For one response attempt, true per-attempt expiry and ordinary UDP I/O errors
+advance to the next nameserver when one remains. A local timer-runtime failure
+instead preserves its exact `io::Error` and stops the affected address family's
+remaining nameserver and CNAME-follow-up work. An A-side terminal error stops
+before the AAAA query. An already completed A address retains precedence over a
+later AAAA-side terminal error.
 Query normalization removes surrounding whitespace and at most
 one optional trailing root dot; a second trailing dot remains an empty label
 and returns `InvalidInput` before query allocation or DNS network I/O.
@@ -474,6 +483,14 @@ wrapper scratch. `rustls_buffer_limit: None` remains a separate choice that
 permits unbounded rustls-internal buffering and does not relax the FlowIO
 write-chunk bound. Raising the read option above its cap therefore does not
 increase the raw read size or reservation request.
+
+`tls_server_end_point` performs a shallow structural check before deriving a
+channel-binding digest from a caller-supplied certificate. The outer sequence
+must contain exactly the ordered `TBSCertificate`, `signatureAlgorithm`, and
+`signatureValue` children with canonical DER lengths. The signature BIT STRING
+must start with a zero unused-bit count and contain at least one payload octet;
+the helper does not recursively validate the certificate or cryptographically
+validate those signature bytes.
 
 SCTP has separate socket and association configuration types. Basic
 one-to-one SCTP works through `SctpListener`, `SctpConnector`, and
