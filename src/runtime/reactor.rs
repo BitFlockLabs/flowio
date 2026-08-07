@@ -170,6 +170,7 @@ impl PendingCancelQueue {
         );
         unsafe {
             if (*ptr).is_cancel_pending() || (*ptr).is_completed() {
+                (*ptr).debug_assert_valid_flags();
                 return;
             }
             debug_assert!(
@@ -186,6 +187,7 @@ impl PendingCancelQueue {
             }
             self.tail = ptr;
             self.len += 1;
+            (*ptr).debug_assert_valid_flags();
         }
     }
 
@@ -231,6 +233,7 @@ impl PendingCancelQueue {
                 debug_assert_eq!(self.len, 0);
                 self.tail = std::ptr::null_mut();
             }
+            (*ptr).debug_assert_valid_flags();
             true
         }
     }
@@ -749,6 +752,9 @@ impl Reactor {
                 (*ptr).bind_owner(owner, registry_index);
             }
             self.live_registry.push(ptr);
+            unsafe {
+                (*ptr).debug_assert_valid_flags();
+            }
         }
         ptr
     }
@@ -1673,6 +1679,7 @@ impl Reactor {
                     Self::try_free_op_unchecked(reactor, state)?;
                 } else {
                     (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
+                    (*state).debug_assert_valid_flags();
                 }
             } else if (*state).is_orphaned() || (*state).is_detached() {
                 Self::try_free_op_unchecked(reactor, state)?;
@@ -3429,6 +3436,11 @@ mod pending_cancel_tests {
         let mut current = queue.head;
         for &expected_ptr in expected {
             assert_eq!(current, expected_ptr);
+            assert!(unsafe { (*current).is_cancel_pending() });
+            assert!(unsafe { (*current).is_orphaned() || (*current).is_runtime_shutdown() });
+            assert!(unsafe { !(*current).is_completed() });
+            assert!(unsafe { !(*current).is_build_aborted() });
+            assert!(unsafe { !(*current).is_ring_abandoned() });
             assert_eq!(unsafe { (*current).cancel_prev() }, previous);
             previous = current;
             current = unsafe { (*current).cancel_next };
@@ -3491,12 +3503,20 @@ mod pending_cancel_tests {
     fn pending_cancel_prev_reuses_waiter_only_after_reference_release() {
         let task = TaskHeader::new();
         let task_ptr = &task as *const TaskHeader as *mut TaskHeader;
-        let (states, pointers) = queue_states(2, false);
-        let second = pointers[1];
+        let mut states: Vec<_> = (0..2).map(|_| CompletionState::empty()).collect();
 
-        unsafe { (*second).register_waiter(task_ptr) };
+        unsafe { states[1].register_waiter(task_ptr) };
         assert_eq!(task.refs.get(), 2);
+        for state in &mut states {
+            state.set_orphaned();
+        }
+        let pointers: Vec<_> = states
+            .iter_mut()
+            .map(|state| state as *mut CompletionState)
+            .collect();
+        let second = pointers[1];
         unsafe { CompletionState::clear_waiter_unchecked(second) };
+        unsafe { (*second).debug_assert_valid_flags() };
         assert_eq!(task.refs.get(), 1);
 
         let mut queue = PendingCancelQueue::new();
@@ -4039,10 +4059,9 @@ mod pending_cancel_tests {
         // The ringless Miri model has no kernel reference. Re-enable ordinary
         // reclamation only after all abandonment assertions have been made.
         unsafe {
-            (*first).state_flags = CompletionState::FLAG_COMPLETED | CompletionState::FLAG_ORPHANED;
-            (*later).state_flags = CompletionState::FLAG_COMPLETED | CompletionState::FLAG_ORPHANED;
-            (*appended).state_flags =
-                CompletionState::FLAG_COMPLETED | CompletionState::FLAG_ORPHANED;
+            (*first).restore_completed_orphaned_after_ringless_abandonment_for_test();
+            (*later).restore_completed_orphaned_after_ringless_abandonment_for_test();
+            (*appended).restore_completed_orphaned_after_ringless_abandonment_for_test();
         }
         reactor.storage_abandoned = false;
         reactor.free_op(first);

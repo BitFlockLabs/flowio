@@ -428,6 +428,18 @@ fn runtime_unix_try_writev_projected_large_piece_count_immediate_success() {
 }
 
 #[test]
+fn runtime_unix_try_writev_projected_reentrant_large_projection_returns_both_sources() {
+    let (mut outer_stream, mut outer_peer) = connected_try_unix_stream();
+    let (inner_stream, mut inner_peer) = connected_try_unix_stream();
+    common::assert_reentrant_projected_try_success(
+        &mut outer_stream,
+        &mut outer_peer,
+        inner_stream,
+        &mut inner_peer,
+    );
+}
+
+#[test]
 fn runtime_unix_try_writev_projected_invalid_projection_returns_source() {
     let (mut stream, mut peer) = connected_try_unix_stream();
 

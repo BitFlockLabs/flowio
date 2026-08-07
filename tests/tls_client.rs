@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -325,6 +326,15 @@ async fn wait_for_server_reset(rx: &mpsc::Receiver<()>) {
 
 #[test]
 fn tls_client_round_trip_and_shutdown() {
+    run_tls_client_round_trip_and_shutdown(false);
+}
+
+#[test]
+fn tls_public_raw_fd_exposure_requires_one_linger_query() {
+    run_tls_client_round_trip_and_shutdown(true);
+}
+
+fn run_tls_client_round_trip_and_shutdown(expose_public_fd: bool) {
     let (client_config, server_config, server_name, expected_cert_der) =
         make_client_server_configs();
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -384,6 +394,9 @@ fn tls_client_round_trip_and_shutdown() {
                 .expect("connect init failed")
                 .await
                 .expect("connect failed");
+            if expose_public_fd {
+                let _ = tcp.as_raw_fd();
+            }
             let mut tls =
                 TlsClientStream::new(tcp, client_config, server_name, tls_options()).unwrap();
 
@@ -409,6 +422,19 @@ fn tls_client_round_trip_and_shutdown() {
         .expect("executor run failed");
 
     server.join().expect("server thread panicked");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.close_linger_queries,
+            usize::from(expose_public_fd),
+            "TLS close performed the wrong number of terminal linger queries"
+        );
+        assert_eq!(stats.close_ring_submissions, 1);
+        assert_eq!(stats.close_worker_admissions, 0);
+        assert_eq!(stats.close_direct_closes, 0);
+    }
 }
 
 #[test]

@@ -82,75 +82,84 @@ pub(crate) struct RetainedPayloadVtable {
     pub(crate) free_storage: unsafe fn(*mut (), *mut RetainedPayloadPool),
 }
 
-/// Debug/test-support counters for asserting retained-pool behavior in tests.
 #[cfg(any(debug_assertions, feature = "test-support"))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RetainedPayloadPoolStats {
-    /// Retained payload allocations served by size-class slabs.
-    pub(crate) pooled_allocs: usize,
-    /// Pooled payload allocations served from returned blocks.
-    pub(crate) pooled_reuses: usize,
-    /// Pooled payload blocks returned to size-class free lists.
-    pub(crate) pooled_frees: usize,
-    /// Retained payload slab pages requested from providers.
-    pub(crate) slab_allocs: usize,
-    /// Retained payload allocations that used the heap fallback.
-    pub(crate) heap_fallbacks: usize,
-    /// Heap fallback payload blocks released.
-    pub(crate) heap_frees: usize,
-    /// Iovec scratch requests served from inline storage.
-    pub(crate) writev_scratch_inline_allocs: usize,
-    /// Iovec scratch requests served by pooled sidecar storage.
-    pub(crate) writev_scratch_pooled_allocs: usize,
-    /// Pooled sidecar scratch requests served from returned blocks.
-    pub(crate) writev_scratch_pooled_reuses: usize,
-    /// Pooled sidecar scratch blocks returned to size-class free lists.
-    pub(crate) writev_scratch_pooled_frees: usize,
-    /// Sidecar scratch slab pages requested from providers.
-    pub(crate) writev_scratch_slab_allocs: usize,
-    /// Scratch requests rejected for exceeding the supported iovec count.
-    pub(crate) writev_scratch_oversize_rejections: usize,
-    /// Scratch requests rejected because no sidecar block was available.
-    pub(crate) writev_scratch_alloc_failures: usize,
+macro_rules! retained_payload_stat_fields {
+    ($callback:ident) => {
+        $callback! {
+            pooled_allocs => retained_pooled_allocs:
+                "Retained payload allocations served by size-class storage.";
+            pooled_reuses => retained_pooled_reuses:
+                "Retained payload allocations served from returned blocks.";
+            pooled_frees => retained_pooled_frees:
+                "Retained payload blocks returned to size-class free lists.";
+            slab_allocs => retained_slab_allocs:
+                "Retained payload slab pages requested from providers.";
+            heap_fallbacks => retained_heap_fallbacks:
+                "Retained payload allocations that used the heap fallback.";
+            heap_frees => retained_heap_frees:
+                "Heap fallback payload blocks released.";
+            writev_scratch_inline_allocs => writev_scratch_inline_allocs:
+                "Iovec scratch requests served from inline storage.";
+            writev_scratch_pooled_allocs => writev_scratch_pooled_allocs:
+                "Iovec scratch requests served by pooled sidecar storage.";
+            writev_scratch_pooled_reuses => writev_scratch_pooled_reuses:
+                "Pooled sidecar scratch requests served from returned blocks.";
+            writev_scratch_pooled_frees => writev_scratch_pooled_frees:
+                "Pooled sidecar scratch blocks returned to size-class free lists.";
+            writev_scratch_slab_allocs => writev_scratch_slab_allocs:
+                "Sidecar scratch slab pages requested from providers.";
+            writev_scratch_oversize_rejections => writev_scratch_oversize_rejections:
+                "Scratch requests rejected for exceeding the supported iovec count.";
+            writev_scratch_alloc_failures => writev_scratch_alloc_failures:
+                "Scratch requests rejected because no sidecar block was available.";
+        }
+    };
 }
 
-#[cfg(any(debug_assertions, test))]
-impl RetainedPayloadPoolStats {
-    /// Returns counter activity observed since `baseline` without mutating the
-    /// retained pools. Saturating subtraction preserves debug bookkeeping if a
-    /// counter has already saturated or a synthetic test baseline is newer.
-    pub(crate) fn saturating_delta_since(self, baseline: Self) -> Self {
-        Self {
-            pooled_allocs: self.pooled_allocs.saturating_sub(baseline.pooled_allocs),
-            pooled_reuses: self.pooled_reuses.saturating_sub(baseline.pooled_reuses),
-            pooled_frees: self.pooled_frees.saturating_sub(baseline.pooled_frees),
-            slab_allocs: self.slab_allocs.saturating_sub(baseline.slab_allocs),
-            heap_fallbacks: self.heap_fallbacks.saturating_sub(baseline.heap_fallbacks),
-            heap_frees: self.heap_frees.saturating_sub(baseline.heap_frees),
-            writev_scratch_inline_allocs: self
-                .writev_scratch_inline_allocs
-                .saturating_sub(baseline.writev_scratch_inline_allocs),
-            writev_scratch_pooled_allocs: self
-                .writev_scratch_pooled_allocs
-                .saturating_sub(baseline.writev_scratch_pooled_allocs),
-            writev_scratch_pooled_reuses: self
-                .writev_scratch_pooled_reuses
-                .saturating_sub(baseline.writev_scratch_pooled_reuses),
-            writev_scratch_pooled_frees: self
-                .writev_scratch_pooled_frees
-                .saturating_sub(baseline.writev_scratch_pooled_frees),
-            writev_scratch_slab_allocs: self
-                .writev_scratch_slab_allocs
-                .saturating_sub(baseline.writev_scratch_slab_allocs),
-            writev_scratch_oversize_rejections: self
-                .writev_scratch_oversize_rejections
-                .saturating_sub(baseline.writev_scratch_oversize_rejections),
-            writev_scratch_alloc_failures: self
-                .writev_scratch_alloc_failures
-                .saturating_sub(baseline.writev_scratch_alloc_failures),
+#[cfg(any(debug_assertions, feature = "test-support"))]
+pub(crate) use retained_payload_stat_fields;
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+macro_rules! define_retained_payload_pool_stats {
+    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+        /// Debug/test-support counters for asserting retained-pool behavior in tests.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub(crate) struct RetainedPayloadPoolStats {
+            $(
+                #[doc = $doc]
+                pub(crate) $field: usize,
+            )*
         }
-    }
+    };
 }
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+retained_payload_stat_fields!(define_retained_payload_pool_stats);
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+macro_rules! impl_retained_payload_pool_stats_delta {
+    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+        impl RetainedPayloadPoolStats {
+            /// Returns counter activity observed since `baseline` without mutating the
+            /// retained pools. Saturating subtraction preserves debug bookkeeping if a
+            /// counter has already saturated or a synthetic test baseline is newer.
+            #[cfg_attr(
+                all(not(debug_assertions), feature = "test-support"),
+                allow(dead_code)
+            )]
+            pub(crate) fn saturating_delta_since(self, baseline: Self) -> Self {
+                Self {
+                    $(
+                        $field: self.$field.saturating_sub(baseline.$field),
+                    )*
+                }
+            }
+        }
+    };
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+retained_payload_stat_fields!(impl_retained_payload_pool_stats_delta);
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[inline(always)]

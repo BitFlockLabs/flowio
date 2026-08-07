@@ -26,9 +26,11 @@ use flowio::test_support::net::sctp::{
     test_accept_slot_drop_cached_state_preserves_unrelated_fd,
     test_accept_slot_drop_future_preserves_unrelated_fd, test_accept_with_established_config_error,
     test_adaptation_indication_type, test_apply_sctp_socket_options, test_assoc_change_type,
-    test_assoc_reset_event_type, test_connect_slot_drop_cached_state_closes_socket_fd,
+    test_assoc_reset_event_type, test_authentication_event_type,
+    test_connect_slot_drop_cached_state_closes_socket_fd,
     test_connect_slot_drop_future_closes_socket_fd, test_fail_notification_mask_after_query,
-    test_parse_notification, test_parse_recv_meta, test_parse_stream_recv_meta,
+    test_parse_notification, test_parse_recv_meta, test_parse_recv_meta_bare_with_policy,
+    test_parse_recv_meta_with_policy, test_parse_stream_recv_meta,
     test_partial_delivery_event_type, test_peer_addr_change_type,
     test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
     test_sctp_socket_receive_options, test_sctp_stream_receive_policy,
@@ -1566,6 +1568,30 @@ fn parse_adaptation_notification() {
     );
 }
 
+#[test]
+fn parse_authentication_notification() {
+    let mut buf = notification_buffer(test_authentication_event_type(), 0x1234, 20);
+    buf.write_u16_at(8, 0x1122)
+        .expect("authentication key number write should fit");
+    buf.write_u16_at(10, 0x3344)
+        .expect("authentication alternate key number write should fit");
+    buf.write_u32_at(12, 0x5566_7788)
+        .expect("authentication indication write should fit");
+    buf.write_i32_at(16, 0x1020_3040)
+        .expect("authentication association id write should fit");
+
+    assert_eq!(
+        test_parse_notification(&buf).expect("authentication notification should parse"),
+        SctpRecvMeta::Notification(SctpNotification::Authentication {
+            flags: 0x1234,
+            key_number: 0x1122,
+            alternate_key_number: 0x3344,
+            indication: 0x5566_7788,
+            assoc_id: 0x1020_3040,
+        })
+    );
+}
+
 /// Parses the legacy SCTP_SEND_FAILED layout that carries sctp_sndrcvinfo.
 #[test]
 fn parse_legacy_send_failed_notification() {
@@ -1640,6 +1666,136 @@ fn parse_recv_meta_rejects_truncated_payload_and_control() {
         "SCTP recvmsg fixed control buffer capacity was exhausted",
         "control truncation error should identify fixed-capacity exhaustion"
     );
+}
+
+#[test]
+fn sctp_diagnostic_error_modes_cover_every_static_receive_diagnostic() {
+    let short_header = vec![0u8; std::mem::size_of::<libc::cmsghdr>() - 1];
+    let malformed_length = vec![0u8; std::mem::size_of::<libc::cmsghdr>()];
+    let mut truncated_rcvinfo = Vec::new();
+    append_initialized_test_cmsg(
+        &mut truncated_rcvinfo,
+        libc::IPPROTO_SCTP,
+        libc::SCTP_RCVINFO,
+        0,
+    );
+
+    let mut covered = 0_usize;
+    let mut assert_modes = |control: &[u8],
+                            controllen: usize,
+                            msg_flags: libc::c_int,
+                            data_slice: &[u8],
+                            recv_rcvinfo_requested: bool,
+                            expected_message: &str| {
+        let production_error = test_parse_recv_meta_with_policy(
+            control,
+            controllen,
+            msg_flags,
+            data_slice,
+            recv_rcvinfo_requested,
+        )
+        .expect_err("production receive classification should fail");
+        assert_eq!(production_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(production_error.to_string(), expected_message);
+        assert!(production_error.get_ref().is_some());
+
+        let bare_error = test_parse_recv_meta_bare_with_policy(
+            control,
+            controllen,
+            msg_flags,
+            data_slice,
+            recv_rcvinfo_requested,
+        )
+        .expect_err("bare receive classification should fail");
+        assert_eq!(bare_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(bare_error.get_ref().is_none());
+        covered += 1;
+    };
+
+    assert_modes(
+        &short_header,
+        short_header.len(),
+        libc::MSG_EOR,
+        b"payload",
+        true,
+        "SCTP recvmsg control message header was malformed",
+    );
+    assert_modes(
+        &malformed_length,
+        malformed_length.len(),
+        libc::MSG_EOR,
+        b"payload",
+        true,
+        "SCTP recvmsg control message length was malformed",
+    );
+    assert_modes(
+        &truncated_rcvinfo,
+        truncated_rcvinfo.len(),
+        libc::MSG_EOR,
+        b"payload",
+        true,
+        "SCTP_RCVINFO control message was truncated",
+    );
+    assert_modes(
+        &[],
+        0,
+        libc::MSG_TRUNC,
+        b"payload",
+        true,
+        "SCTP recvmsg payload was truncated",
+    );
+    assert_modes(
+        &[],
+        0,
+        0,
+        b"payload",
+        true,
+        "SCTP recvmsg payload was partial before end-of-record",
+    );
+    assert_modes(
+        &[],
+        0,
+        libc::MSG_EOR | libc::MSG_CTRUNC,
+        b"payload",
+        true,
+        "SCTP recvmsg fixed control buffer capacity was exhausted",
+    );
+    assert_modes(
+        &[],
+        0,
+        libc::MSG_EOR,
+        b"payload",
+        true,
+        "SCTP recvmsg omitted requested SCTP_RCVINFO",
+    );
+    assert_eq!(covered, 7, "every static SCTP receive diagnostic is paired");
+
+    let mut control = Vec::new();
+    let controllen = append_rcvinfo_cmsg(
+        &mut control,
+        libc::sctp_rcvinfo {
+            rcv_sid: 3,
+            rcv_ssn: 4,
+            rcv_flags: 5,
+            rcv_ppid: 0x0607_0809_u32.to_be(),
+            rcv_tsn: 10,
+            rcv_cumtsn: 11,
+            rcv_context: 12,
+            rcv_assoc_id: 13,
+        },
+    );
+    let production =
+        test_parse_recv_meta_with_policy(&control, controllen, libc::MSG_EOR, b"payload", true)
+            .expect("production success classification failed");
+    let bare = test_parse_recv_meta_bare_with_policy(
+        &control,
+        controllen,
+        libc::MSG_EOR,
+        b"payload",
+        true,
+    )
+    .expect("bare success classification failed");
+    assert_eq!(production, bare);
 }
 
 #[test]
@@ -1948,11 +2104,11 @@ fn parse_partial_delivery_and_reset_notifications() {
 #[test]
 fn parse_unknown_notification_falls_back_to_other() {
     let parsed =
-        test_parse_notification(&notification_buffer(0x9001, 0x0007, 8)).expect("other parse");
+        test_parse_notification(&notification_buffer(0x800e, 0x0007, 8)).expect("other parse");
     assert_eq!(
         parsed,
         SctpRecvMeta::Notification(SctpNotification::Other {
-            kind: 0x9001,
+            kind: 0x800e,
             flags: 0x0007,
             length: 8,
         })
@@ -2000,6 +2156,10 @@ fn known_notification_fields_never_extend_past_declared_length() {
             notification_buffer(test_adaptation_indication_type(), 0, 16),
         ),
         (
+            "authentication",
+            notification_buffer(test_authentication_event_type(), 0, 20),
+        ),
+        (
             "partial delivery",
             notification_buffer(test_partial_delivery_event_type(), 0, 24),
         ),
@@ -2043,14 +2203,14 @@ fn known_notification_fields_never_extend_past_declared_length() {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{name}");
     }
 
-    let mut unknown = notification_buffer(0x9001, 0x0007, 12);
+    let mut unknown = notification_buffer(0x800e, 0x0007, 12);
     unknown
         .write_u32_at(4, 8)
         .expect("unknown declared length write should fit");
     assert_eq!(
         test_parse_notification(&unknown).expect("unknown notification should remain extensible"),
         SctpRecvMeta::Notification(SctpNotification::Other {
-            kind: 0x9001,
+            kind: 0x800e,
             flags: 0x0007,
             length: 8,
         })
@@ -2061,6 +2221,14 @@ fn known_notification_fields_never_extend_past_declared_length() {
 fn notification_helpers() {
     let notification = SctpNotification::Shutdown { assoc_id: 7 };
     assert_eq!(notification.kind(), SctpNotificationKind::Shutdown);
+    let authentication = SctpNotification::Authentication {
+        flags: 1,
+        key_number: 2,
+        alternate_key_number: 3,
+        indication: 4,
+        assoc_id: 5,
+    };
+    assert_eq!(authentication.kind(), SctpNotificationKind::Authentication);
 
     let recv_data = SctpRecvMeta::Data(Default::default());
     assert!(recv_data.is_data());

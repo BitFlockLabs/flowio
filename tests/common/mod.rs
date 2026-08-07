@@ -9,6 +9,10 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -1000,6 +1004,241 @@ pub async fn wait_for_live_slots(pool: &IoBuffPool, expected: usize) {
 pub struct TestProjected<const N: usize> {
     /// Per-iovec payload pieces in send order.
     segments: [&'static [u8]; N],
+}
+
+/// First projected-write size that requires FlowIO's dynamic scratch.
+#[allow(dead_code)]
+pub const DYNAMIC_PROJECTED_PIECES: usize = 17;
+
+/// Independent identity/projection/drop observations for one projected owner.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ProjectedSourceWitness {
+    identity: Arc<()>,
+    projection_calls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+#[allow(dead_code)]
+impl ProjectedSourceWitness {
+    pub fn new() -> Self {
+        Self {
+            identity: Arc::new(()),
+            projection_calls: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn projection_calls(&self) -> usize {
+        self.projection_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn drops(&self) -> usize {
+        self.drops.load(Ordering::Relaxed)
+    }
+}
+
+/// A 17-piece projected owner with exact identity and drop observations.
+#[allow(dead_code)]
+pub struct DropTrackedProjected17 {
+    bytes: [u8; DYNAMIC_PROJECTED_PIECES],
+    witness: ProjectedSourceWitness,
+}
+
+#[allow(dead_code)]
+impl DropTrackedProjected17 {
+    pub fn new(byte: u8) -> (Self, ProjectedSourceWitness) {
+        let witness = ProjectedSourceWitness::new();
+        (Self::from_witness(byte, &witness), witness)
+    }
+
+    pub fn from_witness(byte: u8, witness: &ProjectedSourceWitness) -> Self {
+        Self {
+            bytes: [byte; DYNAMIC_PROJECTED_PIECES],
+            witness: witness.clone(),
+        }
+    }
+
+    pub fn has_identity(&self, witness: &ProjectedSourceWitness) -> bool {
+        Arc::ptr_eq(&self.witness.identity, &witness.identity)
+    }
+
+    pub fn bytes(&self) -> &[u8; DYNAMIC_PROJECTED_PIECES] {
+        &self.bytes
+    }
+}
+
+impl Drop for DropTrackedProjected17 {
+    fn drop(&mut self) {
+        self.witness.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl WritevProjection for DropTrackedProjected17 {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        (DYNAMIC_PROJECTED_PIECES, DYNAMIC_PROJECTED_PIECES)
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        self.witness
+            .projection_calls
+            .fetch_add(1, Ordering::Relaxed);
+        for byte in &self.bytes {
+            pieces.push(std::slice::from_ref(byte))?;
+        }
+        Ok(())
+    }
+}
+
+/// A projected owner that performs one nested immediate projected write while
+/// FlowIO still holds the outer dynamic-scratch borrow.
+#[allow(dead_code)]
+pub struct ReentrantProjected17<S> {
+    outer: DropTrackedProjected17,
+    inner_stream: std::cell::RefCell<S>,
+    inner_source: std::cell::RefCell<Option<DropTrackedProjected17>>,
+    inner_output: std::cell::RefCell<Option<(io::Result<usize>, DropTrackedProjected17)>>,
+}
+
+#[allow(dead_code)]
+impl<S> ReentrantProjected17<S> {
+    pub fn new(
+        outer: DropTrackedProjected17,
+        inner_stream: S,
+        inner_source: DropTrackedProjected17,
+    ) -> Self {
+        Self {
+            outer,
+            inner_stream: std::cell::RefCell::new(inner_stream),
+            inner_source: std::cell::RefCell::new(Some(inner_source)),
+            inner_output: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub fn take_inner_output(&mut self) -> Option<(io::Result<usize>, DropTrackedProjected17)> {
+        self.inner_output.get_mut().take()
+    }
+
+    pub fn outer_has_identity(&self, witness: &ProjectedSourceWitness) -> bool {
+        self.outer.has_identity(witness)
+    }
+
+    pub fn outer_bytes(&self) -> &[u8; DYNAMIC_PROJECTED_PIECES] {
+        self.outer.bytes()
+    }
+}
+
+/// Test-only common surface for immediate projected TCP/Unix writes.
+#[allow(dead_code)]
+pub trait ProjectedTryStream {
+    fn try_projected<T: WritevProjection>(&mut self, source: T) -> (io::Result<usize>, T);
+}
+
+impl ProjectedTryStream for flowio::net::tcp::TcpStream {
+    fn try_projected<T: WritevProjection>(&mut self, source: T) -> (io::Result<usize>, T) {
+        self.try_writev_projected(source)
+    }
+}
+
+impl ProjectedTryStream for flowio::net::unix::UnixStream {
+    fn try_projected<T: WritevProjection>(&mut self, source: T) -> (io::Result<usize>, T) {
+        self.try_writev_projected(source)
+    }
+}
+
+impl<S: ProjectedTryStream + 'static> WritevProjection for ReentrantProjected17<S> {
+    fn writev_count_and_len(&self) -> (usize, usize) {
+        self.outer.writev_count_and_len()
+    }
+
+    fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+        let inner_source = self
+            .inner_source
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("inner projected source is already borrowed"))?
+            .take()
+            .ok_or_else(|| io::Error::other("inner projected source was already consumed"))?;
+        let output = self
+            .inner_stream
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("inner stream is already borrowed"))?
+            .try_projected(inner_source);
+        let mut output_slot = self
+            .inner_output
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("inner projected output is already borrowed"))?;
+        if output_slot.is_some() {
+            return Err(io::Error::other(
+                "inner projected output was already recorded",
+            ));
+        }
+        *output_slot = Some(output);
+        drop(output_slot);
+
+        self.outer.project_writev(pieces)
+    }
+}
+
+/// Proves successful nested dynamic projected writes through a concrete stream
+/// public API, including exact bytes, source identity, and explicit drop time.
+#[allow(dead_code)]
+pub fn assert_reentrant_projected_try_success<S, OuterPeer, InnerPeer>(
+    outer_stream: &mut S,
+    outer_peer: &mut OuterPeer,
+    inner_stream: S,
+    inner_peer: &mut InnerPeer,
+) where
+    S: ProjectedTryStream + 'static,
+    OuterPeer: std::io::Read,
+    InnerPeer: std::io::Read,
+{
+    let (outer_source, outer_witness) = DropTrackedProjected17::new(b'O');
+    let (inner_source, inner_witness) = DropTrackedProjected17::new(b'I');
+    let source = ReentrantProjected17::new(outer_source, inner_stream, inner_source);
+
+    let (outer_result, mut source) = outer_stream.try_projected(source);
+    assert_eq!(
+        outer_result.expect("outer reentrant projected write failed"),
+        DYNAMIC_PROJECTED_PIECES
+    );
+    assert!(
+        source.outer_has_identity(&outer_witness),
+        "outer projected source identity changed while returning from re-entry"
+    );
+    assert_eq!(source.outer_bytes(), &[b'O'; DYNAMIC_PROJECTED_PIECES]);
+
+    let (inner_result, inner_source) = source
+        .take_inner_output()
+        .expect("outer projection did not execute the nested projected write");
+    assert_eq!(
+        inner_result.expect("inner reentrant projected write failed"),
+        DYNAMIC_PROJECTED_PIECES
+    );
+    assert!(
+        inner_source.has_identity(&inner_witness),
+        "inner projected source identity changed while returning from re-entry"
+    );
+    assert_eq!(inner_source.bytes(), &[b'I'; DYNAMIC_PROJECTED_PIECES]);
+
+    assert_eq!(outer_witness.projection_calls(), 1);
+    assert_eq!(inner_witness.projection_calls(), 1);
+    assert_eq!(outer_witness.drops(), 0);
+    assert_eq!(inner_witness.drops(), 0);
+
+    let mut outer_bytes = [0; DYNAMIC_PROJECTED_PIECES];
+    std::io::Read::read_exact(outer_peer, &mut outer_bytes)
+        .expect("read outer reentrant projected bytes");
+    assert_eq!(outer_bytes, [b'O'; DYNAMIC_PROJECTED_PIECES]);
+    let mut inner_bytes = [0; DYNAMIC_PROJECTED_PIECES];
+    std::io::Read::read_exact(inner_peer, &mut inner_bytes)
+        .expect("read inner reentrant projected bytes");
+    assert_eq!(inner_bytes, [b'I'; DYNAMIC_PROJECTED_PIECES]);
+
+    drop(inner_source);
+    assert_eq!(inner_witness.drops(), 1);
+    assert_eq!(outer_witness.drops(), 0);
+    drop(source);
+    assert_eq!(outer_witness.drops(), 1);
 }
 
 impl<const N: usize> TestProjected<N> {

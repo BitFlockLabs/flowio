@@ -1,7 +1,7 @@
 #[path = "common/counting_allocator.rs"]
 mod counting_allocator;
 
-use counting_allocator::{AllocationSnapshot, CountingAllocator};
+use counting_allocator::{CountingAllocator, ThreadLocalAllocationSnapshot};
 use flowio::test_support::net::resolver::response_is_decodable_candidate;
 use std::hint::black_box;
 
@@ -67,7 +67,7 @@ fn malformed_dns_candidates_are_allocation_free() {
         assert!(!response_is_decodable_candidate(packet, QUERY_ID));
     }
 
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     for _ in 0..ROUNDS {
         for packet in malformed {
             assert!(!black_box(response_is_decodable_candidate(
@@ -76,7 +76,7 @@ fn malformed_dns_candidates_are_allocation_free() {
             )));
         }
     }
-    let after = AllocationSnapshot::current();
+    let after = ThreadLocalAllocationSnapshot::current();
 
     after.assert_unchanged_since(before);
 }

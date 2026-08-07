@@ -10,7 +10,10 @@ use flowio::fuzzing::test_support::{
 use flowio::fuzzing::{dns_decode_name, tls_server_end_point};
 use flowio::net::sctp::{SctpNotification, SctpRecvInfo, SctpRecvMeta, SctpSendInfo};
 use flowio::runtime::buffer::bytes::BufferRangeError;
-use flowio::test_support::net::{resolver::decode_name, sctp::append_initialized_test_cmsg};
+use flowio::test_support::net::{
+    resolver::{decode_name, parse_resolv_conf_configuration_bytes},
+    sctp::append_initialized_test_cmsg,
+};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
 const IGNORED_ASSOC_WRAPPER_SENTINEL: u8 = 1;
@@ -566,8 +569,9 @@ fn resolv_conf_byte_parser_corpus_pins_configuration_semantics() {
 
     let nameserver_truncation =
         include_bytes!("../fixtures/fuzzing/dns_parse_resolv_conf_bytes/nameserver_truncation");
+    let decoded_nameserver_truncation = decode_hex_seed(nameserver_truncation);
     assert_eq!(
-        decode_hex_seed(nameserver_truncation),
+        decoded_nameserver_truncation,
         b"nameserver 192.0.2.4\n\
 nameserver 192.0.2.1\n\
 nameserver 192.0.2.4\n\
@@ -582,9 +586,18 @@ nameserver 192.0.2.9\n\
 nameserver 2001:db8::10\n",
         "the canonical fixture must retain duplicates around the cap and later unique entries"
     );
+    let (effective_nameservers, nameservers_were_truncated) =
+        parse_resolv_conf_configuration_bytes(&decoded_nameserver_truncation)
+            .expect("the canonical truncation fixture should expose effective metadata");
+    assert!(nameservers_were_truncated);
     assert_eq!(
         observe_dns_parse_resolv_conf_bytes(nameserver_truncation)
-            .expect("later nameservers should be ignored after eight unique entries"),
+            .expect("later unique nameservers should leave the effective first-eight list"),
+        effective_nameservers,
+        "the legacy fuzz entry must delegate to the metadata-producing parser"
+    );
+    assert_eq!(
+        effective_nameservers,
         [4, 1, 7, 2, 8, 3, 6, 5]
             .into_iter()
             .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 53)))
@@ -635,6 +648,7 @@ fn sctp_notification_fixture_inventory_is_exact() {
         "adaptation",
         "assoc_change",
         "assoc_reset",
+        "authentication",
         "common_header_too_short",
         "declared_length_below_header",
         "declared_length_beyond_buffer",
@@ -650,6 +664,7 @@ fn sctp_notification_fixture_inventory_is_exact() {
         "shutdown",
         "stream_change",
         "stream_reset",
+        "stream_reset_with_tail",
         "unknown_notification",
     ];
 
@@ -664,7 +679,7 @@ fn sctp_notification_boundary_fixtures_reach_exact_paths() {
     const PEER_ADDR_STATE_OFFSET: usize = 136;
     const PEER_ADDR_ERROR_OFFSET: usize = 140;
     const PEER_ADDR_ASSOC_ID_OFFSET: usize = 144;
-    const UNKNOWN_TYPE: u16 = 0x7ffe;
+    const UNKNOWN_TYPE: u16 = 0x800e;
     const PEER_ADDR_CHANGE_TYPE: u16 = (1 << 15) | 2;
 
     let unknown_fixture =
@@ -672,7 +687,7 @@ fn sctp_notification_boundary_fixtures_reach_exact_paths() {
     let unknown = decode_hex_seed(unknown_fixture);
     assert_eq!(
         unknown,
-        [0xfe, 0x7f, 0x34, 0x12, 0x08, 0x00, 0x00, 0x00],
+        [0x0e, 0x80, 0x34, 0x12, 0x08, 0x00, 0x00, 0x00],
         "the unknown-notification fixture must remain one exact common header"
     );
     assert_eq!(
@@ -830,6 +845,27 @@ fn sctp_notification_fixtures_reach_expected_layouts() {
             assoc_id: -29,
         })
     );
+    let authentication_fixture =
+        include_bytes!("../fixtures/fuzzing/sctp_parse_notification/authentication");
+    assert_eq!(
+        decode_hex_seed(authentication_fixture),
+        [
+            0x08, 0x80, 0x34, 0x12, 0x14, 0x00, 0x00, 0x00, 0x22, 0x11, 0x44, 0x33, 0x88, 0x77,
+            0x66, 0x55, 0x40, 0x30, 0x20, 0x10,
+        ],
+        "the authentication fixture must pin the complete 20-byte Linux layout"
+    );
+    assert_eq!(
+        observe_sctp_parse_notification(authentication_fixture)
+            .expect("authentication notification should parse"),
+        SctpRecvMeta::Notification(SctpNotification::Authentication {
+            flags: NOTIFICATION_FLAGS_SENTINEL,
+            key_number: 0x1122,
+            alternate_key_number: 0x3344,
+            indication: 0x5566_7788,
+            assoc_id: 0x1020_3040,
+        })
+    );
     assert_eq!(
         observe_sctp_parse_notification(include_bytes!(
             "../fixtures/fuzzing/sctp_parse_notification/assoc_change"
@@ -983,6 +1019,29 @@ fn sctp_notification_fixtures_reach_expected_layouts() {
             assoc_id: -64,
         })
     );
+
+    let stream_reset_with_tail = decode_hex_seed(include_bytes!(
+        "../fixtures/fuzzing/sctp_parse_notification/stream_reset_with_tail"
+    ));
+    assert_eq!(
+        stream_reset_with_tail,
+        [
+            0x0a, 0x80, 0x34, 0x12, 0x10, 0x00, 0x00, 0x00, 0xc0, 0xff, 0xff, 0xff, 0x22, 0x11,
+            0x44, 0x33,
+        ],
+        "the stream-reset-tail fixture must pin the complete declared Linux layout"
+    );
+    assert_eq!(
+        observe_sctp_parse_notification(include_bytes!(
+            "../fixtures/fuzzing/sctp_parse_notification/stream_reset_with_tail"
+        ))
+        .expect("stream reset with a declared ID tail should parse"),
+        SctpRecvMeta::Notification(SctpNotification::StreamReset {
+            flags: NOTIFICATION_FLAGS_SENTINEL,
+            assoc_id: -64,
+        }),
+        "FlowIO intentionally leaves the declared stream-ID tail unmaterialized"
+    );
 }
 
 #[test]
@@ -1066,7 +1125,7 @@ fn sctp_assoc_addr_fixtures_reach_expected_forward_walk_results() {
             .and_then(|error| error.downcast_ref::<BufferRangeError>()),
         Some(&BufferRangeError {
             offset: 0,
-            width: 2,
+            width: std::mem::size_of::<libc::sa_family_t>(),
             len: 0,
         })
     );

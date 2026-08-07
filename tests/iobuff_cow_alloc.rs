@@ -2,7 +2,8 @@
 mod counting_allocator;
 
 use counting_allocator::{
-    AllocationSnapshot, CountingAllocator, assert_allocation_failure_consumed, fail_next_allocation,
+    CountingAllocator, ThreadLocalAllocationSnapshot, assert_allocation_failure_consumed,
+    fail_next_allocation,
 };
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::buffer::{IoBuff, IoBuffError, IoBuffMut};
@@ -62,11 +63,11 @@ fn assert_heap_shared_cow_success() {
     let survivor = frozen.clone();
     let original_ptr = survivor.bytes().as_ptr();
 
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     let mut copied = frozen
         .make_mut()
         .expect("shared heap source should copy successfully");
-    AllocationSnapshot::current().assert_delta_since(before, 1, 0);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 0);
     assert_advanced_shape(&mut copied);
     assert_ne!(copied.bytes().as_ptr(), original_ptr);
 
@@ -76,15 +77,15 @@ fn assert_heap_shared_cow_success() {
     assert_eq!(copied.bytes(), &ACTIVE[1..]);
     assert_eq!(survivor.bytes(), ACTIVE);
     drop(copied);
-    AllocationSnapshot::current().assert_delta_since(before, 1, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 1);
 
     let recovered = survivor
         .try_mut()
         .expect("consumed COW source should leave one original reference");
     assert_eq!(recovered.bytes().as_ptr(), original_ptr);
-    let before_original_drop = AllocationSnapshot::current();
+    let before_original_drop = ThreadLocalAllocationSnapshot::current();
     drop(recovered);
-    AllocationSnapshot::current().assert_delta_since(before_original_drop, 0, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before_original_drop, 0, 1);
 }
 
 fn assert_heap_shared_cow_failure() {
@@ -95,7 +96,7 @@ fn assert_heap_shared_cow_failure() {
     let survivor = frozen.clone();
     let original_ptr = survivor.bytes().as_ptr();
 
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     fail_next_allocation();
     let err = match frozen.make_mut() {
         Ok(_) => panic!("forced shared COW allocation unexpectedly succeeded"),
@@ -103,7 +104,7 @@ fn assert_heap_shared_cow_failure() {
     };
     assert_allocation_failure_consumed();
     assert_eq!(err, IoBuffError::AllocFailed);
-    AllocationSnapshot::current().assert_unchanged_since(before);
+    ThreadLocalAllocationSnapshot::current().assert_unchanged_since(before);
     assert_eq!(survivor.bytes(), ACTIVE);
 
     let recovered = survivor
@@ -111,7 +112,7 @@ fn assert_heap_shared_cow_failure() {
         .expect("failed COW should leave one valid original reference");
     assert_eq!(recovered.bytes().as_ptr(), original_ptr);
     drop(recovered);
-    AllocationSnapshot::current().assert_delta_since(before, 0, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 1);
 }
 
 fn assert_pool_shared_cow_success_and_failure() {
@@ -128,11 +129,11 @@ fn assert_pool_shared_cow_success_and_failure() {
     let survivor = frozen.clone();
     assert_eq!(pool.live_slots_for_test(), 1);
 
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     let mut copied = frozen
         .make_mut()
         .expect("shared pool source should copy successfully");
-    AllocationSnapshot::current().assert_delta_since(before, 1, 0);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 0);
     assert_advanced_shape(&mut copied);
     copied
         .advance(1)
@@ -140,7 +141,7 @@ fn assert_pool_shared_cow_success_and_failure() {
     assert_eq!(survivor.bytes(), ACTIVE);
     assert_eq!(pool.live_slots_for_test(), 1);
     drop(copied);
-    AllocationSnapshot::current().assert_delta_since(before, 1, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 1);
 
     drop(
         survivor
@@ -153,7 +154,7 @@ fn assert_pool_shared_cow_success_and_failure() {
     let survivor = frozen.clone();
     assert_eq!(pool.live_slots_for_test(), 1);
 
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     fail_next_allocation();
     let err = match frozen.make_mut() {
         Ok(_) => panic!("forced pool-backed COW allocation unexpectedly succeeded"),
@@ -161,7 +162,7 @@ fn assert_pool_shared_cow_success_and_failure() {
     };
     assert_allocation_failure_consumed();
     assert_eq!(err, IoBuffError::AllocFailed);
-    AllocationSnapshot::current().assert_unchanged_since(before);
+    ThreadLocalAllocationSnapshot::current().assert_unchanged_since(before);
     assert_eq!(survivor.bytes(), ACTIVE);
     assert_eq!(pool.live_slots_for_test(), 1);
 
@@ -171,17 +172,17 @@ fn assert_pool_shared_cow_success_and_failure() {
             .expect("failed COW should leave one valid pool reference"),
     );
     assert_eq!(pool.live_slots_for_test(), 0);
-    AllocationSnapshot::current().assert_unchanged_since(before);
+    ThreadLocalAllocationSnapshot::current().assert_unchanged_since(before);
 
-    let reuse_before = AllocationSnapshot::current();
+    let reuse_before = ThreadLocalAllocationSnapshot::current();
     let reused = pool
         .alloc()
         .expect("failed COW should return the original slot for reuse");
-    AllocationSnapshot::current().assert_unchanged_since(reuse_before);
+    ThreadLocalAllocationSnapshot::current().assert_unchanged_since(reuse_before);
     assert_eq!(pool.live_slots_for_test(), 1);
     drop(reused);
     assert_eq!(pool.live_slots_for_test(), 0);
-    AllocationSnapshot::current().assert_unchanged_since(reuse_before);
+    ThreadLocalAllocationSnapshot::current().assert_unchanged_since(reuse_before);
 }
 
 #[test]

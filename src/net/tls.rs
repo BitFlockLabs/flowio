@@ -110,7 +110,6 @@ use rustls::pki_types::alg_id::{
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::future::Future;
 use std::io::{self, Cursor, Read, Write};
-use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::slice;
 use std::sync::Arc;
@@ -1079,8 +1078,10 @@ impl TlsClientStream {
 
             debug_assert!(written > 0);
             debug_assert!(buffer.len() <= chunk_limit);
-            self.pending_write_tls =
-                Some(stream::WriteAllFuture::new(self.stream.as_raw_fd(), buffer));
+            self.pending_write_tls = Some(stream::WriteAllFuture::new(
+                self.stream.raw_fd_for_internal_io(),
+                buffer,
+            ));
         }
     }
 
@@ -1130,7 +1131,7 @@ impl TlsClientStream {
             let buffer = self.take_read_tls_buffer()?;
             let len = tls_read_submission_len(buffer.capacity(), self.transport_read_buffer_size);
             self.pending_read_tls = Some(stream::ReadFuture::new(
-                self.stream.as_raw_fd(),
+                self.stream.raw_fd_for_internal_io(),
                 buffer,
                 len,
             ));
@@ -2377,7 +2378,10 @@ mod tests {
 
         let staged = b"staged tls ciphertext".to_vec();
         tls.write_tls_buffer = None;
-        tls.pending_write_tls = Some(stream::WriteAllFuture::new(tls.stream.as_raw_fd(), staged));
+        tls.pending_write_tls = Some(stream::WriteAllFuture::new(
+            tls.stream.raw_fd_for_internal_io(),
+            staged,
+        ));
         let mut executor = Executor::new().expect("failed to construct runtime executor");
 
         executor

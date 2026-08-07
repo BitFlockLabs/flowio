@@ -92,6 +92,10 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_TOTAL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const HOSTS_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
+/// FlowIO's bound on DNS retry fanout and retained resolver configuration.
+///
+/// This is a library resource policy, not an assertion about another
+/// resolver implementation's nameserver limit.
 const MAX_NAMESERVERS: usize = 8;
 const MAX_RESOLVED_ADDRESSES: usize = 64;
 const MAX_CNAME_HOPS_PER_RESPONSE: usize = 16;
@@ -322,6 +326,8 @@ fn classify_dns_timeout<T>(
 /// use std::net::{Ipv4Addr, SocketAddr};
 ///
 /// let mut resolver = DnsResolver::new(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 53))])?;
+/// assert_eq!(resolver.nameservers().len(), 1);
+/// assert!(!resolver.system_nameservers_were_truncated());
 /// resolver.set_query_timeout(std::time::Duration::from_secs(1));
 /// resolver.set_total_query_timeout(std::time::Duration::from_secs(2));
 /// # Ok::<(), std::io::Error>(())
@@ -330,6 +336,9 @@ fn classify_dns_timeout<T>(
 pub struct DnsResolver {
     /// Upstream recursive resolvers queried over UDP, in retry order.
     nameservers: Box<[SocketAddr]>,
+    /// Whether system configuration contained a later unique valid nameserver
+    /// beyond [`MAX_NAMESERVERS`]. Explicit construction always stores false.
+    system_nameservers_were_truncated: bool,
     /// Timeout for waiting on a matching response after each UDP query send
     /// completes.
     query_timeout: Duration,
@@ -352,17 +361,22 @@ impl DnsResolver {
     /// malformed directive line is skipped without suppressing valid siblings,
     /// while malformed comment bytes are ignored. At most eight unique valid
     /// nameservers are retained; duplicates do not consume that bound and
-    /// first-seen retry order is preserved.
+    /// first-seen retry order is preserved. Use [`Self::nameservers`] to
+    /// inspect the effective list and
+    /// [`Self::system_nameservers_were_truncated`] to determine whether a
+    /// later unique valid entry was omitted.
     ///
     /// # Errors
     ///
-    /// Later valid nameserver directives after the first eight unique entries
-    /// are ignored. Returns [`io::ErrorKind::InvalidData`] when the file exceeds
-    /// 64 KiB and [`io::ErrorKind::NotFound`] when no valid nameserver remains.
-    /// Other file errors retain their existing classifications.
+    /// Returns [`io::ErrorKind::InvalidData`] when the file exceeds 64 KiB and
+    /// [`io::ErrorKind::NotFound`] when no valid nameserver remains. Other file
+    /// errors retain their existing classifications.
     pub fn from_system() -> io::Result<Self> {
-        let nameservers = read_resolv_conf(RESOLV_CONF_PATH)?;
-        Self::new(nameservers)
+        let configuration = read_resolv_conf(RESOLV_CONF_PATH)?;
+        Ok(Self::from_effective_nameservers(
+            configuration.nameservers,
+            configuration.nameservers_were_truncated,
+        ))
     }
 
     /// Builds a resolver from an explicit nameserver list.
@@ -397,14 +411,44 @@ impl DnsResolver {
         }
         nameservers.truncate(unique_len);
 
-        Ok(Self {
+        Ok(Self::from_effective_nameservers(nameservers, false))
+    }
+
+    fn from_effective_nameservers(
+        nameservers: Vec<SocketAddr>,
+        system_nameservers_were_truncated: bool,
+    ) -> Self {
+        debug_assert!(!nameservers.is_empty());
+        debug_assert!(nameservers.len() <= MAX_NAMESERVERS);
+
+        Self {
             nameservers: nameservers.into_boxed_slice(),
+            system_nameservers_were_truncated,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
             total_query_timeout: DEFAULT_TOTAL_QUERY_TIMEOUT,
             deadline_clock: DnsDeadlineClock::default(),
             #[cfg(test)]
             query_hook: None,
-        })
+        }
+    }
+
+    /// Returns the effective upstream nameservers in retry order.
+    ///
+    /// Explicit construction removes duplicates and retains every unique
+    /// address after validation. System construction returns the first eight
+    /// unique valid entries parsed from `/etc/resolv.conf`.
+    pub fn nameservers(&self) -> &[SocketAddr] {
+        &self.nameservers
+    }
+
+    /// Reports whether system configuration was truncated to eight nameservers.
+    ///
+    /// This is `true` only when [`Self::from_system`] found a later unique valid
+    /// nameserver after retaining eight. Duplicate, invalid, and commented-out
+    /// entries do not set it. Resolvers built with [`Self::new`] always return
+    /// `false`.
+    pub fn system_nameservers_were_truncated(&self) -> bool {
+        self.system_nameservers_were_truncated
     }
 
     /// Sets the matching-response wait timeout after each UDP query is sent.
@@ -1165,17 +1209,29 @@ fn parse_hosts_line_bytes(
     Ok(())
 }
 
-fn read_resolv_conf(path: &str) -> io::Result<Vec<SocketAddr>> {
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedResolvConf {
+    nameservers: Vec<SocketAddr>,
+    nameservers_were_truncated: bool,
+}
+
+fn read_resolv_conf(path: &str) -> io::Result<ParsedResolvConf> {
     let contents = read_bounded_file_bytes(
         path,
         RESOLV_CONF_MAX_BYTES,
         "/etc/resolv.conf exceeds the 64 KiB resolver configuration limit",
     )?;
-    parse_resolv_conf_bytes(&contents)
+    parse_resolv_conf_configuration_bytes(&contents)
 }
 
+#[cfg(any(feature = "fuzzing", feature = "test-support"))]
 pub(crate) fn parse_resolv_conf_bytes(contents: &[u8]) -> io::Result<Vec<SocketAddr>> {
+    parse_resolv_conf_configuration_bytes(contents).map(|configuration| configuration.nameservers)
+}
+
+fn parse_resolv_conf_configuration_bytes(contents: &[u8]) -> io::Result<ParsedResolvConf> {
     let mut nameservers = Vec::with_capacity(MAX_NAMESERVERS);
+    let mut nameservers_were_truncated = false;
 
     for line_bytes in contents.split(|byte| *byte == b'\n') {
         let Some(line) = config_line_prefix(line_bytes, |byte| matches!(byte, b'#' | b';')) else {
@@ -1195,9 +1251,14 @@ pub(crate) fn parse_resolv_conf_bytes(contents: &[u8]) -> io::Result<Vec<SocketA
         };
 
         let socket = SocketAddr::new(ip, DNS_PORT);
-        if nameservers.len() < MAX_NAMESERVERS {
-            push_unique_socket_addr(&mut nameservers, socket);
+        if nameservers.len() == MAX_NAMESERVERS {
+            if !nameservers.contains(&socket) {
+                nameservers_were_truncated = true;
+                break;
+            }
+            continue;
         }
+        push_unique_socket_addr(&mut nameservers, socket);
     }
 
     if nameservers.is_empty() {
@@ -1207,7 +1268,10 @@ pub(crate) fn parse_resolv_conf_bytes(contents: &[u8]) -> io::Result<Vec<SocketA
         ));
     }
 
-    Ok(nameservers)
+    Ok(ParsedResolvConf {
+        nameservers,
+        nameservers_were_truncated,
+    })
 }
 
 fn read_bounded_file_bytes(
@@ -2238,12 +2302,24 @@ pub(crate) mod test_support {
 
     /// Repository-only seam for bounded `/etc/resolv.conf` fixtures.
     pub fn read_resolv_conf(path: &str) -> std::io::Result<Vec<SocketAddr>> {
-        super::read_resolv_conf(path)
+        super::read_resolv_conf(path).map(|configuration| configuration.nameservers)
     }
 
     /// Repository-only seam for raw-byte `/etc/resolv.conf` fixtures.
     pub fn parse_resolv_conf_bytes(contents: &[u8]) -> std::io::Result<Vec<SocketAddr>> {
         super::parse_resolv_conf_bytes(contents)
+    }
+
+    /// Repository-only seam for effective `/etc/resolv.conf` metadata.
+    pub fn parse_resolv_conf_configuration_bytes(
+        contents: &[u8],
+    ) -> std::io::Result<(Vec<SocketAddr>, bool)> {
+        super::parse_resolv_conf_configuration_bytes(contents).map(|configuration| {
+            (
+                configuration.nameservers,
+                configuration.nameservers_were_truncated,
+            )
+        })
     }
 
     /// Repository-only seam for the DNS candidate allocation fixture.
@@ -2660,7 +2736,8 @@ mod tests {
 
         let resolver = DnsResolver::new(vec![first, second, first, third, second])
             .expect("duplicate nameservers within the bound should be accepted");
-        assert_eq!(&*resolver.nameservers, &[first, second, third]);
+        assert_eq!(resolver.nameservers(), &[first, second, third]);
+        assert!(!resolver.system_nameservers_were_truncated());
     }
 
     #[test]
@@ -2676,7 +2753,8 @@ mod tests {
 
         let resolver = DnsResolver::new(nameservers.clone())
             .expect("the nameserver boundary should be accepted");
-        assert_eq!(&*resolver.nameservers, nameservers);
+        assert_eq!(resolver.nameservers(), nameservers);
+        assert!(!resolver.system_nameservers_were_truncated());
     }
 
     #[test]
@@ -2699,6 +2777,29 @@ mod tests {
             err.to_string(),
             "resolver supports at most eight unique nameservers"
         );
+    }
+
+    #[test]
+    fn system_resolver_exposes_truncated_effective_configuration() {
+        let configuration = parse_resolv_conf_configuration_bytes(
+            b"nameserver 192.0.2.1\n\
+nameserver 192.0.2.2\n\
+nameserver 192.0.2.3\n\
+nameserver 192.0.2.4\n\
+nameserver 192.0.2.5\n\
+nameserver 192.0.2.6\n\
+nameserver 192.0.2.7\n\
+nameserver 192.0.2.8\n\
+nameserver 192.0.2.9\n",
+        )
+        .expect("system nameserver configuration should parse");
+        let resolver = DnsResolver::from_effective_nameservers(
+            configuration.nameservers,
+            configuration.nameservers_were_truncated,
+        );
+
+        assert_eq!(resolver.nameservers().len(), MAX_NAMESERVERS);
+        assert!(resolver.system_nameservers_were_truncated());
     }
 
     #[test]

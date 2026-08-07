@@ -1,7 +1,7 @@
 #[path = "common/counting_allocator.rs"]
 mod counting_allocator;
 
-use counting_allocator::{AllocationSnapshot, CountingAllocator};
+use counting_allocator::{CountingAllocator, ProcessWideAllocationSnapshot};
 use flowio::net::sctp::{SctpConnector, SctpInitConfig, SctpListener, SctpSocketConfig};
 use flowio::net::tcp::TcpStream;
 use flowio::net::udp::UdpSocket;
@@ -158,7 +158,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
             let warm = Executor::spawn(async { 7usize }).expect("spawn warmup failed");
             assert_eq!(warm.await.expect("warmup task cancelled"), 7);
 
-            let before = AllocationSnapshot::current();
+            let before = ProcessWideAllocationSnapshot::current();
 
             for _ in 0..STEADY_ROUNDS {
                 tcp_recv = tcp_echo_once(&mut tcp, tcp_recv).await;
@@ -181,7 +181,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
                 assert_eq!(handle.await.expect("spawned task cancelled"), 11);
             }
 
-            let after = AllocationSnapshot::current();
+            let after = ProcessWideAllocationSnapshot::current();
             after.assert_unchanged_since(before);
 
             tcp_recv = tcp_echo_once(&mut tcp, tcp_recv).await;

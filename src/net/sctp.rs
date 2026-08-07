@@ -967,6 +967,11 @@ pub enum SctpNotification {
         assoc_id: libc::sctp_assoc_t,
     },
     /// Stream reset completion or state change notification.
+    ///
+    /// Linux may append a variable list of stream identifiers after the
+    /// association ID. FlowIO bounds that tail by the declared notification
+    /// length but intentionally does not materialize it, keeping this value
+    /// fixed-size, allocation-free, and [`Copy`].
     StreamReset {
         /// Kernel flags for the reset event.
         flags: u16,
@@ -1003,6 +1008,20 @@ pub enum SctpNotification {
         flags: u16,
         /// Raw notification length.
         length: u32,
+    },
+    /// Authentication key state changed for an association.
+    Authentication {
+        /// Kernel flags for the authentication event.
+        flags: u16,
+        /// Key number affected by the event.
+        key_number: u16,
+        /// Alternate key number reported by the kernel.
+        alternate_key_number: u16,
+        /// Raw Linux authentication indication; unfamiliar values are
+        /// preserved for forward compatibility.
+        indication: u32,
+        /// Association identifier reported by the kernel.
+        assoc_id: libc::sctp_assoc_t,
     },
 }
 
@@ -1045,6 +1064,8 @@ pub enum SctpNotificationKind {
     StreamChange,
     /// [`SctpNotification::Other`].
     Other,
+    /// [`SctpNotification::Authentication`].
+    Authentication,
 }
 
 impl SctpNotification {
@@ -1063,6 +1084,7 @@ impl SctpNotification {
             Self::AssocReset { .. } => SctpNotificationKind::AssocReset,
             Self::StreamChange { .. } => SctpNotificationKind::StreamChange,
             Self::Other { .. } => SctpNotificationKind::Other,
+            Self::Authentication { .. } => SctpNotificationKind::Authentication,
         }
     }
 }
@@ -5871,7 +5893,7 @@ fn get_assoc_addrs_with(
             unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpGetAddrsHeader) };
         let payload = &buffer[header_len..payload_end];
         let addr_count = checked_assoc_addr_count(header.addr_num as usize, payload.len())?;
-        return parse_assoc_addrs(payload, addr_count).map_err(|err| io::Error::from(err.kind()));
+        return parse_assoc_addrs(payload, addr_count);
     }
 
     Err(io::Error::from(io::ErrorKind::InvalidData))
@@ -6078,95 +6100,123 @@ fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
     }
 }
 
-/// Finds the first complete SCTP_RCVINFO in a bounded control-message chain.
-///
-/// # Safety
-///
-/// Within `min(controllen, control.len())`, every CMSG header and declared
-/// payload byte reached by the walk must be initialized. Alignment padding may
-/// remain uninitialized.
-unsafe fn parse_rcvinfo(
-    control: &[MaybeUninit<u8>],
-    controllen: usize,
-    end_of_record: bool,
-) -> io::Result<Option<SctpRecvInfo>> {
-    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    let min_cmsg_len = cmsg_align(hdr_len);
-    let rcvinfo_len = std::mem::size_of::<libc::sctp_rcvinfo>();
-    let rcvinfo_cmsg_len = min_cmsg_len + rcvinfo_len;
-    let available = controllen.min(control.len());
-    let mut offset = 0usize;
-
-    while offset < available {
-        let remaining = available - offset;
-        if remaining < hdr_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCTP recvmsg control message header was malformed",
-            ));
-        }
-
-        // SAFETY: the caller supplies the kernel-reported prefix. A complete
-        // cmsghdr fits in `remaining`; CMSG alignment padding is never read.
-        let hdr = unsafe {
-            std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
-        };
-        let cmsg_len = hdr.cmsg_len as usize;
-        if cmsg_len < min_cmsg_len || cmsg_len > remaining {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SCTP recvmsg control message length was malformed",
-            ));
-        }
-
-        if hdr.cmsg_level == libc::IPPROTO_SCTP && hdr.cmsg_type == libc::SCTP_RCVINFO {
-            if cmsg_len < rcvinfo_cmsg_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCTP_RCVINFO control message was truncated",
-                ));
-            }
-            // The guards above establish
-            // `offset + min_cmsg_len + rcvinfo_len <= available`.
-            let data_offset = offset + min_cmsg_len;
-
-            // SAFETY: the complete RCVINFO payload is bounded by both this
-            // record and the kernel-reported backing prefix. The ABI permits
-            // an unaligned control buffer, so use an unaligned read.
-            let info = unsafe {
-                std::ptr::read_unaligned(
-                    control
-                        .as_ptr()
-                        .add(data_offset)
-                        .cast::<libc::sctp_rcvinfo>(),
-                )
-            };
-            return Ok(Some(SctpRecvInfo {
-                stream_id: info.rcv_sid,
-                ssn: info.rcv_ssn,
-                flags: info.rcv_flags,
-                ppid: u32::from_be(info.rcv_ppid),
-                tsn: info.rcv_tsn,
-                cumtsn: info.rcv_cumtsn,
-                context: info.rcv_context,
-                assoc_id: info.rcv_assoc_id,
-                end_of_record,
-            }));
-        }
-
-        // `cmsg_len <= remaining <= control.len()`, so a valid slice bounds
-        // the alignment addition below.
-        let aligned_len = cmsg_align(cmsg_len);
-        if aligned_len > remaining {
-            // A final complete cmsg need not include all trailing CMSG_SPACE
-            // padding. No next header can begin in this suffix.
-            break;
-        }
-        offset += aligned_len;
-    }
-
-    Ok(None)
+macro_rules! production_receive_invalid_data {
+    ($message:literal) => {
+        io::Error::new(io::ErrorKind::InvalidData, $message)
+    };
 }
+
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! bare_receive_invalid_data {
+    ($message:literal) => {
+        io::Error::from(io::ErrorKind::InvalidData)
+    };
+}
+
+macro_rules! define_parse_rcvinfo {
+    ($(#[$attribute:meta])* $name:ident, $invalid_data:ident) => {
+        $(#[$attribute])*
+        unsafe fn $name(
+            control: &[MaybeUninit<u8>],
+            controllen: usize,
+            end_of_record: bool,
+        ) -> io::Result<Option<SctpRecvInfo>> {
+            let hdr_len = std::mem::size_of::<libc::cmsghdr>();
+            let min_cmsg_len = cmsg_align(hdr_len);
+            let rcvinfo_len = std::mem::size_of::<libc::sctp_rcvinfo>();
+            let rcvinfo_cmsg_len = min_cmsg_len + rcvinfo_len;
+            let available = controllen.min(control.len());
+            let mut offset = 0usize;
+
+            while offset < available {
+                let remaining = available - offset;
+                if remaining < hdr_len {
+                    return Err($invalid_data!(
+                        "SCTP recvmsg control message header was malformed"
+                    ));
+                }
+
+                // SAFETY: the caller supplies the kernel-reported prefix. A complete
+                // cmsghdr fits in `remaining`; CMSG alignment padding is never read.
+                let hdr = unsafe {
+                    std::ptr::read_unaligned(
+                        control.as_ptr().add(offset).cast::<libc::cmsghdr>(),
+                    )
+                };
+                let cmsg_len = hdr.cmsg_len as usize;
+                if cmsg_len < min_cmsg_len || cmsg_len > remaining {
+                    return Err($invalid_data!(
+                        "SCTP recvmsg control message length was malformed"
+                    ));
+                }
+
+                if hdr.cmsg_level == libc::IPPROTO_SCTP && hdr.cmsg_type == libc::SCTP_RCVINFO {
+                    if cmsg_len < rcvinfo_cmsg_len {
+                        return Err($invalid_data!("SCTP_RCVINFO control message was truncated"));
+                    }
+                    // The guards above establish
+                    // `offset + min_cmsg_len + rcvinfo_len <= available`.
+                    let data_offset = offset + min_cmsg_len;
+
+                    // SAFETY: the complete RCVINFO payload is bounded by both this
+                    // record and the kernel-reported backing prefix. The ABI permits
+                    // an unaligned control buffer, so use an unaligned read.
+                    let info = unsafe {
+                        std::ptr::read_unaligned(
+                            control
+                                .as_ptr()
+                                .add(data_offset)
+                                .cast::<libc::sctp_rcvinfo>(),
+                        )
+                    };
+                    return Ok(Some(SctpRecvInfo {
+                        stream_id: info.rcv_sid,
+                        ssn: info.rcv_ssn,
+                        flags: info.rcv_flags,
+                        ppid: u32::from_be(info.rcv_ppid),
+                        tsn: info.rcv_tsn,
+                        cumtsn: info.rcv_cumtsn,
+                        context: info.rcv_context,
+                        assoc_id: info.rcv_assoc_id,
+                        end_of_record,
+                    }));
+                }
+
+                // `cmsg_len <= remaining <= control.len()`, so a valid slice bounds
+                // the alignment addition below.
+                let aligned_len = cmsg_align(cmsg_len);
+                if aligned_len > remaining {
+                    // A final complete cmsg need not include all trailing CMSG_SPACE
+                    // padding. No next header can begin in this suffix.
+                    break;
+                }
+                offset += aligned_len;
+            }
+
+            Ok(None)
+        }
+    };
+}
+
+define_parse_rcvinfo!(
+    /// Finds the first complete SCTP_RCVINFO in a bounded control-message chain.
+    ///
+    /// # Safety
+    ///
+    /// Within `min(controllen, control.len())`, every CMSG header and declared
+    /// payload byte reached by the walk must be initialized. Alignment padding may
+    /// remain uninitialized.
+    parse_rcvinfo,
+    production_receive_invalid_data
+);
+
+define_parse_rcvinfo!(
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline(always)]
+    /// Diagnostic-only bare-error comparator generated from the shipping walk.
+    parse_rcvinfo_bare,
+    bare_receive_invalid_data
+);
 
 #[inline(always)]
 fn completion_uses_rcvinfo(has_data: bool, msg_flags: libc::c_int) -> bool {
@@ -6175,26 +6225,43 @@ fn completion_uses_rcvinfo(has_data: bool, msg_flags: libc::c_int) -> bool {
         && !sctp_msg_notification(msg_flags)
 }
 
-#[inline(always)]
-/// Parses receive information only when no higher-precedence completion
-/// outcome makes ancillary metadata irrelevant.
-///
-/// # Safety
-///
-/// Within `min(controllen, control.len())`, every CMSG header and declared
-/// payload byte reached by ancillary parsing must be initialized. Alignment
-/// padding may remain uninitialized.
-unsafe fn parse_completion_rcvinfo(
-    control: &[MaybeUninit<u8>],
-    controllen: usize,
-    msg_flags: libc::c_int,
-    has_data: bool,
-) -> io::Result<Option<SctpRecvInfo>> {
-    if controllen == 0 || !completion_uses_rcvinfo(has_data, msg_flags) {
-        return Ok(None);
-    }
-    unsafe { parse_rcvinfo(control, controllen, sctp_msg_end_of_record(msg_flags)) }
+macro_rules! define_parse_completion_rcvinfo {
+    ($(#[$attribute:meta])* $name:ident, $parse_rcvinfo:ident) => {
+        $(#[$attribute])*
+        unsafe fn $name(
+            control: &[MaybeUninit<u8>],
+            controllen: usize,
+            msg_flags: libc::c_int,
+            has_data: bool,
+        ) -> io::Result<Option<SctpRecvInfo>> {
+            if controllen == 0 || !completion_uses_rcvinfo(has_data, msg_flags) {
+                return Ok(None);
+            }
+            unsafe { $parse_rcvinfo(control, controllen, sctp_msg_end_of_record(msg_flags)) }
+        }
+    };
 }
+
+define_parse_completion_rcvinfo!(
+    #[inline(always)]
+    /// Parses receive information only when no higher-precedence completion
+    /// outcome makes ancillary metadata irrelevant.
+    ///
+    /// # Safety
+    ///
+    /// Within `min(controllen, control.len())`, every CMSG header and declared
+    /// payload byte reached by ancillary parsing must be initialized. Alignment
+    /// padding may remain uninitialized.
+    parse_completion_rcvinfo,
+    parse_rcvinfo
+);
+
+define_parse_completion_rcvinfo!(
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline(always)]
+    parse_completion_rcvinfo_bare,
+    parse_rcvinfo_bare
+);
 
 #[cfg(any(test, feature = "test-support"))]
 fn parse_initialized_recv_state_meta_for_test(
@@ -6215,116 +6282,172 @@ fn parse_initialized_recv_state_meta_for_test(
     recv_state.parse_completion_meta(rcvinfo, msg_flags, data_slice, parsed_notification)
 }
 
-#[cfg(any(feature = "fuzzing", feature = "test-support"))]
-pub(crate) fn parse_recv_meta(
-    control: &[u8],
-    controllen: usize,
-    msg_flags: libc::c_int,
-    data_slice: &[u8],
-    recv_rcvinfo_requested: bool,
-) -> io::Result<SctpRecvMeta> {
-    // SAFETY: initialized bytes may always be viewed as MaybeUninit bytes.
-    let control = unsafe {
-        std::slice::from_raw_parts(control.as_ptr().cast::<MaybeUninit<u8>>(), control.len())
-    };
-    // SAFETY: the public test/fuzz facade accepted an initialized byte slice.
-    unsafe {
-        parse_recv_meta_with_notification(
-            control,
-            controllen,
-            msg_flags,
-            data_slice,
-            recv_rcvinfo_requested,
-            None,
-        )
-    }
-}
-
-/// Interprets one completed SCTP metadata receive.
-///
-/// # Safety
-///
-/// Within `min(controllen, control.len())`, every CMSG header and declared
-/// payload byte reached by ancillary parsing must be initialized. Alignment
-/// padding may remain uninitialized.
-#[cfg(any(test, feature = "fuzzing", feature = "test-support"))]
-unsafe fn parse_recv_meta_with_notification(
-    control: &[MaybeUninit<u8>],
-    controllen: usize,
-    msg_flags: libc::c_int,
-    data_slice: &[u8],
-    recv_rcvinfo_requested: bool,
-    parsed_notification: Option<io::Result<SctpRecvMeta>>,
-) -> io::Result<SctpRecvMeta> {
-    let rcvinfo =
-        unsafe { parse_completion_rcvinfo(control, controllen, msg_flags, !data_slice.is_empty()) };
-    classify_recv_meta(
-        rcvinfo,
-        msg_flags,
-        data_slice,
-        recv_rcvinfo_requested,
-        parsed_notification,
-    )
-}
-
-#[inline(always)]
-fn classify_recv_meta(
-    rcvinfo: io::Result<Option<SctpRecvInfo>>,
-    msg_flags: libc::c_int,
-    data_slice: &[u8],
-    recv_rcvinfo_requested: bool,
-    parsed_notification: Option<io::Result<SctpRecvMeta>>,
-) -> io::Result<SctpRecvMeta> {
-    if (msg_flags & libc::MSG_TRUNC) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SCTP recvmsg payload was truncated",
-        ));
-    }
-
-    let end_of_record = (msg_flags & libc::MSG_EOR) != 0;
-    if !end_of_record && !data_slice.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SCTP recvmsg payload was partial before end-of-record",
-        ));
-    }
-
-    if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
-        return match parsed_notification {
-            Some(notification) => notification,
-            None => parse_notification(data_slice),
-        };
-    }
-
-    match rcvinfo {
-        Ok(Some(info)) => {
-            // The subscribed SCTP_RCVINFO cmsg was intact. Linux may still set
-            // MSG_CTRUNC for later control records this API does not consume,
-            // so keep the data path successful.
-            Ok(SctpRecvMeta::Data(info))
-        }
-        Ok(None) => {
-            if (msg_flags & libc::MSG_CTRUNC) != 0 {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCTP recvmsg fixed control buffer capacity was exhausted",
-                ))
-            } else if recv_rcvinfo_requested {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SCTP recvmsg omitted requested SCTP_RCVINFO",
-                ))
-            } else {
-                Ok(SctpRecvMeta::Data(SctpRecvInfo {
-                    end_of_record,
-                    ..SctpRecvInfo::default()
-                }))
+macro_rules! define_parse_recv_meta {
+    ($(#[$attribute:meta])* $visibility:vis $name:ident, $with_notification:ident) => {
+        $(#[$attribute])*
+        $visibility fn $name(
+            control: &[u8],
+            controllen: usize,
+            msg_flags: libc::c_int,
+            data_slice: &[u8],
+            recv_rcvinfo_requested: bool,
+        ) -> io::Result<SctpRecvMeta> {
+            // SAFETY: initialized bytes may always be viewed as MaybeUninit bytes.
+            let control = unsafe {
+                std::slice::from_raw_parts(
+                    control.as_ptr().cast::<MaybeUninit<u8>>(),
+                    control.len(),
+                )
+            };
+            // SAFETY: this facade accepts a fully initialized control-byte slice.
+            unsafe {
+                $with_notification(
+                    control,
+                    controllen,
+                    msg_flags,
+                    data_slice,
+                    recv_rcvinfo_requested,
+                    None,
+                )
             }
         }
-        Err(err) => Err(err),
-    }
+    };
 }
+
+define_parse_recv_meta!(
+    #[cfg(any(feature = "fuzzing", feature = "test-support"))]
+    pub(crate) parse_recv_meta,
+    parse_recv_meta_with_notification
+);
+
+define_parse_recv_meta!(
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline(always)]
+    parse_recv_meta_bare,
+    parse_recv_meta_with_notification_bare
+);
+
+macro_rules! define_parse_recv_meta_with_notification {
+    (
+        $(#[$attribute:meta])*
+        $name:ident,
+        $parse_completion:ident,
+        $classify:ident
+    ) => {
+        $(#[$attribute])*
+        unsafe fn $name(
+            control: &[MaybeUninit<u8>],
+            controllen: usize,
+            msg_flags: libc::c_int,
+            data_slice: &[u8],
+            recv_rcvinfo_requested: bool,
+            parsed_notification: Option<io::Result<SctpRecvMeta>>,
+        ) -> io::Result<SctpRecvMeta> {
+            let rcvinfo = unsafe {
+                $parse_completion(control, controllen, msg_flags, !data_slice.is_empty())
+            };
+            $classify(
+                rcvinfo,
+                msg_flags,
+                data_slice,
+                recv_rcvinfo_requested,
+                parsed_notification,
+            )
+        }
+    };
+}
+
+define_parse_recv_meta_with_notification!(
+    /// Interprets one completed SCTP metadata receive.
+    ///
+    /// # Safety
+    ///
+    /// Within `min(controllen, control.len())`, every CMSG header and declared
+    /// payload byte reached by ancillary parsing must be initialized. Alignment
+    /// padding may remain uninitialized.
+    #[cfg(any(test, feature = "fuzzing", feature = "test-support"))]
+    parse_recv_meta_with_notification,
+    parse_completion_rcvinfo,
+    classify_recv_meta
+);
+
+define_parse_recv_meta_with_notification!(
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline(always)]
+    parse_recv_meta_with_notification_bare,
+    parse_completion_rcvinfo_bare,
+    classify_recv_meta_bare
+);
+
+macro_rules! define_classify_recv_meta {
+    ($(#[$attribute:meta])* $name:ident, $invalid_data:ident) => {
+        $(#[$attribute])*
+        fn $name(
+            rcvinfo: io::Result<Option<SctpRecvInfo>>,
+            msg_flags: libc::c_int,
+            data_slice: &[u8],
+            recv_rcvinfo_requested: bool,
+            parsed_notification: Option<io::Result<SctpRecvMeta>>,
+        ) -> io::Result<SctpRecvMeta> {
+            if (msg_flags & libc::MSG_TRUNC) != 0 {
+                return Err($invalid_data!("SCTP recvmsg payload was truncated"));
+            }
+
+            let end_of_record = (msg_flags & libc::MSG_EOR) != 0;
+            if !end_of_record && !data_slice.is_empty() {
+                return Err($invalid_data!(
+                    "SCTP recvmsg payload was partial before end-of-record"
+                ));
+            }
+
+            if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
+                return match parsed_notification {
+                    Some(notification) => notification,
+                    None => parse_notification(data_slice),
+                };
+            }
+
+            match rcvinfo {
+                Ok(Some(info)) => {
+                    // The subscribed SCTP_RCVINFO cmsg was intact. Linux may still set
+                    // MSG_CTRUNC for later control records this API does not consume,
+                    // so keep the data path successful.
+                    Ok(SctpRecvMeta::Data(info))
+                }
+                Ok(None) => {
+                    if (msg_flags & libc::MSG_CTRUNC) != 0 {
+                        Err($invalid_data!(
+                            "SCTP recvmsg fixed control buffer capacity was exhausted"
+                        ))
+                    } else if recv_rcvinfo_requested {
+                        Err($invalid_data!(
+                            "SCTP recvmsg omitted requested SCTP_RCVINFO"
+                        ))
+                    } else {
+                        Ok(SctpRecvMeta::Data(SctpRecvInfo {
+                            end_of_record,
+                            ..SctpRecvInfo::default()
+                        }))
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        }
+    };
+}
+
+define_classify_recv_meta!(
+    #[inline(always)]
+    classify_recv_meta,
+    production_receive_invalid_data
+);
+
+define_classify_recv_meta!(
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline(always)]
+    classify_recv_meta_bare,
+    bare_receive_invalid_data
+);
 
 fn send_failed_notification(
     error: u32,
@@ -6417,6 +6540,16 @@ const SCTP_ADAPTATION_ASSOC_ID_OFFSET: usize = SCTP_ADAPTATION_INDICATION_OFFSET
 const SCTP_ADAPTATION_MIN_LEN: usize =
     SCTP_ADAPTATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
 
+const SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
+const SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET: usize =
+    SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET + size_of::<u16>();
+const SCTP_AUTHENTICATION_INDICATION_OFFSET: usize =
+    SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET + size_of::<u16>();
+const SCTP_AUTHENTICATION_ASSOC_ID_OFFSET: usize =
+    SCTP_AUTHENTICATION_INDICATION_OFFSET + size_of::<u32>();
+const SCTP_AUTHENTICATION_MIN_LEN: usize =
+    SCTP_AUTHENTICATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>();
+
 const SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET: usize = SCTP_NOTIFICATION_HEADER_LEN;
 const SCTP_PARTIAL_DELIVERY_ASSOC_ID_OFFSET: usize =
     SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET + size_of::<u32>();
@@ -6490,6 +6623,22 @@ const _: () = {
             == SCTP_ADAPTATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
     );
     assert!(
+        SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET
+            == SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET + size_of::<u16>()
+    );
+    assert!(
+        SCTP_AUTHENTICATION_INDICATION_OFFSET
+            == SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET + size_of::<u16>()
+    );
+    assert!(
+        SCTP_AUTHENTICATION_ASSOC_ID_OFFSET
+            == SCTP_AUTHENTICATION_INDICATION_OFFSET + size_of::<u32>()
+    );
+    assert!(
+        SCTP_AUTHENTICATION_MIN_LEN
+            == SCTP_AUTHENTICATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
+    );
+    assert!(
         SCTP_PARTIAL_DELIVERY_MIN_LEN == SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET + size_of::<u32>()
     );
     assert!(
@@ -6513,6 +6662,7 @@ const _: () = {
 ))]
 const _: () = {
     assert!(size_of::<libc::sockaddr_storage>() == 128);
+    assert!(size_of::<libc::sctp_assoc_t>() == 4);
     assert!(size_of::<libc::sctp_sndrcvinfo>() == 32);
     assert!(size_of::<libc::sctp_sndinfo>() == 16);
     assert!(SCTP_NOTIFICATION_HEADER_LEN == 8);
@@ -6523,6 +6673,12 @@ const _: () = {
     assert!(SCTP_REMOTE_ERROR_MIN_LEN == 16);
     assert!(SCTP_SHUTDOWN_MIN_LEN == 12);
     assert!(SCTP_ADAPTATION_MIN_LEN == 16);
+    assert!(SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET == 8);
+    assert!(SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET == 10);
+    assert!(SCTP_AUTHENTICATION_INDICATION_OFFSET == 12);
+    assert!(SCTP_AUTHENTICATION_ASSOC_ID_OFFSET == 16);
+    assert!(SCTP_AUTHENTICATION_MIN_LEN == 20);
+    assert!(LOCAL_SCTP_AUTHENTICATION_EVENT == 0x8008);
     assert!(SCTP_PARTIAL_DELIVERY_MIN_LEN == 24);
     assert!(SCTP_SENDER_DRY_MIN_LEN == 12);
     assert!(SCTP_STREAM_RESET_MIN_LEN == 12);
@@ -6664,6 +6820,25 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                     .map_err(byte_range_invalid_data)?,
             }
         }
+        x if x == LOCAL_SCTP_AUTHENTICATION_EVENT => {
+            if buffer.len() < SCTP_AUTHENTICATION_MIN_LEN {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            SctpNotification::Authentication {
+                flags: sn_flags,
+                key_number: read_u16_at(buffer, SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                alternate_key_number: read_u16_at(
+                    buffer,
+                    SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET,
+                )
+                .map_err(byte_range_invalid_data)?,
+                indication: read_u32_at(buffer, SCTP_AUTHENTICATION_INDICATION_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+                assoc_id: read_i32_at(buffer, SCTP_AUTHENTICATION_ASSOC_ID_OFFSET)
+                    .map_err(byte_range_invalid_data)?,
+            }
+        }
         x if x == LOCAL_SCTP_PARTIAL_DELIVERY_EVENT => {
             if buffer.len() < SCTP_PARTIAL_DELIVERY_MIN_LEN {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
@@ -6744,6 +6919,7 @@ const LOCAL_SCTP_REMOTE_ERROR: libc::c_int = local_sctp_notification_type(4);
 const LOCAL_SCTP_SHUTDOWN_EVENT: libc::c_int = local_sctp_notification_type(5);
 const LOCAL_SCTP_PARTIAL_DELIVERY_EVENT: libc::c_int = local_sctp_notification_type(6);
 const LOCAL_SCTP_ADAPTATION_INDICATION: libc::c_int = local_sctp_notification_type(7);
+const LOCAL_SCTP_AUTHENTICATION_EVENT: libc::c_int = local_sctp_notification_type(8);
 const LOCAL_SCTP_SENDER_DRY_EVENT: libc::c_int = local_sctp_notification_type(9);
 const LOCAL_SCTP_STREAM_RESET_EVENT: libc::c_int = local_sctp_notification_type(10);
 const LOCAL_SCTP_ASSOC_RESET_EVENT: libc::c_int = local_sctp_notification_type(11);
@@ -7016,6 +7192,42 @@ pub(crate) mod test_support {
         parse_recv_meta(control, controllen, msg_flags, data_slice, false)
     }
 
+    /// Runs production SCTP ancillary-data classification with an explicit
+    /// caller-requested `SCTP_RCVINFO` policy for diagnostic observers.
+    pub fn test_parse_recv_meta_with_policy(
+        control: &[u8],
+        controllen: usize,
+        msg_flags: libc::c_int,
+        data_slice: &[u8],
+        recv_rcvinfo_requested: bool,
+    ) -> io::Result<SctpRecvMeta> {
+        parse_recv_meta(
+            control,
+            controllen,
+            msg_flags,
+            data_slice,
+            recv_rcvinfo_requested,
+        )
+    }
+
+    /// Runs the same SCTP ancillary-data classification branches with the
+    /// diagnostic-only bare-`InvalidData` comparator.
+    pub fn test_parse_recv_meta_bare_with_policy(
+        control: &[u8],
+        controllen: usize,
+        msg_flags: libc::c_int,
+        data_slice: &[u8],
+        recv_rcvinfo_requested: bool,
+    ) -> io::Result<SctpRecvMeta> {
+        parse_recv_meta_bare(
+            control,
+            controllen,
+            msg_flags,
+            data_slice,
+            recv_rcvinfo_requested,
+        )
+    }
+
     /// Appends one zero-initialized control-message fixture using the
     /// crate's canonical test header layout.
     pub fn append_initialized_test_cmsg(
@@ -7054,6 +7266,11 @@ pub(crate) mod test_support {
     /// Returns the local Linux ABI value for `SCTP_ADAPTATION_INDICATION`.
     pub const fn test_adaptation_indication_type() -> libc::c_int {
         LOCAL_SCTP_ADAPTATION_INDICATION
+    }
+
+    /// Returns the local Linux ABI value for `SCTP_AUTHENTICATION_EVENT`.
+    pub const fn test_authentication_event_type() -> libc::c_int {
+        LOCAL_SCTP_AUTHENTICATION_EVENT
     }
 
     /// Returns the local Linux ABI value for `SCTP_PEER_ADDR_CHANGE`.
@@ -10192,6 +10409,41 @@ mod tests {
             }),
         ));
 
+        let mut authentication =
+            test_notification_buffer(LOCAL_SCTP_AUTHENTICATION_EVENT, SCTP_AUTHENTICATION_MIN_LEN);
+        write_u16_ne(&mut authentication, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x1234);
+        write_u16_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET,
+            0x1122,
+        );
+        write_u16_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET,
+            0x3344,
+        );
+        write_u32_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_INDICATION_OFFSET,
+            0x5566_7788,
+        );
+        write_i32_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_ASSOC_ID_OFFSET,
+            0x1020_3040,
+        );
+        cases.push((
+            "authentication",
+            authentication,
+            SctpRecvMeta::Notification(SctpNotification::Authentication {
+                flags: 0x1234,
+                key_number: 0x1122,
+                alternate_key_number: 0x3344,
+                indication: 0x5566_7788,
+                assoc_id: 0x1020_3040,
+            }),
+        ));
+
         let mut partial = test_notification_buffer(
             LOCAL_SCTP_PARTIAL_DELIVERY_EVENT,
             SCTP_PARTIAL_DELIVERY_MIN_LEN,
@@ -11378,7 +11630,7 @@ mod tests {
         let cases = notification_layout_cases();
         assert_eq!(
             cases.len(),
-            12,
+            13,
             "every supported notification arm is pinned"
         );
 
@@ -11451,6 +11703,11 @@ mod tests {
                 SCTP_ADAPTATION_MIN_LEN,
             ),
             (
+                "authentication",
+                LOCAL_SCTP_AUTHENTICATION_EVENT,
+                SCTP_AUTHENTICATION_MIN_LEN,
+            ),
+            (
                 "partial delivery",
                 LOCAL_SCTP_PARTIAL_DELIVERY_EVENT,
                 SCTP_PARTIAL_DELIVERY_MIN_LEN,
@@ -11481,7 +11738,7 @@ mod tests {
                 SCTP_SEND_FAILED_EVENT_MIN_LEN,
             ),
         ];
-        assert_eq!(layouts.len(), 12, "every supported arm needs one boundary");
+        assert_eq!(layouts.len(), 13, "every supported arm needs one boundary");
 
         for (name, notification_type, min_len) in layouts {
             let actual_short = test_notification_buffer(notification_type, min_len - 1);
@@ -11507,7 +11764,7 @@ mod tests {
             .expect_err("a short common header must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-        let unknown_type = 0x7ffe;
+        let unknown_type = 0x800e;
         let mut declared_short =
             test_notification_buffer(unknown_type, SCTP_NOTIFICATION_HEADER_LEN);
         write_u32_ne(
@@ -11544,6 +11801,73 @@ mod tests {
                 kind: unknown_type as u16,
                 flags: 0x1234,
                 length: SCTP_NOTIFICATION_HEADER_LEN as u32,
+            })
+        );
+    }
+
+    #[test]
+    fn notification_extensions_remain_bounded_and_unmaterialized() {
+        let mut authentication = test_notification_buffer(
+            LOCAL_SCTP_AUTHENTICATION_EVENT,
+            SCTP_AUTHENTICATION_MIN_LEN + 4,
+        );
+        write_u16_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET,
+            0x1122,
+        );
+        write_u16_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET,
+            0x3344,
+        );
+        write_u32_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_INDICATION_OFFSET,
+            0x5566_7788,
+        );
+        write_i32_ne(
+            &mut authentication,
+            SCTP_AUTHENTICATION_ASSOC_ID_OFFSET,
+            0x1020_3040,
+        );
+        authentication[SCTP_AUTHENTICATION_MIN_LEN..].fill(0xa5);
+        let expected_authentication =
+            SctpRecvMeta::Notification(SctpNotification::Authentication {
+                flags: 0,
+                key_number: 0x1122,
+                alternate_key_number: 0x3344,
+                indication: 0x5566_7788,
+                assoc_id: 0x1020_3040,
+            });
+        assert_eq!(
+            parse_notification(&authentication)
+                .expect("declared authentication extensions must remain forward-compatible"),
+            expected_authentication
+        );
+        write_u32_ne(
+            &mut authentication,
+            SCTP_NOTIFICATION_LENGTH_OFFSET,
+            SCTP_AUTHENTICATION_MIN_LEN as u32,
+        );
+        assert_eq!(
+            parse_notification(&authentication)
+                .expect("trailing backing bytes must not alter authentication decoding"),
+            expected_authentication
+        );
+
+        let mut stream_reset =
+            test_notification_buffer(LOCAL_SCTP_STREAM_RESET_EVENT, SCTP_STREAM_RESET_MIN_LEN + 4);
+        write_u16_ne(&mut stream_reset, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x1234);
+        write_i32_ne(&mut stream_reset, SCTP_STREAM_RESET_ASSOC_ID_OFFSET, -64);
+        write_u16_ne(&mut stream_reset, SCTP_STREAM_RESET_MIN_LEN, 0x1122);
+        write_u16_ne(&mut stream_reset, SCTP_STREAM_RESET_MIN_LEN + 2, 0x3344);
+        assert_eq!(
+            parse_notification(&stream_reset)
+                .expect("declared stream-ID tails are accepted without materialization"),
+            SctpRecvMeta::Notification(SctpNotification::StreamReset {
+                flags: 0x1234,
+                assoc_id: -64,
             })
         );
     }
@@ -12022,6 +12346,46 @@ mod tests {
     }
 
     #[test]
+    fn assoc_addrs_wrapper_preserves_parser_buffer_range_error() {
+        const ASSOC_ID: libc::sctp_assoc_t = 47;
+        const DECLARED_ADDR_COUNT: u32 = 3;
+
+        let mut calls = 0;
+        let err = get_assoc_addrs_with(SCTP_GET_PEER_ADDRS_OPT, ASSOC_ID, |buffer| {
+            calls += 1;
+            let header_len = std::mem::size_of::<SctpGetAddrsHeader>();
+            let ipv6_len = std::mem::size_of::<libc::sockaddr_in6>();
+            let entry = assoc_ipv6_entry(Ipv6Addr::LOCALHOST.octets(), 3868, 7, 9, ipv6_len);
+            let response_len = header_len + 2 * entry.len();
+            assert!(response_len <= buffer.len());
+
+            let header = SctpGetAddrsHeader {
+                assoc_id: ASSOC_ID,
+                addr_num: DECLARED_ADDR_COUNT,
+            };
+            unsafe {
+                std::ptr::write_unaligned(buffer.as_mut_ptr() as *mut SctpGetAddrsHeader, header);
+            }
+            buffer[header_len..header_len + entry.len()].copy_from_slice(&entry);
+            buffer[header_len + entry.len()..response_len].copy_from_slice(&entry);
+            Ok(response_len)
+        })
+        .expect_err("a third declared address must reach the parser and fail");
+
+        assert_eq!(calls, 1);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.get_ref()
+                .and_then(|error| error.downcast_ref::<BufferRangeError>()),
+            Some(&BufferRangeError {
+                offset: 0,
+                width: std::mem::size_of::<libc::sa_family_t>(),
+                len: 0,
+            })
+        );
+    }
+
+    #[test]
     fn assoc_addrs_buffer_len_accepts_bounded_capacity() {
         let header_len = std::mem::size_of::<SctpGetAddrsHeader>();
         let storage_len = std::mem::size_of::<libc::sockaddr_storage>();
@@ -12376,7 +12740,7 @@ mod tests {
                 .and_then(|error| error.downcast_ref::<BufferRangeError>()),
             Some(&BufferRangeError {
                 offset: 0,
-                width: 2,
+                width: std::mem::size_of::<libc::sa_family_t>(),
                 len: 0,
             })
         );

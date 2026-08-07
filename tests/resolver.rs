@@ -2,8 +2,8 @@ use flowio::net::resolver::{DnsResolver, resolve_host};
 use flowio::runtime::buffer::bytes::{ByteWriteAt, read_u16_be_at};
 use flowio::runtime::executor::Executor;
 use flowio::test_support::net::resolver::{
-    lookup_ipv4, parse_hosts_bytes, parse_resolv_conf_bytes, read_resolv_conf,
-    resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
+    lookup_ipv4, parse_hosts_bytes, parse_resolv_conf_bytes, parse_resolv_conf_configuration_bytes,
+    read_resolv_conf, resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
 };
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
@@ -287,6 +287,20 @@ fn dns_resolver_requires_nameserver() {
     let err = DnsResolver::new(Vec::new()).expect_err("empty nameserver list should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(err.to_string(), "resolver requires at least one nameserver");
+}
+
+#[test]
+fn dns_resolver_exposes_every_valid_explicit_nameserver_count() {
+    for count in 1..=8 {
+        let configured = (1..=count)
+            .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet as u8), 53)))
+            .collect::<Vec<_>>();
+        let resolver = DnsResolver::new(configured.clone())
+            .expect("one through eight explicit nameservers should be accepted");
+
+        assert_eq!(resolver.nameservers(), configured);
+        assert!(!resolver.system_nameservers_were_truncated());
+    }
 }
 
 #[test]
@@ -670,9 +684,12 @@ nameserver 192.0.2.5\n\
 nameserver 192.0.2.6\n\
 nameserver 192.0.2.7\n\
 nameserver 192.0.2.8\n\
-nameserver 192.0.2.1\n";
+nameserver 192.0.2.1\n\
+nameserver invalid.example\n\
+# nameserver 192.0.2.9\n\
+search ignored.example ; nameserver 192.0.2.9\n";
 
-    let nameservers = parse_resolv_conf_bytes(contents)
+    let (nameservers, nameservers_were_truncated) = parse_resolv_conf_configuration_bytes(contents)
         .expect("eight unique nameservers plus a duplicate should be accepted");
     assert_eq!(
         nameservers,
@@ -681,6 +698,32 @@ nameserver 192.0.2.1\n";
             .collect::<Vec<_>>(),
         "the parser must preserve first-seen order and DNS port 53"
     );
+    assert!(
+        !nameservers_were_truncated,
+        "duplicates, invalid directives, and comments must not report truncation"
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_accepts_exactly_eight_without_truncation() {
+    let contents = b"nameserver 192.0.2.1\n\
+nameserver 192.0.2.2\n\
+nameserver 192.0.2.3\n\
+nameserver 192.0.2.4\n\
+nameserver 192.0.2.5\n\
+nameserver 192.0.2.6\n\
+nameserver 192.0.2.7\n\
+nameserver 192.0.2.8\n";
+
+    let (nameservers, nameservers_were_truncated) = parse_resolv_conf_configuration_bytes(contents)
+        .expect("exactly eight unique nameservers should be accepted");
+    assert_eq!(
+        nameservers,
+        (1..=8)
+            .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 53)))
+            .collect::<Vec<_>>()
+    );
+    assert!(!nameservers_were_truncated);
 }
 
 #[test]
@@ -700,7 +743,7 @@ nameserver 2001:db8::10\n\
 nameserver 198.51.\xff.1\n\
 search ignored.example\n";
 
-    let nameservers = parse_resolv_conf_bytes(contents)
+    let (nameservers, nameservers_were_truncated) = parse_resolv_conf_configuration_bytes(contents)
         .expect("later nameserver directives should be ignored after eight unique entries");
     assert_eq!(
         nameservers,
@@ -708,6 +751,36 @@ search ignored.example\n";
             .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 53))),
         "system parsing must retain exactly the first eight unique addresses in retry order"
     );
+    assert!(
+        nameservers_were_truncated,
+        "the first later unique valid nameserver must make truncation observable"
+    );
+}
+
+#[test]
+fn resolver_resolv_conf_parser_finds_a_later_unique_after_a_long_duplicate_tail() {
+    let mut contents = String::new();
+    for last_octet in 1..=8 {
+        contents.push_str(&format!("nameserver 192.0.2.{last_octet}\n"));
+    }
+    for _ in 0..512 {
+        contents.push_str("nameserver 192.0.2.1\n");
+    }
+    contents.push_str("nameserver invalid.example\n");
+    contents.push_str("# nameserver 192.0.2.99\n");
+    contents.push_str("nameserver 192.0.2.9\n");
+    contents.push_str("nameserver 192.0.2.10\n");
+
+    let (nameservers, nameservers_were_truncated) =
+        parse_resolv_conf_configuration_bytes(contents.as_bytes())
+            .expect("a bounded duplicate tail should preserve the effective configuration");
+    assert_eq!(
+        nameservers,
+        (1..=8)
+            .map(|last_octet| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last_octet), 53)))
+            .collect::<Vec<_>>()
+    );
+    assert!(nameservers_were_truncated);
 }
 
 #[test]

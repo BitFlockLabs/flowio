@@ -4,56 +4,34 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
-/// Debug counters for retained-pool white-box tests.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RetainedPayloadPoolStats {
-    /// Payload allocations served by retained size-class storage.
-    pub pooled_allocs: usize,
-    /// Pooled payload allocations served from a returned free-list block.
-    pub pooled_reuses: usize,
-    /// Pooled payload blocks returned to their size-class free lists.
-    pub pooled_frees: usize,
-    /// Slab pages requested for retained payload size classes.
-    pub slab_allocs: usize,
-    /// Payload allocations that fell back to the global heap.
-    pub heap_fallbacks: usize,
-    /// Heap-fallback payload allocations released.
-    pub heap_frees: usize,
-    /// Iovec scratch requests served by inline metadata storage.
-    pub writev_scratch_inline_allocs: usize,
-    /// Iovec scratch requests served by pooled sidecar blocks.
-    pub writev_scratch_pooled_allocs: usize,
-    /// Sidecar requests served from returned free-list blocks.
-    pub writev_scratch_pooled_reuses: usize,
-    /// Sidecar blocks returned to their size-class free lists.
-    pub writev_scratch_pooled_frees: usize,
-    /// Slab pages requested for iovec sidecar size classes.
-    pub writev_scratch_slab_allocs: usize,
-    /// Scratch requests rejected for exceeding the supported iovec count.
-    pub writev_scratch_oversize_rejections: usize,
-    /// Scratch requests rejected because a sidecar block was unavailable.
-    pub writev_scratch_alloc_failures: usize,
+macro_rules! define_retained_payload_pool_stats {
+    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+        /// Debug counters for retained-pool white-box tests.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct RetainedPayloadPoolStats {
+            $(
+                #[doc = $doc]
+                pub $field: usize,
+            )*
+        }
+    };
 }
 
-impl From<super::retained::RetainedPayloadPoolStats> for RetainedPayloadPoolStats {
-    fn from(stats: super::retained::RetainedPayloadPoolStats) -> Self {
-        Self {
-            pooled_allocs: stats.pooled_allocs,
-            pooled_reuses: stats.pooled_reuses,
-            pooled_frees: stats.pooled_frees,
-            slab_allocs: stats.slab_allocs,
-            heap_fallbacks: stats.heap_fallbacks,
-            heap_frees: stats.heap_frees,
-            writev_scratch_inline_allocs: stats.writev_scratch_inline_allocs,
-            writev_scratch_pooled_allocs: stats.writev_scratch_pooled_allocs,
-            writev_scratch_pooled_reuses: stats.writev_scratch_pooled_reuses,
-            writev_scratch_pooled_frees: stats.writev_scratch_pooled_frees,
-            writev_scratch_slab_allocs: stats.writev_scratch_slab_allocs,
-            writev_scratch_oversize_rejections: stats.writev_scratch_oversize_rejections,
-            writev_scratch_alloc_failures: stats.writev_scratch_alloc_failures,
+super::retained::retained_payload_stat_fields!(define_retained_payload_pool_stats);
+
+macro_rules! impl_retained_payload_pool_stats_conversion {
+    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+        impl From<super::retained::RetainedPayloadPoolStats> for RetainedPayloadPoolStats {
+            fn from(stats: super::retained::RetainedPayloadPoolStats) -> Self {
+                Self {
+                    $($field: stats.$field,)*
+                }
+            }
         }
-    }
+    };
 }
+
+super::retained::retained_payload_stat_fields!(impl_retained_payload_pool_stats_conversion);
 
 /// Retained payload pool wrapper for integration tests.
 pub struct RetainedPayloadPool {

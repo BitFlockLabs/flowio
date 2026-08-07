@@ -267,15 +267,16 @@ impl<T> DList<T> {
         }
     }
 
-    /// Adds an element to the front of the list.
+    /// Shared front-insertion implementation for the checked and unchecked APIs.
     #[inline(always)]
     /// # Safety
     ///
-    /// The caller must ensure that `node_link` is a valid, non-null pointer
-    /// to a currently unlinked `Link` and satisfies the whole-allocation
-    /// provenance and stable-storage requirements documented on [`DList`].
-    #[cfg(any(test, feature = "test-support"))]
-    pub unsafe fn push_front(&mut self, node_link: *mut Link) {
+    /// The list must be initialized and remain at its stable address.
+    /// `node_link` must be valid, non-null, currently unlinked, and satisfy the
+    /// whole-allocation provenance and stable-storage requirements documented
+    /// on [`DList`]. `CHECK_DETACHED` controls only the debug diagnostic; it
+    /// does not weaken the caller's unlinked-node obligation.
+    unsafe fn push_front_inner<const CHECK_DETACHED: bool>(&mut self, node_link: *mut Link) {
         debug_assert_list_inited!(self);
 
         let head_ptr = &mut self.head as *mut Link;
@@ -286,12 +287,28 @@ impl<T> DList<T> {
         };
 
         debug_assert!(!node_link.is_null());
-        debug_assert!(unsafe { (*node_link).is_unlinked() }, "double insert");
+        if CHECK_DETACHED {
+            debug_assert!(unsafe { (*node_link).is_unlinked() }, "double insert");
+        }
 
         debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
 
         unsafe {
             Self::__list_add(node_link, head_ptr, next, head_ptr);
+        }
+    }
+
+    /// Adds an element to the front of the list.
+    #[inline(always)]
+    /// # Safety
+    ///
+    /// The caller must ensure that `node_link` is a valid, non-null pointer
+    /// to a currently unlinked `Link` and satisfies the whole-allocation
+    /// provenance and stable-storage requirements documented on [`DList`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub unsafe fn push_front(&mut self, node_link: *mut Link) {
+        unsafe {
+            self.push_front_inner::<true>(node_link);
         }
     }
 
@@ -307,20 +324,8 @@ impl<T> DList<T> {
     /// to a currently unlinked `Link` and satisfies the whole-allocation
     /// provenance and stable-storage requirements documented on [`DList`].
     pub unsafe fn push_front_unchecked(&mut self, node_link: *mut Link) {
-        debug_assert_list_inited!(self);
-
-        let head_ptr = &mut self.head as *mut Link;
-        let next = if self.head.next.is_null() {
-            head_ptr
-        } else {
-            unsafe { Self::normalize_head_ptr((*head_ptr).next, head_ptr) }
-        };
-
-        debug_assert!(!node_link.is_null());
-        debug_assert!(node_link != head_ptr, "attempted to insert sentinel");
-
         unsafe {
-            Self::__list_add(node_link, head_ptr, next, head_ptr);
+            self.push_front_inner::<false>(node_link);
         }
     }
 
@@ -983,6 +988,85 @@ mod tests {
         assert!(unchecked.is_empty());
         assert!(checked_nodes.iter().all(|node| node.link.is_unlinked()));
         assert!(unchecked_nodes.iter().all(|node| node.link.is_unlinked()));
+    }
+
+    #[test]
+    fn checked_and_unchecked_push_front_preserve_lifo_transitions() {
+        let mut checked = DList::<Node>::new_uninit();
+        checked.init();
+        let mut unchecked = DList::<Node>::new_uninit();
+        unchecked.init();
+        let mut checked_nodes: [Node; 3] = std::array::from_fn(|index| Node {
+            id: index as u32 + 1,
+            link: Link::new_unlinked(),
+        });
+        let mut unchecked_nodes: [Node; 3] = std::array::from_fn(|index| Node {
+            id: index as u32 + 1,
+            link: Link::new_unlinked(),
+        });
+        let checked_links: [*mut Link; 3] =
+            std::array::from_fn(|index| node_link_ptr(&mut checked_nodes[index]));
+        let unchecked_links: [*mut Link; 3] =
+            std::array::from_fn(|index| node_link_ptr(&mut unchecked_nodes[index]));
+
+        unsafe {
+            for index in 0..checked_links.len() {
+                checked.push_front(checked_links[index]);
+                unchecked.push_front_unchecked(unchecked_links[index]);
+
+                let checked_front = checked
+                    .front(offset_of!(Node, link))
+                    .expect("checked list lost its front node");
+                let unchecked_front = unchecked
+                    .front(offset_of!(Node, link))
+                    .expect("unchecked list lost its front node");
+                assert_eq!((*checked_front).id, index as u32 + 1);
+                assert_eq!((*unchecked_front).id, index as u32 + 1);
+            }
+
+            for expected in (1..=3).rev() {
+                let checked_node = checked
+                    .pop_front(offset_of!(Node, link))
+                    .expect("checked list ended before the expected node");
+                let unchecked_node = unchecked
+                    .pop_front(offset_of!(Node, link))
+                    .expect("unchecked list ended before the expected node");
+                assert_eq!((*checked_node).id, expected);
+                assert_eq!((*unchecked_node).id, expected);
+            }
+        }
+
+        assert!(checked.is_empty());
+        assert!(unchecked.is_empty());
+        assert!(checked_nodes.iter().all(|node| node.link.is_unlinked()));
+        assert!(unchecked_nodes.iter().all(|node| node.link.is_unlinked()));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn checked_push_front_rejects_double_insert() {
+        let mut list = DList::<Node>::new_uninit();
+        list.init();
+        let mut node = Node {
+            id: 1,
+            link: Link::new_unlinked(),
+        };
+        let link = node_link_ptr(&mut node);
+
+        unsafe {
+            list.push_front(link);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                list.push_front(link);
+            }));
+            assert!(result.is_err());
+            assert_eq!(
+                list.pop_front(offset_of!(Node, link)),
+                Some(std::ptr::addr_of_mut!(node))
+            );
+        }
+
+        assert!(list.is_empty());
+        assert!(node.link.is_unlinked());
     }
 
     #[test]

@@ -38,6 +38,40 @@ use std::rc::Rc;
 /// Retained payload storage is backed by the reactor's private retained-payload
 /// pool for common payload sizes. Oversized or over-aligned payloads use the
 /// documented heap fallback carried by the same erased vtable.
+///
+/// # Stable lifecycle states
+///
+/// The flag abbreviations below are `C` completed, `O` orphaned, `D` detached,
+/// `P` cancel-pending, `S` runtime-shutdown, `X` context-rejected, `A`
+/// ring-abandoned, and `B` build-aborted. A stable state is a handoff boundary
+/// at which another lifecycle function may inspect the slot; it does not mean
+/// that the state remains live for an extended period.
+///
+/// | Family | Stable flags | `waiter` / `cancel_next` meaning |
+/// | --- | --- | --- |
+/// | Fresh, resubmitted, or active | none, optionally `X` after submission | `waiter` is null or owns one task reference; stashed SCTP receives legitimately have no waiter. `cancel_next` is null. |
+/// | Completed and future-owned | `C`, `C|S`, `C|X`, or `C|S|X` | Both links are null after target retirement transfers the waiter. |
+/// | Completion-to-reclamation | `C|O`, optionally `S` and/or `X`; or `C|D`, optionally `S` | Both links are null and the state is consumed immediately. `O` and `D` are mutually exclusive, and detached operations do not acquire `X`. |
+/// | Synthetic completed test setup | `C` | `waiter` may still own one task reference so shutdown re-entry tests can build the pre-existing state directly. `cancel_next` is null. |
+/// | Orphan awaiting its target CQE | `O`, optionally `S` and/or `X` | Both links are null unless the state enters the cancel-retry queue. |
+/// | Cancel retry | `P` plus at least one of `O` or `S`, optionally `X` | `waiter` is `cancel_prev`, which is null at the queue head; `cancel_next` is the next queue entry. |
+/// | Detached close | `D` | Both links are null and no future or task waiter owns the operation. |
+/// | Shutdown-owned pending | `S`, optionally `O`, `P`, and/or `X` | Both links are null after shutdown transfers the waiter, except for the `P` queue interpretation above. |
+/// | Shutdown stress setup | `S|D`, optionally `P` | Test support exercises detached shutdown states; links use the normal null or cancel-queue interpretation. |
+/// | Build-aborted before submission | `B` | `waiter` may still own a task reference or be null; `cancel_next` is null and no target CQE exists. |
+/// | Ring-abandoned | `A|S`, `A|O`, or `A|S|O`, optionally `X`; or `A|D` (test stress may add `S`) | Both links are null, the target CQE was not observed, and the slot is never reclaimed. Tests may construct bare `A`. |
+///
+/// `X` records poll-context rejection without changing ownership. Registry,
+/// owner, result, and retained-payload fields are orthogonal to this table.
+/// Several mutation sequences deliberately pass through shapes that are not
+/// stable handoff states: orphaning sets `O` before transferring the waiter;
+/// completion sets `C` before transferring the waiter or reclaiming `C|O` and
+/// `C|D`; cancel insertion sets `P` before publishing both links; cancel
+/// removal clears links before `P`; reset clears flags before registering the
+/// next waiter; shutdown and ring abandonment transfer waiters and cancel links
+/// before publishing `S` or `A`; and build-abort publication precedes retained
+/// payload destruction. No state may be inspected after task or payload
+/// release unless its liveness has been independently re-established.
 #[doc(hidden)]
 #[repr(C, align(64))]
 pub struct CompletionState {
@@ -148,6 +182,7 @@ impl CompletionState {
     #[inline(always)]
     pub fn set_detached(&mut self) {
         self.state_flags |= Self::FLAG_DETACHED;
+        self.debug_assert_valid_flags();
     }
 
     #[inline(always)]
@@ -199,16 +234,19 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn set_runtime_shutdown(&mut self) {
         self.state_flags |= Self::FLAG_RUNTIME_SHUTDOWN;
+        self.debug_assert_valid_flags();
     }
 
     #[inline(always)]
     pub(crate) fn set_ring_abandoned(&mut self) {
         self.state_flags |= Self::FLAG_RING_ABANDONED;
+        self.debug_assert_valid_flags();
     }
 
     #[inline(always)]
     pub(crate) fn set_build_aborted(&mut self) {
         self.state_flags |= Self::FLAG_BUILD_ABORTED;
+        self.debug_assert_valid_flags();
     }
 
     #[inline(always)]
@@ -219,6 +257,94 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn set_context_rejected(&mut self) {
         self.state_flags |= Self::FLAG_CONTEXT_REJECTED;
+        self.debug_assert_valid_flags();
+    }
+
+    /// Asserts the stable flag, waiter, and cancel-link relationships recorded
+    /// in this type's lifecycle table.
+    ///
+    /// Callers must use this only after completing a state-local lifecycle
+    /// transaction. Completion/orphan publication and cancel-link mutations
+    /// deliberately pass through intermediate shapes that are not valid
+    /// handoff boundaries.
+    #[inline(always)]
+    pub(crate) fn debug_assert_valid_flags(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let known_flags = Self::FLAG_COMPLETED
+                | Self::FLAG_ORPHANED
+                | Self::FLAG_DETACHED
+                | Self::FLAG_CANCEL_PENDING
+                | Self::FLAG_RUNTIME_SHUTDOWN
+                | Self::FLAG_CONTEXT_REJECTED
+                | Self::FLAG_RING_ABANDONED
+                | Self::FLAG_BUILD_ABORTED;
+            let flags = self.state_flags;
+            let completed = flags & Self::FLAG_COMPLETED != 0;
+            let orphaned = flags & Self::FLAG_ORPHANED != 0;
+            let detached = flags & Self::FLAG_DETACHED != 0;
+            let cancel_pending = flags & Self::FLAG_CANCEL_PENDING != 0;
+            let runtime_shutdown = flags & Self::FLAG_RUNTIME_SHUTDOWN != 0;
+            let context_rejected = flags & Self::FLAG_CONTEXT_REJECTED != 0;
+            let ring_abandoned = flags & Self::FLAG_RING_ABANDONED != 0;
+            let build_aborted = flags & Self::FLAG_BUILD_ABORTED != 0;
+
+            debug_assert_eq!(
+                flags & !known_flags,
+                0,
+                "completion state contains an unknown lifecycle flag"
+            );
+            debug_assert!(
+                !(orphaned && detached),
+                "completion state cannot be both orphaned and detached"
+            );
+            debug_assert!(
+                !cancel_pending || orphaned || runtime_shutdown,
+                "cancel-pending state lacks orphan or shutdown ownership"
+            );
+            debug_assert!(
+                !(completed && cancel_pending),
+                "completed state remained on the cancel-retry queue"
+            );
+            debug_assert!(
+                !(completed && ring_abandoned),
+                "completed state was also classified as ring-abandoned"
+            );
+            debug_assert!(
+                !(ring_abandoned && cancel_pending),
+                "ring-abandoned state remained on the cancel-retry queue"
+            );
+            debug_assert!(
+                !build_aborted || flags == Self::FLAG_BUILD_ABORTED,
+                "build-aborted state retained a submitted lifecycle flag"
+            );
+            debug_assert!(
+                !(detached && context_rejected),
+                "detached state cannot acquire context rejection"
+            );
+            debug_assert!(
+                !ring_abandoned
+                    || orphaned
+                    || runtime_shutdown
+                    || detached
+                    || flags == Self::FLAG_RING_ABANDONED,
+                "ring-abandoned state lacks abandonment ownership provenance"
+            );
+            debug_assert!(
+                cancel_pending || self.cancel_next.is_null(),
+                "completion state retained cancel_next outside the retry queue"
+            );
+            debug_assert!(
+                cancel_pending
+                    || !(orphaned || detached || runtime_shutdown || ring_abandoned)
+                    || self.waiter.is_null(),
+                "completion state retained a task waiter after ownership transfer"
+            );
+            debug_assert!(
+                self.waiter.is_null() || !completed || flags == Self::FLAG_COMPLETED,
+                "completed state overlay retained a task waiter"
+            );
+        }
     }
 
     #[inline(always)]
@@ -281,6 +407,7 @@ impl CompletionState {
             unsafe { retain_task(task) };
         }
         self.waiter = task;
+        self.debug_assert_valid_flags();
     }
 
     /// Replaces an operation's waiter without retaining a state borrow while
@@ -293,6 +420,7 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) unsafe fn replace_waiter_unchecked(state: *mut Self, task: *mut TaskHeader) {
         debug_assert!(unsafe { !(*state).is_cancel_pending() });
+        unsafe { (*state).debug_assert_valid_flags() };
         unsafe { replace_task_ref(std::ptr::addr_of_mut!((*state).waiter), task) };
     }
 
@@ -308,7 +436,9 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) unsafe fn take_waiter_unchecked(state: *mut Self) -> *mut TaskHeader {
         debug_assert!(unsafe { !(*state).is_cancel_pending() });
-        unsafe { take_task_ref(std::ptr::addr_of_mut!((*state).waiter)) }
+        let waiter = unsafe { take_task_ref(std::ptr::addr_of_mut!((*state).waiter)) };
+        unsafe { (*state).debug_assert_valid_flags() };
+        waiter
     }
 
     /// Clears the waiter word without retaining a state borrow while releasing
@@ -486,6 +616,20 @@ impl CompletionState {
         self.state_flags = 0;
         self.waiter = std::ptr::null_mut();
         self.cancel_next = std::ptr::null_mut();
+        self.debug_assert_valid_flags();
+    }
+
+    /// Restores ordinary reclamation after a ringless test has proved the
+    /// abandoned-storage shape. A real abandoned state must never be reclaimed.
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn restore_completed_orphaned_after_ringless_abandonment_for_test(&mut self) {
+        debug_assert!(self.is_ring_abandoned());
+        debug_assert!(!self.is_cancel_pending());
+        debug_assert!(self.waiter.is_null());
+        debug_assert!(self.cancel_next.is_null());
+        self.state_flags = Self::FLAG_COMPLETED | Self::FLAG_ORPHANED;
+        self.debug_assert_valid_flags();
     }
 }
 
@@ -539,6 +683,774 @@ mod tests {
         cancel: |_| {},
         destroy: inspect_replaced_waiter,
     };
+
+    #[derive(Clone, Copy)]
+    enum StableMutation {
+        Completed,
+        Orphaned,
+        Detached,
+        RuntimeShutdown,
+        ContextRejected,
+        RingAbandoned,
+        BuildAborted,
+    }
+
+    #[derive(Clone, Copy)]
+    enum StableWaiterRole {
+        Null,
+        Task,
+        CancelHead,
+        CancelAfter,
+    }
+
+    struct StableStateCase {
+        name: &'static str,
+        mutations: &'static [StableMutation],
+        waiter_role: StableWaiterRole,
+        expected_flags: u32,
+    }
+
+    fn apply_stable_mutation(state: &mut CompletionState, mutation: StableMutation) {
+        match mutation {
+            StableMutation::Completed => state.set_completed(),
+            StableMutation::Orphaned => state.set_orphaned(),
+            StableMutation::Detached => state.set_detached(),
+            StableMutation::RuntimeShutdown => state.set_runtime_shutdown(),
+            StableMutation::ContextRejected => state.set_context_rejected(),
+            StableMutation::RingAbandoned => state.set_ring_abandoned(),
+            StableMutation::BuildAborted => state.set_build_aborted(),
+        }
+    }
+
+    fn assert_documented_stable_shape(
+        case: &StableStateCase,
+        state: &CompletionState,
+        task_waiter: *mut TaskHeader,
+        cancel_previous: *mut CompletionState,
+    ) {
+        let flags = state.state_flags;
+        let completed = flags & CompletionState::FLAG_COMPLETED != 0;
+        let orphaned = flags & CompletionState::FLAG_ORPHANED != 0;
+        let detached = flags & CompletionState::FLAG_DETACHED != 0;
+        let cancel_pending = flags & CompletionState::FLAG_CANCEL_PENDING != 0;
+        let runtime_shutdown = flags & CompletionState::FLAG_RUNTIME_SHUTDOWN != 0;
+        let ring_abandoned = flags & CompletionState::FLAG_RING_ABANDONED != 0;
+        let build_aborted = flags & CompletionState::FLAG_BUILD_ABORTED != 0;
+
+        assert_eq!(flags, case.expected_flags, "{} flags", case.name);
+        if cancel_pending {
+            assert!(
+                orphaned || runtime_shutdown,
+                "{} queued without orphan or shutdown ownership",
+                case.name
+            );
+            assert!(
+                !completed && !ring_abandoned && !build_aborted,
+                "{} queued after terminal classification",
+                case.name
+            );
+        } else {
+            assert!(
+                state.cancel_next.is_null(),
+                "{} retained a next link outside the cancel queue",
+                case.name
+            );
+        }
+        if completed {
+            assert!(
+                !cancel_pending && !ring_abandoned && !build_aborted,
+                "{} completed with an incompatible terminal flag",
+                case.name
+            );
+        }
+        if ring_abandoned {
+            assert!(
+                !completed && !cancel_pending && !build_aborted,
+                "{} abandoned after completion or before-submission abort",
+                case.name
+            );
+            assert!(
+                state.waiter.is_null(),
+                "{} abandoned with a waiter",
+                case.name
+            );
+            assert!(
+                state.cancel_next.is_null(),
+                "{} abandoned with a cancel link",
+                case.name
+            );
+        }
+        if build_aborted {
+            assert_eq!(
+                flags
+                    & (CompletionState::FLAG_COMPLETED
+                        | CompletionState::FLAG_ORPHANED
+                        | CompletionState::FLAG_DETACHED
+                        | CompletionState::FLAG_CANCEL_PENDING
+                        | CompletionState::FLAG_RUNTIME_SHUTDOWN
+                        | CompletionState::FLAG_RING_ABANDONED),
+                0,
+                "{} build-aborted after submission ownership",
+                case.name
+            );
+        }
+        if (orphaned || detached || runtime_shutdown || ring_abandoned) && !cancel_pending {
+            assert!(
+                state.waiter.is_null(),
+                "{} retained a task waiter after ownership transfer",
+                case.name
+            );
+        }
+
+        match case.waiter_role {
+            StableWaiterRole::Null => {
+                assert!(state.waiter.is_null(), "{} waiter", case.name);
+                assert!(!cancel_pending, "{} null role hid cancel_prev", case.name);
+            }
+            StableWaiterRole::Task => {
+                assert_eq!(state.waiter, task_waiter, "{} task waiter", case.name);
+                assert!(!cancel_pending, "{} task waiter was repurposed", case.name);
+            }
+            StableWaiterRole::CancelHead => {
+                assert!(cancel_pending, "{} missing cancel-pending", case.name);
+                assert!(
+                    state.cancel_prev().is_null(),
+                    "{} queue-head prev",
+                    case.name
+                );
+            }
+            StableWaiterRole::CancelAfter => {
+                assert!(cancel_pending, "{} missing cancel-pending", case.name);
+                assert_eq!(
+                    state.cancel_prev(),
+                    cancel_previous,
+                    "{} queued previous link",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_state_flag_and_accessor_inventory_is_complete() {
+        let source = include_str!("op.rs");
+        let flag_names: Vec<_> = source
+            .lines()
+            .filter_map(|line| {
+                let (_, tail) = line.split_once("const FLAG_")?;
+                tail.split_once(':').map(|(name, _)| name)
+            })
+            .collect();
+        assert_eq!(
+            flag_names,
+            [
+                "COMPLETED",
+                "ORPHANED",
+                "DETACHED",
+                "CANCEL_PENDING",
+                "RUNTIME_SHUTDOWN",
+                "CONTEXT_REJECTED",
+                "RING_ABANDONED",
+                "BUILD_ABORTED",
+            ]
+        );
+
+        let flags = [
+            CompletionState::FLAG_COMPLETED,
+            CompletionState::FLAG_ORPHANED,
+            CompletionState::FLAG_DETACHED,
+            CompletionState::FLAG_CANCEL_PENDING,
+            CompletionState::FLAG_RUNTIME_SHUTDOWN,
+            CompletionState::FLAG_CONTEXT_REJECTED,
+            CompletionState::FLAG_RING_ABANDONED,
+            CompletionState::FLAG_BUILD_ABORTED,
+        ];
+        assert!(flags.into_iter().all(u32::is_power_of_two));
+        assert_eq!(flags.into_iter().fold(0, |mask, flag| mask | flag), 0xff);
+
+        let implementation = source
+            .split_once("impl CompletionState {")
+            .expect("CompletionState implementation missing")
+            .1
+            .split_once("\n}\n\nimpl InPlaceInit for CompletionState")
+            .expect("CompletionState implementation boundary missing")
+            .0;
+        let mut lifecycle_accessors: Vec<_> = implementation
+            .split("fn ")
+            .skip(1)
+            .filter_map(|tail| {
+                let name = tail
+                    .trim_start()
+                    .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .next()?;
+                (name == "empty"
+                    || name.starts_with("is_")
+                    || name.starts_with("set_")
+                    || name.starts_with("clear_")
+                    || matches!(
+                        name,
+                        "debug_assert_valid_flags"
+                            | "link_pending_cancel_after"
+                            | "cancel_prev"
+                            | "register_waiter"
+                            | "replace_waiter_unchecked"
+                            | "restore_completed_orphaned_after_ringless_abandonment_for_test"
+                            | "take_waiter_unchecked"
+                            | "reset_for_resubmit"
+                    ))
+                .then_some(name)
+            })
+            .collect();
+        lifecycle_accessors.sort_unstable();
+        assert_eq!(
+            lifecycle_accessors,
+            [
+                "cancel_prev",
+                "clear_cancel_pending",
+                "clear_pending_cancel_links",
+                "clear_waiter_unchecked",
+                "debug_assert_valid_flags",
+                "empty",
+                "is_build_aborted",
+                "is_cancel_pending",
+                "is_completed",
+                "is_context_rejected",
+                "is_detached",
+                "is_orphaned",
+                "is_ring_abandoned",
+                "is_runtime_shutdown",
+                "link_pending_cancel_after",
+                "register_waiter",
+                "replace_waiter_unchecked",
+                "reset_for_resubmit",
+                "restore_completed_orphaned_after_ringless_abandonment_for_test",
+                "set_build_aborted",
+                "set_cancel_pending",
+                "set_cancel_prev",
+                "set_completed",
+                "set_context_rejected",
+                "set_detached",
+                "set_orphaned",
+                "set_ring_abandoned",
+                "set_runtime_shutdown",
+                "take_waiter_unchecked",
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_state_stable_family_matrix_matches_documented_waiter_roles() {
+        use StableMutation as M;
+        use StableWaiterRole as W;
+
+        let cases = [
+            StableStateCase {
+                name: "fresh",
+                mutations: &[],
+                waiter_role: W::Null,
+                expected_flags: 0,
+            },
+            StableStateCase {
+                name: "active waiting",
+                mutations: &[],
+                waiter_role: W::Task,
+                expected_flags: 0,
+            },
+            StableStateCase {
+                name: "context-rejected active without waiter",
+                mutations: &[M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "context-rejected active waiting",
+                mutations: &[M::ContextRejected],
+                waiter_role: W::Task,
+                expected_flags: CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "completed future-owned",
+                mutations: &[M::Completed],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED,
+            },
+            StableStateCase {
+                name: "completed test setup retaining waiter",
+                mutations: &[M::Completed],
+                waiter_role: W::Task,
+                expected_flags: CompletionState::FLAG_COMPLETED,
+            },
+            StableStateCase {
+                name: "completed shutdown-owned future",
+                mutations: &[M::Completed, M::RuntimeShutdown],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_RUNTIME_SHUTDOWN,
+            },
+            StableStateCase {
+                name: "completed context-rejected future",
+                mutations: &[M::Completed, M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "completed shutdown context-rejected future",
+                mutations: &[M::Completed, M::RuntimeShutdown, M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "completed orphan reclamation",
+                mutations: &[M::Completed, M::Orphaned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED | CompletionState::FLAG_ORPHANED,
+            },
+            StableStateCase {
+                name: "completed detached reclamation",
+                mutations: &[M::Completed, M::Detached],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED | CompletionState::FLAG_DETACHED,
+            },
+            StableStateCase {
+                name: "completed shutdown orphan reclamation",
+                mutations: &[M::Completed, M::RuntimeShutdown, M::Orphaned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED,
+            },
+            StableStateCase {
+                name: "completed context-rejected orphan reclamation",
+                mutations: &[M::Completed, M::Orphaned, M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "completed shutdown context-rejected orphan reclamation",
+                mutations: &[
+                    M::Completed,
+                    M::RuntimeShutdown,
+                    M::Orphaned,
+                    M::ContextRejected,
+                ],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "orphan awaiting target",
+                mutations: &[M::Orphaned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_ORPHANED,
+            },
+            StableStateCase {
+                name: "context-rejected orphan",
+                mutations: &[M::Orphaned, M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "orphan cancel head",
+                mutations: &[M::Orphaned],
+                waiter_role: W::CancelHead,
+                expected_flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "orphan cancel after",
+                mutations: &[M::Orphaned],
+                waiter_role: W::CancelAfter,
+                expected_flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "context-rejected orphan cancel after",
+                mutations: &[M::Orphaned, M::ContextRejected],
+                waiter_role: W::CancelAfter,
+                expected_flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "detached close",
+                mutations: &[M::Detached],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_DETACHED,
+            },
+            StableStateCase {
+                name: "shutdown-owned pending",
+                mutations: &[M::RuntimeShutdown],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN,
+            },
+            StableStateCase {
+                name: "context-rejected shutdown-owned pending",
+                mutations: &[M::RuntimeShutdown, M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "shutdown orphan awaiting target",
+                mutations: &[M::RuntimeShutdown, M::Orphaned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED,
+            },
+            StableStateCase {
+                name: "context-rejected shutdown orphan awaiting target",
+                mutations: &[M::RuntimeShutdown, M::Orphaned, M::ContextRejected],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED,
+            },
+            StableStateCase {
+                name: "shutdown cancel head",
+                mutations: &[M::RuntimeShutdown],
+                waiter_role: W::CancelHead,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "context-rejected shutdown cancel head",
+                mutations: &[M::RuntimeShutdown, M::ContextRejected],
+                waiter_role: W::CancelHead,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "shutdown orphan cancel after",
+                mutations: &[M::RuntimeShutdown, M::Orphaned],
+                waiter_role: W::CancelAfter,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "context-rejected shutdown orphan cancel after",
+                mutations: &[M::RuntimeShutdown, M::Orphaned, M::ContextRejected],
+                waiter_role: W::CancelAfter,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "shutdown detached cancel stress",
+                mutations: &[M::RuntimeShutdown, M::Detached],
+                waiter_role: W::CancelAfter,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_DETACHED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+            },
+            StableStateCase {
+                name: "build-aborted without waiter",
+                mutations: &[M::BuildAborted],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_BUILD_ABORTED,
+            },
+            StableStateCase {
+                name: "build-aborted retaining waiter",
+                mutations: &[M::BuildAborted],
+                waiter_role: W::Task,
+                expected_flags: CompletionState::FLAG_BUILD_ABORTED,
+            },
+            StableStateCase {
+                name: "synthetic bare abandonment",
+                mutations: &[M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "shutdown abandonment",
+                mutations: &[M::RuntimeShutdown, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "orphan abandonment",
+                mutations: &[M::Orphaned, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "shutdown orphan abandonment",
+                mutations: &[M::RuntimeShutdown, M::Orphaned, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "detached abandonment",
+                mutations: &[M::Detached, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_DETACHED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "shutdown detached abandonment stress",
+                mutations: &[M::RuntimeShutdown, M::Detached, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_DETACHED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "context-rejected shutdown abandonment",
+                mutations: &[M::RuntimeShutdown, M::ContextRejected, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "context-rejected orphan abandonment",
+                mutations: &[M::Orphaned, M::ContextRejected, M::RingAbandoned],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+            StableStateCase {
+                name: "context-rejected shutdown orphan abandonment",
+                mutations: &[
+                    M::RuntimeShutdown,
+                    M::Orphaned,
+                    M::ContextRejected,
+                    M::RingAbandoned,
+                ],
+                waiter_role: W::Null,
+                expected_flags: CompletionState::FLAG_RUNTIME_SHUTDOWN
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_RING_ABANDONED,
+            },
+        ];
+
+        let task = TaskHeader::new();
+        let task_ptr = &task as *const TaskHeader as *mut TaskHeader;
+        let mut observed_flags = 0u32;
+        for case in &cases {
+            let mut state = CompletionState::empty();
+            let mut previous = CompletionState::empty();
+            for &mutation in case.mutations {
+                apply_stable_mutation(&mut state, mutation);
+            }
+            match case.waiter_role {
+                W::Null => {}
+                W::Task => unsafe { state.register_waiter(task_ptr) },
+                W::CancelHead => state.link_pending_cancel_after(std::ptr::null_mut()),
+                W::CancelAfter => {
+                    state.link_pending_cancel_after(std::ptr::addr_of_mut!(previous));
+                }
+            }
+
+            assert_documented_stable_shape(
+                case,
+                &state,
+                task_ptr,
+                std::ptr::addr_of_mut!(previous),
+            );
+            state.debug_assert_valid_flags();
+            observed_flags |= state.state_flags;
+
+            match case.waiter_role {
+                W::Task => unsafe {
+                    CompletionState::clear_waiter_unchecked(std::ptr::addr_of_mut!(state));
+                },
+                W::CancelHead | W::CancelAfter => state.clear_pending_cancel_links(),
+                W::Null => {}
+            }
+            assert!(state.waiter.is_null(), "{} cleanup waiter", case.name);
+            assert!(state.cancel_next.is_null(), "{} cleanup next", case.name);
+            assert_eq!(task.refs.get(), 1, "{} task reference pairing", case.name);
+        }
+
+        assert_eq!(observed_flags, 0xff, "stable matrix omitted a flag");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn completion_state_invalid_stable_shapes_fail_at_their_exact_rule() {
+        struct InvalidCase {
+            name: &'static str,
+            flags: u32,
+            task_waiter: bool,
+            cancel_next: bool,
+            expected: &'static str,
+        }
+
+        let cases = [
+            InvalidCase {
+                name: "unknown flag",
+                flags: 1 << 8,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "unknown lifecycle flag",
+            },
+            InvalidCase {
+                name: "orphaned detached",
+                flags: CompletionState::FLAG_ORPHANED | CompletionState::FLAG_DETACHED,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "both orphaned and detached",
+            },
+            InvalidCase {
+                name: "unowned cancel retry",
+                flags: CompletionState::FLAG_CANCEL_PENDING,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "lacks orphan or shutdown ownership",
+            },
+            InvalidCase {
+                name: "completed cancel retry",
+                flags: CompletionState::FLAG_COMPLETED
+                    | CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CANCEL_PENDING,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "completed state remained on the cancel-retry queue",
+            },
+            InvalidCase {
+                name: "completed abandonment",
+                flags: CompletionState::FLAG_COMPLETED | CompletionState::FLAG_RING_ABANDONED,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "completed state was also classified as ring-abandoned",
+            },
+            InvalidCase {
+                name: "abandoned cancel retry",
+                flags: CompletionState::FLAG_ORPHANED
+                    | CompletionState::FLAG_CANCEL_PENDING
+                    | CompletionState::FLAG_RING_ABANDONED,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "ring-abandoned state remained on the cancel-retry queue",
+            },
+            InvalidCase {
+                name: "build-aborted shutdown",
+                flags: CompletionState::FLAG_BUILD_ABORTED | CompletionState::FLAG_RUNTIME_SHUTDOWN,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "build-aborted state retained a submitted lifecycle flag",
+            },
+            InvalidCase {
+                name: "build-aborted context rejection",
+                flags: CompletionState::FLAG_BUILD_ABORTED | CompletionState::FLAG_CONTEXT_REJECTED,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "build-aborted state retained a submitted lifecycle flag",
+            },
+            InvalidCase {
+                name: "detached context rejection",
+                flags: CompletionState::FLAG_DETACHED | CompletionState::FLAG_CONTEXT_REJECTED,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "detached state cannot acquire context rejection",
+            },
+            InvalidCase {
+                name: "context-rejected bare abandonment",
+                flags: CompletionState::FLAG_CONTEXT_REJECTED
+                    | CompletionState::FLAG_RING_ABANDONED,
+                task_waiter: false,
+                cancel_next: false,
+                expected: "lacks abandonment ownership provenance",
+            },
+            InvalidCase {
+                name: "cancel link outside queue",
+                flags: 0,
+                task_waiter: false,
+                cancel_next: true,
+                expected: "retained cancel_next outside the retry queue",
+            },
+            InvalidCase {
+                name: "orphaned task waiter",
+                flags: CompletionState::FLAG_ORPHANED,
+                task_waiter: true,
+                cancel_next: false,
+                expected: "task waiter after ownership transfer",
+            },
+            InvalidCase {
+                name: "detached task waiter",
+                flags: CompletionState::FLAG_DETACHED,
+                task_waiter: true,
+                cancel_next: false,
+                expected: "task waiter after ownership transfer",
+            },
+            InvalidCase {
+                name: "shutdown task waiter",
+                flags: CompletionState::FLAG_RUNTIME_SHUTDOWN,
+                task_waiter: true,
+                cancel_next: false,
+                expected: "task waiter after ownership transfer",
+            },
+            InvalidCase {
+                name: "abandoned task waiter",
+                flags: CompletionState::FLAG_RING_ABANDONED,
+                task_waiter: true,
+                cancel_next: false,
+                expected: "task waiter after ownership transfer",
+            },
+            InvalidCase {
+                name: "completed context-rejected task waiter",
+                flags: CompletionState::FLAG_COMPLETED | CompletionState::FLAG_CONTEXT_REJECTED,
+                task_waiter: true,
+                cancel_next: false,
+                expected: "completed state overlay retained a task waiter",
+            },
+        ];
+
+        let task = TaskHeader::new();
+        let task_ptr = &task as *const TaskHeader as *mut TaskHeader;
+        for case in cases {
+            let mut state = CompletionState::empty();
+            let mut next = CompletionState::empty();
+            if case.task_waiter {
+                unsafe { state.register_waiter(task_ptr) };
+            }
+            state.state_flags = case.flags;
+            if case.cancel_next {
+                state.cancel_next = std::ptr::addr_of_mut!(next);
+            }
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.debug_assert_valid_flags();
+            }))
+            .expect_err(case.name);
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .expect("validator panic did not carry text");
+            assert!(
+                message.contains(case.expected),
+                "{} reached the wrong rule: {message}",
+                case.name
+            );
+
+            state.state_flags = 0;
+            state.cancel_next = std::ptr::null_mut();
+            if case.task_waiter {
+                unsafe {
+                    CompletionState::clear_waiter_unchecked(std::ptr::addr_of_mut!(state));
+                }
+            }
+            assert_eq!(task.refs.get(), 1, "{} leaked a task ref", case.name);
+        }
+    }
 
     #[test]
     fn completion_waiter_reference_pairing_is_exact() {

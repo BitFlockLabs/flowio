@@ -86,7 +86,7 @@
 
 use super::{
     CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, close_fd,
-    completion_cqe_result, current_local_addr, get_sock_opt, new_nonblocking_socket,
+    completion_cqe_result, current_local_addr, get_sock_opt, invalid_data, new_nonblocking_socket,
     set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
     write_msghdr,
 };
@@ -618,6 +618,39 @@ fn udp_payload_is_truncated(msg_flags: libc::c_int) -> bool {
 }
 
 #[inline(always)]
+fn udp_receive_result<const BARE_INVALID_DATA: bool>(
+    actual: usize,
+    msg_flags: libc::c_int,
+    truncated_message: &'static str,
+) -> io::Result<usize> {
+    if udp_payload_is_truncated(msg_flags) {
+        Err(invalid_data::<BARE_INVALID_DATA>(truncated_message))
+    } else {
+        Ok(actual)
+    }
+}
+
+#[inline(always)]
+fn udp_recv_msg_result<const BARE_INVALID_DATA: bool>(
+    actual: usize,
+    msg_flags: libc::c_int,
+) -> io::Result<usize> {
+    udp_receive_result::<BARE_INVALID_DATA>(actual, msg_flags, "UDP recv_msg message was truncated")
+}
+
+#[inline(always)]
+fn udp_recv_from_result<const BARE_INVALID_DATA: bool>(
+    actual: usize,
+    msg_flags: libc::c_int,
+) -> io::Result<usize> {
+    udp_receive_result::<BARE_INVALID_DATA>(
+        actual,
+        msg_flags,
+        "UDP recv_from message was truncated",
+    )
+}
+
+#[inline(always)]
 /// Takes a completed datagram payload through its origin reactor.
 ///
 /// # Safety
@@ -795,14 +828,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             };
 
             let msg = unsafe { payload.msghdr.assume_init_ref() };
-            let result = if udp_payload_is_truncated(msg.msg_flags) {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "UDP recv_msg message was truncated",
-                ))
-            } else {
-                Ok(actual)
-            };
+            let result = udp_recv_msg_result::<false>(actual, msg.msg_flags);
 
             return Poll::Ready(unsafe {
                 complete_read_with_progress(buffer, this.write_base_len, actual, result)
@@ -1007,14 +1033,12 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             };
 
             let msg = unsafe { payload.msghdr.assume_init_ref() };
-            let result = if udp_payload_is_truncated(msg.msg_flags) {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "UDP recv_from message was truncated",
-                ))
-            } else {
-                unsafe { socket_addr_from_c(payload.addr.assume_init_ref(), msg.msg_namelen) }
-                    .map(|addr| (actual, addr))
+            let result = match udp_recv_from_result::<false>(actual, msg.msg_flags) {
+                Ok(actual) => {
+                    unsafe { socket_addr_from_c(payload.addr.assume_init_ref(), msg.msg_namelen) }
+                        .map(|addr| (actual, addr))
+                }
+                Err(err) => Err(err),
             };
             return Poll::Ready(unsafe {
                 complete_read_with_progress(buffer, this.write_base_len, actual, result)
@@ -1179,6 +1203,38 @@ impl<B: IoBuffReadOnly> Drop for SendToFuture<'_, B> {
     }
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Classifies a connected UDP `recv_msg` completion through the production
+    /// static-message error representation.
+    pub fn test_classify_recv_msg(actual: usize, msg_flags: libc::c_int) -> io::Result<usize> {
+        udp_recv_msg_result::<false>(actual, msg_flags)
+    }
+
+    /// Classifies a connected UDP `recv_msg` completion through the
+    /// diagnostic-only bare-`InvalidData` comparator.
+    pub fn test_classify_recv_msg_bare(actual: usize, msg_flags: libc::c_int) -> io::Result<usize> {
+        udp_recv_msg_result::<true>(actual, msg_flags)
+    }
+
+    /// Classifies an explicit-source UDP `recv_from` completion through the
+    /// production static-message error representation.
+    pub fn test_classify_recv_from(actual: usize, msg_flags: libc::c_int) -> io::Result<usize> {
+        udp_recv_from_result::<false>(actual, msg_flags)
+    }
+
+    /// Classifies an explicit-source UDP `recv_from` completion through the
+    /// diagnostic-only bare-`InvalidData` comparator.
+    pub fn test_classify_recv_from_bare(
+        actual: usize,
+        msg_flags: libc::c_int,
+    ) -> io::Result<usize> {
+        udp_recv_from_result::<true>(actual, msg_flags)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +1251,39 @@ mod tests {
             (libc::MSG_PEEK | libc::MSG_TRUNC, true),
         ] {
             assert_eq!(udp_payload_is_truncated(flags), expected, "flags={flags}");
+        }
+    }
+
+    #[test]
+    fn udp_error_modes_share_each_payload_classification_branch() {
+        type Classifier = fn(usize, libc::c_int) -> io::Result<usize>;
+
+        for (production, bare, expected_message) in [
+            (
+                udp_recv_msg_result::<false> as Classifier,
+                udp_recv_msg_result::<true> as Classifier,
+                "UDP recv_msg message was truncated",
+            ),
+            (
+                udp_recv_from_result::<false> as Classifier,
+                udp_recv_from_result::<true> as Classifier,
+                "UDP recv_from message was truncated",
+            ),
+        ] {
+            for flags in [0, libc::MSG_CTRUNC, libc::MSG_PEEK] {
+                assert_eq!(production(17, flags).expect("production success"), 17);
+                assert_eq!(bare(17, flags).expect("bare success"), 17);
+            }
+
+            let production_error =
+                production(17, libc::MSG_TRUNC).expect_err("production truncation should fail");
+            assert_eq!(production_error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(production_error.to_string(), expected_message);
+            assert!(production_error.get_ref().is_some());
+
+            let bare_error = bare(17, libc::MSG_TRUNC).expect_err("bare truncation should fail");
+            assert_eq!(bare_error.kind(), io::ErrorKind::InvalidData);
+            assert!(bare_error.get_ref().is_none());
         }
     }
 

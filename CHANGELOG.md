@@ -86,6 +86,13 @@ Alpha prereleases carry no compatibility guarantee.
   zero-length source with `InvalidInput` before kernel submission and return
   the rental owner unchanged. Empty and zero-readable vectored chains no longer
   complete with `Ok(0)`; legal zero-length UDP datagrams are unaffected.
+- **Breaking:** Linux SCTP authentication notifications (`0x8008`) now decode
+  to the fixed, allocation-free `SctpNotification::Authentication` variant.
+  `SctpNotification` and `SctpNotificationKind` each gain a variant, so
+  downstream exhaustive matches must add an arm. Declared authentication
+  records shorter than 20 bytes return `InvalidData`; raw indication values are
+  preserved. Stream-reset stream-ID tails remain bounded by the declared
+  record but are intentionally not materialized.
 - Runtime dependencies have been refreshed while retaining the existing
   feature set and minimum supported Rust version.
 - Compatibility documentation now consistently states that x86-64 Linux is
@@ -124,6 +131,16 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- FlowIO-internal TLS transport reads and writes now borrow their TCP
+  descriptor without treating it as publicly exposed. Fresh, unexposed TLS
+  connections retain known-nonpositive linger provenance and avoid an
+  unnecessary terminal `SO_LINGER` query; public `TcpStream::as_raw_fd`
+  behavior is unchanged.
+- TCP and Unix immediate projected writes now use bounded local iovec scratch
+  when called during thread-local teardown or re-entry. A user thread-local
+  destructor can therefore perform a projected write without triggering a
+  library panic; allocation failure returns `WouldBlock` with the exact source
+  and no payload bytes are copied.
 - Metadata-free UDP `recv_msg` and `recv_from` now reject only payload
   truncation. Discarded ancillary metadata no longer turns a complete datagram
   into `InvalidData` when those APIs requested and return no control data.
@@ -142,9 +159,13 @@ Alpha prereleases carry no compatibility guarantee.
   owner, while an earlier transport-write failure retains precedence over
   either shutdown state.
 - System resolver parsing now retains at most eight unique valid nameservers
-  from `/etc/resolv.conf`. Later nameserver directives are ignored; duplicates
-  do not consume the bound and first-seen retry order is retained. Explicit
-  `DnsResolver::new` input remains strict and rejects a ninth unique entry.
+  from `/etc/resolv.conf`. Later unique nameservers are omitted; duplicates do
+  not consume the bound and first-seen retry order is retained. The additive
+  `DnsResolver::nameservers` and
+  `DnsResolver::system_nameservers_were_truncated` methods expose the effective
+  list and whether system configuration contained a later unique valid entry.
+  Explicit `DnsResolver::new` input remains strict and rejects a ninth unique
+  entry.
 - DNS resolution now stops retrying other nameservers when a successfully
   parsed CNAME chain exceeds the remaining total-hop budget. This local policy
   failure still allows the sibling address family to supply a usable address.

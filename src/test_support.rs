@@ -82,14 +82,21 @@ pub mod net {
     pub mod resolver {
         pub use crate::net::resolver::test_support::{
             decode_name, extend_unique_socket_addrs, lookup_ipv4, parse_hosts_bytes,
-            parse_ipv4_response, parse_resolv_conf_bytes, read_resolv_conf,
-            resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
+            parse_ipv4_response, parse_resolv_conf_bytes, parse_resolv_conf_configuration_bytes,
+            read_resolv_conf, resolve_host_with_hosts_path, resolve_local_host_with_hosts_path,
             response_is_decodable_candidate,
         };
     }
 
     pub mod tcp {
         pub use crate::net::tcp::test_support::test_accept_slot_drop_cached_state_preserves_unrelated_fd;
+    }
+
+    pub mod udp {
+        pub use crate::net::udp::test_support::{
+            test_classify_recv_from, test_classify_recv_from_bare, test_classify_recv_msg,
+            test_classify_recv_msg_bare,
+        };
     }
 
     pub mod sctp {
@@ -99,9 +106,10 @@ pub mod net {
             test_accept_slot_drop_future_preserves_unrelated_fd,
             test_accept_with_established_config_error, test_adaptation_indication_type,
             test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
-            test_connect_slot_drop_cached_state_closes_socket_fd,
+            test_authentication_event_type, test_connect_slot_drop_cached_state_closes_socket_fd,
             test_connect_slot_drop_future_closes_socket_fd,
             test_fail_notification_mask_after_query, test_parse_notification, test_parse_recv_meta,
+            test_parse_recv_meta_bare_with_policy, test_parse_recv_meta_with_policy,
             test_parse_stream_recv_meta, test_partial_delivery_event_type,
             test_peer_addr_change_type, test_peer_addr_params_rejects_optlen,
             test_remote_error_type, test_sctp_socket_options, test_sctp_socket_receive_options,

@@ -493,6 +493,17 @@ impl TcpStream {
         super::shutdown_socket(self.fd.raw_fd(), how)
     }
 
+    /// Returns the descriptor for FlowIO-owned operations without exposing it
+    /// outside the crate or invalidating known linger provenance.
+    ///
+    /// Callers must not leak the descriptor or mutate shared socket options.
+    /// Public raw-descriptor access continues to use [`AsRawFd`] below and
+    /// permanently marks the descriptor's linger state uncertain.
+    #[inline(always)]
+    pub(crate) fn raw_fd_for_internal_io(&self) -> RawFd {
+        self.fd.raw_fd()
+    }
+
     stream::impl_stream_rw!(TcpStream, "flowio::net::tcp::TcpStream");
 }
 
@@ -1334,5 +1345,21 @@ mod tests {
             source.linger_provenance(),
             LingerProvenance::KnownNonPositive
         );
+    }
+
+    #[test]
+    fn internal_raw_fd_access_preserves_linger_provenance() {
+        let stream = TcpStream {
+            fd: RuntimeFd::from_fresh_raw_fd(-1),
+        };
+
+        assert_eq!(stream.raw_fd_for_internal_io(), -1);
+        assert_eq!(
+            stream.fd.linger_provenance(),
+            LingerProvenance::KnownNonPositive
+        );
+
+        assert_eq!(stream.as_raw_fd(), -1);
+        assert_eq!(stream.fd.linger_provenance(), LingerProvenance::Uncertain);
     }
 }

@@ -164,11 +164,14 @@ macro_rules! impl_stream_rw {
         ///
         /// FlowIO projects borrowed byte pieces from the owned `source`,
         /// performs one `sendmsg`, and returns the source immediately. Up to
-        /// 16 pieces use inline stack scratch; larger projections use bounded
-        /// reusable thread-local `Vec` scratch and may allocate when capacity
-        /// must grow. Message bytes are not copied, and no retained operation
-        /// state is created. Projections above 1024 non-empty pieces are
-        /// rejected with [`io::ErrorKind::InvalidInput`].
+        /// 16 pieces use inline stack scratch; larger projections normally use
+        /// bounded reusable thread-local `Vec` scratch and may allocate when
+        /// capacity must grow. Re-entry or thread-local teardown uses one
+        /// bounded local vector instead; if its reservation fails, this returns
+        /// [`io::ErrorKind::WouldBlock`] with the exact source. Message bytes
+        /// are not copied, and no retained operation state is created.
+        /// Projections above 1024 non-empty pieces are rejected with
+        /// [`io::ErrorKind::InvalidInput`].
         /// A declared-empty projection is still invoked once for contract
         /// validation; a valid empty projection completes with `Ok(0)` and no
         /// syscall.
@@ -176,8 +179,9 @@ macro_rules! impl_stream_rw {
         /// This is a deadline-edge primitive. Prefer
         /// [`Self::writev_projected`] / [`Self::writev_all_projected`] for
         /// normal FlowIO async I/O. Avoid this on an allocation-sensitive
-        /// deadline edge with more than 16 pieces unless its thread-local
-        /// scratch has already grown to the required capacity.
+        /// deadline edge with more than 16 pieces unless execution is
+        /// non-reentrant and its thread-local scratch has already grown to the
+        /// required capacity.
         #[doc = concat!(
             "# Example\n",
             "```no_run\n",
@@ -1522,11 +1526,11 @@ thread_local! {
 #[inline]
 fn try_writev_projected_with_scratch<T: WritevProjection>(
     fd: RawFd,
-    source: T,
+    source: &T,
     expected_count: usize,
     expected_total: usize,
     scratch: &mut [MaybeUninit<libc::iovec>],
-) -> (io::Result<usize>, T) {
+) -> io::Result<usize> {
     let projection = {
         let mut pieces = WritevPieces::new(&mut scratch[..expected_count]);
         source
@@ -1534,19 +1538,14 @@ fn try_writev_projected_with_scratch<T: WritevProjection>(
             .map(|()| (pieces.count(), pieces.total()))
     };
 
-    let (projected_count, projected_total) = match projection {
-        Ok(count_and_total) => count_and_total,
-        Err(err) => return (Err(err), source),
-    };
+    let (projected_count, projected_total) = projection?;
 
-    if let Err(err) = validate_try_projected_materialized_shape(
+    validate_try_projected_materialized_shape(
         projected_count,
         projected_total,
         expected_count,
         expected_total,
-    ) {
-        return (Err(err), source);
-    }
+    )?;
 
     let iovecs = unsafe { iovec_slice_mut_from_uninit(&mut scratch[..expected_count]) };
     let msg = libc::msghdr {
@@ -1560,33 +1559,18 @@ fn try_writev_projected_with_scratch<T: WritevProjection>(
     };
 
     let result = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
-    (one_shot_syscall_result(result), source)
+    one_shot_syscall_result(result)
 }
 
 #[inline]
 fn try_writev_projected_with_dynamic_scratch<T: WritevProjection>(
     fd: RawFd,
-    source: T,
+    source: &T,
     expected_count: usize,
     expected_total: usize,
-) -> (io::Result<usize>, T) {
-    let tls_result = TRY_WRITEV_PROJECTED_SCRATCH.with(|cell| {
-        let Ok(mut scratch) = cell.try_borrow_mut() else {
-            return Err(source);
-        };
-        Ok(try_writev_projected_with_vec_scratch(
-            fd,
-            source,
-            expected_count,
-            expected_total,
-            &mut scratch,
-        ))
-    });
-
-    match tls_result {
-        Ok(result) => result,
-        Err(source) => {
-            let mut scratch = Vec::new();
+) -> io::Result<usize> {
+    let tls_result = TRY_WRITEV_PROJECTED_SCRATCH.try_with(|cell| {
+        cell.try_borrow_mut().ok().map(|mut scratch| {
             try_writev_projected_with_vec_scratch(
                 fd,
                 source,
@@ -1594,8 +1578,26 @@ fn try_writev_projected_with_dynamic_scratch<T: WritevProjection>(
                 expected_total,
                 &mut scratch,
             )
+        })
+    });
+
+    match tls_result {
+        Ok(Some(result)) => result,
+        Ok(None) | Err(_) => {
+            try_writev_projected_with_fresh_scratch(fd, source, expected_count, expected_total)
         }
     }
+}
+
+#[inline]
+fn try_writev_projected_with_fresh_scratch<T: WritevProjection>(
+    fd: RawFd,
+    source: &T,
+    expected_count: usize,
+    expected_total: usize,
+) -> io::Result<usize> {
+    let mut scratch = Vec::new();
+    try_writev_projected_with_vec_scratch(fd, source, expected_count, expected_total, &mut scratch)
 }
 
 #[inline]
@@ -1615,14 +1617,12 @@ fn reserve_projected_scratch_capacity(
 #[inline]
 fn try_writev_projected_with_vec_scratch<T: WritevProjection>(
     fd: RawFd,
-    source: T,
+    source: &T,
     expected_count: usize,
     expected_total: usize,
     scratch: &mut Vec<MaybeUninit<libc::iovec>>,
-) -> (io::Result<usize>, T) {
-    if let Err(err) = reserve_projected_scratch_capacity(scratch, expected_count) {
-        return (Err(err), source);
-    }
+) -> io::Result<usize> {
+    reserve_projected_scratch_capacity(scratch, expected_count)?;
 
     let capacity = scratch.capacity();
     if scratch.len() < capacity {
@@ -1660,10 +1660,12 @@ pub(crate) fn try_writev_projected_once<T: WritevProjection>(
 
     if iov_count <= TRY_WRITEV_INLINE_IOVECS {
         let mut scratch = uninit_iovecs::<TRY_WRITEV_INLINE_IOVECS>();
-        return try_writev_projected_with_scratch(fd, source, iov_count, total, &mut scratch);
+        let result = try_writev_projected_with_scratch(fd, &source, iov_count, total, &mut scratch);
+        return (result, source);
     }
 
-    try_writev_projected_with_dynamic_scratch(fd, source, iov_count, total)
+    let result = try_writev_projected_with_dynamic_scratch(fd, &source, iov_count, total);
+    (result, source)
 }
 
 #[inline]
@@ -5050,6 +5052,336 @@ mod tests {
         assert_eq!(scratch.len(), 0);
     }
 
+    struct ProjectedTryScratchFixture {
+        previous: Option<Vec<MaybeUninit<libc::iovec>>>,
+        allocation: *const MaybeUninit<libc::iovec>,
+        capacity: usize,
+        len: usize,
+    }
+
+    impl ProjectedTryScratchFixture {
+        fn install(capacity: usize) -> Self {
+            TRY_WRITEV_PROJECTED_SCRATCH
+                .try_with(|cell| {
+                    let mut scratch = Vec::with_capacity(capacity);
+                    let actual_capacity = scratch.capacity();
+                    scratch.resize_with(actual_capacity, MaybeUninit::uninit);
+                    let allocation = scratch.as_ptr();
+                    let len = scratch.len();
+                    let previous = cell.replace(scratch);
+                    Self {
+                        previous: Some(previous),
+                        allocation,
+                        capacity: actual_capacity,
+                        len,
+                    }
+                })
+                .expect("projected-write scratch TLS should be available in a unit test")
+        }
+
+        fn assert_unchanged(&self) {
+            TRY_WRITEV_PROJECTED_SCRATCH
+                .try_with(|cell| {
+                    let scratch = cell.borrow();
+                    assert_eq!(scratch.as_ptr(), self.allocation);
+                    assert_eq!(scratch.capacity(), self.capacity);
+                    assert_eq!(scratch.len(), self.len);
+                })
+                .expect("projected-write scratch TLS disappeared during a unit test");
+        }
+    }
+
+    impl Drop for ProjectedTryScratchFixture {
+        fn drop(&mut self) {
+            let previous = self
+                .previous
+                .take()
+                .expect("projected-write scratch fixture restored twice");
+            TRY_WRITEV_PROJECTED_SCRATCH
+                .try_with(|cell| drop(cell.replace(previous)))
+                .expect("projected-write scratch TLS disappeared before fixture restoration");
+        }
+    }
+
+    struct TrackedProjectedTryCarrier {
+        id: usize,
+        token: Box<u8>,
+        bytes: [u8; 17],
+        projection_calls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+        saw_borrowed_tls_scratch: Rc<Cell<bool>>,
+        projection_error: Option<i32>,
+    }
+
+    impl TrackedProjectedTryCarrier {
+        fn new(
+            id: usize,
+            projection_calls: &Rc<Cell<usize>>,
+            drops: &Rc<Cell<usize>>,
+            saw_borrowed_tls_scratch: &Rc<Cell<bool>>,
+            projection_error: Option<i32>,
+        ) -> Self {
+            Self {
+                id,
+                token: Box::new(id as u8),
+                bytes: [0x5a; 17],
+                projection_calls: Rc::clone(projection_calls),
+                drops: Rc::clone(drops),
+                saw_borrowed_tls_scratch: Rc::clone(saw_borrowed_tls_scratch),
+                projection_error,
+            }
+        }
+
+        fn token_ptr(&self) -> *const u8 {
+            self.token.as_ref()
+        }
+    }
+
+    impl WritevProjection for TrackedProjectedTryCarrier {
+        fn writev_count_and_len(&self) -> (usize, usize) {
+            (self.bytes.len(), self.bytes.len())
+        }
+
+        fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+            self.projection_calls.set(self.projection_calls.get() + 1);
+            let tls_scratch_is_borrowed = TRY_WRITEV_PROJECTED_SCRATCH
+                .try_with(|cell| cell.try_borrow_mut().is_err())
+                .expect("projected-write scratch TLS should remain addressable");
+            self.saw_borrowed_tls_scratch.set(tls_scratch_is_borrowed);
+            for byte in &self.bytes {
+                pieces.push(std::slice::from_ref(byte))?;
+            }
+            match self.projection_error {
+                Some(raw_error) => Err(io::Error::from_raw_os_error(raw_error)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for TrackedProjectedTryCarrier {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct ReentrantProjectedTryCarrier {
+        id: usize,
+        token: Box<u8>,
+        bytes: [u8; 17],
+        projection_calls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+        inner: RefCell<Option<TrackedProjectedTryCarrier>>,
+        inner_error: Cell<Option<i32>>,
+    }
+
+    impl ReentrantProjectedTryCarrier {
+        fn token_ptr(&self) -> *const u8 {
+            self.token.as_ref()
+        }
+
+        fn inner_identity(&self) -> (usize, *const u8) {
+            let inner = self.inner.borrow();
+            let inner = inner
+                .as_ref()
+                .expect("reentrant projection did not restore its inner carrier");
+            (inner.id, inner.token_ptr())
+        }
+    }
+
+    impl WritevProjection for ReentrantProjectedTryCarrier {
+        fn writev_count_and_len(&self) -> (usize, usize) {
+            (self.bytes.len(), self.bytes.len())
+        }
+
+        fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+            self.projection_calls.set(self.projection_calls.get() + 1);
+
+            let inner = self
+                .inner
+                .borrow_mut()
+                .take()
+                .expect("reentrant projection lost its inner carrier");
+            let (inner_result, inner) = try_writev_projected_once(-1, inner);
+            let inner_error = inner_result
+                .expect_err("inner projected write should fail")
+                .raw_os_error();
+            self.inner_error.set(inner_error);
+            assert!(
+                self.inner.replace(Some(inner)).is_none(),
+                "reentrant projection replaced a live inner carrier"
+            );
+
+            for byte in &self.bytes {
+                pieces.push(std::slice::from_ref(byte))?;
+            }
+            Err(io::Error::from_raw_os_error(libc::ECANCELED))
+        }
+    }
+
+    impl Drop for ReentrantProjectedTryCarrier {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn projected_try_write_available_tls_propagates_projection_error_once() {
+        let scratch = ProjectedTryScratchFixture::install(32);
+        let projection_calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let saw_borrowed_tls_scratch = Rc::new(Cell::new(false));
+        let source = TrackedProjectedTryCarrier::new(
+            0x71,
+            &projection_calls,
+            &drops,
+            &saw_borrowed_tls_scratch,
+            Some(libc::EPROTO),
+        );
+        let token = source.token_ptr();
+
+        let (result, source) = try_writev_projected_once(-1, source);
+
+        assert_eq!(
+            result
+                .expect_err("projection error should bypass the socket syscall")
+                .raw_os_error(),
+            Some(libc::EPROTO)
+        );
+        assert_eq!(projection_calls.get(), 1, "projection was retried");
+        assert!(
+            saw_borrowed_tls_scratch.get(),
+            "available TLS scratch was not borrowed around projection"
+        );
+        assert_eq!(source.id, 0x71);
+        assert_eq!(source.token_ptr(), token);
+        assert_eq!(drops.get(), 0, "projection failure dropped the source");
+        scratch.assert_unchanged();
+
+        drop(source);
+        assert_eq!(drops.get(), 1, "returned source did not drop exactly once");
+    }
+
+    #[test]
+    fn projected_try_write_reentry_uses_fresh_scratch_and_returns_both_carriers() {
+        let scratch = ProjectedTryScratchFixture::install(32);
+        let outer_projection_calls = Rc::new(Cell::new(0));
+        let outer_drops = Rc::new(Cell::new(0));
+        let inner_projection_calls = Rc::new(Cell::new(0));
+        let inner_drops = Rc::new(Cell::new(0));
+        let inner_saw_borrowed_tls_scratch = Rc::new(Cell::new(false));
+        let inner = TrackedProjectedTryCarrier::new(
+            0x72,
+            &inner_projection_calls,
+            &inner_drops,
+            &inner_saw_borrowed_tls_scratch,
+            Some(libc::EPROTO),
+        );
+        let inner_token = inner.token_ptr();
+        let source = ReentrantProjectedTryCarrier {
+            id: 0x73,
+            token: Box::new(0x73),
+            bytes: [0x6b; 17],
+            projection_calls: Rc::clone(&outer_projection_calls),
+            drops: Rc::clone(&outer_drops),
+            inner: RefCell::new(Some(inner)),
+            inner_error: Cell::new(None),
+        };
+        let outer_token = source.token_ptr();
+
+        let (result, source) = try_writev_projected_once(-1, source);
+
+        assert_eq!(
+            result
+                .expect_err("outer projection should fail before its socket syscall")
+                .raw_os_error(),
+            Some(libc::ECANCELED)
+        );
+        assert_eq!(outer_projection_calls.get(), 1);
+        assert_eq!(
+            inner_projection_calls.get(),
+            1,
+            "inner projection was retried"
+        );
+        assert_eq!(source.inner_error.get(), Some(libc::EPROTO));
+        assert!(
+            inner_saw_borrowed_tls_scratch.get(),
+            "inner projection did not run while the outer TLS scratch was borrowed"
+        );
+        assert_eq!(source.id, 0x73);
+        assert_eq!(source.token_ptr(), outer_token);
+        assert_eq!(source.inner_identity(), (0x72, inner_token));
+        assert_eq!(outer_drops.get(), 0, "outer source was dropped early");
+        assert_eq!(inner_drops.get(), 0, "inner source was dropped early");
+        scratch.assert_unchanged();
+
+        drop(source);
+        assert_eq!(
+            outer_drops.get(),
+            1,
+            "outer source did not drop exactly once"
+        );
+        assert_eq!(
+            inner_drops.get(),
+            1,
+            "inner source did not drop exactly once"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn projected_try_write_reentry_propagates_inner_syscall_error_once() {
+        let scratch = ProjectedTryScratchFixture::install(32);
+        let outer_projection_calls = Rc::new(Cell::new(0));
+        let outer_drops = Rc::new(Cell::new(0));
+        let inner_projection_calls = Rc::new(Cell::new(0));
+        let inner_drops = Rc::new(Cell::new(0));
+        let inner_saw_borrowed_tls_scratch = Rc::new(Cell::new(false));
+        let inner = TrackedProjectedTryCarrier::new(
+            0x74,
+            &inner_projection_calls,
+            &inner_drops,
+            &inner_saw_borrowed_tls_scratch,
+            None,
+        );
+        let inner_token = inner.token_ptr();
+        let source = ReentrantProjectedTryCarrier {
+            id: 0x75,
+            token: Box::new(0x75),
+            bytes: [0x6b; 17],
+            projection_calls: Rc::clone(&outer_projection_calls),
+            drops: Rc::clone(&outer_drops),
+            inner: RefCell::new(Some(inner)),
+            inner_error: Cell::new(None),
+        };
+        let outer_token = source.token_ptr();
+
+        let (result, source) = try_writev_projected_once(-1, source);
+
+        assert_eq!(
+            result
+                .expect_err("outer projection should fail before its socket syscall")
+                .raw_os_error(),
+            Some(libc::ECANCELED)
+        );
+        assert_eq!(outer_projection_calls.get(), 1);
+        assert_eq!(inner_projection_calls.get(), 1, "inner write was retried");
+        assert_eq!(source.inner_error.get(), Some(libc::EBADF));
+        assert!(
+            inner_saw_borrowed_tls_scratch.get(),
+            "inner syscall path did not use fresh scratch during re-entry"
+        );
+        assert_eq!(source.id, 0x75);
+        assert_eq!(source.token_ptr(), outer_token);
+        assert_eq!(source.inner_identity(), (0x74, inner_token));
+        assert_eq!(outer_drops.get(), 0, "outer source was dropped early");
+        assert_eq!(inner_drops.get(), 0, "inner source was dropped early");
+        scratch.assert_unchanged();
+
+        drop(source);
+        assert_eq!(outer_drops.get(), 1);
+        assert_eq!(inner_drops.get(), 1);
+    }
+
     #[test]
     fn projected_try_write_limits_follow_retained_scratch_limits() {
         struct OversizedProjection {
@@ -5131,16 +5463,14 @@ mod tests {
         let mut scratch = Vec::<MaybeUninit<libc::iovec>>::with_capacity(32);
         let allocation = scratch.as_ptr();
         let capacity = scratch.capacity();
-        let mut source = UnderProjected([0x5a; 16]);
+        let source = UnderProjected([0x5a; 16]);
 
         for _ in 0..2 {
-            let (result, returned) =
-                try_writev_projected_with_vec_scratch(-1, source, 17, 17, &mut scratch);
+            let result = try_writev_projected_with_vec_scratch(-1, &source, 17, 17, &mut scratch);
             assert_eq!(
                 result.expect_err("under-projection should fail").kind(),
                 io::ErrorKind::InvalidInput
             );
-            source = returned;
             assert_eq!(scratch.as_ptr(), allocation);
             assert_eq!(scratch.capacity(), capacity);
             assert_eq!(scratch.len(), capacity);

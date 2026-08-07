@@ -431,6 +431,22 @@ pub(crate) fn invalid_input_kind() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidInput)
 }
 
+/// Builds either FlowIO's production static-message `InvalidData` diagnostic
+/// or a message-free comparator selected at monomorphization time.
+///
+/// `BARE` is used only by feature-gated diagnostic observers. Shipping paths
+/// instantiate `false`, preserving their exact cause text. Keeping the choice
+/// const-generic lets an observer reach the same validation branch without a
+/// runtime mode branch in that path.
+#[inline(always)]
+pub(crate) fn invalid_data<const BARE: bool>(message: &'static str) -> io::Error {
+    if BARE {
+        io::Error::from(io::ErrorKind::InvalidData)
+    } else {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+}
+
 /// Result of retiring one completed payload-owning operation.
 ///
 /// Rejection remains a distinct variant so ordinary completion sites cannot

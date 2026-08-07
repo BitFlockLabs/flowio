@@ -2,7 +2,7 @@
 mod counting_allocator;
 
 use counting_allocator::{
-    AllocationSnapshot, CountingAllocator, assert_allocation_failure_consumed,
+    CountingAllocator, ThreadLocalAllocationSnapshot, assert_allocation_failure_consumed,
     fail_next_allocation_of_size,
 };
 use flowio::net::tcp::TcpStream;
@@ -142,25 +142,25 @@ fn tls_scratch_reservation_failures_return_out_of_memory_and_reclaim_partial_wor
     let first_fixture = constructor_fixture();
     let first_config = Arc::clone(&first_fixture.config);
     fail_next_allocation_of_size(READ_SIZE);
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     expect_error_kind(
         construct(first_fixture, options),
         io::ErrorKind::OutOfMemory,
     );
     assert_allocation_failure_consumed();
-    AllocationSnapshot::current().assert_delta_since(before, 0, 0);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 0);
     drop(first_config);
 
     let second_fixture = constructor_fixture();
     let second_config = Arc::clone(&second_fixture.config);
     fail_next_allocation_of_size(WRITE_SIZE);
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     expect_error_kind(
         construct(second_fixture, options),
         io::ErrorKind::OutOfMemory,
     );
     assert_allocation_failure_consumed();
-    AllocationSnapshot::current().assert_delta_since(before, 1, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 1);
     drop(second_config);
 }
 
@@ -177,22 +177,22 @@ fn oversized_read_scratch_reserves_one_wire_record_and_keeps_write_independent()
     let read_fixture = constructor_fixture();
     let read_config = Arc::clone(&read_fixture.config);
     fail_next_allocation_of_size(EFFECTIVE_READ_SIZE);
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     expect_error_kind(construct(read_fixture, options), io::ErrorKind::OutOfMemory);
     assert_allocation_failure_consumed();
-    AllocationSnapshot::current().assert_delta_since(before, 0, 0);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 0);
     drop(read_config);
 
     let write_fixture = constructor_fixture();
     let write_config = Arc::clone(&write_fixture.config);
     fail_next_allocation_of_size(WRITE_SIZE);
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     expect_error_kind(
         construct(write_fixture, options),
         io::ErrorKind::OutOfMemory,
     );
     assert_allocation_failure_consumed();
-    AllocationSnapshot::current().assert_delta_since(before, 1, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 1);
     drop(write_config);
 }
 

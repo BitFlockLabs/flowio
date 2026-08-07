@@ -10,6 +10,10 @@ use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::{TimeoutError, timeout};
+use flowio::test_support::net::udp::{
+    test_classify_recv_from, test_classify_recv_from_bare, test_classify_recv_msg,
+    test_classify_recv_msg_bare,
+};
 #[cfg(any(debug_assertions, feature = "test-support"))]
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
@@ -702,6 +706,39 @@ fn runtime_udp_rental_send_futures_poll_after_ready_parks() {
             assert_poll_after_ready_parks(socket.send_to(Vec::<u8>::new(), peer_addr)).await;
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn udp_diagnostic_error_modes_cover_both_production_truncation_sites() {
+    type Classifier = fn(usize, libc::c_int) -> io::Result<usize>;
+
+    for (production, bare, expected_message) in [
+        (
+            test_classify_recv_msg as Classifier,
+            test_classify_recv_msg_bare as Classifier,
+            "UDP recv_msg message was truncated",
+        ),
+        (
+            test_classify_recv_from as Classifier,
+            test_classify_recv_from_bare as Classifier,
+            "UDP recv_from message was truncated",
+        ),
+    ] {
+        for flags in [0, libc::MSG_CTRUNC, libc::MSG_PEEK] {
+            assert_eq!(production(23, flags).expect("production success"), 23);
+            assert_eq!(bare(23, flags).expect("bare success"), 23);
+        }
+
+        let production_error =
+            production(23, libc::MSG_TRUNC).expect_err("production truncation should fail");
+        assert_eq!(production_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(production_error.to_string(), expected_message);
+        assert!(production_error.get_ref().is_some());
+
+        let bare_error = bare(23, libc::MSG_TRUNC).expect_err("bare truncation should fail");
+        assert_eq!(bare_error.kind(), io::ErrorKind::InvalidData);
+        assert!(bare_error.get_ref().is_none());
+    }
 }
 
 #[test]

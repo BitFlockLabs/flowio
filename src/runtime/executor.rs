@@ -275,6 +275,22 @@ define_runtime_stats!(pub(crate));
 #[cfg(all(not(debug_assertions), any(test, feature = "test-support")))]
 const _: [(); 0] = [(); size_of::<RuntimeStats>()];
 
+#[cfg(debug_assertions)]
+macro_rules! define_apply_retained_payload_stats {
+    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+        #[inline(always)]
+        fn apply_retained_payload_stats(
+            stats: &mut RuntimeStats,
+            retained: RetainedPayloadPoolStats,
+        ) {
+            $(stats.$runtime_field = retained.$field;)*
+        }
+    };
+}
+
+#[cfg(debug_assertions)]
+crate::runtime::retained::retained_payload_stat_fields!(define_apply_retained_payload_stats);
+
 struct ExecutorTaskMemProvider {
     /// Minimum alignment guaranteed for task slab allocations.
     alignment: usize,
@@ -1342,6 +1358,7 @@ pub(crate) unsafe fn completed_op_ctx(
     debug_assert!(!state_ptr.is_null(), "completed operation state is missing");
     let state = unsafe { &mut *state_ptr };
     debug_assert!(state.is_completed(), "operation has not completed");
+    state.debug_assert_valid_flags();
     let owner = state.owner_ptr();
     debug_assert!(!owner.is_null(), "completed operation has no origin owner");
 
@@ -1399,6 +1416,9 @@ pub(crate) unsafe fn refresh_op_waiter_from_waker(
         unsafe { !(*state_ptr).is_completed() },
         "cannot refresh a completed operation"
     );
+    unsafe {
+        (*state_ptr).debug_assert_valid_flags();
+    }
     if unsafe { (*state_ptr).is_ring_abandoned() } {
         return true;
     }
@@ -2499,20 +2519,7 @@ impl Executor {
             .reactor
             .retained_payload_stats()
             .saturating_delta_since(retained_stats_baseline);
-        runtime_state.stats.retained_pooled_allocs = retained.pooled_allocs;
-        runtime_state.stats.retained_pooled_reuses = retained.pooled_reuses;
-        runtime_state.stats.retained_pooled_frees = retained.pooled_frees;
-        runtime_state.stats.retained_slab_allocs = retained.slab_allocs;
-        runtime_state.stats.retained_heap_fallbacks = retained.heap_fallbacks;
-        runtime_state.stats.retained_heap_frees = retained.heap_frees;
-        runtime_state.stats.writev_scratch_inline_allocs = retained.writev_scratch_inline_allocs;
-        runtime_state.stats.writev_scratch_pooled_allocs = retained.writev_scratch_pooled_allocs;
-        runtime_state.stats.writev_scratch_pooled_reuses = retained.writev_scratch_pooled_reuses;
-        runtime_state.stats.writev_scratch_pooled_frees = retained.writev_scratch_pooled_frees;
-        runtime_state.stats.writev_scratch_slab_allocs = retained.writev_scratch_slab_allocs;
-        runtime_state.stats.writev_scratch_oversize_rejections =
-            retained.writev_scratch_oversize_rejections;
-        runtime_state.stats.writev_scratch_alloc_failures = retained.writev_scratch_alloc_failures;
+        apply_retained_payload_stats(&mut runtime_state.stats, retained);
         self.last_stats = runtime_state.stats;
     }
 
@@ -2819,6 +2826,7 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
     }
 
     unsafe {
+        (*state_ptr).debug_assert_valid_flags();
         if (*state_ptr).is_ring_abandoned() {
             // Ring-abandoned state and payload storage are deliberately leaked:
             // no target CQE proved that the kernel released its references.
@@ -2832,6 +2840,7 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
             // its target CQE retires the slot instead of preserving it for an
             // escaped future.
             (*state_ptr).set_orphaned();
+            (*state_ptr).debug_assert_valid_flags();
         } else {
             cancel_op_unchecked(state_ptr);
         }
@@ -5054,6 +5063,48 @@ mod tests {
         assert_eq!(resumed.writev_scratch_slab_allocs, 0);
         assert_eq!(resumed.writev_scratch_oversize_rejections, 0);
         assert_eq!(resumed.writev_scratch_alloc_failures, 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn retained_pool_stats_map_every_field_to_runtime_stats() {
+        let retained = RetainedPayloadPoolStats {
+            pooled_allocs: 1,
+            pooled_reuses: 2,
+            pooled_frees: 3,
+            slab_allocs: 4,
+            heap_fallbacks: 5,
+            heap_frees: 6,
+            writev_scratch_inline_allocs: 7,
+            writev_scratch_pooled_allocs: 8,
+            writev_scratch_pooled_reuses: 9,
+            writev_scratch_pooled_frees: 10,
+            writev_scratch_slab_allocs: 11,
+            writev_scratch_oversize_rejections: 12,
+            writev_scratch_alloc_failures: 13,
+        };
+        let mut runtime = RuntimeStats::default();
+
+        apply_retained_payload_stats(&mut runtime, retained);
+
+        assert_eq!(
+            [
+                runtime.retained_pooled_allocs,
+                runtime.retained_pooled_reuses,
+                runtime.retained_pooled_frees,
+                runtime.retained_slab_allocs,
+                runtime.retained_heap_fallbacks,
+                runtime.retained_heap_frees,
+                runtime.writev_scratch_inline_allocs,
+                runtime.writev_scratch_pooled_allocs,
+                runtime.writev_scratch_pooled_reuses,
+                runtime.writev_scratch_pooled_frees,
+                runtime.writev_scratch_slab_allocs,
+                runtime.writev_scratch_oversize_rejections,
+                runtime.writev_scratch_alloc_failures,
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        );
     }
 
     #[cfg(not(miri))]

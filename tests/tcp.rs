@@ -1,12 +1,12 @@
 mod common;
 
 use common::{
-    BoundedTcpListener, BoundedTcpPeer, BoundedTcpStream, EmptyProjected,
-    TestIoBuffMut as IoBuffMut, TestProjected, TryCountMismatchedProjected, TryMismatchedProjected,
-    TryOversizedProjected, connect_bounded_tcp_peer, fill_try_send_buffer,
-    ipv6_loopback_capability_unavailable, make_payload_chain, make_read_chain,
-    make_read_only_chain, poll_once_pending, run_test, run_test_output, set_positive_linger,
-    spawn_bounded_tcp_peer,
+    BoundedTcpListener, BoundedTcpPeer, BoundedTcpStream, DYNAMIC_PROJECTED_PIECES,
+    DropTrackedProjected17, EmptyProjected, ProjectedSourceWitness, TestIoBuffMut as IoBuffMut,
+    TestProjected, TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
+    connect_bounded_tcp_peer, fill_try_send_buffer, ipv6_loopback_capability_unavailable,
+    make_payload_chain, make_read_chain, make_read_only_chain, poll_once_pending, run_test,
+    run_test_output, set_positive_linger, spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -22,6 +22,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -33,6 +37,9 @@ const TCP_UNSUBMITTED_READINESS_TEST: &str =
     "runtime_tcp_unsubmitted_readiness_retains_listener_fd_until_ring_safe";
 const TCP_BOUNDED_PEER_STALL_CHILD_ENV: &str = "FLOWIO_TCP_BOUNDED_PEER_STALL_CHILD";
 const TCP_BOUNDED_PEER_STALL_TEST: &str = "bounded_tcp_peer_forced_stalls_fail_with_context";
+const TCP_PROJECTED_TLS_DESTRUCTOR_CHILD_ENV: &str = "FLOWIO_TCP_PROJECTED_TLS_DESTRUCTOR_CHILD";
+const TCP_PROJECTED_TLS_DESTRUCTOR_TEST: &str =
+    "runtime_tcp_try_writev_projected_survives_tls_destructor_order";
 const TCP_IPV6_FLOWIO_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn bind_std_ipv6_tcp_listener_or_skip(test_name: &str) -> Option<BoundedTcpListener> {
@@ -75,6 +82,115 @@ fn connected_try_tcp_stream() -> (TcpStream, BoundedTcpStream) {
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
     (TcpStream::from_owned_fd(stream.into_inner().into()), peer)
+}
+
+struct ProjectedTlsOrderProbe {
+    drops: RefCell<Option<Arc<AtomicUsize>>>,
+}
+
+impl ProjectedTlsOrderProbe {
+    const fn new() -> Self {
+        Self {
+            drops: RefCell::new(None),
+        }
+    }
+
+    fn arm(&self, drops: Arc<AtomicUsize>) -> bool {
+        let Ok(mut slot) = self.drops.try_borrow_mut() else {
+            return false;
+        };
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(drops);
+        true
+    }
+}
+
+impl Drop for ProjectedTlsOrderProbe {
+    fn drop(&mut self) {
+        if let Some(drops) = self.drops.get_mut().take() {
+            drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProjectedTlsDestructorOutcome {
+    probe_unavailable: bool,
+    probe_drops_before_write: usize,
+    write_result: Result<usize, io::ErrorKind>,
+    source_identity_preserved: bool,
+    projection_calls: usize,
+    drops_before_explicit_drop: usize,
+    drops_after_explicit_drop: usize,
+    shutdown_result: Result<(), io::ErrorKind>,
+    read_result: Result<(), io::ErrorKind>,
+    received: [u8; DYNAMIC_PROJECTED_PIECES],
+    eof_result: Result<usize, io::ErrorKind>,
+}
+
+struct ProjectedTlsDestructorState {
+    stream: TcpStream,
+    peer: BoundedTcpStream,
+    source_witness: ProjectedSourceWitness,
+    probe_drops: Arc<AtomicUsize>,
+    outcome: Arc<Mutex<Option<ProjectedTlsDestructorOutcome>>>,
+}
+
+impl Drop for ProjectedTlsDestructorState {
+    fn drop(&mut self) {
+        let probe_unavailable = PROJECTED_TLS_DESTRUCTOR_ORDER_PROBE
+            .try_with(|_| ())
+            .is_err();
+        let probe_drops_before_write = self.probe_drops.load(Ordering::Relaxed);
+
+        let source = DropTrackedProjected17::from_witness(b'D', &self.source_witness);
+        let (write_result, source) = self.stream.try_writev_projected(source);
+        let source_identity_preserved = source.has_identity(&self.source_witness);
+        let projection_calls = self.source_witness.projection_calls();
+        let drops_before_explicit_drop = self.source_witness.drops();
+        drop(source);
+        let drops_after_explicit_drop = self.source_witness.drops();
+
+        let shutdown_result = self
+            .stream
+            .shutdown(Shutdown::Write)
+            .map_err(|err| err.kind());
+        let mut received = [0; DYNAMIC_PROJECTED_PIECES];
+        let read_result = self
+            .peer
+            .read_exact(&mut received)
+            .map_err(|err| err.kind());
+        let mut trailing = [0; 1];
+        let eof_result = self.peer.read(&mut trailing).map_err(|err| err.kind());
+
+        let outcome = ProjectedTlsDestructorOutcome {
+            probe_unavailable,
+            probe_drops_before_write,
+            write_result: write_result.map_err(|err| err.kind()),
+            source_identity_preserved,
+            projection_calls,
+            drops_before_explicit_drop,
+            drops_after_explicit_drop,
+            shutdown_result,
+            read_result,
+            received,
+            eof_result,
+        };
+        if let Ok(mut slot) = self.outcome.lock()
+            && slot.is_none()
+        {
+            *slot = Some(outcome);
+        }
+    }
+}
+
+thread_local! {
+    static PROJECTED_TLS_DESTRUCTOR_STATE: RefCell<Option<ProjectedTlsDestructorState>> =
+        const { RefCell::new(None) };
+    static PROJECTED_TLS_DESTRUCTOR_ORDER_PROBE: ProjectedTlsOrderProbe =
+        const { ProjectedTlsOrderProbe::new() };
 }
 
 #[test]
@@ -698,6 +814,105 @@ fn runtime_tcp_try_writev_projected_large_piece_count_immediate_success() {
     let mut got = vec![0u8; expected.len()];
     peer.read_exact(&mut got).expect("std read failed");
     assert_eq!(got, expected);
+}
+
+#[test]
+fn runtime_tcp_try_writev_projected_reentrant_large_projection_returns_both_sources() {
+    let (mut outer_stream, mut outer_peer) = connected_try_tcp_stream();
+    let (inner_stream, mut inner_peer) = connected_try_tcp_stream();
+    common::assert_reentrant_projected_try_success(
+        &mut outer_stream,
+        &mut outer_peer,
+        inner_stream,
+        &mut inner_peer,
+    );
+}
+
+#[test]
+fn runtime_tcp_try_writev_projected_survives_tls_destructor_order() {
+    if std::env::var_os(TCP_PROJECTED_TLS_DESTRUCTOR_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            TCP_PROJECTED_TLS_DESTRUCTOR_TEST,
+            TCP_PROJECTED_TLS_DESTRUCTOR_CHILD_ENV,
+            Duration::from_secs(5),
+        );
+        return;
+    }
+
+    let outcome = Arc::new(Mutex::new(None));
+    let child_outcome = Arc::clone(&outcome);
+    let worker = common::spawn_bounded_tcp_peer_with_timeout(
+        "projected-write TLS destructor worker",
+        Duration::from_secs(2),
+        move |_deadline| {
+            let (stream, mut peer) = connected_try_tcp_stream();
+            peer.set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set destructor peer read timeout");
+            let source_witness = ProjectedSourceWitness::new();
+            let probe_drops = Arc::new(AtomicUsize::new(0));
+            let state = ProjectedTlsDestructorState {
+                stream,
+                peer,
+                source_witness,
+                probe_drops: Arc::clone(&probe_drops),
+                outcome: child_outcome,
+            };
+
+            // Initialize the user destructor first and the order probe second.
+            // Warming FlowIO's dynamic scratch last makes its teardown precede the
+            // probe, which in turn must precede the user destructor.
+            PROJECTED_TLS_DESTRUCTOR_STATE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                assert!(slot.is_none(), "destructor state initialized twice");
+                *slot = Some(state);
+            });
+            PROJECTED_TLS_DESTRUCTOR_ORDER_PROBE.with(|probe| {
+                assert!(
+                    probe.arm(probe_drops),
+                    "destructor order probe initialized twice"
+                );
+            });
+
+            let (mut warm_stream, mut warm_peer) = connected_try_tcp_stream();
+            let (warm_source, warm_witness) = DropTrackedProjected17::new(b'W');
+            let (warm_result, warm_source) = warm_stream.try_writev_projected(warm_source);
+            assert_eq!(
+                warm_result.expect("warm dynamic projected write failed"),
+                DYNAMIC_PROJECTED_PIECES
+            );
+            assert!(warm_source.has_identity(&warm_witness));
+            assert_eq!(warm_witness.projection_calls(), 1);
+            assert_eq!(warm_witness.drops(), 0);
+            let mut warm_bytes = [0; DYNAMIC_PROJECTED_PIECES];
+            warm_peer
+                .read_exact(&mut warm_bytes)
+                .expect("read warm projected bytes");
+            assert_eq!(warm_bytes, [b'W'; DYNAMIC_PROJECTED_PIECES]);
+            drop(warm_source);
+            assert_eq!(warm_witness.drops(), 1);
+        },
+    );
+    worker.finish();
+
+    let outcome = outcome
+        .lock()
+        .expect("destructor outcome lock poisoned")
+        .take()
+        .expect("TLS destructor did not publish its projected-write outcome");
+    assert!(
+        outcome.probe_unavailable,
+        "order probe remained accessible during the user TLS destructor"
+    );
+    assert_eq!(outcome.probe_drops_before_write, 1);
+    assert_eq!(outcome.write_result, Ok(DYNAMIC_PROJECTED_PIECES));
+    assert!(outcome.source_identity_preserved);
+    assert_eq!(outcome.projection_calls, 1);
+    assert_eq!(outcome.drops_before_explicit_drop, 0);
+    assert_eq!(outcome.drops_after_explicit_drop, 1);
+    assert_eq!(outcome.shutdown_result, Ok(()));
+    assert_eq!(outcome.read_result, Ok(()));
+    assert_eq!(outcome.received, [b'D'; DYNAMIC_PROJECTED_PIECES]);
+    assert_eq!(outcome.eof_result, Ok(0));
 }
 
 #[test]

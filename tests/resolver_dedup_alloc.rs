@@ -1,7 +1,7 @@
 #[path = "common/counting_allocator.rs"]
 mod counting_allocator;
 
-use counting_allocator::{AllocationSnapshot, CountingAllocator};
+use counting_allocator::{CountingAllocator, ThreadLocalAllocationSnapshot};
 use flowio::test_support::net::resolver::extend_unique_socket_addrs;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -25,10 +25,10 @@ fn resolver_address_deduplication_needs_no_scratch_allocation() {
         new_v4.ip(),
     ];
 
-    let before = AllocationSnapshot::current();
+    let before = ThreadLocalAllocationSnapshot::current();
     extend_unique_socket_addrs(&mut addrs, &ips, port)
         .expect("four unique addresses should remain within the result bound");
-    let after = AllocationSnapshot::current();
+    let after = ThreadLocalAllocationSnapshot::current();
 
     after.assert_unchanged_since(before);
     assert_eq!(addrs, [existing_v4, existing_v6, new_v4, new_v6]);

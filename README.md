@@ -352,6 +352,14 @@ When the requested notification mask is empty, PDAPI is the sole kernel event,
 so even its short-buffer fragments remain internal through EOR. If other
 notification types are requested, a caller buffer that truncates an event
 before it can be parsed completely retains the normal `InvalidData` behavior.
+Linux authentication events are returned as the fixed,
+allocation-free `SctpNotification::Authentication` value with flags, key and
+alternate-key numbers, the raw indication, and association ID. A declared
+authentication record shorter than 20 bytes is `InvalidData`; unfamiliar
+indications remain observable rather than being rejected. Linux stream-reset
+events may carry a variable stream-ID tail. FlowIO bounds that tail by the
+declared record but intentionally returns only the fixed flags and association
+ID, preserving the `Copy` notification model without per-event allocation.
 
 `SctpStream::from_owned_fd` and `SctpStream::from_raw_fd` adopt ownership but
 do not inspect or configure the socket. The caller must provide nonblocking
@@ -403,9 +411,12 @@ alias text.
 `resolv.conf` strips its earliest `#` or `;` comment marker at the byte level,
 then validates only the directive as UTF-8. A malformed directive line is
 skipped without suppressing valid siblings, and malformed comment bytes are
-ignored. At most eight unique valid nameservers are retained; after the eighth
-unique nameserver, all later nameserver directives are ignored. Duplicates do
-not consume the bound, and first-seen retry order is retained. One owned query
+ignored. At most eight unique valid nameservers are retained. After reaching
+that bound, parsing stops when the first later unique valid entry proves that
+the effective list was truncated; duplicates, invalid directives, and comments
+do not set the truncation state. `DnsResolver::nameservers` exposes the
+effective retry order, and `DnsResolver::system_nameservers_were_truncated`
+exposes that state (`false` for explicit construction). One owned query
 allocation and one safely returned response allocation are reused across
 sequential A, AAAA, nameserver retry,
 and bounded CNAME-follow-up work; a timed-out kernel-visible response buffer
