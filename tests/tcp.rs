@@ -5,8 +5,9 @@ use common::{
     DropTrackedProjected17, EmptyProjected, ProjectedSourceWitness, TestIoBuffMut as IoBuffMut,
     TestProjected, TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
     connect_bounded_tcp_peer, fill_try_send_buffer, ipv6_loopback_capability_unavailable,
-    make_payload_chain, make_read_chain, make_read_only_chain, poll_once_pending, run_test,
-    run_test_output, set_positive_linger, spawn_bounded_tcp_peer,
+    lowest_available_fd, make_payload_chain, make_read_chain, make_read_only_chain,
+    poll_once_pending, raw_fd_is_open, run_test, run_test_output, set_positive_linger,
+    spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -40,6 +41,12 @@ const TCP_BOUNDED_PEER_STALL_TEST: &str = "bounded_tcp_peer_forced_stalls_fail_w
 const TCP_PROJECTED_TLS_DESTRUCTOR_CHILD_ENV: &str = "FLOWIO_TCP_PROJECTED_TLS_DESTRUCTOR_CHILD";
 const TCP_PROJECTED_TLS_DESTRUCTOR_TEST: &str =
     "runtime_tcp_try_writev_projected_survives_tls_destructor_order";
+const TCP_OWNED_CONNECT_REUSE_CHILD_ENV: &str = "FLOWIO_TCP_OWNED_CONNECT_REUSE_CHILD";
+const TCP_OWNED_CONNECT_REUSE_TEST: &str =
+    "runtime_tcp_owned_zero_timeout_retains_socket_until_connect_cqe";
+const TCP_REUSABLE_CONNECT_REUSE_CHILD_ENV: &str = "FLOWIO_TCP_REUSABLE_CONNECT_REUSE_CHILD";
+const TCP_REUSABLE_CONNECT_REUSE_TEST: &str =
+    "runtime_tcp_reusable_dropped_connect_retains_socket_until_connect_cqe";
 const TCP_IPV6_FLOWIO_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn bind_std_ipv6_tcp_listener_or_skip(test_name: &str) -> Option<BoundedTcpListener> {
@@ -51,6 +58,84 @@ fn bind_std_ipv6_tcp_listener_or_skip(test_name: &str) -> Option<BoundedTcpListe
         }
         Err(err) => panic!("trusted std IPv6 TCP probe failed for {test_name}: {err}"),
     }
+}
+
+/// Holds one bound TCP port without listening so connection attempts receive a
+/// deterministic refusal while no parallel test can acquire the same port.
+fn bound_non_listening_tcp_endpoint() -> (OwnedFd, SocketAddr) {
+    // SAFETY: successful socket returns one descriptor whose sole ownership is
+    // immediately transferred into OwnedFd.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_INET,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_TCP,
+        )
+    };
+    assert!(
+        raw >= 0,
+        "failed to create non-listening TCP endpoint: {}",
+        io::Error::last_os_error(),
+    );
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let bind_addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+
+    // SAFETY: `bind_addr` is fully initialized and borrowed for its exact size.
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&bind_addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "failed to bind non-listening TCP endpoint: {}",
+        io::Error::last_os_error(),
+    );
+
+    let mut bound_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut bound_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: both output pointers remain writable for their declared sizes.
+    let rc = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            (&mut bound_addr as *mut libc::sockaddr_in).cast::<libc::sockaddr>(),
+            &mut bound_len,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "failed to read non-listening TCP endpoint: {}",
+        io::Error::last_os_error(),
+    );
+    assert_eq!(
+        bound_len as usize,
+        std::mem::size_of::<libc::sockaddr_in>(),
+        "unexpected non-listening TCP endpoint length",
+    );
+    assert_eq!(
+        bound_addr.sin_family,
+        libc::AF_INET as libc::sa_family_t,
+        "unexpected non-listening TCP endpoint family",
+    );
+
+    let addr = SocketAddr::from((
+        Ipv4Addr::from(bound_addr.sin_addr.s_addr.to_ne_bytes()),
+        u16::from_be(bound_addr.sin_port),
+    ));
+    assert_eq!(addr.ip(), Ipv4Addr::LOCALHOST);
+    assert_ne!(addr.port(), 0, "kernel did not assign a TCP endpoint port");
+    (fd, addr)
 }
 
 /// Spawns a std TCP peer that connects, verifies the payload it receives, and
@@ -1843,6 +1928,171 @@ fn runtime_tcp_read_exact_eof() {
     peer.finish();
 }
 
+#[test]
+fn runtime_tcp_owned_zero_timeout_retains_socket_until_connect_cqe() {
+    if std::env::var_os(TCP_OWNED_CONNECT_REUSE_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            TCP_OWNED_CONNECT_REUSE_TEST,
+            TCP_OWNED_CONNECT_REUSE_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let first_listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("first std bind failed");
+    let first_addr = first_listener
+        .local_addr()
+        .expect("first local_addr failed");
+    let second_listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("second std bind failed");
+    let second_addr = second_listener
+        .local_addr()
+        .expect("second local_addr failed");
+    assert_ne!(first_addr, second_addr);
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let (stream, first_fd, second_fd) = run_test_output(&mut executor, async move {
+        let first_fd = lowest_available_fd();
+        let first = TcpStream::connect_timeout(first_addr, Duration::ZERO)
+            .expect("zero-timeout connect initialization failed");
+        assert!(
+            raw_fd_is_open(first_fd),
+            "owned connect did not acquire the predicted lowest descriptor",
+        );
+
+        let err = match first.await {
+            Ok(_) => panic!("zero-timeout connect unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            raw_fd_is_open(first_fd),
+            "timed-out CONNECT released its socket before the queued target CQE",
+        );
+
+        let second_fd = lowest_available_fd();
+        assert_ne!(
+            second_fd, first_fd,
+            "the still-kernel-visible CONNECT descriptor became reusable",
+        );
+        let second = TcpStream::connect(second_addr).expect("second connect initialization failed");
+        assert!(
+            raw_fd_is_open(second_fd),
+            "second owned connect did not acquire the predicted descriptor",
+        );
+        let second = second.await.expect("second connect failed");
+        assert_eq!(second.as_raw_fd(), second_fd);
+        assert_eq!(
+            second.peer_addr().expect("second peer_addr failed"),
+            second_addr
+        );
+        (second, first_fd, second_fd)
+    });
+
+    assert!(
+        !raw_fd_is_open(first_fd),
+        "cancelled owned CONNECT retained its socket after target retirement",
+    );
+    assert_eq!(stream.as_raw_fd(), second_fd);
+    let deadline = common::TcpPeerDeadline::new("owned fd-reuse second peer");
+    let (_accepted, remote_addr) = deadline
+        .accept(&second_listener)
+        .expect("second peer did not receive the owned connection");
+    assert_eq!(
+        stream.local_addr().expect("connected local_addr failed"),
+        remote_addr,
+    );
+    drop(stream);
+    assert!(
+        !raw_fd_is_open(second_fd),
+        "completed owned TCP stream did not close after scope exit",
+    );
+    drop(first_listener);
+}
+
+#[test]
+fn runtime_tcp_reusable_dropped_connect_retains_socket_until_connect_cqe() {
+    if std::env::var_os(TCP_REUSABLE_CONNECT_REUSE_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            TCP_REUSABLE_CONNECT_REUSE_TEST,
+            TCP_REUSABLE_CONNECT_REUSE_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let first_listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("first std bind failed");
+    let first_addr = first_listener
+        .local_addr()
+        .expect("first local_addr failed");
+    let second_listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("second std bind failed");
+    let second_addr = second_listener
+        .local_addr()
+        .expect("second local_addr failed");
+    assert_ne!(first_addr, second_addr);
+
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    let (stream, first_fd, second_fd) = run_test_output(&mut executor, async move {
+        let mut connector = TcpConnector::new();
+        let first_fd = lowest_available_fd();
+        let first = connector
+            .connect(first_addr)
+            .expect("first reusable connect initialization failed");
+        assert!(
+            raw_fd_is_open(first_fd),
+            "reusable connect did not acquire the predicted lowest descriptor",
+        );
+        poll_once_pending(first).await;
+        assert!(
+            raw_fd_is_open(first_fd),
+            "dropped CONNECT released its socket before the queued target CQE",
+        );
+
+        let second_fd = lowest_available_fd();
+        assert_ne!(
+            second_fd, first_fd,
+            "the still-kernel-visible reusable CONNECT descriptor became reusable",
+        );
+        let second = connector
+            .connect(second_addr)
+            .expect("second reusable connect initialization failed");
+        assert!(
+            raw_fd_is_open(second_fd),
+            "second reusable connect did not acquire the predicted descriptor",
+        );
+        let second = second.await.expect("second reusable connect failed");
+        assert_eq!(second.as_raw_fd(), second_fd);
+        assert_eq!(
+            second.peer_addr().expect("second peer_addr failed"),
+            second_addr
+        );
+        (second, first_fd, second_fd)
+    });
+
+    assert!(
+        !raw_fd_is_open(first_fd),
+        "cancelled reusable CONNECT retained its socket after target retirement",
+    );
+    assert_eq!(stream.as_raw_fd(), second_fd);
+    let deadline = common::TcpPeerDeadline::new("reusable fd-reuse second peer");
+    let (_accepted, remote_addr) = deadline
+        .accept(&second_listener)
+        .expect("second peer did not receive the reusable connection");
+    assert_eq!(
+        stream.local_addr().expect("connected local_addr failed"),
+        remote_addr,
+    );
+    drop(stream);
+    assert!(
+        !raw_fd_is_open(second_fd),
+        "completed reusable TCP stream did not close after scope exit",
+    );
+    drop(first_listener);
+}
+
 /// TcpStream::connect() convenience creates a connection without a TcpConnector.
 #[test]
 fn runtime_tcp_stream_connect() {
@@ -2013,11 +2263,7 @@ fn runtime_tcp_connector_reuses_slot_for_plain_then_timed_success() {
 #[test]
 fn runtime_tcp_stream_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
-
-    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("std bind failed");
-    let addr = listener.local_addr().expect("local_addr failed");
-    drop(listener);
+    let (refusal_guard, addr) = bound_non_listening_tcp_endpoint();
 
     executor
         .run(async move {
@@ -2031,16 +2277,13 @@ fn runtime_tcp_stream_connect_timeout_propagates_connect_error() {
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
         })
         .expect("executor run failed");
+    drop(refusal_guard);
 }
 
 #[test]
 fn runtime_tcp_connector_connect_timeout_propagates_connect_error() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
-
-    let listener = BoundedTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("std bind failed");
-    let addr = listener.local_addr().expect("local_addr failed");
-    drop(listener);
+    let (refusal_guard, addr) = bound_non_listening_tcp_endpoint();
 
     let mut connector = TcpConnector::new();
     executor
@@ -2056,6 +2299,7 @@ fn runtime_tcp_connector_connect_timeout_propagates_connect_error() {
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
         })
         .expect("executor run failed");
+    drop(refusal_guard);
 }
 
 #[test]

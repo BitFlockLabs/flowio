@@ -7,6 +7,7 @@ use flowio::runtime::timer::sleep;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::os::fd::RawFd;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::{
@@ -56,6 +57,66 @@ pub async fn poll_once_pending<F: Future>(future: F) {
         Poll::Ready(())
     })
     .await;
+}
+
+/// Returns whether one numeric descriptor currently names an open descriptor.
+///
+/// This is used only by isolated child-process ownership regressions, where no
+/// sibling test can race descriptor creation with the observation.
+#[allow(dead_code)]
+pub fn raw_fd_is_open(fd: RawFd) -> bool {
+    loop {
+        // SAFETY: F_GETFD accepts any numeric descriptor and does not take
+        // ownership of it.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if rc >= 0 {
+            return true;
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EBADF),
+            "fcntl(F_GETFD) failed unexpectedly for descriptor {fd}: {err}",
+        );
+        return false;
+    }
+}
+
+/// Finds the lowest descriptor number a subsequent socket allocation must use.
+///
+/// Linux allocates the lowest available descriptor. Callers run in an exact
+/// child test and create no descriptor between this probe and the socket under
+/// test, making numeric reuse deterministic without mutating production code.
+#[allow(dead_code)]
+pub fn lowest_available_fd() -> RawFd {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is writable for the duration of getrlimit.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(
+        rc,
+        0,
+        "getrlimit(RLIMIT_NOFILE) failed: {}",
+        io::Error::last_os_error(),
+    );
+    let upper = if limit.rlim_cur == libc::RLIM_INFINITY {
+        RawFd::MAX as libc::rlim_t
+    } else {
+        limit.rlim_cur.min(RawFd::MAX as libc::rlim_t)
+    };
+
+    for fd in 0..upper as RawFd {
+        if !raw_fd_is_open(fd) {
+            return fd;
+        }
+    }
+    panic!("no descriptor is available below the process soft limit");
 }
 
 /// Default absolute deadline for one blocking standard-library TCP peer.

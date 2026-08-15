@@ -1929,6 +1929,33 @@ fn resolve_host_accepts_sixteen_total_cname_hops() {
 }
 
 #[test]
+fn resolve_host_zero_remaining_cname_hops_accepts_direct_sibling_address() {
+    let expected = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x116);
+    let addrs = resolve_after_exhausting_cname_hops(
+        TestAnswer::Cname("c17.example.test"),
+        TestAnswer::Aaaa(expected),
+    )
+    .expect("a direct sibling address should remain usable with no CNAME hops remaining");
+
+    assert_eq!(addrs, vec![SocketAddr::from((expected, 5432))]);
+}
+
+#[test]
+fn resolve_host_zero_remaining_cname_hops_rejects_follow_cname_without_underflow() {
+    let err = resolve_after_exhausting_cname_hops(
+        TestAnswer::Cname("c17.example.test"),
+        TestAnswer::Empty,
+    )
+    .expect_err("a CNAME transition with no remaining hop budget should fail");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        err.to_string(),
+        "DNS resolution exceeded maximum total CNAME hop count",
+    );
+}
+
+#[test]
 fn resolve_host_rejects_seventeen_total_cname_hops_without_nameserver_retry() {
     let first_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind first dns socket");
@@ -2749,85 +2776,13 @@ fn resolve_host_rejects_literal_dot_cname_without_followup_query() {
 }
 
 fn assert_rejected_cname_has_no_followup(answer: TestAnswer, expected_message: &'static str) {
-    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("failed to bind test dns socket");
-    let nameserver = server.local_addr().expect("failed to read dns socket addr");
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let thread = thread::spawn(move || {
-        server
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("failed to set initial dns timeout");
-
-        let mut queries = Vec::new();
-        for expected_qtype in [1, 28] {
-            let mut buffer = [0u8; 512];
-            let (len, peer) = server.recv_from(&mut buffer).expect("dns recv_from failed");
-            let query = &buffer[..len];
-            let qname = parse_qname(query).expect("failed to parse dns qname");
-            assert_eq!(qname, "db.example.test");
-            let qtype = parse_qtype(query).expect("failed to parse dns qtype");
-            assert_eq!(qtype, expected_qtype);
-            queries.push((qname, qtype));
-            let response = build_response(
-                query,
-                if qtype == 1 {
-                    answer
-                } else {
-                    TestAnswer::Empty
-                },
-            );
-            server
-                .send_to(&response, peer)
-                .expect("dns send_to response failed");
-        }
-
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("resolver did not finish the CNAME rejection test");
-        server
-            .set_nonblocking(true)
-            .expect("failed to make follow-up probe nonblocking");
-        loop {
-            let mut unexpected = [0u8; 512];
-            match server.recv_from(&mut unexpected) {
-                Ok((len, _)) => {
-                    let query = &unexpected[..len];
-                    queries.push((
-                        parse_qname(query).expect("failed to parse follow-up qname"),
-                        parse_qtype(query).expect("failed to parse follow-up qtype"),
-                    ));
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) => panic!("follow-up query probe failed: {err}"),
-            }
-        }
-        queries
-    });
-
-    let mut executor = Executor::new().expect("failed to construct runtime executor");
-    executor
-        .run(async move {
-            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
-            resolver.set_query_timeout(Duration::from_millis(200));
-            let result = resolver.resolve_host("db.example.test", 5432).await;
-            done_tx
-                .send(())
-                .expect("failed to release the DNS query recorder");
-            let err = result.expect_err("invalid CNAME target should fail");
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(err.to_string(), expected_message);
-        })
-        .expect("executor run failed");
-
-    let queries = thread.join().expect("dns thread panicked");
-    assert_eq!(
-        queries,
-        [
-            ("db.example.test".to_owned(), 1),
-            ("db.example.test".to_owned(), 28),
-        ],
-        "invalid CNAME target must not produce a follow-up query",
-    );
+    let err = resolve_with_recorded_dns_queries([
+        ("db.example.test", 1, answer),
+        ("db.example.test", 28, TestAnswer::Empty),
+    ])
+    .expect_err("invalid CNAME target should fail");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), expected_message);
 }
 
 #[test]
@@ -2895,6 +2850,103 @@ where
     F: Fn(&str, u16) -> Option<TestAnswer> + Send + 'static,
 {
     resolve_named_with_mock_dns("db.example.test", expected_queries, query_timeout, answer)
+}
+
+fn resolve_after_exhausting_cname_hops(
+    followup_a: TestAnswer,
+    followup_aaaa: TestAnswer,
+) -> io::Result<Vec<SocketAddr>> {
+    resolve_with_recorded_dns_queries([
+        (
+            "db.example.test",
+            1,
+            TestAnswer::CnameChain {
+                names: &CNAME_RESPONSE_BOUNDARY_CHAIN[..17],
+                address: None,
+            },
+        ),
+        ("db.example.test", 28, TestAnswer::Empty),
+        ("c16.example.test", 1, followup_a),
+        ("c16.example.test", 28, followup_aaaa),
+    ])
+}
+
+fn resolve_with_recorded_dns_queries<const N: usize>(
+    expected: [(&'static str, u16, TestAnswer); N],
+) -> io::Result<Vec<SocketAddr>> {
+    let server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("failed to bind test dns socket");
+    let nameserver = server.local_addr().expect("failed to read dns socket addr");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let expected_queries: Vec<_> = expected
+        .iter()
+        .map(|(name, qtype, _)| ((*name).to_owned(), *qtype))
+        .collect();
+    let thread = thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("failed to set test dns timeout");
+
+        let mut queries = Vec::new();
+        for (expected_name, expected_qtype, answer) in expected {
+            let mut buffer = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buffer).expect("dns recv_from failed");
+            let query = &buffer[..len];
+            let qname = parse_qname(query).expect("failed to parse dns qname");
+            let qtype = parse_qtype(query).expect("failed to parse dns qtype");
+            assert_eq!(qname, expected_name);
+            assert_eq!(qtype, expected_qtype);
+            queries.push((qname, qtype));
+            server
+                .send_to(&build_response(query, answer), peer)
+                .expect("dns send_to response failed");
+        }
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resolver did not finish the recorded-query test");
+        server
+            .set_nonblocking(true)
+            .expect("failed to make follow-up probe nonblocking");
+        loop {
+            let mut unexpected = [0u8; 512];
+            match server.recv_from(&mut unexpected) {
+                Ok((len, _)) => {
+                    let query = &unexpected[..len];
+                    queries.push((
+                        parse_qname(query).expect("failed to parse extra qname"),
+                        parse_qtype(query).expect("failed to parse extra qtype"),
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("extra query probe failed: {err}"),
+            }
+        }
+        queries
+    });
+
+    let result = Rc::new(Cell::new(None));
+    let task_result = Rc::clone(&result);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+    executor
+        .run(async move {
+            let mut resolver = DnsResolver::new(vec![nameserver]).expect("resolver init failed");
+            resolver.set_query_timeout(Duration::from_millis(200));
+            task_result.set(Some(resolver.resolve_host("db.example.test", 5432).await));
+            done_tx
+                .send(())
+                .expect("failed to release the DNS query recorder");
+        })
+        .expect("executor run failed");
+
+    let queries = thread.join().expect("dns thread panicked");
+    assert_eq!(
+        queries, expected_queries,
+        "resolver must preserve the exact family transcript",
+    );
+    result
+        .take()
+        .expect("resolver task completed without recording its result")
 }
 
 fn resolve_named_with_mock_dns<F>(

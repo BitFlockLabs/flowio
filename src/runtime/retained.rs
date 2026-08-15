@@ -653,7 +653,7 @@ pub(crate) unsafe fn with_raw_retained_slot<T: 'static, R>(
 pub(crate) struct RawRetainedSlot<'slot, T: 'static> {
     ptr: NonNull<MaybeUninit<T>>,
     pool: NonNull<RetainedPayloadPool>,
-    vtable: RetainedPayloadVtable,
+    vtable: &'static RetainedPayloadVtable,
     _brand: RetainedSlotBrand<'slot>,
     _owner_thread_only: PhantomData<Rc<()>>,
     #[cfg(test)]
@@ -669,7 +669,7 @@ impl<'slot, T: 'static> RawRetainedSlot<'slot, T> {
     unsafe fn new(
         ptr: *mut MaybeUninit<T>,
         pool: NonNull<RetainedPayloadPool>,
-        vtable: RetainedPayloadVtable,
+        vtable: &'static RetainedPayloadVtable,
         #[cfg(test)] poison_cleanup: Option<unsafe fn(*mut ())>,
     ) -> Self {
         Self {
@@ -729,7 +729,7 @@ pub(crate) struct WritingRetainedSlot<'slot, T: 'static> {
     ptr: NonNull<MaybeUninit<T>>,
     #[cfg(test)]
     pool: NonNull<RetainedPayloadPool>,
-    vtable: RetainedPayloadVtable,
+    vtable: &'static RetainedPayloadVtable,
     _brand: RetainedSlotBrand<'slot>,
     _owner_thread_only: PhantomData<Rc<()>>,
     #[cfg(test)]
@@ -1005,7 +1005,7 @@ pub(crate) struct RetainedPayload<T: 'static> {
     /// Pointer to initialized retained payload storage.
     ptr: NonNull<T>,
     /// Release hooks matching the allocation path for `ptr`.
-    vtable: RetainedPayloadVtable,
+    vtable: &'static RetainedPayloadVtable,
     /// Carries the concrete payload type for drop-checking and variance.
     _marker: PhantomData<T>,
 }
@@ -1016,7 +1016,10 @@ impl<T: 'static> RetainedPayload<T> {
     /// `ptr` must point to initialized storage for `T`, and `vtable` must
     /// release that exact storage allocation path.
     #[inline(always)]
-    pub(crate) unsafe fn from_raw_parts(ptr: *mut T, vtable: RetainedPayloadVtable) -> Self {
+    pub(crate) unsafe fn from_raw_parts(
+        ptr: *mut T,
+        vtable: &'static RetainedPayloadVtable,
+    ) -> Self {
         Self {
             ptr: {
                 debug_assert!(!ptr.is_null(), "retained payload pointer must be non-null");
@@ -1039,7 +1042,7 @@ impl<T: 'static> RetainedPayload<T> {
     ///
     /// The returned parts must later be reconstructed and consumed exactly
     /// once; this handle intentionally has no independent `Drop` path.
-    pub(crate) fn into_raw_parts(self) -> (*mut (), RetainedPayloadVtable) {
+    pub(crate) fn into_raw_parts(self) -> (*mut (), &'static RetainedPayloadVtable) {
         (self.ptr.as_ptr() as *mut (), self.vtable)
     }
 
@@ -1234,49 +1237,49 @@ fn class_index_for<T>() -> Option<usize> {
 }
 
 #[inline(always)]
-fn pooled_vtable<T: 'static>(class_index: usize) -> RetainedPayloadVtable {
+fn pooled_vtable<T: 'static>(class_index: usize) -> &'static RetainedPayloadVtable {
     match class_index {
-        0 => RetainedPayloadVtable {
+        0 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 0>,
             free_storage: pooled_free_storage::<T, 0>,
         },
-        1 => RetainedPayloadVtable {
+        1 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 1>,
             free_storage: pooled_free_storage::<T, 1>,
         },
-        2 => RetainedPayloadVtable {
+        2 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 2>,
             free_storage: pooled_free_storage::<T, 2>,
         },
-        3 => RetainedPayloadVtable {
+        3 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 3>,
             free_storage: pooled_free_storage::<T, 3>,
         },
-        4 => RetainedPayloadVtable {
+        4 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 4>,
             free_storage: pooled_free_storage::<T, 4>,
         },
-        5 => RetainedPayloadVtable {
+        5 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 5>,
             free_storage: pooled_free_storage::<T, 5>,
         },
-        6 => RetainedPayloadVtable {
+        6 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 6>,
             free_storage: pooled_free_storage::<T, 6>,
         },
-        7 => RetainedPayloadVtable {
+        7 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 7>,
             free_storage: pooled_free_storage::<T, 7>,
         },
-        8 => RetainedPayloadVtable {
+        8 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 8>,
             free_storage: pooled_free_storage::<T, 8>,
         },
-        9 => RetainedPayloadVtable {
+        9 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 9>,
             free_storage: pooled_free_storage::<T, 9>,
         },
-        10 => RetainedPayloadVtable {
+        10 => &RetainedPayloadVtable {
             drop_and_free: pooled_drop_and_free::<T, 10>,
             free_storage: pooled_free_storage::<T, 10>,
         },
@@ -1285,8 +1288,8 @@ fn pooled_vtable<T: 'static>(class_index: usize) -> RetainedPayloadVtable {
 }
 
 #[inline(always)]
-fn heap_vtable<T: 'static>() -> RetainedPayloadVtable {
-    RetainedPayloadVtable {
+fn heap_vtable<T: 'static>() -> &'static RetainedPayloadVtable {
+    &RetainedPayloadVtable {
         drop_and_free: heap_drop_and_free::<T>,
         free_storage: heap_free_storage::<T>,
     }
@@ -1432,6 +1435,40 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn static_vtable_refs_bind_exact_type_class_and_heap_hooks() {
+        // Miri may materialize the same generic function item at distinct
+        // abstract code addresses. Runtime dispatch behavior remains covered
+        // by the pooled and heap backing-release tests below.
+        #[cfg(not(miri))]
+        {
+            let pooled = pooled_vtable::<u32>(2);
+            assert!(std::ptr::fn_addr_eq(
+                pooled.drop_and_free,
+                pooled_drop_and_free::<u32, 2> as unsafe fn(*mut (), *mut RetainedPayloadPool),
+            ));
+            assert!(std::ptr::fn_addr_eq(
+                pooled.free_storage,
+                pooled_free_storage::<u32, 2> as unsafe fn(*mut (), *mut RetainedPayloadPool),
+            ));
+
+            let heap = heap_vtable::<u64>();
+            assert!(std::ptr::fn_addr_eq(
+                heap.drop_and_free,
+                heap_drop_and_free::<u64> as unsafe fn(*mut (), *mut RetainedPayloadPool),
+            ));
+            assert!(std::ptr::fn_addr_eq(
+                heap.free_storage,
+                heap_free_storage::<u64> as unsafe fn(*mut (), *mut RetainedPayloadPool),
+            ));
+        }
+
+        assert_eq!(
+            std::mem::size_of::<Option<&'static RetainedPayloadVtable>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
 
     struct ScratchPayload {
         _scratch: RetainedIovecScratch,

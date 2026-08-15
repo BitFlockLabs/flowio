@@ -1079,7 +1079,7 @@ impl TlsClientStream {
             debug_assert!(written > 0);
             debug_assert!(buffer.len() <= chunk_limit);
             self.pending_write_tls = Some(stream::WriteAllFuture::new(
-                self.stream.raw_fd_for_internal_io(),
+                self.stream.staged_fd_op_state_for_internal_io(),
                 buffer,
             ));
         }
@@ -1131,7 +1131,7 @@ impl TlsClientStream {
             let buffer = self.take_read_tls_buffer()?;
             let len = tls_read_submission_len(buffer.capacity(), self.transport_read_buffer_size);
             self.pending_read_tls = Some(stream::ReadFuture::new(
-                self.stream.raw_fd_for_internal_io(),
+                self.stream.staged_fd_op_state_for_internal_io(),
                 buffer,
                 len,
             ));
@@ -2379,7 +2379,7 @@ mod tests {
         let staged = b"staged tls ciphertext".to_vec();
         tls.write_tls_buffer = None;
         tls.pending_write_tls = Some(stream::WriteAllFuture::new(
-            tls.stream.raw_fd_for_internal_io(),
+            tls.stream.staged_fd_op_state_for_internal_io(),
             staged,
         ));
         let mut executor = Executor::new().expect("failed to construct runtime executor");

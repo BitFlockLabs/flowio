@@ -189,7 +189,7 @@ use super::{
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::validate_local_io_result;
-use crate::runtime::fd::{LingerProvenance, RuntimeFd};
+use crate::runtime::fd::{LingerProvenance, RuntimeFd, RuntimeFdOpState};
 #[cfg(any(test, feature = "test-support"))]
 use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Timeout, timeout};
@@ -198,7 +198,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -242,13 +241,18 @@ fn prepare_connect_slot(slot: &mut ConnectSlot, addr: SocketAddr) -> io::Result<
     }
     slot.cleanup_fd();
     slot.in_use = true;
-    slot.fd = match new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM) {
-        Ok(fd) => fd,
+    let fd = match new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM) {
+        Ok(fd) => {
+            // SAFETY: socket creation returned one fresh descriptor and this
+            // local becomes its sole owner before any fallible later step.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
         Err(err) => {
             slot.in_use = false;
             return Err(err);
         }
     };
+    slot.fd = Some(fd);
     slot.addr = Some(RetainedConnectAddr::from_socket_addr(addr));
     Ok(())
 }
@@ -275,6 +279,12 @@ fn poll_tcp_connect(slot: &mut ConnectSlot, cx: &mut Context<'_>) -> Poll<io::Re
 ///
 /// On the steady-state fast path, keep the stream alive and reuse it for many
 /// reads and writes rather than reconnecting repeatedly.
+///
+/// The stream is an owner-OS-thread value and is neither [`Send`](std::marker::Send)
+/// nor [`Sync`](std::marker::Sync).
+/// An idle stream may be used by another FlowIO executor on that same thread;
+/// once I/O is submitted, its future and completion state remain with the
+/// originating executor through the target completion.
 ///
 /// # Example
 /// ```no_run
@@ -499,9 +509,18 @@ impl TcpStream {
     /// Callers must not leak the descriptor or mutate shared socket options.
     /// Public raw-descriptor access continues to use [`AsRawFd`] below and
     /// permanently marks the descriptor's linger state uncertain.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn raw_fd_for_internal_io(&self) -> RawFd {
         self.fd.raw_fd()
+    }
+
+    /// Clones one owner-thread descriptor lease for a self-contained staged
+    /// TLS raw-I/O future. The future moves this exact lease into its
+    /// completion state on first submission and drops it locally if unpolled.
+    #[inline(always)]
+    pub(crate) fn staged_fd_op_state_for_internal_io(&self) -> RuntimeFdOpState<'static> {
+        self.fd.lease().into_op_state()
     }
 
     stream::impl_stream_rw!(TcpStream, "flowio::net::tcp::TcpStream");
@@ -662,7 +681,7 @@ impl Drop for TcpConnector {
 /// ```
 pub struct TcpListener {
     /// Owned listening socket descriptor.
-    fd: Rc<RuntimeFd>,
+    fd: RuntimeFd,
     /// Cached local address assigned after bind/listen.
     local_addr: SocketAddr,
     /// Reusable accept state kept across accepts.
@@ -724,9 +743,9 @@ impl TcpListener {
             }
         };
 
-        let fd = Rc::new(RuntimeFd::from_fresh_raw_fd(fd));
+        let fd = RuntimeFd::from_fresh_raw_fd(fd);
         Ok(Self {
-            accept_slot: AcceptSlot::new(Rc::clone(&fd)),
+            accept_slot: AcceptSlot::new(&fd),
             fd,
             local_addr,
         })
@@ -893,8 +912,8 @@ pub(crate) mod test_support {
         state.result = fd;
         state.set_completed();
 
-        let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(fd));
-        let mut slot = AcceptSlot::new(Rc::clone(&listener_fd));
+        let listener_fd = RuntimeFd::from_fresh_raw_fd(fd);
+        let mut slot = AcceptSlot::new(&listener_fd);
         slot.in_use = true;
         slot.state_ptr = &mut state;
 
@@ -1081,12 +1100,13 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
-    fn tcp_connect_drop_paths_preserve_socket_and_slot_ownership() {
+    fn tcp_unsubmitted_connect_drop_paths_close_prepared_sockets() {
         let future_fd = crate::runtime::fd::distinctive_closeable_test_fd()
             .expect("reusable connect fd creation failed");
         let mut future_slot = ConnectSlot::new(());
         future_slot.in_use = true;
-        future_slot.fd = future_fd;
+        // SAFETY: the test-created descriptor has no other owner.
+        future_slot.fd = Some(unsafe { OwnedFd::from_raw_fd(future_fd) });
         future_slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
             [127, 0, 0, 1],
             9,
@@ -1096,7 +1116,7 @@ mod tests {
         });
         assert!(future_slot.state_ptr.is_null());
         assert!(!future_slot.in_use);
-        assert_eq!(future_slot.fd, -1);
+        assert!(future_slot.fd.is_none());
         assert!(future_slot.addr.is_none());
         assert!(crate::runtime::fd::raw_fd_is_closed(future_fd));
 
@@ -1104,37 +1124,14 @@ mod tests {
             .expect("owned connect fd creation failed");
         let mut owned_slot = ConnectSlot::new(());
         owned_slot.in_use = true;
-        owned_slot.fd = owned_fd;
+        // SAFETY: the test-created descriptor has no other owner.
+        owned_slot.fd = Some(unsafe { OwnedFd::from_raw_fd(owned_fd) });
         owned_slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
             [127, 0, 0, 1],
             9,
         ))));
         drop(OwnedConnectFuture { slot: owned_slot });
         assert!(crate::runtime::fd::raw_fd_is_closed(owned_fd));
-
-        let cached_fd = crate::runtime::fd::distinctive_closeable_test_fd()
-            .expect("cached connect fd creation failed");
-        let mut cached_slot = ConnectSlot::new(());
-        cached_slot.in_use = true;
-        cached_slot.fd = cached_fd;
-        cached_slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
-            [127, 0, 0, 1],
-            9,
-        ))));
-        let mut cached_state = CompletionState::empty();
-        cached_state.set_ring_abandoned();
-        cached_slot.state_ptr = &mut cached_state;
-        cached_slot.retire_cached_state();
-        assert!(cached_slot.state_ptr.is_null());
-        assert!(!cached_slot.in_use);
-        assert_eq!(cached_slot.fd, cached_fd);
-        assert!(cached_slot.addr.is_some());
-        assert!(!crate::runtime::fd::raw_fd_is_closed(cached_fd));
-        assert!(cached_state.is_ring_abandoned());
-        assert!(!cached_state.is_completed());
-        cached_slot.cleanup_fd();
-        assert_eq!(cached_slot.fd, -1);
-        assert!(crate::runtime::fd::raw_fd_is_closed(cached_fd));
     }
 
     #[cfg(not(miri))]
@@ -1146,7 +1143,8 @@ mod tests {
                 .expect("reusable connect fd creation failed");
             let mut reusable = ConnectSlot::new(());
             reusable.in_use = true;
-            reusable.fd = reusable_fd;
+            // SAFETY: the test-created descriptor has no other owner.
+            reusable.fd = Some(unsafe { OwnedFd::from_raw_fd(reusable_fd) });
             reusable.addr = Some(RetainedConnectAddr::from_socket_addr(remote_addr));
 
             crate::runtime::test_hooks::fail_next_op_alloc();
@@ -1156,7 +1154,7 @@ mod tests {
             ));
             assert!(reusable.state_ptr.is_null());
             assert!(!reusable.in_use);
-            assert_eq!(reusable.fd, -1);
+            assert!(reusable.fd.is_none());
             assert!(
                 reusable.addr.is_some(),
                 "allocation failure must precede retained-address transfer"
@@ -1168,7 +1166,8 @@ mod tests {
             reusable.cleanup_fd();
             let retry_fd = crate::runtime::fd::distinctive_closeable_test_fd()
                 .expect("retry connect fd creation failed");
-            reusable.fd = retry_fd;
+            // SAFETY: the test-created descriptor has no other owner.
+            reusable.fd = Some(unsafe { OwnedFd::from_raw_fd(retry_fd) });
             drop(ConnectFuture {
                 slot: &mut reusable,
             });
@@ -1178,7 +1177,8 @@ mod tests {
                 .expect("owned connect fd creation failed");
             let mut owned_slot = ConnectSlot::new(());
             owned_slot.in_use = true;
-            owned_slot.fd = owned_fd;
+            // SAFETY: the test-created descriptor has no other owner.
+            owned_slot.fd = Some(unsafe { OwnedFd::from_raw_fd(owned_fd) });
             owned_slot.addr = Some(RetainedConnectAddr::from_socket_addr(remote_addr));
             let mut owned = OwnedConnectFuture { slot: owned_slot };
 
@@ -1189,7 +1189,7 @@ mod tests {
             ));
             assert!(owned.slot.state_ptr.is_null());
             assert!(!owned.slot.in_use);
-            assert_eq!(owned.slot.fd, -1);
+            assert!(owned.slot.fd.is_none());
             assert!(
                 owned.slot.addr.is_none(),
                 "submission failure must retire the transferred address"
@@ -1208,44 +1208,48 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
-    fn ring_abandoned_connects_close_owned_sockets_without_reclaiming_state() {
-        let reusable_fd = crate::runtime::fd::distinctive_closeable_test_fd()
-            .expect("reusable connect fd creation failed");
-        let owned_fd = crate::runtime::fd::distinctive_closeable_test_fd()
-            .expect("owned connect fd creation failed");
-        let mut reusable_state = CompletionState::empty();
-        reusable_state.set_ring_abandoned();
-        let mut owned_state = CompletionState::empty();
-        owned_state.set_ring_abandoned();
-        let mut cx = Context::from_waker(std::task::Waker::noop());
+    fn ring_abandoned_tcp_connect_retains_submitted_socket_with_state() {
+        crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state_ptr.is_null(), "TCP connect state allocation failed");
+            let fd = crate::runtime::fd::distinctive_closeable_test_fd()
+                .expect("TCP connect fd creation failed");
+            // SAFETY: the test-created descriptor has no other owner.
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let retained = unsafe {
+                (&mut *reactor).alloc_retained_payload(crate::net::RetainedConnectPayload::new(
+                    owned_fd,
+                    RetainedConnectAddr::from_socket_addr(SocketAddr::from(([127, 0, 0, 1], 9))),
+                ))
+            };
+            unsafe {
+                (*state_ptr).attach_retained_payload(retained);
+                (*state_ptr).set_ring_abandoned();
+            }
 
-        let mut reusable = ConnectSlot::new(());
-        reusable.state_ptr = &mut reusable_state;
-        reusable.in_use = true;
-        reusable.fd = reusable_fd;
-        assert!(matches!(
-            poll_tcp_connect(&mut reusable, &mut cx),
-            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
-        ));
-        assert!(reusable.state_ptr.is_null());
-        assert!(!reusable.in_use);
-        assert!(crate::runtime::fd::raw_fd_is_closed(reusable_fd));
-        assert!(reusable_state.is_ring_abandoned());
-        assert!(!reusable_state.is_completed());
+            let mut slot = ConnectSlot::new(());
+            slot.state_ptr = state_ptr;
+            slot.in_use = true;
+            assert!(matches!(
+                poll_tcp_connect(&mut slot, cx),
+                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+            ));
+            assert!(slot.state_ptr.is_null());
+            assert!(!slot.in_use);
+            assert!(slot.fd.is_none());
+            assert!(slot.addr.is_none());
+            assert!(unsafe { (*state_ptr).is_ring_abandoned() });
+            assert!(!crate::runtime::fd::raw_fd_is_closed(fd));
 
-        let mut owned_slot = ConnectSlot::new(());
-        owned_slot.state_ptr = &mut owned_state;
-        owned_slot.in_use = true;
-        owned_slot.fd = owned_fd;
-        let mut owned = OwnedConnectFuture { slot: owned_slot };
-        assert!(matches!(
-            Pin::new(&mut owned).poll(&mut cx),
-            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
-        ));
-        assert!(owned.slot.state_ptr.is_null());
-        assert!(crate::runtime::fd::raw_fd_is_closed(owned_fd));
-        assert!(owned_state.is_ring_abandoned());
-        assert!(!owned_state.is_completed());
+            unsafe {
+                (*state_ptr).restore_completed_orphaned_after_ringless_abandonment_for_test();
+                crate::runtime::reactor::Reactor::free_op_unchecked(reactor, state_ptr);
+            }
+            assert!(crate::runtime::fd::raw_fd_is_closed(fd));
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
     }
 
     #[cfg(not(miri))]

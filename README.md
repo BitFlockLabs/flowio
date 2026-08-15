@@ -182,6 +182,16 @@ handles return `Err(JoinError::Cancelled)`. If `Executor::run` returns
 `WouldBlock`, live tasks remain owned by that executor and a later `run` resumes
 them alongside its new root future.
 
+Live transports are owner-OS-thread values. `TcpStream`, `UnixStream`, and
+`UdpSocket` are explicitly `!Send + !Sync`; other descriptor-bearing handles
+and futures are also local. An otherwise-idle socket may be used sequentially
+by another FlowIO executor on the same owner thread. Once an operation
+publishes an SQE, its future, completion state, and descriptor lease remain
+bound to the submitting executor through target completion or the exceptional
+ring-abandonment path. Do not move a live socket, FlowIO buffer, task/reactor
+state, polled future, submitted operation, completion state, or task waker to
+another OS thread.
+
 Only one `Executor::run` may be active on a thread. Poll runtime I/O and timer
 futures only through the executor that submitted or armed them. Polling without
 an active FlowIO run or through another executor returns `NotConnected`.
@@ -211,8 +221,10 @@ Unsubmitted rental I/O returns its buffer immediately; submitted I/O retains
 the buffer until the original completion and then returns it with that error.
 If the exceptional bounded shutdown fallback abandons an `io_uring` without
 observing the target completion, it cannot safely return that ownership: the
-operation remains pending and its kernel-visible state and buffer are retained
-until process exit.
+operation remains pending and its kernel-visible state, buffer, and descriptor
+core are retained until process exit. One abandoned reactor can retain at most
+`ring_entries` descriptor cores through operation states; repeated abandoned
+reactors can accumulate these bounded sets and exhaust process descriptors.
 TLS futures validate this boundary before touching rustls or a stream-owned
 staged raw TCP operation. A rejected TLS poll leaves that raw operation
 attached for the next valid TLS call. If a prior valid write poll already
@@ -222,9 +234,23 @@ ciphertext can still be transmitted when valid TLS work resumes.
 Standard task `Waker` values must be cloned, woken, and dropped on the thread
 that owns their executor. Debug builds assert this contract; release builds
 keep the direct, allocation-free owner-thread wake path. FlowIO intentionally
-has no cross-thread task-waker relay. Use an application-owned channel or
-reactor-layer signaling for cross-thread work, then create or wake FlowIO tasks
-on the owner thread.
+has no cross-thread task-waker relay or inter-executor queue. A separately
+approved later bounded facility may carry only unpolled, runtime-independent
+`Send` requests/results; the destination owner thread must create and poll the
+corresponding FlowIO task. Never put a live socket, FlowIO buffer, polled
+future, SQE/completion state, task/reactor state, or task waker in that
+facility.
+
+Each distinct runtime descriptor owns one owner-thread `Rc` core. Formerly
+inline TCP/Unix/UDP/SCTP construction and adoption therefore gain one setup
+allocation; TCP/SCTP listeners replace their prior allocation, TLS shares its
+TCP core, a Unix pair creates two cores, and a split clone creates one for its
+duplicate fd. Allocation failure invokes Rust's global allocation-error handler
+(normally process abort), not a typed FlowIO error. Core allocation and final
+deallocation may synchronize or block inside the selected global allocator.
+Each actual initial local fd-backed data submission retains one non-atomic core
+lease until its target completion; retries reuse it, and clone/non-final release
+does not allocate.
 
 Each executor has one bounded worker for terminal socket closes. Dropping a
 fresh, never publicly exposed TCP, Unix, UDP, or SCTP socket skips terminal

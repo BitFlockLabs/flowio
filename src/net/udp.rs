@@ -93,12 +93,10 @@ use super::{
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
-    submit_retained_sqe, validate_local_io_result,
+    UnsubmittedOpGuard, completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker,
+    refresh_op_waiter_from_waker, submit_retained_fd_sqe, validate_local_io_result,
 };
-use crate::runtime::fd::RuntimeFd;
-use crate::runtime::op::CompletionState;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::fd::{RuntimeFd, RuntimeFdOpState};
 use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
@@ -116,6 +114,12 @@ use std::task::{Context, Poll};
 /// `recv_from` in that case; connected `send` / `recv` is the intended
 /// fixed-peer fast path. Use `recv_msg` on connected sockets when the caller
 /// must reject truncated datagrams.
+///
+/// The socket is an owner-OS-thread value and is neither [`Send`](std::marker::Send)
+/// nor [`Sync`](std::marker::Sync).
+/// An idle socket may be used by another FlowIO executor on that same thread;
+/// once I/O is submitted, its future and completion state remain with the
+/// originating executor through the target completion.
 ///
 /// # Example
 /// ```no_run
@@ -298,7 +302,7 @@ impl UdpSocket {
         };
         RecvFuture {
             fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd_state: self.fd.op_state(),
             buffer: Some(buffer),
             len,
             write_base_len,
@@ -332,7 +336,7 @@ impl UdpSocket {
         };
         RecvMsgFuture {
             fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd_state: self.fd.op_state(),
             buffer: Some(buffer),
             len,
             write_base_len,
@@ -355,7 +359,7 @@ impl UdpSocket {
         };
         SendFuture {
             fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd_state: self.fd.op_state(),
             buffer: Some(buffer),
             len,
             input_error,
@@ -388,7 +392,7 @@ impl UdpSocket {
         };
         RecvFromFuture {
             fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd_state: self.fd.op_state(),
             buffer: Some(buffer),
             len,
             write_base_len,
@@ -418,7 +422,7 @@ impl UdpSocket {
         };
         SendToFuture {
             fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd_state: self.fd.op_state(),
             buffer: Some(buffer),
             len,
             addr,
@@ -445,7 +449,7 @@ struct RetainedRecvPayload<B: IoBuffReadWrite> {
 
 // The retained recvmsg/sendmsg payloads become self-referential after their
 // msghdr points at embedded iovec fields and, where needed, embedded sockaddr
-// storage. Initialize those pointers only after submit_retained_sqe has moved
+// storage. Initialize those pointers only after submit_retained_fd_sqe has moved
 // the payload to its stable retained address.
 struct RetainedRecvMsgPayload<B: IoBuffReadWrite> {
     /// Caller-owned destination buffer retained while connected recvmsg is live.
@@ -655,26 +659,42 @@ fn udp_recv_from_result<const BARE_INVALID_DATA: bool>(
 ///
 /// # Safety
 ///
-/// A non-null `*state_ptr` must identify a completed operation retaining a
-/// payload of type `T`.
+/// A submitted pointer in `fd_state` must identify an operation retaining a
+/// payload of type `T`. If it is completed, this function consumes that
+/// pointer before retiring the operation through its origin reactor.
 unsafe fn take_completed_udp_payload<T: 'static>(
     cx: &mut Context<'_>,
-    state_ptr: &mut *mut CompletionState,
+    fd_state: &mut RuntimeFdOpState<'_>,
 ) -> Option<CompletionTake<i32, T>> {
-    if (*state_ptr).is_null() || unsafe { !(**state_ptr).is_completed() } {
+    let state_ptr = fd_state.state_ptr();
+    if state_ptr.is_null() || unsafe { !(*state_ptr).is_completed() } {
         return None;
     }
 
-    let result = unsafe { (**state_ptr).result };
-    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
-    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(*state_ptr) };
-    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
-    *state_ptr = std::ptr::null_mut();
+    let state_ptr = fd_state.take_state_ptr();
+    let result = unsafe { (*state_ptr).result };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
+    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(state_ptr) };
+    unsafe { op_ctx.free_op_unchecked(state_ptr) };
     Some(CompletionTake::from_context(
         result,
         payload,
         op_ctx.context_rejected(),
     ))
+}
+
+#[inline(always)]
+fn debug_assert_udp_fd_state(fd: RawFd, fd_state: &RuntimeFdOpState<'_>) {
+    let state_fd = fd_state.raw_fd();
+    debug_assert!(
+        state_fd < 0 || fd == state_fd,
+        "UDP future raw descriptor and typed operation state diverged"
+    );
+}
+
+#[inline(always)]
+fn udp_future_is_fused<T>(fd_state: &RuntimeFdOpState<'_>, buffer: &Option<T>) -> bool {
+    fd_state.is_null() && buffer.is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -683,10 +703,11 @@ unsafe fn take_completed_udp_payload<T: 'static>(
 
 #[doc(hidden)]
 pub struct RecvFuture<'a, B: IoBuffReadWrite> {
-    /// Connected socket descriptor used for this receive.
+    /// Connected descriptor snapshot retained in the established layout.
+    /// SQE construction derives the live descriptor from `fd_state`.
     fd: RawFd,
-    /// Completion state for the submitted receive operation.
-    state_ptr: *mut CompletionState,
+    /// Borrowed descriptor capability before submission, then completion state.
+    fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
     /// Maximum datagram bytes requested from the kernel.
@@ -705,19 +726,19 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.state_ptr.is_null()
+        if this.fd_state.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
         {
             let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
-        if this.state_ptr.is_null() && this.buffer.is_none() {
+        if udp_future_is_fused(&this.fd_state, &this.buffer) {
             return Poll::Pending;
         }
 
         if let Some(completion) =
-            unsafe { take_completed_udp_payload::<RetainedRecvPayload<B>>(cx, &mut this.state_ptr) }
+            unsafe { take_completed_udp_payload::<RetainedRecvPayload<B>>(cx, &mut this.fd_state) }
         {
             let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
@@ -730,7 +751,8 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             });
         }
 
-        if this.state_ptr.is_null() {
+        if this.fd_state.state_ptr().is_null() {
+            debug_assert_udp_fd_state(this.fd, &this.fd_state);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -743,7 +765,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
-            this.state_ptr = state_ptr;
+            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
@@ -751,30 +773,33 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 buffer: unsafe { opt_take(&mut this.buffer) },
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.fd_state,
+                    payload,
+                    |fd, payload| {
                         let ptr = payload.buffer.as_mut_ptr();
-                        Ok(opcode::Recv::new(types::Fd(this.fd), ptr, this.len)
+                        Ok(opcode::Recv::new(types::Fd(fd), ptr, this.len)
                             .build()
                             .user_data(state_ptr as u64))
-                    })
-                {
-                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.fd_state.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.fd_state) };
     }
 }
 
@@ -784,10 +809,11 @@ impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct RecvMsgFuture<'a, B: IoBuffReadWrite> {
-    /// Connected socket descriptor used for this receive.
+    /// Connected descriptor snapshot retained in the established layout.
+    /// SQE construction derives the live descriptor from `fd_state`.
     fd: RawFd,
-    /// Completion state for the submitted recvmsg operation.
-    state_ptr: *mut CompletionState,
+    /// Borrowed descriptor capability before submission, then completion state.
+    fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
     /// Maximum datagram bytes requested from the kernel.
@@ -806,19 +832,19 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.state_ptr.is_null()
+        if this.fd_state.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
         {
             let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
-        if this.state_ptr.is_null() && this.buffer.is_none() {
+        if udp_future_is_fused(&this.fd_state, &this.buffer) {
             return Poll::Pending;
         }
 
         if let Some(completion) = unsafe {
-            take_completed_udp_payload::<RetainedRecvMsgPayload<B>>(cx, &mut this.state_ptr)
+            take_completed_udp_payload::<RetainedRecvMsgPayload<B>>(cx, &mut this.fd_state)
         } {
             let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
@@ -835,7 +861,8 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             });
         }
 
-        if this.state_ptr.is_null() {
+        if this.fd_state.state_ptr().is_null() {
+            debug_assert_udp_fd_state(this.fd, &this.fd_state);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -848,7 +875,7 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
-            this.state_ptr = state_ptr;
+            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
@@ -859,33 +886,36 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
             };
 
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.fd_state,
+                    payload,
+                    |fd, payload| {
                         initialize_retained_recv_msg_payload(payload, this.len);
 
                         Ok(
-                            opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
+                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
                                 .build()
                                 .user_data(state_ptr as u64),
                         )
-                    })
-                {
-                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.fd_state.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadWrite> Drop for RecvMsgFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.fd_state) };
     }
 }
 
@@ -895,10 +925,11 @@ impl<B: IoBuffReadWrite> Drop for RecvMsgFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct SendFuture<'a, B: IoBuffReadOnly> {
-    /// Connected socket descriptor used for this send.
+    /// Connected descriptor snapshot retained in the established layout.
+    /// SQE construction derives the live descriptor from `fd_state`.
     fd: RawFd,
-    /// Completion state for the submitted send operation.
-    state_ptr: *mut CompletionState,
+    /// Borrowed descriptor capability before submission, then completion state.
+    fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
     /// Validated datagram byte count submitted to the kernel.
@@ -915,25 +946,26 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.state_ptr.is_null()
+        if this.fd_state.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
         {
             let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
-        if this.state_ptr.is_null() && this.buffer.is_none() {
+        if udp_future_is_fused(&this.fd_state, &this.buffer) {
             return Poll::Pending;
         }
 
         if let Some(completion) =
-            unsafe { take_completed_udp_payload::<RetainedSendPayload<B>>(cx, &mut this.state_ptr) }
+            unsafe { take_completed_udp_payload::<RetainedSendPayload<B>>(cx, &mut this.fd_state) }
         {
             let (result, payload) = completion.into_io_result(completion_cqe_result);
             return Poll::Ready((result, payload.buffer));
         }
 
-        if this.state_ptr.is_null() {
+        if this.fd_state.state_ptr().is_null() {
+            debug_assert_udp_fd_state(this.fd, &this.fd_state);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -946,7 +978,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
-            this.state_ptr = state_ptr;
+            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
@@ -954,30 +986,33 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                 buffer: unsafe { opt_take(&mut this.buffer) },
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.fd_state,
+                    payload,
+                    |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(opcode::Send::new(types::Fd(this.fd), ptr, this.len)
+                        Ok(opcode::Send::new(types::Fd(fd), ptr, this.len)
                             .build()
                             .user_data(state_ptr as u64))
-                    })
-                {
-                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.fd_state.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.fd_state) };
     }
 }
 
@@ -987,12 +1022,13 @@ impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct RecvFromFuture<'a, B: IoBuffReadWrite> {
-    /// Socket descriptor used for the explicit-peer `recvmsg` receive path.
-    /// The socket may also be connected; this API still asks the kernel for
-    /// the source address.
+    /// Descriptor snapshot retained in the established layout for the
+    /// explicit-peer `recvmsg` path. The socket may also be connected; this
+    /// API still asks the kernel for the source address. SQE construction
+    /// derives the live descriptor from `fd_state`.
     fd: RawFd,
-    /// Completion state for the submitted recvmsg operation.
-    state_ptr: *mut CompletionState,
+    /// Borrowed descriptor capability before submission, then completion state.
+    fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
     /// Maximum datagram bytes requested from the kernel.
@@ -1011,19 +1047,19 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.state_ptr.is_null()
+        if this.fd_state.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
         {
             let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
-        if this.state_ptr.is_null() && this.buffer.is_none() {
+        if udp_future_is_fused(&this.fd_state, &this.buffer) {
             return Poll::Pending;
         }
 
         if let Some(completion) = unsafe {
-            take_completed_udp_payload::<RetainedRecvFromPayload<B>>(cx, &mut this.state_ptr)
+            take_completed_udp_payload::<RetainedRecvFromPayload<B>>(cx, &mut this.fd_state)
         } {
             let (result, payload) = completion.into_io_result(completion_cqe_result);
             let buffer = payload.buffer;
@@ -1045,7 +1081,8 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
             });
         }
 
-        if this.state_ptr.is_null() {
+        if this.fd_state.state_ptr().is_null() {
+            debug_assert_udp_fd_state(this.fd, &this.fd_state);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -1058,7 +1095,7 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
-            this.state_ptr = state_ptr;
+            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
@@ -1070,33 +1107,36 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                 msghdr: MaybeUninit::uninit(),
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.fd_state,
+                    payload,
+                    |fd, payload| {
                         initialize_retained_recv_from_payload(payload, this.len);
 
                         Ok(
-                            opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
+                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
                                 .build()
                                 .user_data(state_ptr as u64),
                         )
-                    })
-                {
-                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.fd_state.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadWrite> Drop for RecvFromFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.fd_state) };
     }
 }
 
@@ -1106,12 +1146,13 @@ impl<B: IoBuffReadWrite> Drop for RecvFromFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct SendToFuture<'a, B: IoBuffReadOnly> {
-    /// Socket descriptor used for the explicit-destination `sendmsg` path.
-    /// The socket may also be connected; this API still sends to the provided
-    /// destination address.
+    /// Descriptor snapshot retained in the established layout for the
+    /// explicit-destination `sendmsg` path. The socket may also be connected;
+    /// this API still sends to the provided destination address. SQE
+    /// construction derives the live descriptor from `fd_state`.
     fd: RawFd,
-    /// Completion state for the submitted sendmsg operation.
-    state_ptr: *mut CompletionState,
+    /// Borrowed descriptor capability before submission, then completion state.
+    fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
     /// Validated datagram byte count submitted through the retained iovec.
@@ -1130,25 +1171,26 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.state_ptr.is_null()
+        if this.fd_state.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
         {
             let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
-        if this.state_ptr.is_null() && this.buffer.is_none() {
+        if udp_future_is_fused(&this.fd_state, &this.buffer) {
             return Poll::Pending;
         }
 
         if let Some(completion) = unsafe {
-            take_completed_udp_payload::<RetainedSendToPayload<B>>(cx, &mut this.state_ptr)
+            take_completed_udp_payload::<RetainedSendToPayload<B>>(cx, &mut this.fd_state)
         } {
             let (result, payload) = completion.into_io_result(completion_cqe_result);
             return Poll::Ready((result, payload.buffer));
         }
 
-        if this.state_ptr.is_null() {
+        if this.fd_state.state_ptr().is_null() {
+            debug_assert_udp_fd_state(this.fd, &this.fd_state);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -1161,12 +1203,11 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
             }
-            this.state_ptr = state_ptr;
+            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
 
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
             let destination = this.addr;
-            let fd = this.fd;
             let len = this.len;
             let payload = RetainedSendToPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -1175,31 +1216,34 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                 msghdr: MaybeUninit::uninit(),
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.fd_state,
+                    payload,
+                    |fd, payload| {
                         initialize_retained_send_to_payload(payload, destination, len);
 
                         Ok(opcode::SendMsg::new(types::Fd(fd), payload.msghdr.as_ptr())
                             .build()
                             .user_data(state_ptr as u64))
-                    })
-                {
-                    Reactor::free_op_unchecked(pctx.reactor(), state_ptr);
-                    this.state_ptr = std::ptr::null_mut();
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.fd_state.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadOnly> Drop for SendToFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.fd_state) };
     }
 }
 
@@ -1238,6 +1282,42 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::op::CompletionState;
+
+    #[test]
+    fn terminal_fd_state_keeps_udp_send_future_fused() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-2);
+        let fd = runtime.raw_fd();
+        let mut fd_state = runtime.op_state();
+        let mut completion = CompletionState::empty();
+        unsafe {
+            completion.attach_fd_lease(fd_state.take_initial_lease());
+            fd_state.publish_submitted_state(std::ptr::from_mut(&mut completion));
+        }
+        assert_eq!(
+            fd_state.take_state_ptr(),
+            std::ptr::from_mut(&mut completion)
+        );
+        drop(completion.take_fd_lease());
+
+        let mut future = SendFuture::<Vec<u8>> {
+            fd,
+            fd_state,
+            buffer: None,
+            len: 0,
+            input_error: None,
+            _marker: PhantomData,
+        };
+        debug_assert_udp_fd_state(future.fd, &future.fd_state);
+        assert!(udp_future_is_fused(&future.fd_state, &future.buffer));
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            Pin::new(&mut future).poll(&mut cx).is_pending(),
+            "terminal UDP send future did not remain fused"
+        );
+    }
 
     #[test]
     fn udp_payload_truncation_flag_predicate_covers_supported_combinations() {

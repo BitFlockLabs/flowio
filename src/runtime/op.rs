@@ -2,6 +2,7 @@
 //! the runtime's concrete futures.
 
 use crate::runtime::executor::ExecutorOwner;
+use crate::runtime::fd::{RuntimeFdCore, RuntimeFdLease};
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool, RetainedPayloadVtable};
 #[cfg(any(test, feature = "test-support"))]
 use crate::runtime::task::clear_task_ref;
@@ -93,7 +94,10 @@ pub struct CompletionState {
     /// attached.
     retained_payload: *mut (),
     /// Release vtable for `retained_payload`.
-    retained_payload_vtable: Option<RetainedPayloadVtable>,
+    retained_payload_vtable: Option<&'static RetainedPayloadVtable>,
+    /// Non-atomic descriptor lease retained from userspace-SQ publication
+    /// through the target CQE. Sequential retries keep this same owner.
+    fd_lease: Option<Rc<RuntimeFdCore>>,
     /// Stable executor owner that allocated this completion-state slot.
     owner: Option<Rc<ExecutorOwner>>,
 }
@@ -130,6 +134,7 @@ impl CompletionState {
             cancel_next: std::ptr::null_mut(),
             retained_payload: std::ptr::null_mut(),
             retained_payload_vtable: None,
+            fd_lease: None,
             owner: None,
         }
     }
@@ -370,6 +375,64 @@ impl CompletionState {
     #[inline(always)]
     pub(crate) fn owner_ptr(&self) -> *const ExecutorOwner {
         self.owner.as_ref().map_or(std::ptr::null(), Rc::as_ptr)
+    }
+
+    /// Attaches the descriptor lease immediately before userspace-SQ
+    /// publication.
+    #[inline(always)]
+    pub(crate) fn attach_fd_lease(&mut self, lease: RuntimeFdLease) {
+        debug_assert!(
+            self.fd_lease.is_none(),
+            "completion state already has an fd lease"
+        );
+        self.fd_lease = Some(lease.into_core());
+    }
+
+    /// Returns the raw descriptor from the lease already retained by this
+    /// state.
+    ///
+    /// # Safety
+    ///
+    /// This completion state must hold the descriptor lease installed by a
+    /// published typed fd submission.
+    #[inline(always)]
+    pub(crate) unsafe fn fd_lease_raw_fd(&self) -> std::os::fd::RawFd {
+        debug_assert!(self.fd_lease.is_some(), "completion state has no fd lease");
+        // SAFETY: the debug assertion and the typed submission lifecycle
+        // establish that resubmission only occurs with the initial lease live.
+        let core = unsafe { self.fd_lease.as_ref().unwrap_unchecked() };
+        core.raw_fd()
+    }
+
+    /// Returns the provenance-preserving core pointer from the attached lease.
+    ///
+    /// # Safety
+    ///
+    /// This completion state must hold the descriptor lease installed by a
+    /// published typed fd submission. The caller must keep either that lease or
+    /// an independently live borrowed parent count alive while using the
+    /// pointer; borrowed-state retirement relies on its parent lifetime after
+    /// the state lease is reclaimed.
+    #[inline(always)]
+    pub(crate) unsafe fn fd_lease_core_ptr(&self) -> std::ptr::NonNull<RuntimeFdCore> {
+        debug_assert!(self.fd_lease.is_some(), "completion state has no fd lease");
+        // SAFETY: the typed publication invariant guarantees the option is
+        // populated, and `Rc::as_ptr` preserves the allocation provenance.
+        let core = unsafe { self.fd_lease.as_ref().unwrap_unchecked() };
+        // SAFETY: an Rc allocation pointer is non-null for its live owner.
+        unsafe { std::ptr::NonNull::new_unchecked(Rc::as_ptr(core).cast_mut()) }
+    }
+
+    /// Takes the state lease before payload destruction and slot recycling.
+    #[inline(always)]
+    pub(crate) fn take_fd_lease(&mut self) -> Option<RuntimeFdLease> {
+        self.fd_lease.take().map(RuntimeFdLease::from_core)
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn has_fd_lease(&self) -> bool {
+        self.fd_lease.is_some()
     }
 
     /// Asserts that releasing this state's owner cannot destroy the pool whose
@@ -646,13 +709,65 @@ impl InPlaceInit for CompletionState {
 }
 
 const _: [(); 64] = [(); std::mem::size_of::<CompletionState>()];
+const _: [(); 64] = [(); std::mem::align_of::<CompletionState>()];
+const _: [(); std::mem::size_of::<usize>()] =
+    [(); std::mem::size_of::<Option<&'static RetainedPayloadVtable>>()];
+const _: [(); std::mem::size_of::<usize>()] =
+    [(); std::mem::size_of::<Option<Rc<RuntimeFdCore>>>()];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fd::RuntimeFd;
     use crate::runtime::task::{TaskVTable, release_task};
     use std::cell::Cell;
     use std::task::Poll;
+
+    #[test]
+    fn completion_state_layout_matches_fd_lease_declaration() {
+        assert_eq!(std::mem::size_of::<CompletionState>(), 64);
+        assert_eq!(std::mem::align_of::<CompletionState>(), 64);
+        assert_eq!(std::mem::offset_of!(CompletionState, result), 0);
+        assert_eq!(std::mem::offset_of!(CompletionState, state_flags), 4);
+        assert_eq!(std::mem::offset_of!(CompletionState, registry_index), 8);
+        assert_eq!(std::mem::offset_of!(CompletionState, waiter), 16);
+        assert_eq!(std::mem::offset_of!(CompletionState, cancel_next), 24);
+        assert_eq!(std::mem::offset_of!(CompletionState, retained_payload), 32);
+        assert_eq!(
+            std::mem::offset_of!(CompletionState, retained_payload_vtable),
+            40
+        );
+        assert_eq!(std::mem::offset_of!(CompletionState, fd_lease), 48);
+        assert_eq!(std::mem::offset_of!(CompletionState, owner), 56);
+        assert_eq!(
+            std::mem::size_of::<Option<&'static RetainedPayloadVtable>>(),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<Rc<RuntimeFdCore>>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn sequential_reset_preserves_exact_initial_fd_lease() {
+        let fd = RuntimeFd::from_fresh_raw_fd(-1);
+        let mut fd_state = fd.op_state();
+        let mut state = CompletionState::empty();
+        state.attach_fd_lease(unsafe { fd_state.take_initial_lease() });
+        assert!(state.has_fd_lease());
+        assert_eq!(unsafe { state.fd_lease_raw_fd() }, -1);
+
+        state.set_completed();
+        state.reset_for_resubmit();
+        assert!(state.has_fd_lease());
+        assert_eq!(unsafe { state.fd_lease_raw_fd() }, -1);
+
+        let lease = state.take_fd_lease().expect("state lease missing");
+        assert!(!state.has_fd_lease());
+        assert_eq!(lease.raw_fd(), -1);
+        drop(lease);
+    }
 
     thread_local! {
         static REPLACED_WAITER_STATE: Cell<*mut CompletionState> =

@@ -222,11 +222,11 @@ use crate::runtime::buffer::bytes::{
 use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut, invalid_read_iovec_shape};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_op_ptr_unchecked, poll_ctx_from_waker,
-    refresh_op_waiter_from_waker, submit_initialized_retained_sqe, submit_retained_sqe,
-    validate_local_io_result,
+    PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_fd_op_state_unchecked,
+    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
+    submit_initialized_retained_fd_sqe, submit_retained_fd_sqe, validate_local_io_result,
 };
-use crate::runtime::fd::{LingerProvenance, RuntimeFd};
+use crate::runtime::fd::{LingerProvenance, RuntimeFd, RuntimeFdOpState};
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::{
@@ -245,6 +245,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::ptr::NonNull;
+#[cfg(test)]
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -1769,15 +1770,12 @@ fn decode_peer_addr_params_sockopt(
     buffer: &[u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN],
     optlen: usize,
 ) -> io::Result<SctpPeerAddrParams> {
-    if (std::mem::size_of::<SctpPaddrParamsRaw>()..=SCTP_PADDR_PARAMS_RAW_OPT_LEN).contains(&optlen)
-    {
+    if optlen == SCTP_PADDR_PARAMS_RAW_OPT_LEN {
         let raw = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRaw) };
         return raw.to_fields().to_public();
     }
 
-    if (std::mem::size_of::<SctpPaddrParamsRawLegacy>()..=SCTP_PADDR_PARAMS_LEGACY_OPT_LEN)
-        .contains(&optlen)
-    {
+    if optlen == SCTP_PADDR_PARAMS_LEGACY_OPT_LEN {
         let raw =
             unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRawLegacy) };
         return raw.to_fields().to_public();
@@ -1824,6 +1822,26 @@ where
     ))
 }
 
+fn finish_accepted_owned_stream_with<F>(
+    accepted_fd: OwnedFd,
+    accepted_linger_provenance: LingerProvenance,
+    addr: &libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
+    config: SctpSocketConfig,
+    apply_config: F,
+) -> io::Result<(SctpStream, SocketAddr)>
+where
+    F: FnOnce(RawFd, SctpSocketConfig, LingerProvenance) -> io::Result<()>,
+{
+    finish_accepted_runtime_stream_with(
+        RuntimeFd::from_owned_with_provenance(accepted_fd, accepted_linger_provenance),
+        addr,
+        addrlen,
+        config,
+        apply_config,
+    )
+}
+
 #[cfg(test)]
 fn finish_accepted_stream(
     accepted_fd: OwnedFd,
@@ -1831,12 +1849,25 @@ fn finish_accepted_stream(
     addrlen: libc::socklen_t,
     config: SctpSocketConfig,
 ) -> io::Result<(SctpStream, SocketAddr)> {
-    finish_accepted_runtime_stream_with(
-        RuntimeFd::from_fresh_owned(accepted_fd),
+    finish_accepted_owned_stream_with(
+        accepted_fd,
+        LingerProvenance::KnownNonPositive,
         addr,
         addrlen,
         config,
         apply_sctp_accepted_established_config,
+    )
+}
+
+fn finish_connected_runtime_stream(
+    connected_fd: OwnedFd,
+    remote_addr: SocketAddr,
+    config: SctpSocketConfig,
+) -> SctpStream {
+    SctpStream::from_configured_runtime_fd(
+        RuntimeFd::from_fresh_owned(connected_fd),
+        remote_addr,
+        config,
     )
 }
 
@@ -1855,41 +1886,43 @@ fn prepare_connect_slot(
     slot.cleanup_fd();
     slot.completion_data = config;
     slot.in_use = true;
-    slot.fd = match new_sctp_socket(socket_domain(remote_addr), libc::SOCK_STREAM) {
-        Ok(fd) => fd,
+    let fd = match new_sctp_socket(socket_domain(remote_addr), libc::SOCK_STREAM) {
+        Ok(fd) => {
+            // SAFETY: socket creation returned one fresh descriptor and this
+            // local becomes its sole owner before any fallible setup step.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
         Err(err) => {
             slot.in_use = false;
             return Err(err);
         }
     };
-    if let Err(err) = configure_sctp_socket(slot.fd, config) {
-        slot.cleanup_fd();
+    if let Err(err) = configure_sctp_socket(fd.as_raw_fd(), config) {
         slot.in_use = false;
         return Err(err);
     }
 
     if let Some(local_addr) = local_addr {
-        if let Err(err) = set_reuse_addr(slot.fd) {
-            slot.cleanup_fd();
+        if let Err(err) = set_reuse_addr(fd.as_raw_fd()) {
             slot.in_use = false;
             return Err(err);
         }
         let (sockaddr, sockaddr_len) = socket_addr_to_c(local_addr);
         let bind_res = unsafe {
             libc::bind(
-                slot.fd,
+                fd.as_raw_fd(),
                 &sockaddr as *const _ as *const libc::sockaddr,
                 sockaddr_len,
             )
         };
         if bind_res < 0 {
             let err = io::Error::last_os_error();
-            slot.cleanup_fd();
             slot.in_use = false;
             return Err(err);
         }
     }
 
+    slot.fd = Some(fd);
     slot.addr = Some(RetainedConnectAddr::from_socket_addr(remote_addr));
     Ok(())
 }
@@ -1914,7 +1947,7 @@ fn prepare_connect_slot(
 /// ```
 pub struct SctpListener {
     /// Listening SCTP socket descriptor.
-    fd: Rc<RuntimeFd>,
+    fd: RuntimeFd,
     /// Local address bound to the listening socket.
     local_addr: SocketAddr,
     /// Reusable accept state for at most one in-flight accept future.
@@ -1984,9 +2017,9 @@ impl SctpListener {
             }
         };
 
-        let fd = Rc::new(RuntimeFd::from_fresh_raw_fd(fd));
+        let fd = RuntimeFd::from_fresh_raw_fd(fd);
         Ok(Self {
-            accept_slot: AcceptSlot::new(Rc::clone(&fd)),
+            accept_slot: AcceptSlot::new(&fd),
             fd,
             local_addr,
             accepted_config: config,
@@ -3141,6 +3174,10 @@ impl SctpStream {
 
     /// Reads `SCTP_PEER_ADDR_PARAMS` for the whole association or for one specific path.
     ///
+    /// On supported x86-64 Linux, the kernel response must use exactly the
+    /// 152-byte legacy or 156-byte modern rounded socket-option length. Any
+    /// other response length is returned as [`io::ErrorKind::InvalidData`].
+    ///
     /// This is path/association status-control work, not the per-message data
     /// fast path.
     pub fn peer_addr_params(&self, address: Option<SocketAddr>) -> io::Result<SctpPeerAddrParams> {
@@ -3340,9 +3377,11 @@ impl SctpStream {
         if input_error.is_none() && self.recv_state.has_stashed_receive() {
             input_error = Some(invalid_input_kind());
         }
+        let state_ptr = self.fd.op_state();
+        let fd = state_ptr.raw_fd();
         DataRecvFuture {
-            fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd,
+            state_ptr,
             buffer: Some(buffer),
             write_base_len,
             len,
@@ -3369,9 +3408,11 @@ impl SctpStream {
                 0
             }
         };
+        let state_ptr = self.fd.op_state();
+        let fd = state_ptr.raw_fd();
         DataSendFuture {
-            fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd,
+            state_ptr,
             buffer: Some(buffer),
             len,
             input_error,
@@ -3411,9 +3452,11 @@ impl SctpStream {
                 0
             }
         };
+        let state_ptr = self.fd.op_state();
+        let fd = state_ptr.raw_fd();
         RecvFuture {
-            fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd,
+            state_ptr,
             buffer: Some(buffer),
             write_base_len,
             len,
@@ -3447,9 +3490,11 @@ impl SctpStream {
                 0
             }
         };
+        let state_ptr = self.fd.op_state();
+        let fd = state_ptr.raw_fd();
         SendFuture {
-            fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd,
+            state_ptr,
             buffer: Some(buffer),
             len,
             sndinfo: raw_sndinfo_from_public(info),
@@ -3494,9 +3539,11 @@ impl SctpStream {
                 Some((iov_count, writable)) => (iov_count, writable, false),
                 None => (0, 0, true),
             };
+        let state_ptr = self.fd.op_state();
+        let fd = state_ptr.raw_fd();
         RecvVectoredFuture {
-            fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd,
+            state_ptr,
             buffer: Some(buffer),
             iov_count,
             writable,
@@ -3531,9 +3578,11 @@ impl SctpStream {
                 Some((iov_count, total)) => (iov_count, total, false),
                 None => (0, 0, true),
             };
+        let state_ptr = self.fd.op_state();
+        let fd = state_ptr.raw_fd();
         SendVectoredFuture {
-            fd: self.fd.raw_fd(),
-            state_ptr: std::ptr::null_mut(),
+            fd,
+            state_ptr,
             buffer: Some(buffer),
             iov_count,
             total,
@@ -3671,6 +3720,50 @@ const _: () = {
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const _: () = {
+    // Linux UAPI's three leading u16 fields and libc's C-layout mirror leave
+    // implicit bytes 6-7 before the first u32 field.
+    assert!(std::mem::size_of::<libc::sctp_rcvinfo>() == 28);
+    assert!(std::mem::align_of::<libc::sctp_rcvinfo>() == 4);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_sid) == 0);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_ssn) == 2);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_flags) == 4);
+    assert!(
+        std::mem::offset_of!(libc::sctp_rcvinfo, rcv_ppid)
+            == std::mem::offset_of!(libc::sctp_rcvinfo, rcv_flags) + std::mem::size_of::<u16>() + 2
+    );
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_ppid) == 8);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_tsn) == 12);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_cumtsn) == 16);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_context) == 20);
+    assert!(std::mem::offset_of!(libc::sctp_rcvinfo, rcv_assoc_id) == 24);
+
+    // Linux exposes the packed peer-path parameter payload through a sockopt
+    // length rounded externally to four bytes. `packed(4)` would incorrectly
+    // move the unaligned `path_mtu` field from byte 138 to byte 140.
+    assert!(std::mem::size_of::<SctpPaddrParamsRaw>() == 155);
+    assert!(std::mem::align_of::<SctpPaddrParamsRaw>() == 1);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, assoc_id) == 0);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, address) == 4);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, heartbeat_interval_ms) == 132);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, path_max_retransmits) == 136);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, path_mtu) == 138);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, sack_delay_ms) == 142);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, flags) == 146);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, ipv6_flow_label) == 150);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRaw, dscp) == 154);
+    assert!(SCTP_PADDR_PARAMS_RAW_OPT_LEN == 156);
+
+    assert!(std::mem::size_of::<SctpPaddrParamsRawLegacy>() == 150);
+    assert!(std::mem::align_of::<SctpPaddrParamsRawLegacy>() == 1);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, assoc_id) == 0);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, address) == 4);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, heartbeat_interval_ms) == 132);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, path_max_retransmits) == 136);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, path_mtu) == 138);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, sack_delay_ms) == 142);
+    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, flags) == 146);
+    assert!(SCTP_PADDR_PARAMS_LEGACY_OPT_LEN == 152);
+
     assert!(SOCKET_TIMESTAMP_CONTROL_LEN == 32);
     assert!(SOCKET_TIMESTAMPING_CONTROL_LEN == 64);
     assert!(SOCKET_TIMESTAMPING_PKTINFO_CONTROL_LEN == 32);
@@ -3763,7 +3856,46 @@ struct RetainedSctpSendPayload<B: IoBuffReadOnly> {
     msghdr: MaybeUninit<libc::msghdr>,
 }
 
-const SCTP_SNDINFO_CONTROL_LEN: usize = cmsg_space(std::mem::size_of::<libc::sctp_sndinfo>());
+const SCTP_SNDINFO_HEADER_LEN: usize = std::mem::size_of::<libc::cmsghdr>();
+const SCTP_SNDINFO_DATA_OFFSET: usize = cmsg_align(SCTP_SNDINFO_HEADER_LEN);
+const SCTP_SNDINFO_DATA_LEN: usize = std::mem::size_of::<libc::sctp_sndinfo>();
+const SCTP_SNDINFO_CMSG_LEN: usize = SCTP_SNDINFO_HEADER_LEN + SCTP_SNDINFO_DATA_LEN;
+const SCTP_SNDINFO_CONTROL_LEN: usize = cmsg_space(SCTP_SNDINFO_DATA_LEN);
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+const _: () = {
+    assert!(std::mem::size_of::<libc::cmsghdr>() == 16);
+    assert!(std::mem::align_of::<libc::cmsghdr>() == 8);
+    assert!(std::mem::offset_of!(libc::cmsghdr, cmsg_len) == 0);
+    assert!(std::mem::offset_of!(libc::cmsghdr, cmsg_level) == 8);
+    assert!(std::mem::offset_of!(libc::cmsghdr, cmsg_type) == 12);
+
+    assert!(std::mem::size_of::<libc::sctp_sndinfo>() == 16);
+    assert!(std::mem::align_of::<libc::sctp_sndinfo>() == 4);
+    assert!(std::mem::offset_of!(libc::sctp_sndinfo, snd_sid) == 0);
+    assert!(std::mem::offset_of!(libc::sctp_sndinfo, snd_flags) == 2);
+    assert!(std::mem::offset_of!(libc::sctp_sndinfo, snd_ppid) == 4);
+    assert!(std::mem::offset_of!(libc::sctp_sndinfo, snd_context) == 8);
+    assert!(std::mem::offset_of!(libc::sctp_sndinfo, snd_assoc_id) == 12);
+
+    assert!(SCTP_SNDINFO_HEADER_LEN == 16);
+    assert!(SCTP_SNDINFO_DATA_OFFSET == 16);
+    assert!(SCTP_SNDINFO_DATA_LEN == 16);
+    assert!(SCTP_SNDINFO_CMSG_LEN == 32);
+    assert!(SCTP_SNDINFO_CONTROL_LEN == 32);
+    assert!(SCTP_SNDINFO_DATA_OFFSET + SCTP_SNDINFO_DATA_LEN == SCTP_SNDINFO_CONTROL_LEN);
+    assert!(SCTP_SNDINFO_DATA_OFFSET + std::mem::offset_of!(libc::sctp_sndinfo, snd_sid) == 16);
+    assert!(SCTP_SNDINFO_DATA_OFFSET + std::mem::offset_of!(libc::sctp_sndinfo, snd_flags) == 18);
+    assert!(SCTP_SNDINFO_DATA_OFFSET + std::mem::offset_of!(libc::sctp_sndinfo, snd_ppid) == 20);
+    assert!(SCTP_SNDINFO_DATA_OFFSET + std::mem::offset_of!(libc::sctp_sndinfo, snd_context) == 24);
+    assert!(
+        SCTP_SNDINFO_DATA_OFFSET + std::mem::offset_of!(libc::sctp_sndinfo, snd_assoc_id) == 28
+    );
+};
 
 /// Initializes the non-owning fields shared by retained SCTP send payloads.
 ///
@@ -3771,9 +3903,10 @@ const SCTP_SNDINFO_CONTROL_LEN: usize = cmsg_space(std::mem::size_of::<libc::sct
 ///
 /// `msghdr` and `control` must point into one raw retained slot at their final
 /// addresses, be properly aligned and writable for their complete field
-/// sizes, and not overlap each other or the initialized iovec prefix. `iov`
-/// must point at `iovlen` initialized iovecs whose backing allocations remain
-/// stable until the target CQE retires.
+/// sizes, and not overlap each other or the initialized iovec prefix. This
+/// function initializes the complete control array before forming its mutable
+/// reference. `iov` must point at `iovlen` initialized iovecs whose backing
+/// allocations remain stable until the target CQE retires.
 #[inline(always)]
 unsafe fn init_retained_sctp_send_fields(
     msghdr: *mut MaybeUninit<libc::msghdr>,
@@ -3783,6 +3916,9 @@ unsafe fn init_retained_sctp_send_fields(
     sndinfo: libc::sctp_sndinfo,
 ) {
     unsafe {
+        // The retained slot starts uninitialized. Initialize every byte before
+        // creating `&mut [u8; SCTP_SNDINFO_CONTROL_LEN]`; optimized builds may
+        // eliminate these stores after seeing the two complete writes below.
         std::ptr::write_bytes(control, 0, 1);
         write_msghdr(
             &mut *msghdr,
@@ -4478,15 +4614,12 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
 }
 
 #[inline(always)]
-/// Releases one completed or unsubmitted SCTP operation slot.
-///
-/// # Safety
-///
-/// `*state_ptr` must be non-null, owned by `pctx`'s reactor, and no kernel
-/// operation may still reference its state or retained payload.
-unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) {
-    unsafe { Reactor::free_op_unchecked(pctx.reactor(), *state_ptr) };
-    *state_ptr = std::ptr::null_mut();
+fn debug_assert_sctp_fd_state(fd: RawFd, fd_state: &RuntimeFdOpState<'_>) {
+    let state_fd = fd_state.raw_fd();
+    debug_assert!(
+        state_fd < 0 || fd == state_fd,
+        "SCTP future raw descriptor and typed operation state diverged"
+    );
 }
 
 #[inline(always)]
@@ -4495,7 +4628,7 @@ unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) 
 ///
 /// # Safety
 ///
-/// A non-null `*state_ptr` must identify a completed FlowIO operation with
+/// A non-null submitted pointer in `fd_state` must identify a completed FlowIO operation with
 /// retained payload type `T`. Cleanup uses its recorded origin reactor, and
 /// `extract` must move or drop every initialized field that requires
 /// destruction. The extractor receives `Some(actual)` only for a successful
@@ -4503,20 +4636,21 @@ unsafe fn free_sctp_state(pctx: &PollCtx, state_ptr: &mut *mut CompletionState) 
 /// potentially uninitialized kernel-output storage after errors or rejection.
 unsafe fn take_completed_sctp_payload_with<T: 'static, R>(
     cx: &mut Context<'_>,
-    state_ptr: &mut *mut CompletionState,
+    fd_state: &mut RuntimeFdOpState<'_>,
     extract: impl FnOnce(*mut T, Option<usize>) -> R,
 ) -> Option<CompletionTake<io::Result<usize>, R>> {
-    if (*state_ptr).is_null() {
+    let state_ptr = fd_state.state_ptr();
+    if state_ptr.is_null() {
         return None;
     }
 
-    let state = unsafe { &**state_ptr };
+    let state = unsafe { &*state_ptr };
     if !state.is_completed() {
         return None;
     }
 
     let result = completion_cqe_result(state.result);
-    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), *state_ptr) };
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
     let context_rejected = op_ctx.context_rejected();
     let actual = if context_rejected {
         None
@@ -4524,43 +4658,18 @@ unsafe fn take_completed_sctp_payload_with<T: 'static, R>(
         result.as_ref().ok().copied()
     };
     let value = unsafe {
-        op_ctx.take_retained_payload_with_unchecked::<T, R>(*state_ptr, |payload| {
+        op_ctx.take_retained_payload_with_unchecked::<T, R>(state_ptr, |payload| {
             extract(payload, actual)
         })
     };
-    unsafe { op_ctx.free_op_unchecked(*state_ptr) };
-    *state_ptr = std::ptr::null_mut();
+    let retired = fd_state.take_state_ptr();
+    debug_assert_eq!(retired, state_ptr);
+    unsafe { op_ctx.free_op_unchecked(state_ptr) };
     Some(CompletionTake::from_context(
         result,
         value,
         context_rejected,
     ))
-}
-
-#[inline(always)]
-/// Allocates the initial SCTP operation state and registers the current task.
-///
-/// # Safety
-///
-/// `*state_ptr` must be null, and `cx` must carry a valid FlowIO waker for the
-/// executor/reactor that will own the new operation.
-unsafe fn prepare_initial_sctp_state(
-    cx: &mut Context<'_>,
-    state_ptr: &mut *mut CompletionState,
-) -> io::Result<PollCtx> {
-    debug_assert!(
-        (*state_ptr).is_null(),
-        "SCTP operation state already allocated"
-    );
-    let pctx = poll_ctx_from_waker(cx)?;
-    let new_state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-    if new_state_ptr.is_null() {
-        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-    }
-
-    *state_ptr = new_state_ptr;
-    unsafe { (*new_state_ptr).register_waiter(pctx.owner_task()) };
-    Ok(pctx)
 }
 
 #[inline(always)]
@@ -4591,7 +4700,7 @@ pub struct DataRecvFuture<'a, B: IoBuffReadWrite> {
     /// SCTP association socket descriptor used for this data-only receive.
     fd: RawFd,
     /// Completion state for the submitted receive operation.
-    state_ptr: *mut CompletionState,
+    state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
     /// Logical buffer length captured before the receive writable window formed.
@@ -4609,6 +4718,7 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -4641,42 +4751,46 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
         }
 
         if this.state_ptr.is_null() {
-            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
-                Ok(pctx) => pctx,
+            let (pctx, guard) = match unsafe { prepare_unsubmitted_sctp_state(cx) } {
+                Ok(state) => state,
                 Err(err) => {
                     let buffer = unsafe { opt_take(&mut this.buffer) };
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = this.state_ptr;
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedDataRecvPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.state_ptr,
+                    payload,
+                    |fd, payload| {
                         let ptr = payload.buffer.as_mut_ptr();
-                        Ok(opcode::Recv::new(types::Fd(this.fd), ptr, this.len)
+                        Ok(opcode::Recv::new(types::Fd(fd), ptr, this.len)
                             .build()
                             .user_data(state_ptr as u64))
-                    })
-                {
-                    free_sctp_state(&pctx, &mut this.state_ptr);
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadWrite> Drop for DataRecvFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.state_ptr) };
     }
 }
 
@@ -4685,7 +4799,7 @@ pub struct DataSendFuture<'a, B: IoBuffReadOnly> {
     /// SCTP association socket descriptor used for this data-only send.
     fd: RawFd,
     /// Completion state for the submitted send operation.
-    state_ptr: *mut CompletionState,
+    state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
     /// Validated contiguous send length.
@@ -4701,6 +4815,7 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -4725,45 +4840,44 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
         }
 
         if this.state_ptr.is_null() {
-            let pctx = match unsafe { prepare_initial_sctp_state(cx, &mut this.state_ptr) } {
-                Ok(pctx) => pctx,
+            let (pctx, guard) = match unsafe { prepare_unsubmitted_sctp_state(cx) } {
+                Ok(state) => state,
                 Err(err) => {
                     let buffer = unsafe { opt_take(&mut this.buffer) };
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = this.state_ptr;
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedDataSendPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.state_ptr,
+                    payload,
+                    |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(build_sctp_send_entry(
-                            this.fd,
-                            ptr,
-                            this.len,
-                            state_ptr as u64,
-                        ))
-                    })
-                {
-                    free_sctp_state(&pctx, &mut this.state_ptr);
+                        Ok(build_sctp_send_entry(fd, ptr, this.len, state_ptr as u64))
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadOnly> Drop for DataSendFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.state_ptr) };
     }
 }
 
@@ -4772,7 +4886,7 @@ pub struct RecvFuture<'a, B: IoBuffReadWrite> {
     /// SCTP association socket descriptor used for this recvmsg path.
     fd: RawFd,
     /// Completion state for the submitted receive operation.
-    state_ptr: *mut CompletionState,
+    state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
     /// Logical buffer length captured before the receive writable window formed.
@@ -4792,6 +4906,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -4924,23 +5039,27 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 )
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_initialized_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_initialized_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.state_ptr,
+                    payload,
+                    |fd, payload| {
                         Ok(
-                            opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
+                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
                                 .build()
                                 .user_data(state_ptr as u64),
                         )
-                    })
-                {
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
-            this.state_ptr = guard.into_state_ptr();
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr.state_ptr()) };
         Poll::Pending
     }
 }
@@ -4952,12 +5071,14 @@ impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
             if self.state_ptr.is_null() {
                 SctpRecvState::clear_stashed_waiter_unchecked(recv_state);
             } else {
+                let mut state_ptr = self.state_ptr.take_state_ptr();
                 SctpRecvState::stash_unchecked(
                     recv_state,
-                    std::ptr::addr_of_mut!(self.state_ptr),
+                    &mut state_ptr,
                     0,
                     process_stashed_sctp_recv::<B>,
                 );
+                debug_assert!(state_ptr.is_null());
             }
         }
     }
@@ -4968,7 +5089,7 @@ pub struct SendFuture<'a, B: IoBuffReadOnly> {
     /// SCTP association socket descriptor used for this sendmsg path.
     fd: RawFd,
     /// Completion state for the submitted send operation.
-    state_ptr: *mut CompletionState,
+    state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
     /// Validated contiguous send length.
@@ -4986,6 +5107,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -5028,30 +5150,34 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                 )
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_initialized_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_initialized_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.state_ptr,
+                    payload,
+                    |fd, payload| {
                         Ok(build_sctp_sendmsg_entry(
-                            this.fd,
+                            fd,
                             payload.msghdr.as_ptr(),
                             state_ptr as u64,
                         ))
-                    })
-                {
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
-            this.state_ptr = guard.into_state_ptr();
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.state_ptr) };
     }
 }
 
@@ -5064,7 +5190,7 @@ pub struct RecvVectoredFuture<'a, const N: usize> {
     /// SCTP association socket descriptor used for this vectored recvmsg path.
     fd: RawFd,
     /// Completion state for the submitted receive operation.
-    state_ptr: *mut CompletionState,
+    state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned vectored receive chain returned on completion.
     buffer: Option<IoBuffVecMut<N>>,
     /// Number of nonempty writable segments materialized for each submission.
@@ -5084,6 +5210,7 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
 
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
@@ -5249,23 +5376,27 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 }
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_initialized_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_initialized_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.state_ptr,
+                    payload,
+                    |fd, payload| {
                         Ok(
-                            opcode::RecvMsg::new(types::Fd(this.fd), payload.msghdr.as_mut_ptr())
+                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
                                 .build()
                                 .user_data(state_ptr as u64),
                         )
-                    })
-                {
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
-            this.state_ptr = guard.into_state_ptr();
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr.state_ptr()) };
         Poll::Pending
     }
 }
@@ -5277,12 +5408,14 @@ impl<const N: usize> Drop for RecvVectoredFuture<'_, N> {
             if self.state_ptr.is_null() {
                 SctpRecvState::clear_stashed_waiter_unchecked(recv_state);
             } else {
+                let mut state_ptr = self.state_ptr.take_state_ptr();
                 SctpRecvState::stash_unchecked(
                     recv_state,
-                    std::ptr::addr_of_mut!(self.state_ptr),
+                    &mut state_ptr,
                     self.iov_count,
                     process_stashed_sctp_recv_vectored::<N>,
                 );
+                debug_assert!(state_ptr.is_null());
             }
         }
     }
@@ -5297,7 +5430,7 @@ pub struct SendVectoredFuture<'a, const N: usize> {
     /// SCTP association socket descriptor used for this vectored sendmsg path.
     fd: RawFd,
     /// Completion state for the submitted send operation.
-    state_ptr: *mut CompletionState,
+    state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned vectored send chain returned on completion.
     buffer: Option<IoBuffVec<N>>,
     /// Number of nonempty readable segments expected at materialization.
@@ -5317,6 +5450,7 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
 
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
@@ -5376,30 +5510,34 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
                 }
             };
             unsafe {
-                if let Err((e, payload)) =
-                    submit_initialized_retained_sqe(&pctx, state_ptr, payload, |payload| {
+                if let Err((e, payload)) = submit_initialized_retained_fd_sqe(
+                    &pctx,
+                    state_ptr,
+                    &mut this.state_ptr,
+                    payload,
+                    |fd, payload| {
                         Ok(build_sctp_sendmsg_entry(
-                            this.fd,
+                            fd,
                             payload.msghdr.as_ptr(),
                             state_ptr as u64,
                         ))
-                    })
-                {
+                    },
+                ) {
                     return Poll::Ready((Err(e), payload.buffer));
                 }
             }
-            this.state_ptr = guard.into_state_ptr();
+            guard.disarm();
             return Poll::Pending;
         }
 
-        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr) };
+        unsafe { refresh_op_waiter_from_waker(cx, this.state_ptr.state_ptr()) };
         Poll::Pending
     }
 }
 
 impl<const N: usize> Drop for SendVectoredFuture<'_, N> {
     fn drop(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
+        unsafe { drop_fd_op_state_unchecked(&mut self.state_ptr) };
     }
 }
 
@@ -5449,10 +5587,9 @@ impl AcceptFuture<'_> {
             this.prepared,
             cx,
             move |accepted_fd, accepted_linger_provenance, addr, addrlen| {
-                let accepted_fd =
-                    RuntimeFd::from_owned_with_provenance(accepted_fd, accepted_linger_provenance);
-                finish_accepted_runtime_stream_with(
+                finish_accepted_owned_stream_with(
                     accepted_fd,
+                    accepted_linger_provenance,
                     addr,
                     addrlen,
                     accepted_config,
@@ -5512,11 +5649,7 @@ impl Future for ConnectFuture<'_> {
         let remote_addr = this.remote_addr;
         this.slot.poll_connect(cx, move |fd, config| {
             apply_sctp_established_config(fd.as_raw_fd(), *config)?;
-            Ok(SctpStream::from_configured_runtime_fd(
-                RuntimeFd::from_fresh_owned(fd),
-                remote_addr,
-                *config,
-            ))
+            Ok(finish_connected_runtime_stream(fd, remote_addr, *config))
         })
     }
 }
@@ -5777,11 +5910,8 @@ const _: () = {
     );
 };
 
-fn checked_assoc_addr_count(addr_count: usize, payload_len: usize) -> io::Result<usize> {
-    if addr_count > payload_len / MIN_SCTP_ASSOC_ADDR_LEN {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
-    Ok(addr_count)
+fn assoc_addrs_initial_capacity(addr_count: usize, payload_len: usize) -> usize {
+    addr_count.min(payload_len / MIN_SCTP_ASSOC_ADDR_LEN)
 }
 
 fn assoc_addrs_buffer_len(
@@ -5892,8 +6022,7 @@ fn get_assoc_addrs_with(
         let header =
             unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpGetAddrsHeader) };
         let payload = &buffer[header_len..payload_end];
-        let addr_count = checked_assoc_addr_count(header.addr_num as usize, payload.len())?;
-        return parse_assoc_addrs(payload, addr_count);
+        return parse_assoc_addrs(payload, header.addr_num as usize);
     }
 
     Err(io::Error::from(io::ErrorKind::InvalidData))
@@ -5951,7 +6080,13 @@ fn storage_to_option_socket_addr(
 /// Linux emits one concrete `sockaddr_in` or `sockaddr_in6` per family with no
 /// padding between entries. The declared count must consume the full payload.
 pub(crate) fn parse_assoc_addrs(payload: &[u8], addr_count: usize) -> io::Result<Vec<SocketAddr>> {
-    let mut addrs = Vec::with_capacity(addr_count);
+    // Bound allocation by what the returned payload could physically contain,
+    // but let the forward walk retain its exact family/framing error order.
+    // Every successful push consumes at least MIN_SCTP_ASSOC_ADDR_LEN bytes,
+    // so this capacity is sufficient without allowing malformed counts to
+    // request unrelated memory.
+    let initial_capacity = assoc_addrs_initial_capacity(addr_count, payload.len());
+    let mut addrs = Vec::with_capacity(initial_capacity);
     let mut remaining = payload;
 
     for _ in 0..addr_count {
@@ -6075,27 +6210,15 @@ pub(crate) fn append_initialized_test_cmsg(
     write_test_cmsg_header(storage, offset, level, cmsg_type, payload_len)
 }
 
-fn write_cmsg_sndinfo(control: &mut [u8], sndinfo: libc::sctp_sndinfo) {
-    let hdr_len = std::mem::size_of::<libc::cmsghdr>();
-    let data_offset = cmsg_align(hdr_len);
-    let data_len = std::mem::size_of::<libc::sctp_sndinfo>();
-    let needed = data_offset + data_len;
-    // Callers size `control` via cmsg_space(size_of::<sctp_sndinfo>()), so
-    // `needed` should fit; the guard is defensive and avoids writing past a
-    // short slice.
-    debug_assert!(control.len() >= needed);
-    if control.len() < needed {
-        return;
-    }
-
+fn write_cmsg_sndinfo(control: &mut [u8; SCTP_SNDINFO_CONTROL_LEN], sndinfo: libc::sctp_sndinfo) {
     let hdr = libc::cmsghdr {
-        cmsg_len: (hdr_len + data_len) as _,
+        cmsg_len: SCTP_SNDINFO_CMSG_LEN as _,
         cmsg_level: libc::IPPROTO_SCTP,
         cmsg_type: libc::SCTP_SNDINFO,
     };
     unsafe {
         std::ptr::write_unaligned(control.as_mut_ptr() as *mut libc::cmsghdr, hdr);
-        let data_ptr = control.as_mut_ptr().add(data_offset);
+        let data_ptr = control.as_mut_ptr().add(SCTP_SNDINFO_DATA_OFFSET);
         std::ptr::write_unaligned(data_ptr as *mut libc::sctp_sndinfo, sndinfo);
     }
 }
@@ -6973,6 +7096,46 @@ pub(crate) mod test_support {
         )
     }
 
+    /// Constructs the exact post-`accept4` SCTP stream owner without requiring
+    /// a live SCTP association.
+    ///
+    /// This deterministic allocation oracle consumes the supplied sole fd
+    /// owner, routes it through the maintained accept-result descriptor-core
+    /// seam, and deliberately replaces kernel established-socket configuration
+    /// with a no-op. It is available only through the test-support feature.
+    pub fn test_construct_sctp_accept_result(
+        accepted_fd: OwnedFd,
+        remote_addr: SocketAddr,
+    ) -> io::Result<SctpStream> {
+        let (addr, addrlen) = socket_addr_to_c(remote_addr);
+        finish_accepted_owned_stream_with(
+            accepted_fd,
+            LingerProvenance::KnownNonPositive,
+            &addr,
+            addrlen,
+            SctpSocketConfig::data(SctpInitConfig::default()),
+            |_fd, _config, _provenance| Ok(()),
+        )
+        .map(|(stream, _remote_addr)| stream)
+    }
+
+    /// Constructs the exact successful SCTP connect-result owner without
+    /// requiring a live SCTP association.
+    ///
+    /// This deterministic allocation oracle consumes the supplied sole fd
+    /// owner at the maintained post-configuration connect-result seam. It is
+    /// available only through the test-support feature.
+    pub fn test_construct_sctp_connect_result(
+        connected_fd: OwnedFd,
+        remote_addr: SocketAddr,
+    ) -> SctpStream {
+        finish_connected_runtime_stream(
+            connected_fd,
+            remote_addr,
+            SctpSocketConfig::data(SctpInitConfig::default()),
+        )
+    }
+
     /// Reads the effective Linux SCTP receive-notification options for tests.
     pub fn test_sctp_socket_receive_options(fd: RawFd) -> io::Result<(SctpNotificationMask, bool)> {
         let events: SctpEventSubscribe = get_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_EVENTS)?;
@@ -7074,8 +7237,8 @@ pub(crate) mod test_support {
         state.result = fd;
         state.set_completed();
 
-        let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(fd));
-        let mut slot = AcceptSlot::new(Rc::clone(&listener_fd));
+        let listener_fd = RuntimeFd::from_fresh_raw_fd(fd);
+        let mut slot = AcceptSlot::new(&listener_fd);
         slot.in_use = true;
         slot.state_ptr = &mut state;
 
@@ -7117,7 +7280,8 @@ pub(crate) mod test_support {
         let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
         let mut slot = ConnectSlot::new(SctpSocketConfig::default());
         slot.in_use = true;
-        slot.fd = fd;
+        // SAFETY: the test-created descriptor has no other owner.
+        slot.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
         slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
             [127, 0, 0, 1],
             9,
@@ -7125,7 +7289,7 @@ pub(crate) mod test_support {
 
         slot.drop_future();
 
-        if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 || slot.addr.is_some() {
+        if !slot.state_ptr.is_null() || slot.in_use || slot.fd.is_some() || slot.addr.is_some() {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
         if !crate::runtime::fd::raw_fd_is_closed(fd) {
@@ -7134,16 +7298,14 @@ pub(crate) mod test_support {
         Ok(())
     }
 
-    /// Verifies forgotten-future connector teardown closes the socket and
-    /// releases every field owned by its reusable connection slot.
+    /// Verifies connector teardown closes a prepared, not-yet-submitted socket
+    /// and releases every field owned directly by its reusable slot.
     pub fn test_connect_slot_drop_cached_state_closes_socket_fd() -> io::Result<()> {
         let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-        let mut state = CompletionState::empty();
-        state.set_ring_abandoned();
         let mut slot = ConnectSlot::new(SctpSocketConfig::default());
-        slot.state_ptr = &mut state;
         slot.in_use = true;
-        slot.fd = fd;
+        // SAFETY: the test-created descriptor has no other owner.
+        slot.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
         slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
             [127, 0, 0, 1],
             9,
@@ -7151,13 +7313,10 @@ pub(crate) mod test_support {
 
         slot.drop_cached_state();
 
-        if !slot.state_ptr.is_null() || slot.in_use || slot.fd != -1 || slot.addr.is_some() {
+        if !slot.state_ptr.is_null() || slot.in_use || slot.fd.is_some() || slot.addr.is_some() {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
         if !crate::runtime::fd::raw_fd_is_closed(fd) {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        if !state.is_ring_abandoned() || state.is_completed() {
             return Err(io::Error::from(io::ErrorKind::Other));
         }
         Ok(())
@@ -7346,6 +7505,28 @@ mod tests {
     use crate::runtime::task::{TaskHeader, TaskVTable};
     use crate::runtime::test_hooks;
 
+    fn invalid_fd_op_state() -> RuntimeFdOpState<'static> {
+        RuntimeFd::from_fresh_raw_fd(RuntimeFd::INVALID)
+            .lease()
+            .into_op_state()
+    }
+
+    /// Creates the exact submitted-state representation used by production
+    /// around one manually prepared completion fixture.
+    ///
+    /// # Safety
+    ///
+    /// `state_ptr` must be a live state whose eventual retirement owns the
+    /// lease installed here.
+    unsafe fn invalid_submitted_fd_op_state(
+        state_ptr: *mut CompletionState,
+    ) -> RuntimeFdOpState<'static> {
+        let mut fd_state = invalid_fd_op_state();
+        unsafe { (*state_ptr).attach_fd_lease(fd_state.take_initial_lease()) };
+        unsafe { fd_state.publish_submitted_state(state_ptr) };
+        fd_state
+    }
+
     thread_local! {
         static STASH_PUBLICATION_RECV_STATE: Cell<*mut SctpRecvState> =
             const { Cell::new(std::ptr::null_mut()) };
@@ -7440,8 +7621,8 @@ mod tests {
         let recv_ptr = recv_segment.as_mut_ptr();
         let mut recv_state = SctpRecvState::external();
         let mut recv = RecvVectoredFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(IoBuffVecMut::from_array([recv_segment])),
             iov_count: RETAINED_IOVEC_MAX_COUNT + 1,
             writable: 0,
@@ -7481,8 +7662,8 @@ mod tests {
             .expect("aggregate send segment missing")
             .as_ptr();
         let mut send = SendVectoredFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(send_chain),
             iov_count: RETAINED_IOVEC_MAX_COUNT + 1,
             total: 0,
@@ -7579,8 +7760,8 @@ mod tests {
             process_completed: Some(reject_invalid_request_stash_processing),
         };
         let mut recv = RecvFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(buffer),
             write_base_len: 0,
             len: 0,
@@ -7632,8 +7813,8 @@ mod tests {
             process_completed: Some(reject_invalid_request_stash_processing),
         };
         let mut recv = RecvVectoredFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(chain),
             iov_count: RETAINED_IOVEC_MAX_COUNT + 1,
             writable: 0,
@@ -7701,8 +7882,8 @@ mod tests {
             process_completed: Some(reject_invalid_request_stash_processing),
         };
         let mut recv = RecvVectoredFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(IoBuffVecMut::from_array([recv_segment])),
             iov_count: RETAINED_IOVEC_MAX_COUNT + 1,
             writable: 8,
@@ -7740,8 +7921,8 @@ mod tests {
             .expect("over-limit send segment missing")
             .as_ptr();
         let mut send = SendVectoredFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(send_chain),
             iov_count: RETAINED_IOVEC_MAX_COUNT + 1,
             total: 7,
@@ -7857,8 +8038,8 @@ mod tests {
         let mut buffer = IoBuffMut::new(0, 16, 0).expect("receive buffer allocation failed");
         let original_buffer_ptr = buffer.as_mut_ptr();
         let mut recv = RecvFuture {
-            fd: -1,
-            state_ptr: std::ptr::null_mut(),
+            fd: RuntimeFd::INVALID,
+            state_ptr: invalid_fd_op_state(),
             buffer: Some(buffer),
             write_base_len: 0,
             len: 16,
@@ -7882,31 +8063,55 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
-    fn ring_abandoned_sctp_connect_closes_owned_socket_without_reclaiming_state() {
-        let fd = crate::runtime::fd::distinctive_closeable_test_fd()
-            .expect("SCTP connect fd creation failed");
-        let mut state = CompletionState::empty();
-        state.set_ring_abandoned();
-        let mut slot = ConnectSlot::new(SctpSocketConfig::default());
-        slot.state_ptr = &mut state;
-        slot.in_use = true;
-        slot.fd = fd;
-        let mut connect = ConnectFuture {
-            slot: &mut slot,
-            remote_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
-        };
-        let mut cx = Context::from_waker(std::task::Waker::noop());
+    fn ring_abandoned_sctp_connect_retains_submitted_socket_with_state() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let remote_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+            let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state_ptr.is_null(), "SCTP connect state allocation failed");
+            let fd = crate::runtime::fd::distinctive_closeable_test_fd()
+                .expect("SCTP connect fd creation failed");
+            // SAFETY: the test-created descriptor has no other owner.
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let retained = unsafe {
+                (&mut *reactor).alloc_retained_payload(crate::net::RetainedConnectPayload::new(
+                    owned_fd,
+                    RetainedConnectAddr::from_socket_addr(remote_addr),
+                ))
+            };
+            unsafe {
+                (*state_ptr).attach_retained_payload(retained);
+                (*state_ptr).set_ring_abandoned();
+            }
 
-        assert!(matches!(
-            Pin::new(&mut connect).poll(&mut cx),
-            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
-        ));
-        drop(connect);
-        assert!(slot.state_ptr.is_null());
-        assert!(!slot.in_use);
-        assert!(crate::runtime::fd::raw_fd_is_closed(fd));
-        assert!(state.is_ring_abandoned());
-        assert!(!state.is_completed());
+            let mut slot = ConnectSlot::new(SctpSocketConfig::default());
+            slot.state_ptr = state_ptr;
+            slot.in_use = true;
+            let mut connect = ConnectFuture {
+                slot: &mut slot,
+                remote_addr,
+            };
+
+            assert!(matches!(
+                Pin::new(&mut connect).poll(cx),
+                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+            ));
+            drop(connect);
+            assert!(slot.state_ptr.is_null());
+            assert!(!slot.in_use);
+            assert!(slot.fd.is_none());
+            assert!(slot.addr.is_none());
+            assert!(unsafe { (*state_ptr).is_ring_abandoned() });
+            assert!(!crate::runtime::fd::raw_fd_is_closed(fd));
+
+            unsafe {
+                (*state_ptr).restore_completed_orphaned_after_ringless_abandonment_for_test();
+                Reactor::free_op_unchecked(reactor, state_ptr);
+            }
+            assert!(crate::runtime::fd::raw_fd_is_closed(fd));
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
     }
 
     #[cfg(not(miri))]
@@ -7920,18 +8125,22 @@ mod tests {
                 !state_ptr.is_null(),
                 "SCTP completed-connect state allocation failed"
             );
-            let retained_addr = unsafe {
-                (&mut *reactor)
-                    .alloc_retained_payload(RetainedConnectAddr::from_socket_addr(remote_addr))
+            let fd = crate::runtime::fd::distinctive_closeable_test_fd()
+                .expect("SCTP completed-connect fd creation failed");
+            // SAFETY: the test-created descriptor has no other owner.
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let retained = unsafe {
+                (&mut *reactor).alloc_retained_payload(crate::net::RetainedConnectPayload::new(
+                    owned_fd,
+                    RetainedConnectAddr::from_socket_addr(remote_addr),
+                ))
             };
             unsafe {
-                (*state_ptr).attach_retained_payload(retained_addr);
+                (*state_ptr).attach_retained_payload(retained);
                 (*state_ptr).result = 0;
                 (*state_ptr).set_completed();
             }
 
-            let fd = crate::runtime::fd::distinctive_closeable_test_fd()
-                .expect("SCTP completed-connect fd creation failed");
             let config = SctpSocketConfig {
                 default_peer_addr_params: Some(SctpPeerAddrParams::for_address(remote_addr)),
                 ..SctpSocketConfig::default()
@@ -7939,7 +8148,6 @@ mod tests {
             let mut slot = ConnectSlot::new(config);
             slot.state_ptr = state_ptr;
             slot.in_use = true;
-            slot.fd = fd;
             let mut connect = ConnectFuture {
                 slot: &mut slot,
                 remote_addr,
@@ -7952,7 +8160,7 @@ mod tests {
             drop(connect);
             assert!(slot.state_ptr.is_null());
             assert!(!slot.in_use);
-            assert_eq!(slot.fd, -1);
+            assert!(slot.fd.is_none());
             assert!(slot.addr.is_none());
             assert!(crate::runtime::fd::raw_fd_is_closed(fd));
             assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
@@ -8127,8 +8335,8 @@ mod tests {
                 let (chain, initial_shape, pointers) = sctp_read_shape_drift_chain(drift);
                 let mut recv_state = SctpRecvState::external();
                 let mut future: RecvVectoredFuture<'_, 2> = RecvVectoredFuture {
-                    fd: -1,
-                    state_ptr: std::ptr::null_mut(),
+                    fd: RuntimeFd::INVALID,
+                    state_ptr: invalid_fd_op_state(),
                     buffer: Some(chain),
                     iov_count: initial_shape.0,
                     writable: initial_shape.1,
@@ -8212,8 +8420,8 @@ mod tests {
                     Some((2, 8))
                 );
                 let mut future: SendVectoredFuture<'_, 2> = SendVectoredFuture {
-                    fd: -1,
-                    state_ptr: std::ptr::null_mut(),
+                    fd: RuntimeFd::INVALID,
+                    state_ptr: invalid_fd_op_state(),
                     buffer: Some(chain),
                     iov_count: expected_shape.0,
                     total: expected_shape.1,
@@ -8383,14 +8591,11 @@ mod tests {
             );
 
             let aborted_state = state_ptr(&future);
-            assert!(!aborted_state.is_null(), "future lost its aborted state");
-            unsafe {
-                assert!((*aborted_state).is_build_aborted());
-                assert!(!(*aborted_state).is_completed());
-                assert!(!(*aborted_state).is_orphaned());
-                assert!(!(*aborted_state).is_cancel_pending());
-            }
-            assert_eq!(unsafe { (&*reactor).live_op_count() }, 1);
+            assert!(
+                aborted_state.is_null(),
+                "pre-push builder panic published an operation state"
+            );
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
             assert_eq!(owner.inflight_op_count_for_test(), 0);
 
             let after_unwind = unsafe { (&*reactor).retained_payload_stats() };
@@ -8417,7 +8622,7 @@ mod tests {
                 1,
                 "shutdown attempted cancellation for a never-submitted state"
             );
-            assert_eq!(unsafe { (&*reactor).live_op_count() }, 1);
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
             drop(future);
             assert_eq!(
                 test_hooks::raw_sqe_submit_failures_remaining(),
@@ -8431,9 +8636,9 @@ mod tests {
             assert_eq!(first_drops.get(), 1);
 
             let replacement = unsafe { (&mut *reactor).alloc_op() };
-            assert_eq!(
-                replacement, aborted_state,
-                "aborted operation slot was not returned for exact reuse"
+            assert!(
+                !replacement.is_null(),
+                "pre-push panic did not return its operation slot"
             );
             unsafe { (&mut *reactor).free_op(replacement) };
             assert_eq!(injected.kind(), io::ErrorKind::WouldBlock);
@@ -8478,15 +8683,15 @@ mod tests {
     fn lean_sctp_receive_builder_panic_reclaims_payload_and_operation() {
         assert_lean_sctp_builder_panic_reclaims(
             |buffer| DataRecvFuture {
-                fd: -1,
-                state_ptr: std::ptr::null_mut(),
+                fd: RuntimeFd::INVALID,
+                state_ptr: invalid_fd_op_state(),
                 buffer: Some(buffer),
                 write_base_len: 0,
                 len: 16,
                 input_error: None,
                 _marker: PhantomData::<&'static mut SctpStream>,
             },
-            |future: &DataRecvFuture<'_, RetainedConstructorBuffer>| future.state_ptr,
+            |future: &DataRecvFuture<'_, RetainedConstructorBuffer>| future.state_ptr.state_ptr(),
         );
     }
 
@@ -8494,14 +8699,14 @@ mod tests {
     fn lean_sctp_send_builder_panic_reclaims_payload_and_operation() {
         assert_lean_sctp_builder_panic_reclaims(
             |buffer| DataSendFuture {
-                fd: -1,
-                state_ptr: std::ptr::null_mut(),
+                fd: RuntimeFd::INVALID,
+                state_ptr: invalid_fd_op_state(),
                 buffer: Some(buffer),
                 len: 16,
                 input_error: None,
                 _marker: PhantomData::<&'static mut SctpStream>,
             },
-            |future: &DataSendFuture<'_, RetainedConstructorBuffer>| future.state_ptr,
+            |future: &DataSendFuture<'_, RetainedConstructorBuffer>| future.state_ptr.state_ptr(),
         );
     }
 
@@ -8640,6 +8845,67 @@ mod tests {
         assert_eq!(info.snd_ppid, expected.snd_ppid);
         assert_eq!(info.snd_context, expected.snd_context);
         assert_eq!(info.snd_assoc_id, expected.snd_assoc_id);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn expected_sctp_sndinfo_control(
+        sndinfo: libc::sctp_sndinfo,
+    ) -> [u8; SCTP_SNDINFO_CONTROL_LEN] {
+        let mut expected = [0_u8; SCTP_SNDINFO_CONTROL_LEN];
+        expected[0..8].copy_from_slice(&32_usize.to_ne_bytes());
+        expected[8..12].copy_from_slice(&libc::IPPROTO_SCTP.to_ne_bytes());
+        expected[12..16].copy_from_slice(&libc::SCTP_SNDINFO.to_ne_bytes());
+        expected[16..18].copy_from_slice(&sndinfo.snd_sid.to_ne_bytes());
+        expected[18..20].copy_from_slice(&sndinfo.snd_flags.to_ne_bytes());
+        expected[20..24].copy_from_slice(&sndinfo.snd_ppid.to_ne_bytes());
+        expected[24..28].copy_from_slice(&sndinfo.snd_context.to_ne_bytes());
+        expected[28..32].copy_from_slice(&sndinfo.snd_assoc_id.to_ne_bytes());
+        expected
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn sctp_sndinfo_control_has_exact_all_field_bytes() {
+        let sndinfo = libc::sctp_sndinfo {
+            snd_sid: 0x1122,
+            snd_flags: 0x3344,
+            snd_ppid: 0x5566_7788,
+            snd_context: 0x99aa_bbcc,
+            snd_assoc_id: -0x0102_0304,
+        };
+        let mut control = [0xa5_u8; SCTP_SNDINFO_CONTROL_LEN];
+
+        write_cmsg_sndinfo(&mut control, sndinfo);
+
+        assert_eq!(control, expected_sctp_sndinfo_control(sndinfo));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn sctp_sndinfo_control_has_exact_default_bytes() {
+        let sndinfo = raw_sndinfo_from_public(SctpSendInfo::default());
+        let mut control = [0xa5_u8; SCTP_SNDINFO_CONTROL_LEN];
+
+        write_cmsg_sndinfo(&mut control, sndinfo);
+
+        assert_eq!(control, expected_sctp_sndinfo_control(sndinfo));
+        assert!(
+            control[SCTP_SNDINFO_DATA_OFFSET..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
     }
 
     #[test]
@@ -10733,9 +10999,15 @@ mod tests {
             }
         }
 
+        let mut fd_state = stream.fd.op_state();
+        let fd = fd_state.raw_fd();
+        unsafe {
+            (*state_ptr).attach_fd_lease(fd_state.take_initial_lease());
+            fd_state.publish_submitted_state(state_ptr);
+        }
         let dropped: RecvFuture<'_, RetainedConstructorBuffer> = RecvFuture {
-            fd: stream.fd.raw_fd(),
-            state_ptr,
+            fd,
+            state_ptr: fd_state,
             buffer: None,
             write_base_len: 0,
             len: 32,
@@ -11088,8 +11360,8 @@ mod tests {
         }
 
         let mut future: RecvFuture<'_, RejectedContextRecvBuffer> = RecvFuture {
-            fd: -1,
-            state_ptr,
+            fd: RuntimeFd::INVALID,
+            state_ptr: unsafe { invalid_submitted_fd_op_state(state_ptr) },
             buffer: None,
             write_base_len: 0,
             len: 32,
@@ -11202,8 +11474,8 @@ mod tests {
         }
 
         let mut future: RecvVectoredFuture<'_, 2> = RecvVectoredFuture {
-            fd: -1,
-            state_ptr,
+            fd: RuntimeFd::INVALID,
+            state_ptr: unsafe { invalid_submitted_fd_op_state(state_ptr) },
             buffer: None,
             iov_count,
             writable: writable_len,
@@ -11358,8 +11630,8 @@ mod tests {
 
             let mut recv_state = SctpRecvState::external();
             let mut future: RecvFuture<'_, RetainedConstructorBuffer> = RecvFuture {
-                fd: -1,
-                state_ptr,
+                fd: RuntimeFd::INVALID,
+                state_ptr: unsafe { invalid_submitted_fd_op_state(state_ptr) },
                 buffer: None,
                 write_base_len: 32,
                 len: 32,
@@ -12348,14 +12620,13 @@ mod tests {
     #[test]
     fn assoc_addrs_wrapper_preserves_parser_buffer_range_error() {
         const ASSOC_ID: libc::sctp_assoc_t = 47;
-        const DECLARED_ADDR_COUNT: u32 = 3;
+        const DECLARED_ADDR_COUNT: u32 = 2;
 
         let mut calls = 0;
         let err = get_assoc_addrs_with(SCTP_GET_PEER_ADDRS_OPT, ASSOC_ID, |buffer| {
             calls += 1;
             let header_len = std::mem::size_of::<SctpGetAddrsHeader>();
-            let ipv6_len = std::mem::size_of::<libc::sockaddr_in6>();
-            let entry = assoc_ipv6_entry(Ipv6Addr::LOCALHOST.octets(), 3868, 7, 9, ipv6_len);
+            let entry = assoc_ipv4_entry([192, 0, 2, 1], 3868, 8);
             let response_len = header_len + 2 * entry.len();
             assert!(response_len <= buffer.len());
 
@@ -12370,7 +12641,7 @@ mod tests {
             buffer[header_len + entry.len()..response_len].copy_from_slice(&entry);
             Ok(response_len)
         })
-        .expect_err("a third declared address must reach the parser and fail");
+        .expect_err("two compact addresses must reach the parser and fail");
 
         assert_eq!(calls, 1);
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -12492,31 +12763,30 @@ mod tests {
     }
 
     #[test]
-    fn assoc_addr_count_is_bounded_by_payload_capacity() {
-        let one = checked_assoc_addr_count(1, MIN_SCTP_ASSOC_ADDR_LEN)
-            .expect("one minimum-sized record should succeed");
-        assert_eq!(one, 1);
-        let one_byte_short = checked_assoc_addr_count(1, MIN_SCTP_ASSOC_ADDR_LEN - 1)
-            .expect_err("a short payload cannot contain one record");
-        assert_eq!(one_byte_short.kind(), io::ErrorKind::InvalidData);
+    fn assoc_addr_initial_capacity_is_bounded_by_payload() {
+        assert_eq!(assoc_addrs_initial_capacity(0, 0), 0);
+        assert_eq!(assoc_addrs_initial_capacity(usize::MAX, 0), 0);
+        assert_eq!(
+            assoc_addrs_initial_capacity(usize::MAX, MIN_SCTP_ASSOC_ADDR_LEN - 1),
+            0
+        );
+        assert_eq!(
+            assoc_addrs_initial_capacity(usize::MAX, MIN_SCTP_ASSOC_ADDR_LEN),
+            1
+        );
 
         let max_payload =
             MAX_SCTP_ASSOC_ADDR_CAPACITY * std::mem::size_of::<libc::sockaddr_storage>();
         let packed_ipv4_max = max_payload / MIN_SCTP_ASSOC_ADDR_LEN;
         assert!(packed_ipv4_max > MAX_SCTP_ASSOC_ADDR_CAPACITY);
         assert_eq!(
-            checked_assoc_addr_count(packed_ipv4_max, max_payload)
-                .expect("capacity-derived maximum should succeed"),
+            assoc_addrs_initial_capacity(packed_ipv4_max, max_payload),
             packed_ipv4_max
         );
-
-        let short_payload = checked_assoc_addr_count(packed_ipv4_max, max_payload - 1)
-            .expect_err("actual short payload should lower the count bound");
-        assert_eq!(short_payload.kind(), io::ErrorKind::InvalidData);
-
-        let err = checked_assoc_addr_count(packed_ipv4_max + 1, max_payload)
-            .expect_err("over-cap addr count should fail");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            assoc_addrs_initial_capacity(usize::MAX, max_payload - 1),
+            packed_ipv4_max - 1
+        );
     }
 
     #[test]
@@ -12634,6 +12904,32 @@ mod tests {
         assert_eq!(decoded, params);
         assert_eq!(decoded.ipv6_flow_label, 0);
         assert_eq!(decoded.dscp, 0);
+    }
+
+    #[test]
+    fn paddr_params_sockopt_accepts_only_exact_rounded_lengths() {
+        let buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
+
+        for optlen in (0..=157).chain(std::iter::once(usize::MAX)) {
+            let result = decode_peer_addr_params_sockopt(&buffer, optlen);
+            if matches!(
+                optlen,
+                SCTP_PADDR_PARAMS_LEGACY_OPT_LEN | SCTP_PADDR_PARAMS_RAW_OPT_LEN
+            ) {
+                result.expect("exact supported peer-parameter length should decode");
+                continue;
+            }
+
+            let err = result.expect_err("unsupported peer-parameter length should fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unexpected SCTP_PEER_ADDR_PARAMS length {} (expected {} or {})",
+                    optlen, SCTP_PADDR_PARAMS_RAW_OPT_LEN, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN
+                )
+            );
+        }
     }
 
     #[test]
@@ -12766,6 +13062,20 @@ mod tests {
         let extra_payload = parse_assoc_addrs(&payload, 0)
             .expect_err("non-empty payload with zero count should fail");
         assert_eq!(extra_payload.kind(), io::ErrorKind::InvalidData);
+
+        let huge_count = parse_assoc_addrs(&[], usize::MAX)
+            .expect_err("a huge count with no payload must fail without a huge allocation");
+        assert_eq!(huge_count.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            huge_count
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<BufferRangeError>()),
+            Some(&BufferRangeError {
+                offset: 0,
+                width: std::mem::size_of::<libc::sa_family_t>(),
+                len: 0,
+            })
+        );
     }
 
     #[test]

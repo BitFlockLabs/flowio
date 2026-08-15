@@ -46,6 +46,12 @@ const COMPLETION_DRAIN_DESCRIPTOR_CHILD_TEST: &str =
     "runtime_real_completion_drain_closes_payload_descriptor_without_ring_reentry";
 const CANCEL_WRITE_ALL_CHILD_ENV: &str = "FLOWIO_CANCEL_WRITE_ALL_CHILD";
 const CANCEL_WRITE_ALL_CHILD_TEST: &str = "runtime_cancel_write_all_mid_flight";
+const ABANDONED_READ_PAYLOAD_CHILD_ENV: &str = "FLOWIO_ABANDONED_READ_PAYLOAD_CHILD";
+const ABANDONED_READ_PAYLOAD_CHILD_TEST: &str =
+    "runtime_executor_drop_fallback_abandons_inflight_read_payload";
+const ABANDONED_ESCAPED_READ_CHILD_ENV: &str = "FLOWIO_ABANDONED_ESCAPED_READ_CHILD";
+const ABANDONED_ESCAPED_READ_CHILD_TEST: &str =
+    "runtime_executor_drop_fallback_keeps_escaped_read_pending";
 
 fn new_executor() -> Executor {
     Executor::new().expect("failed to construct runtime executor")
@@ -2329,6 +2335,15 @@ fn runtime_cancelled_sleep_rejects_outside_run_after_executor_drop() {
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_executor_drop_fallback_abandons_inflight_read_payload() {
+    if std::env::var_os(ABANDONED_READ_PAYLOAD_CHILD_ENV).is_none() {
+        run_exact_test_child_with_watchdog(
+            ABANDONED_READ_PAYLOAD_CHILD_TEST,
+            ABANDONED_READ_PAYLOAD_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
     let mut executor = new_executor();
     let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
     let reader_fd = reader.as_raw_fd();
@@ -2359,19 +2374,26 @@ fn runtime_executor_drop_fallback_abandons_inflight_read_payload() {
         0,
         "ring-abandoned in-flight buffer was released without a target CQE"
     );
-    match fd_identity(reader_fd) {
-        Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EBADF)),
-        Ok(current_identity) => assert_ne!(
-            current_identity, reader_identity,
-            "reader descriptor stayed open after executor drop"
-        ),
-    }
+    assert_eq!(
+        fd_identity(reader_fd).expect("ring-abandoned reader descriptor closed"),
+        reader_identity,
+        "ring abandonment did not retain the exact unresolved descriptor"
+    );
     drop(writer);
 }
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn runtime_executor_drop_fallback_keeps_escaped_read_pending() {
+    if std::env::var_os(ABANDONED_ESCAPED_READ_CHILD_ENV).is_none() {
+        run_exact_test_child_with_watchdog(
+            ABANDONED_ESCAPED_READ_CHILD_TEST,
+            ABANDONED_ESCAPED_READ_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
     let mut executor = new_executor();
     let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
     let reader_fd = reader.as_raw_fd();
@@ -2427,13 +2449,11 @@ fn runtime_executor_drop_fallback_keeps_escaped_read_pending() {
         0,
         "dropping an escaped ring-abandoned read released its buffer"
     );
-    match fd_identity(reader_fd) {
-        Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EBADF)),
-        Ok(current_identity) => assert_ne!(
-            current_identity, reader_identity,
-            "escaped reader descriptor stayed open after future drop"
-        ),
-    }
+    assert_eq!(
+        fd_identity(reader_fd).expect("escaped ring-abandoned reader descriptor closed"),
+        reader_identity,
+        "future drop did not retain the exact unresolved descriptor"
+    );
     drop(writer);
 }
 

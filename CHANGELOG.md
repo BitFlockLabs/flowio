@@ -10,6 +10,25 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** `TcpStream`, `UnixStream`, and `UdpSocket` are now explicitly
+  `!Send + !Sync`, removing their incidental `Send` auto trait and matching
+  FlowIO's owner-OS-thread runtime contract. Other descriptor-bearing public
+  types were already local; the public `UnwindSafe`/`RefUnwindSafe` matrix,
+  nominal APIs, errors, and wire behavior are unchanged. An idle socket may
+  still be used by another FlowIO executor on the same owner thread, but a
+  published operation remains bound to its origin executor. FlowIO adds no
+  inter-executor queue or transferable socket/runtime state.
+- Runtime descriptors now use one owner-thread `Rc` core per distinct fd, and
+  each submitted local data operation retains one non-atomic lease through its
+  target completion. This adds one setup allocation on formerly inline
+  TCP/Unix/UDP/SCTP construction/adoption paths; listener construction replaces
+  its prior allocation and TLS reuses its TCP core. Allocation failure invokes
+  Rust's global allocation-error handler (normally process abort), while core
+  allocation and final deallocation may synchronize or block inside the
+  selected allocator. Clone/non-final release does not allocate.
+  Exceptional ring abandonment now retains unresolved data-operation fds until
+  process exit—at most `ring_entries` per abandoned reactor, accumulating
+  across repeated abandoned reactors—rather than risk numeric-fd reuse.
 - **Breaking:** `UdpSocket::local_addr` now returns
   `io::Result<SocketAddr>` and queries the live descriptor on each call. It
   reports kernel-assigned wildcard ports and address selection after connect or
@@ -68,6 +87,12 @@ Alpha prereleases carry no compatibility guarantee.
   `set_query_timeout` remains the per-response-attempt cap. Local resolution
   remains outside the budget, and a completed address still wins over a later
   family timeout.
+- **Breaking:** upstream DNS resolution now requires exact two-byte
+  nonblocking kernel randomness for both A and AAAA transaction IDs before
+  opening a DNS socket. Each ID permits at most three `EINTR` retries; a short
+  return or any other error fails the lookup instead of using the former
+  atomic/time-derived fallback. Literal-IP, localhost, and hosts-file results
+  remain independent of transaction-ID randomness.
 - TLS transport-read scratch is now capped at one 18,437-byte wire record after
   validating the original option. Values below or equal to the cap are
   unchanged; exceptional read-scratch recovery uses the same cap, and write
@@ -82,6 +107,10 @@ Alpha prereleases carry no compatibility guarantee.
   changing whether the stream list is empty. Generic empty requests and any
   other intent/list mismatch now return `InvalidInput` before a socket-option
   syscall.
+- **Breaking:** `SctpStream::peer_addr_params` now accepts only the exact
+  152-byte legacy or 156-byte modern Linux `SCTP_PEER_ADDR_PARAMS` response.
+  Intermediate packed lengths that do not match either externally rounded
+  kernel layout now return `InvalidData` instead of being decoded.
 - **Breaking:** SCTP `send`, `send_msg`, and `send_msg_vectored` now reject a
   zero-length source with `InvalidInput` before kernel submission and return
   the rental owner unchanged. Empty and zero-readable vectored chains no longer

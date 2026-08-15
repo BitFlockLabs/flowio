@@ -129,6 +129,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 /// On the steady-state fast path, keep the stream alive and reuse it for many
 /// reads and writes rather than reconstructing it around each operation.
 ///
+/// The stream is an owner-OS-thread value and is neither [`Send`](std::marker::Send)
+/// nor [`Sync`](std::marker::Sync).
+/// An idle stream may be used by another FlowIO executor on that same thread;
+/// once I/O is submitted, its future and completion state remain with the
+/// originating executor through the target completion.
+///
 /// # Example
 /// ```no_run
 /// use flowio::net::unix::UnixStream;

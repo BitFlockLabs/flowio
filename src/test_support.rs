@@ -35,6 +35,14 @@ pub mod utils {
 }
 
 pub mod runtime {
+    pub mod fd_codegen {
+        pub use crate::runtime::executor::flowio_slice305_probe_resubmit_same_state;
+        pub use crate::runtime::fd::{
+            flowio_slice305_probe_clone_lease, flowio_slice305_probe_drop_nonfinal_lease,
+        };
+        pub use crate::runtime::reactor::flowio_slice305_probe_reclaim_target;
+    }
+
     pub mod reactor {
         #[cfg(not(miri))]
         pub use crate::runtime::reactor::{
@@ -107,16 +115,16 @@ pub mod net {
             test_accept_with_established_config_error, test_adaptation_indication_type,
             test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
             test_authentication_event_type, test_connect_slot_drop_cached_state_closes_socket_fd,
-            test_connect_slot_drop_future_closes_socket_fd,
-            test_fail_notification_mask_after_query, test_parse_notification, test_parse_recv_meta,
-            test_parse_recv_meta_bare_with_policy, test_parse_recv_meta_with_policy,
-            test_parse_stream_recv_meta, test_partial_delivery_event_type,
-            test_peer_addr_change_type, test_peer_addr_params_rejects_optlen,
-            test_remote_error_type, test_sctp_socket_options, test_sctp_socket_receive_options,
-            test_sctp_stream_receive_policy, test_send_failed_error_offset,
-            test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
-            test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
-            test_stream_reset_event_type,
+            test_connect_slot_drop_future_closes_socket_fd, test_construct_sctp_accept_result,
+            test_construct_sctp_connect_result, test_fail_notification_mask_after_query,
+            test_parse_notification, test_parse_recv_meta, test_parse_recv_meta_bare_with_policy,
+            test_parse_recv_meta_with_policy, test_parse_stream_recv_meta,
+            test_partial_delivery_event_type, test_peer_addr_change_type,
+            test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
+            test_sctp_socket_receive_options, test_sctp_stream_receive_policy,
+            test_send_failed_error_offset, test_send_failed_event_type,
+            test_send_failed_info_offset, test_send_failed_type, test_sender_dry_event_type,
+            test_shutdown_event_type, test_stream_change_event_type, test_stream_reset_event_type,
         };
     }
 

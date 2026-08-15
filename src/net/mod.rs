@@ -187,11 +187,12 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+use std::cell::Cell;
 use std::io;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::rc::Rc;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::task::{Context, Poll};
 
 use crate::runtime::buffer::IoBuffReadWrite;
@@ -690,7 +691,7 @@ enum AcceptReadinessState {
 struct AcceptReadinessSlot {
     /// Listener retained by every readiness submission until its CQE or
     /// cancellation retires.
-    listener_fd: Rc<RuntimeFd>,
+    listener_fd: RuntimeFd,
     /// Completion state for the current or last readiness submission.
     state_ptr: *mut CompletionState,
     /// Nonnegative readiness mask retained after `EMFILE` or `ENFILE`.
@@ -706,16 +707,20 @@ struct AcceptReadinessSlot {
     in_use: bool,
     /// Normal, one bare-`POLLERR` rearm consumed, or permanently terminal.
     readiness_state: AcceptReadinessState,
+    /// Preserves the listener handles' pre-core `!UnwindSafe` auto-trait
+    /// boundary without adding storage.
+    _unwind_boundary: PhantomData<&'static Cell<()>>,
 }
 
 impl AcceptReadinessSlot {
-    fn new(listener_fd: Rc<RuntimeFd>) -> Self {
+    fn new(listener_fd: &RuntimeFd) -> Self {
         Self {
-            listener_fd,
+            listener_fd: listener_fd.clone_handle(),
             state_ptr: std::ptr::null_mut(),
             unconsumed_readiness: NO_UNCONSUMED_ACCEPT_READINESS,
             in_use: false,
             readiness_state: AcceptReadinessState::Ready,
+            _unwind_boundary: PhantomData,
         }
     }
 
@@ -1031,8 +1036,8 @@ where
 
     crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
         let reactor = owner.reactor_ptr();
-        let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(-1));
-        let mut slot = AcceptReadinessSlot::new(listener_fd);
+        let listener_fd = crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(-1);
+        let mut slot = AcceptReadinessSlot::new(&listener_fd);
         slot.in_use = true;
         let input_error = slot
             .prepare()
@@ -1061,8 +1066,8 @@ where
             "{transport} listener teardown retained its accept marker"
         );
 
-        let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(-1));
-        let mut slot = AcceptReadinessSlot::new(listener_fd);
+        let listener_fd = crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(-1);
+        let mut slot = AcceptReadinessSlot::new(&listener_fd);
         let state_ptr = unsafe { (&mut *reactor).alloc_op() };
         assert!(
             !state_ptr.is_null(),
@@ -1126,7 +1131,7 @@ where
 #[cfg(all(test, not(miri)))]
 fn completed_accept_readiness_for_test(
     cx: &std::task::Context<'_>,
-    listener_fd: &std::rc::Rc<crate::runtime::fd::RuntimeFd>,
+    listener_fd: &crate::runtime::fd::RuntimeFd,
     result: i32,
 ) -> *mut crate::runtime::op::CompletionState {
     let pctx = crate::runtime::executor::poll_ctx_from_waker(cx)
@@ -1185,10 +1190,11 @@ fn test_terminal_accept_readiness<T, P, N>(
     listener.set_nonblocking(true).unwrap_or_else(|err| {
         panic!("empty {transport}-path listener nonblocking setup failed: {err}")
     });
-    let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_owned(
-        std::os::fd::OwnedFd::from(listener),
-    ));
-    let listener_keepalive = std::rc::Rc::clone(&listener_fd);
+    let listener_fd =
+        crate::runtime::fd::RuntimeFd::from_fresh_owned(std::os::fd::OwnedFd::from(listener));
+    // Keep one owner outside `Executor::run` so this readiness-only test does
+    // not count the listener's ordinary final close SQE as a readiness submit.
+    let listener_keepalive = listener_fd.clone_handle();
     let terminal_masks = [
         libc::POLLHUP as i32,
         libc::POLLNVAL as i32,
@@ -1204,7 +1210,7 @@ fn test_terminal_accept_readiness<T, P, N>(
     executor
         .run(async move {
             for readiness in terminal_masks {
-                let mut adapter = AcceptReadinessSlot::new(std::rc::Rc::clone(&listener_fd));
+                let mut adapter = AcceptReadinessSlot::new(&listener_fd);
                 let state_ptr = std::future::poll_fn(|cx| {
                     std::task::Poll::Ready(completed_accept_readiness_for_test(
                         cx,
@@ -1286,17 +1292,18 @@ where
     listener.set_nonblocking(true).unwrap_or_else(|err| {
         panic!("empty {transport}-path listener nonblocking setup failed: {err}")
     });
-    let listener_fd = std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_owned(
-        std::os::fd::OwnedFd::from(listener),
-    ));
-    let listener_keepalive = std::rc::Rc::clone(&listener_fd);
+    let listener_fd =
+        crate::runtime::fd::RuntimeFd::from_fresh_owned(std::os::fd::OwnedFd::from(listener));
+    // Keep one owner outside `Executor::run` so this readiness-only test does
+    // not count the listener's ordinary final close SQE as a readiness submit.
+    let listener_keepalive = listener_fd.clone_handle();
     let mut executor = crate::runtime::executor::Executor::new()
         .unwrap_or_else(|err| panic!("{transport} accept readiness executor failed: {err}"));
 
     executor
         .run(async move {
             for readiness in [libc::POLLERR as i32, (libc::POLLIN | libc::POLLERR) as i32] {
-                let mut adapter = AcceptReadinessSlot::new(std::rc::Rc::clone(&listener_fd));
+                let mut adapter = AcceptReadinessSlot::new(&listener_fd);
                 adapter.readiness_state = AcceptReadinessState::BarePollErrorRearmed;
                 let state_ptr = std::future::poll_fn(|cx| {
                     std::task::Poll::Ready(completed_accept_readiness_for_test(
@@ -1429,14 +1436,6 @@ fn close_fd(fd: RawFd) {
     }
 }
 
-#[inline(always)]
-fn close_if_valid(fd: &mut RawFd) {
-    if *fd >= 0 {
-        close_fd(*fd);
-        *fd = -1;
-    }
-}
-
 fn set_reuse_addr(fd: RawFd) -> io::Result<()> {
     set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &1i32)
 }
@@ -1467,8 +1466,7 @@ fn socket_addr_to_c(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
     (storage, len)
 }
 
-/// Kernel-visible connect address storage retained until the connect CQE
-/// retires.
+/// Prepared connect address stored in the slot until submission.
 #[derive(Clone, Copy)]
 struct RetainedConnectAddr {
     /// Prepared peer address retained until connect completion.
@@ -1488,18 +1486,52 @@ impl RetainedConnectAddr {
     }
 }
 
+/// Sole socket owner and kernel-visible address retained until the target
+/// connect CQE retires.
+struct RetainedConnectPayload {
+    /// Socket whose numeric descriptor is referenced by the connect SQE.
+    fd: OwnedFd,
+    /// Prepared peer address referenced by the connect SQE.
+    addr: RetainedConnectAddr,
+}
+
+impl RetainedConnectPayload {
+    fn new(fd: OwnedFd, addr: RetainedConnectAddr) -> Self {
+        Self { fd, addr }
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn addr_ptr(&self) -> *const libc::sockaddr {
+        self.addr.addr_ptr()
+    }
+
+    fn addrlen(&self) -> libc::socklen_t {
+        self.addr.addrlen
+    }
+
+    fn into_fd(self) -> OwnedFd {
+        self.fd
+    }
+}
+
 /// Common owner-thread state for one asynchronous connect submission.
 ///
-/// The raw socket stays outside [`RuntimeFd`] until connection establishment
-/// and any transport-specific completion work succeeds. Every earlier exit
-/// therefore keeps the existing direct `libc::close` behavior.
+/// The socket stays outside [`RuntimeFd`] until connection establishment and
+/// any transport-specific completion work succeeds. Before submission this
+/// slot owns it directly; after submission the retained completion payload owns
+/// it until the target CQE proves that the kernel no longer references its
+/// numeric descriptor.
 struct ConnectSubmissionSlot<C> {
     /// Completion state for the current or last connect submission.
     state_ptr: *mut CompletionState,
     /// True while a reusable transport future is borrowing this slot.
     in_use: bool,
-    /// Socket being connected for the current attempt.
-    fd: RawFd,
+    /// Socket being prepared for the current attempt. Submission moves this
+    /// owner into [`RetainedConnectPayload`].
+    fd: Option<OwnedFd>,
     /// Prepared remote address retained until submission.
     addr: Option<RetainedConnectAddr>,
     /// Transport data needed after the connect CQE succeeds.
@@ -1511,22 +1543,14 @@ impl<C> ConnectSubmissionSlot<C> {
         Self {
             state_ptr: std::ptr::null_mut(),
             in_use: false,
-            fd: -1,
+            fd: None,
             addr: None,
             completion_data,
         }
     }
 
     fn cleanup_fd(&mut self) {
-        close_if_valid(&mut self.fd);
-    }
-
-    fn take_fd(&mut self) -> OwnedFd {
-        let fd = std::mem::replace(&mut self.fd, -1);
-        debug_assert!(fd >= 0, "successful connect must own a socket");
-        // SAFETY: this slot owns the successfully connected socket, and the
-        // sentinel replacement above prevents later cleanup from closing it.
-        unsafe { OwnedFd::from_raw_fd(fd) }
+        self.fd = None;
     }
 
     fn drop_future(&mut self) {
@@ -1560,21 +1584,20 @@ impl<C> ConnectSubmissionSlot<C> {
                 let result = state.result;
                 let op_ctx =
                     unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), self.state_ptr) };
+                let payload = unsafe {
+                    op_ctx.take_retained_payload_unchecked::<RetainedConnectPayload>(self.state_ptr)
+                };
+                let completion =
+                    CompletionTake::from_context(result, payload, op_ctx.context_rejected());
                 unsafe { op_ctx.free_op_unchecked(self.state_ptr) };
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
-                if op_ctx.context_rejected() {
-                    self.cleanup_fd();
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-                }
-                if let Err(err) = connect_cqe_result(result) {
-                    self.cleanup_fd();
-                    return Poll::Ready(Err(err));
-                }
-
-                let fd = self.take_fd();
-                return Poll::Ready(finish_connected(fd, &self.completion_data));
+                let (result, payload) = completion.into_io_result(connect_cqe_result);
+                return Poll::Ready(match result {
+                    Ok(()) => finish_connected(payload.into_fd(), &self.completion_data),
+                    Err(err) => Err(err),
+                });
             }
         }
 
@@ -1598,7 +1621,15 @@ impl<C> ConnectSubmissionSlot<C> {
             unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
 
             let payload = match self.addr.take() {
-                Some(payload) => payload,
+                Some(addr) => match self.fd.take() {
+                    Some(fd) => RetainedConnectPayload::new(fd, addr),
+                    None => {
+                        unsafe { Reactor::free_op_unchecked(pctx.reactor(), state_ptr) };
+                        self.state_ptr = std::ptr::null_mut();
+                        self.in_use = false;
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::InvalidInput)));
+                    }
+                },
                 None => {
                     unsafe { Reactor::free_op_unchecked(pctx.reactor(), state_ptr) };
                     self.state_ptr = std::ptr::null_mut();
@@ -1612,9 +1643,9 @@ impl<C> ConnectSubmissionSlot<C> {
                 if let Err((err, _payload)) =
                     submit_retained_sqe(&pctx, state_ptr, payload, |payload| {
                         let sqe = io_uring::opcode::Connect::new(
-                            io_uring::types::Fd(self.fd),
+                            io_uring::types::Fd(payload.raw_fd()),
                             payload.addr_ptr(),
-                            payload.addrlen,
+                            payload.addrlen(),
                         )
                         .build()
                         .user_data(state_ptr as u64);
@@ -1800,7 +1831,16 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
 mod tests {
     use super::*;
     use crate::runtime::buffer::IoBuffMut;
+    use static_assertions::assert_not_impl_any;
     use std::cell::Cell;
+
+    assert_not_impl_any!(AcceptReadinessSlot: Send, Sync, std::panic::UnwindSafe, std::panic::RefUnwindSafe);
+
+    #[test]
+    fn accept_readiness_slot_preserves_listener_layout_and_auto_traits() {
+        assert_eq!(std::mem::size_of::<AcceptReadinessSlot>(), 24);
+        assert_eq!(std::mem::align_of::<AcceptReadinessSlot>(), 8);
+    }
 
     #[test]
     fn completion_take_resolves_rejection_without_running_accepted_mapping() {
@@ -1956,32 +1996,136 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
     }
 
+    #[cfg(not(miri))]
     #[test]
-    fn ring_abandoned_connect_submission_slot_releases_attempt_ownership() {
-        let mut state = CompletionState::empty();
-        state.set_ring_abandoned();
-        let mut slot = ConnectSubmissionSlot::new(());
-        slot.state_ptr = &mut state;
-        slot.in_use = true;
-        slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
-            [127, 0, 0, 1],
-            9,
-        ))));
-        let mut cx = Context::from_waker(std::task::Waker::noop());
+    fn ring_abandoned_connect_submission_retains_socket_with_kernel_visible_state() {
+        crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state_ptr.is_null(), "connect state allocation failed");
+            let fd = crate::runtime::fd::distinctive_closeable_test_fd()
+                .expect("connect fd creation failed");
+            // SAFETY: the test-created descriptor has no other owner.
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let retained = unsafe {
+                (&mut *reactor).alloc_retained_payload(RetainedConnectPayload::new(
+                    owned_fd,
+                    RetainedConnectAddr::from_socket_addr(SocketAddr::from(([127, 0, 0, 1], 9))),
+                ))
+            };
+            unsafe {
+                (*state_ptr).attach_retained_payload(retained);
+                (*state_ptr).set_ring_abandoned();
+            }
 
-        let outcome: Poll<io::Result<()>> = slot.poll_connect(&mut cx, |_, _| {
-            panic!("ring-abandoned connect reached its success finalizer")
+            let mut slot = ConnectSubmissionSlot::new(());
+            slot.state_ptr = state_ptr;
+            slot.in_use = true;
+            let outcome: Poll<io::Result<()>> = slot.poll_connect(cx, |_, _| {
+                panic!("ring-abandoned connect reached its success finalizer")
+            });
+            assert!(matches!(
+                outcome,
+                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
+            ));
+            assert!(slot.state_ptr.is_null());
+            assert!(!slot.in_use);
+            assert!(slot.fd.is_none());
+            assert!(slot.addr.is_none());
+            assert!(unsafe { (*state_ptr).is_ring_abandoned() });
+            assert!(!crate::runtime::fd::raw_fd_is_closed(fd));
+
+            unsafe {
+                (*state_ptr).restore_completed_orphaned_after_ringless_abandonment_for_test();
+                Reactor::free_op_unchecked(reactor, state_ptr);
+            }
+            assert!(crate::runtime::fd::raw_fd_is_closed(fd));
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
         });
-        assert!(matches!(
-            outcome,
-            Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
-        ));
-        assert!(slot.state_ptr.is_null());
-        assert!(!slot.in_use);
-        assert_eq!(slot.fd, -1);
-        assert!(slot.addr.is_none());
-        assert!(state.is_ring_abandoned());
-        assert!(!state.is_completed());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn completed_connect_payload_transitions_cover_success_error_and_context_rejection() {
+        #[derive(Clone, Copy)]
+        enum Expected {
+            Success,
+            OsError(libc::c_int),
+            ContextRejected,
+        }
+
+        crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            for (result, context_rejected, expected) in [
+                (0, false, Expected::Success),
+                (
+                    -libc::ECONNREFUSED,
+                    false,
+                    Expected::OsError(libc::ECONNREFUSED),
+                ),
+                (0, true, Expected::ContextRejected),
+            ] {
+                let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+                assert!(!state_ptr.is_null(), "connect state allocation failed");
+                let raw_fd = crate::runtime::fd::distinctive_closeable_test_fd()
+                    .expect("connect fd creation failed");
+                // SAFETY: the test-created descriptor has no other owner.
+                let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+                let retained = unsafe {
+                    (&mut *reactor).alloc_retained_payload(RetainedConnectPayload::new(
+                        fd,
+                        RetainedConnectAddr::from_socket_addr(SocketAddr::from((
+                            [127, 0, 0, 1],
+                            9,
+                        ))),
+                    ))
+                };
+                unsafe {
+                    (*state_ptr).attach_retained_payload(retained);
+                    (*state_ptr).result = result;
+                    if context_rejected {
+                        (*state_ptr).set_context_rejected();
+                    }
+                    (*state_ptr).set_completed();
+                }
+
+                let mut slot = ConnectSubmissionSlot::new(());
+                slot.state_ptr = state_ptr;
+                slot.in_use = true;
+                let outcome = slot.poll_connect(cx, |fd, _| Ok(fd));
+                assert!(slot.state_ptr.is_null());
+                assert!(!slot.in_use);
+                assert!(slot.fd.is_none());
+                assert!(slot.addr.is_none());
+
+                match expected {
+                    Expected::Success => {
+                        let Poll::Ready(Ok(fd)) = outcome else {
+                            panic!("successful connect did not transfer its exact fd owner");
+                        };
+                        assert_eq!(fd.as_raw_fd(), raw_fd);
+                        assert!(!crate::runtime::fd::raw_fd_is_closed(raw_fd));
+                        drop(fd);
+                    }
+                    Expected::OsError(errno) => {
+                        let Poll::Ready(Err(err)) = outcome else {
+                            panic!("failed connect did not return its CQE error");
+                        };
+                        assert_eq!(err.raw_os_error(), Some(errno));
+                    }
+                    Expected::ContextRejected => {
+                        let Poll::Ready(Err(err)) = outcome else {
+                            panic!("context-rejected connect unexpectedly succeeded");
+                        };
+                        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+                    }
+                }
+                assert!(crate::runtime::fd::raw_fd_is_closed(raw_fd));
+                assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                assert_eq!(owner.inflight_op_count_for_test(), 0);
+            }
+        });
     }
 
     #[test]
@@ -2099,8 +2243,8 @@ mod tests {
 
     #[test]
     fn accept_slot_bare_poll_error_budget_survives_ordinary_rearm() {
-        let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
-        let mut slot = AcceptReadinessSlot::new(listener_fd);
+        let listener_fd = RuntimeFd::from_fresh_raw_fd(-1);
+        let mut slot = AcceptReadinessSlot::new(&listener_fd);
         let would_block = io::Error::from_raw_os_error(libc::EAGAIN);
 
         slot.record_rearm(true);
@@ -2143,9 +2287,8 @@ mod tests {
             for fail_submission in [false, true] {
                 crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, cx| {
                     let reactor = owner.reactor_ptr();
-                    let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
-                    let listener_keepalive = Rc::clone(&listener_fd);
-                    let mut slot = AcceptReadinessSlot::new(listener_fd);
+                    let listener_keepalive = RuntimeFd::from_fresh_raw_fd(-1);
+                    let mut slot = AcceptReadinessSlot::new(&listener_keepalive);
                     slot.prepare()
                         .expect("fresh accept slot should prepare for fault injection");
                     slot.unconsumed_readiness = readiness;
@@ -2190,7 +2333,7 @@ mod tests {
                     assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
                     assert_eq!(owner.inflight_op_count_for_test(), 0);
                     assert_eq!(
-                        Rc::strong_count(&listener_keepalive),
+                        listener_keepalive.strong_count_for_test(),
                         2,
                         "failed rearm leaked or released retained listener ownership"
                     );
@@ -2225,7 +2368,7 @@ mod tests {
                     assert_eq!(slot.readiness_state, AcceptReadinessState::Ready);
 
                     drop(slot);
-                    assert_eq!(Rc::strong_count(&listener_keepalive), 1);
+                    assert_eq!(listener_keepalive.strong_count_for_test(), 1);
                 });
             }
         }
@@ -2239,14 +2382,13 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("listener nonblocking setup failed");
-        let listener_fd = Rc::new(RuntimeFd::from_fresh_owned(OwnedFd::from(listener)));
-        let listener_keepalive = Rc::clone(&listener_fd);
+        let listener_keepalive = RuntimeFd::from_fresh_owned(OwnedFd::from(listener));
+        let mut slot = AcceptReadinessSlot::new(&listener_keepalive);
         let mut executor =
             crate::runtime::executor::Executor::new().expect("executor construction failed");
 
         executor
             .run(async move {
-                let mut slot = AcceptReadinessSlot::new(listener_fd);
                 slot.prepare().expect("accept slot preparation failed");
                 slot.unconsumed_readiness = libc::POLLERR as libc::c_short;
 
@@ -2299,9 +2441,11 @@ mod tests {
         let expected_peer = peer.local_addr().expect("peer local address missing");
         let listener_raw = std::os::fd::AsRawFd::as_raw_fd(&listener);
 
-        let listener_fd = Rc::new(RuntimeFd::from_fresh_owned(OwnedFd::from(listener)));
-        let listener_weak = Rc::downgrade(&listener_fd);
-        let listener_keepalive = Rc::clone(&listener_fd);
+        let listener_fd = RuntimeFd::from_fresh_owned(OwnedFd::from(listener));
+        let listener_weak = listener_fd.weak_for_test();
+        let listener_keepalive = listener_fd.clone_handle();
+        let mut slot = AcceptReadinessSlot::new(&listener_fd);
+        drop(listener_fd);
         let mut executor =
             crate::runtime::executor::Executor::new().expect("executor construction failed");
         let exhausted_errnos = [
@@ -2321,7 +2465,6 @@ mod tests {
                     Poll::Ready(pctx.reactor())
                 })
                 .await;
-                let mut slot = AcceptReadinessSlot::new(listener_fd);
                 slot.prepare().expect("initial accept preparation failed");
                 slot.state_ptr = std::future::poll_fn(|cx| {
                     Poll::Ready(completed_accept_readiness_for_test(
@@ -2468,13 +2611,14 @@ mod tests {
         let expected_stale_peer = stale_peer
             .local_addr()
             .expect("stale-readiness peer local address missing");
-        let stale_listener = Rc::clone(&listener_keepalive);
+        let stale_listener = listener_keepalive.clone_handle();
         let mut stale_executor =
             crate::runtime::executor::Executor::new().expect("stale executor construction failed");
 
         stale_executor
             .run(async move {
-                let mut slot = AcceptReadinessSlot::new(stale_listener);
+                let mut slot = AcceptReadinessSlot::new(&stale_listener);
+                drop(stale_listener);
                 slot.unconsumed_readiness = libc::POLLIN as libc::c_short;
                 slot.prepare()
                     .expect("cached stale-readiness accept preparation failed");
@@ -2532,8 +2676,8 @@ mod tests {
     #[test]
     fn pollnval_ebadf_accept_readiness_latches_after_preserving_the_first_errno() {
         crate::runtime::executor::with_ringless_poll_context_for_test(1, |_owner, cx| {
-            let listener_fd = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
-            let mut slot = AcceptReadinessSlot::new(listener_fd);
+            let listener_fd = RuntimeFd::from_fresh_raw_fd(-1);
+            let mut slot = AcceptReadinessSlot::new(&listener_fd);
             slot.prepare().expect("fresh accept slot should prepare");
             slot.state_ptr =
                 completed_accept_readiness_for_test(cx, &slot.listener_fd, libc::POLLNVAL as i32);
@@ -2584,8 +2728,8 @@ mod tests {
     fn accept_readiness_slot_prepare_drop_and_reuse_match_transport_contracts() {
         let raw = crate::runtime::fd::distinctive_closeable_test_fd()
             .expect("distinctive listener fd failed");
-        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(raw));
-        let mut slot = AcceptReadinessSlot::new(Rc::clone(&listener));
+        let listener = RuntimeFd::from_fresh_raw_fd(raw);
+        let mut slot = AcceptReadinessSlot::new(&listener);
 
         slot.prepare().expect("first prepare should claim the slot");
         let err = slot
@@ -2649,9 +2793,8 @@ mod tests {
             .expect("peer connect failed");
             let expected_peer = peer.local_addr().expect("peer local address missing");
 
-            let listener_fd = Rc::new(RuntimeFd::from_fresh_owned(OwnedFd::from(listener)));
-            let listener_keepalive = Rc::clone(&listener_fd);
-            let mut slot = AcceptReadinessSlot::new(listener_fd);
+            let listener_keepalive = RuntimeFd::from_fresh_owned(OwnedFd::from(listener));
+            let mut slot = AcceptReadinessSlot::new(&listener_keepalive);
             let mut executor =
                 crate::runtime::executor::Executor::new().expect("executor construction failed");
 
@@ -2728,6 +2871,12 @@ mod tests {
 
     #[test]
     fn retained_connect_address_owns_exact_ipv4_and_ipv6_storage() {
+        let address_size = std::mem::size_of::<RetainedConnectAddr>();
+        let payload_size = std::mem::size_of::<RetainedConnectPayload>();
+        assert!(address_size > 128 && address_size <= 256);
+        assert!(payload_size > 128 && payload_size <= 256);
+        assert!(std::mem::align_of::<RetainedConnectPayload>() <= 64);
+
         let addresses = [
             SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 17), 0x1234)),
             SocketAddr::V6(SocketAddrV6::new(

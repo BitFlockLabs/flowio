@@ -2,8 +2,9 @@ mod common;
 
 use common::{
     DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
-    enable_socket_timestampns, make_payload_chain, make_read_chain, poll_once_pending,
-    run_test_output, set_positive_linger, wait_for_drop_count, wait_for_live_slots,
+    enable_socket_timestampns, lowest_available_fd, make_payload_chain, make_read_chain,
+    poll_once_pending, raw_fd_is_open, run_test_output, set_positive_linger, wait_for_drop_count,
+    wait_for_live_slots,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
@@ -59,6 +60,9 @@ const SCTP_ACTIVE_IOVEC_REJECTION_TEST: &str =
 const SCTP_ACTIVE_IOVEC_BOUNDARY_CHILD_ENV: &str = "FLOWIO_SCTP_ACTIVE_IOVEC_BOUNDARY_CHILD";
 const SCTP_ACTIVE_IOVEC_BOUNDARY_TEST: &str =
     "runtime_sctp_active_iovec_boundary_accepts_sparse_and_excess_capacity_chains";
+const SCTP_CONNECT_REUSE_CHILD_ENV: &str = "FLOWIO_SCTP_CONNECT_REUSE_CHILD";
+const SCTP_CONNECT_REUSE_TEST: &str =
+    "runtime_sctp_reusable_dropped_connect_retains_socket_until_connect_cqe";
 const SCTP_ACTIVE_IOVEC_TEST_STACK_BYTES: &str = "33554432";
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
@@ -1506,10 +1510,10 @@ fn sctp_connect_slot_drop_cached_state_closes_socket_fd() {
 }
 
 #[test]
-fn sctp_peer_addr_params_rejects_gap_optlen() {
-    // 153 lands outside both modern and legacy SCTP_PEER_ADDR_PARAMS optlen
-    // ranges, so decode must reject it.
-    test_peer_addr_params_rejects_optlen(153).unwrap();
+fn sctp_peer_addr_params_rejects_exact_length_neighbors() {
+    for optlen in [149, 150, 151, 153, 154, 155, 157] {
+        test_peer_addr_params_rejects_optlen(optlen).unwrap();
+    }
 }
 
 #[test]
@@ -4773,6 +4777,89 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state() {
                 .expect("shutdown failed");
         })
         .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_reusable_dropped_connect_retains_socket_until_connect_cqe() {
+    if std::env::var_os(SCTP_CONNECT_REUSE_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            SCTP_CONNECT_REUSE_TEST,
+            SCTP_CONNECT_REUSE_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    const TEST_NAME: &str =
+        "runtime_sctp_reusable_dropped_connect_retains_socket_until_connect_cqe";
+    let init = SctpInitConfig::diameter_default();
+    let first_listener =
+        match SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init) {
+            Ok(listener) => listener,
+            Err(err) if capability_unavailable(&err) => {
+                eprintln!("skipping {TEST_NAME}: SCTP unsupported ({err})");
+                return;
+            }
+            Err(err) => panic!("failed to bind first SCTP listener for {TEST_NAME}: {err}"),
+        };
+    let mut second_listener =
+        SctpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128, init).unwrap_or_else(
+            |err| panic!("failed to bind second SCTP listener for {TEST_NAME}: {err}"),
+        );
+    let first_addr = first_listener.local_addr();
+    let second_addr = second_listener.local_addr();
+    assert_ne!(first_addr, second_addr);
+
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (first_fd, second_fd) = run_test_output(&mut executor, async move {
+        let mut connector = SctpConnector::new(init);
+        let first_fd = lowest_available_fd();
+        let first = connector
+            .connect(first_addr)
+            .expect("first SCTP connect initialization failed");
+        assert!(
+            raw_fd_is_open(first_fd),
+            "first SCTP connect did not acquire the predicted lowest descriptor",
+        );
+        poll_once_pending(first).await;
+        assert!(
+            raw_fd_is_open(first_fd),
+            "dropped SCTP CONNECT released its socket before the queued target CQE",
+        );
+
+        let second_fd = lowest_available_fd();
+        assert_ne!(
+            second_fd, first_fd,
+            "the still-kernel-visible SCTP CONNECT descriptor became reusable",
+        );
+        let second = connector
+            .connect(second_addr)
+            .expect("second SCTP connect initialization failed");
+        assert!(
+            raw_fd_is_open(second_fd),
+            "second SCTP connect did not acquire the predicted descriptor",
+        );
+        let second = second.await.expect("second SCTP connect failed");
+        assert_eq!(second.as_raw_fd(), second_fd);
+        assert_eq!(second.peer_addr(), second_addr);
+        let client_addr = second.local_addr().expect("SCTP client local_addr failed");
+        let (_server, remote_addr) = timeout(Duration::from_secs(1), second_listener.accept())
+            .await
+            .expect("second SCTP listener accept timed out")
+            .expect("second SCTP listener accept failed");
+        assert_eq!(remote_addr, client_addr);
+        (first_fd, second_fd)
+    });
+
+    assert!(
+        !raw_fd_is_open(first_fd),
+        "cancelled SCTP CONNECT retained its socket after target retirement",
+    );
+    assert!(
+        !raw_fd_is_open(second_fd),
+        "completed SCTP stream did not close exactly once after scope exit",
+    );
+    drop(first_listener);
 }
 
 #[test]

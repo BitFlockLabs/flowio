@@ -63,15 +63,17 @@ use crate::runtime::timer::{Timeout, TimeoutError, timeout, timeout_at};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const DNS_PORT: u16 = 53;
 const DNS_CLASS_IN: u16 = 1;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_AAAA: u16 = 28;
+const DNS_A_RDATA_LEN: usize = 4;
+const DNS_AAAA_RDATA_LEN: usize = 16;
 const DNS_FLAG_QR: u16 = 0x8000;
+const DNS_FLAG_RD: u16 = 0x0100;
 const DNS_FLAG_TC: u16 = 0x0200;
 const DNS_OPCODE_MASK: u16 = 0x7800;
 const DNS_RCODE_MASK: u16 = 0x000F;
@@ -102,11 +104,10 @@ const MAX_CNAME_HOPS_PER_RESPONSE: usize = 16;
 const MAX_CNAME_FOLLOWUP_QUERIES: usize = 1;
 const MAX_CNAME_TOTAL_HOPS: usize = 16;
 const MAX_NAME_COMPRESSION_DEPTH: usize = 8;
+const DNS_QUERY_ID_MAX_ATTEMPTS: usize = 4;
 pub(crate) const DNS_UDP_RESPONSE_BUFFER_SIZE: usize = 2048;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const HOSTS_PATH: &str = "/etc/hosts";
-
-static QUERY_ID_STATE: AtomicU64 = AtomicU64::new(0);
 
 enum QueryAttemptError {
     Io(io::Error),
@@ -128,6 +129,13 @@ impl std::error::Error for TotalQueryTimeout {}
 
 fn total_query_timeout_error() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, TotalQueryTimeout)
+}
+
+fn total_cname_hop_limit_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "DNS resolution exceeded maximum total CNAME hop count",
+    )
 }
 
 #[cfg(test)]
@@ -218,6 +226,9 @@ struct DnsQueryDeadline {
 #[cfg(test)]
 type DnsQueryHook =
     fn(SocketAddr, &[u8], u16) -> Option<Result<(Vec<u8>, usize), QueryAttemptError>>;
+
+#[cfg(test)]
+type DnsQueryIdSource = fn() -> io::Result<u16>;
 
 impl DnsQueryDeadline {
     fn new(timeout: Duration, clock: DnsDeadlineClock) -> Self {
@@ -349,6 +360,9 @@ pub struct DnsResolver {
     /// Deterministic attempt replacement used only by in-module tests.
     #[cfg(test)]
     query_hook: Option<DnsQueryHook>,
+    /// Deterministic transaction-ID source used only by in-module tests.
+    #[cfg(test)]
+    query_id_source: Option<DnsQueryIdSource>,
 }
 
 impl DnsResolver {
@@ -429,6 +443,8 @@ impl DnsResolver {
             deadline_clock: DnsDeadlineClock::default(),
             #[cfg(test)]
             query_hook: None,
+            #[cfg(test)]
+            query_id_source: None,
         }
     }
 
@@ -594,6 +610,12 @@ impl DnsResolver {
     /// over-limit condition returns `InvalidData`; results are never
     /// truncated. Invalid hosts lines still count toward the raw file-size
     /// limit.
+    ///
+    /// After local resolution misses, upstream DNS requires exact two-byte
+    /// nonblocking kernel randomness for both A and AAAA transaction IDs before
+    /// opening a DNS socket. Numeric zero is valid. A short return or an error
+    /// after at most three `EINTR` retries fails the logical lookup without
+    /// nameserver or sibling-family failover.
     pub async fn resolve_host(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.resolve_host_with_hosts_path(HOSTS_PATH, host, port)
             .await
@@ -619,10 +641,9 @@ impl DnsResolver {
         let deadline = DnsQueryDeadline::new(self.total_query_timeout, self.deadline_clock);
         let mut current = host.to_owned();
         let mut cname_followup_queries = 0usize;
-        let mut total_cname_hops = 0usize;
+        let mut remaining_cname_hops = MAX_CNAME_TOTAL_HOPS;
         let mut query_storage = DnsQueryStorage::new();
         loop {
-            let remaining_cname_hops = MAX_CNAME_TOTAL_HOPS - total_cname_hops;
             match self
                 .gather_dns_addresses(
                     &current,
@@ -636,7 +657,11 @@ impl DnsResolver {
             {
                 ResolveHostStep::Resolved => return Ok(addrs),
                 ResolveHostStep::FollowCname { next, cname_hops } => {
-                    total_cname_hops += cname_hops;
+                    // A zero budget still permits this A/AAAA query and a direct
+                    // answer; only a selected CNAME continuation consumes hops.
+                    remaining_cname_hops = remaining_cname_hops
+                        .checked_sub(cname_hops)
+                        .ok_or_else(total_cname_hop_limit_error)?;
                     if cname_followup_queries == MAX_CNAME_FOLLOWUP_QUERIES {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -654,11 +679,11 @@ impl DnsResolver {
         &self,
         host: &str,
         qtype: u16,
+        query_id: u16,
         remaining_cname_hops: usize,
         query_storage: &mut DnsQueryStorage,
         deadline: DnsQueryDeadline,
     ) -> Result<LookupResult, DnsLookupError> {
-        let query_id = next_query_id();
         patch_query_packet(&mut query_storage.packet, query_id, qtype)
             .map_err(DnsLookupError::classify)?;
         let mut last_err = None;
@@ -683,10 +708,7 @@ impl DnsResolver {
                             return Ok(result);
                         }
                         Ok(_) => {
-                            return Err(DnsLookupError::Recoverable(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "DNS resolution exceeded maximum total CNAME hop count",
-                            )));
+                            return Err(DnsLookupError::Recoverable(total_cname_hop_limit_error()));
                         }
                         Err(err) => last_err = Some(err),
                     }
@@ -808,10 +830,16 @@ impl DnsResolver {
         deadline: DnsQueryDeadline,
     ) -> io::Result<ResolveHostStep> {
         encode_query_packet(&mut query_storage.packet, current)?;
+        // Claim both family IDs before the first socket operation. A failure
+        // is terminal for the logical lookup and cannot be hidden by an A
+        // result or trigger nameserver/family failover.
+        let a_query_id = self.next_query_id()?;
+        let aaaa_query_id = self.next_query_id()?;
         let a = match self
             .lookup_name(
                 current,
                 DNS_TYPE_A,
+                a_query_id,
                 remaining_cname_hops,
                 query_storage,
                 deadline,
@@ -826,12 +854,22 @@ impl DnsResolver {
             .lookup_name(
                 current,
                 DNS_TYPE_AAAA,
+                aaaa_query_id,
                 remaining_cname_hops,
                 query_storage,
                 deadline,
             )
             .await;
         finish_dns_family_lookups(current, port, addrs, a, aaaa)
+    }
+
+    fn next_query_id(&self) -> io::Result<u16> {
+        #[cfg(test)]
+        if let Some(source) = self.query_id_source {
+            return source();
+        }
+
+        random_query_id()
     }
 }
 
@@ -980,90 +1018,36 @@ enum DnsRecordSection {
     Additional,
 }
 
-fn next_query_id() -> u16 {
-    os_random_query_id().unwrap_or_else(fallback_query_id)
+fn random_query_id() -> io::Result<u16> {
+    random_query_id_with(|bytes| {
+        let result =
+            unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), libc::GRND_NONBLOCK) };
+        if result >= 0 {
+            return Ok(result as usize);
+        }
+        Err(io::Error::last_os_error())
+    })
 }
 
-fn os_random_query_id() -> Option<u16> {
+fn random_query_id_with(
+    mut read: impl FnMut(&mut [u8; 2]) -> io::Result<usize>,
+) -> io::Result<u16> {
     let mut bytes = [0u8; 2];
-    let mut filled = 0usize;
-    while filled < bytes.len() {
-        let remaining = bytes.len() - filled;
-        let result = unsafe {
-            libc::getrandom(
-                bytes[filled..].as_mut_ptr().cast(),
-                remaining,
-                libc::GRND_NONBLOCK,
-            )
-        };
-        if result > 0 {
-            filled += result as usize;
-            continue;
-        }
-        if result == 0 {
-            return None;
-        }
-
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return None;
-    }
-
-    Some(u16::from_ne_bytes(bytes))
-}
-
-fn fallback_query_id() -> u16 {
-    let seed = fallback_query_seed();
-    let mut current = QUERY_ID_STATE.load(Ordering::Relaxed);
-
+    let mut attempts = 0usize;
     loop {
-        let next = next_fallback_query_state(current, seed);
-        match QUERY_ID_STATE.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return query_id_from_state(next),
-            Err(observed) => current = observed,
+        attempts += 1;
+        match read(&mut bytes) {
+            Ok(2) => return Ok(u16::from_ne_bytes(bytes)),
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Err(err)
+                if err.kind() == io::ErrorKind::Interrupted
+                    && attempts < DNS_QUERY_ID_MAX_ATTEMPTS =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err),
         }
     }
-}
-
-fn fallback_query_seed() -> u64 {
-    // Best-effort fallback when nonblocking OS randomness is unavailable. This
-    // mixer avoids a sequential process-wide counter but is not a cryptographic
-    // random-number generator.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0);
-    let pid = std::process::id() as u64;
-    let state_addr = (&QUERY_ID_STATE as *const AtomicU64 as usize) as u64;
-    mix_query_id_state(nanos ^ pid.rotate_left(17) ^ state_addr.rotate_left(31))
-}
-
-fn next_fallback_query_state(current: u64, seed: u64) -> u64 {
-    let base = if current == 0 {
-        seed
-    } else {
-        current.wrapping_add(0x9E37_79B9_7F4A_7C15)
-    };
-    let mixed = mix_query_id_state(base);
-    if mixed == 0 { 1 } else { mixed }
-}
-
-fn mix_query_id_state(mut value: u64) -> u64 {
-    value ^= value >> 12;
-    value ^= value << 25;
-    value ^= value >> 27;
-    value.wrapping_mul(0x2545_F491_4F6C_DD1D)
-}
-
-fn query_id_from_state(state: u64) -> u16 {
-    (state as u16) ^ ((state >> 16) as u16) ^ ((state >> 32) as u16) ^ ((state >> 48) as u16)
 }
 
 fn new_dns_response_buffer() -> Vec<u8> {
@@ -1540,13 +1524,13 @@ fn push_unique_socket_addr(addrs: &mut Vec<SocketAddr>, addr: SocketAddr) {
 }
 
 fn encode_query_packet(packet: &mut Vec<u8>, host: &str) -> io::Result<()> {
-    debug_assert!(validate_query_name(host).is_ok());
+    validate_query_name(host)?;
     packet.clear();
     let mut header = [0u8; DNS_HEADER_LEN];
     {
         let mut cursor = BufferCursorMut::new(&mut header);
         cursor.put_u16_be(0).map_err(byte_range_eof)?;
-        cursor.put_u16_be(0x0100).map_err(byte_range_eof)?;
+        cursor.put_u16_be(DNS_FLAG_RD).map_err(byte_range_eof)?;
         cursor.put_u16_be(1).map_err(byte_range_eof)?;
         cursor.put_u16_be(0).map_err(byte_range_eof)?;
         cursor.put_u16_be(0).map_err(byte_range_eof)?;
@@ -1811,21 +1795,21 @@ fn parse_response_records(
                 walk_dns_name(packet, owner_offset, 0).map_err(DnsNameWalkError::into_io_error)?;
             offset = checked_add(offset, consumed, packet.len())?;
             let rr = parse_rr_header(packet, offset)?;
-            offset = rr.data_offset + rr.rdlength as usize;
+            offset = rr.data_end;
             let contributes = retain_resolution_data
                 && section == DnsRecordSection::Answer
                 && rr.class == DNS_CLASS_IN;
 
             match rr.rr_type {
                 DNS_TYPE_A => {
-                    if rr.rdlength != 4 {
+                    if usize::from(rr.rdlength) != DNS_A_RDATA_LEN {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "DNS A RDATA length was not 4 bytes",
                         ));
                     }
                     if contributes {
-                        let data = &packet[rr.data_offset..rr.data_offset + 4];
+                        let data = &packet[rr.data_offset..rr.data_end];
                         let owner = materialize_walked_dns_name(
                             packet,
                             owner_offset,
@@ -1839,15 +1823,15 @@ fn parse_response_records(
                     }
                 }
                 DNS_TYPE_AAAA => {
-                    if rr.rdlength != 16 {
+                    if usize::from(rr.rdlength) != DNS_AAAA_RDATA_LEN {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "DNS AAAA RDATA length was not 16 bytes",
                         ));
                     }
                     if contributes {
-                        let mut octets = [0u8; 16];
-                        octets.copy_from_slice(&packet[rr.data_offset..rr.data_offset + 16]);
+                        let mut octets = [0u8; DNS_AAAA_RDATA_LEN];
+                        octets.copy_from_slice(&packet[rr.data_offset..rr.data_end]);
                         let owner = materialize_walked_dns_name(
                             packet,
                             owner_offset,
@@ -1903,6 +1887,8 @@ struct RrHeader {
     rdlength: u16,
     /// Offset of the RDATA payload inside the full DNS packet.
     data_offset: usize,
+    /// Checked exclusive endpoint of the RDATA payload inside the packet.
+    data_end: usize,
 }
 
 fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
@@ -1913,13 +1899,14 @@ fn parse_rr_header(packet: &[u8], offset: usize) -> io::Result<RrHeader> {
     let class = read_u16_be_at(packet, class_offset).map_err(byte_range_eof)?;
     let rdlength = read_u16_be_at(packet, rdlength_offset).map_err(byte_range_eof)?;
     let data_offset = end;
-    checked_add(data_offset, rdlength as usize, packet.len())?;
+    let data_end = checked_add(data_offset, usize::from(rdlength), packet.len())?;
 
     Ok(RrHeader {
         rr_type,
         class,
         rdlength,
         data_offset,
+        data_end,
     })
 }
 
@@ -2246,10 +2233,12 @@ pub(crate) mod test_support {
         super::validate_query_name(host)?;
         let mut query_storage = super::DnsQueryStorage::new();
         super::encode_query_packet(&mut query_storage.packet, host)?;
+        let query_id = resolver.next_query_id()?;
         resolver
             .lookup_name(
                 host,
                 super::DNS_TYPE_A,
+                query_id,
                 super::MAX_CNAME_TOTAL_HOPS,
                 &mut query_storage,
                 super::DnsQueryDeadline::new(resolver.total_query_timeout, resolver.deadline_clock),
@@ -2344,7 +2333,6 @@ mod tests {
     use crate::runtime::executor::Executor;
     #[cfg(not(miri))]
     use std::cell::RefCell;
-    #[cfg(not(miri))]
     use std::collections::VecDeque;
     #[cfg(not(miri))]
     use std::net::UdpSocket as StdUdpSocket;
@@ -2375,11 +2363,20 @@ mod tests {
     }
 
     #[cfg(not(miri))]
+    enum ScriptedQueryId {
+        Id(u16),
+        Error(i32),
+    }
+
+    #[cfg(not(miri))]
     thread_local! {
         static DEADLINE_CLOCK_SCRIPT: RefCell<Option<DeadlineClockScript>> = const {
             RefCell::new(None)
         };
         static DNS_QUERY_SCRIPT: RefCell<Option<VecDeque<ScriptedQueryStep>>> = const {
+            RefCell::new(None)
+        };
+        static DNS_QUERY_ID_SCRIPT: RefCell<Option<VecDeque<ScriptedQueryId>>> = const {
             RefCell::new(None)
         };
     }
@@ -2486,6 +2483,27 @@ mod tests {
     }
 
     #[cfg(not(miri))]
+    fn scripted_query_id_source() -> io::Result<u16> {
+        DNS_QUERY_ID_SCRIPT.with(|script| {
+            match script
+                .borrow_mut()
+                .as_mut()
+                .expect("DNS query-ID source was called without a script")
+                .pop_front()
+                .expect("DNS query-ID source consumed more steps than expected")
+            {
+                ScriptedQueryId::Id(id) => Ok(id),
+                ScriptedQueryId::Error(errno) => Err(io::Error::from_raw_os_error(errno)),
+            }
+        })
+    }
+
+    #[cfg(not(miri))]
+    fn panic_query_id_source() -> io::Result<u16> {
+        panic!("local resolver path requested a DNS query ID")
+    }
+
+    #[cfg(not(miri))]
     struct DeadlineClockGuard;
 
     #[cfg(not(miri))]
@@ -2522,6 +2540,9 @@ mod tests {
     struct QueryScriptGuard;
 
     #[cfg(not(miri))]
+    struct QueryIdScriptGuard;
+
+    #[cfg(not(miri))]
     impl QueryScriptGuard {
         fn install(steps: Vec<ScriptedQueryStep>) -> Self {
             DNS_QUERY_SCRIPT.with(|script| {
@@ -2545,6 +2566,38 @@ mod tests {
     impl Drop for QueryScriptGuard {
         fn drop(&mut self) {
             DNS_QUERY_SCRIPT.with(|script| {
+                *script.borrow_mut() = None;
+            });
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl QueryIdScriptGuard {
+        fn install(steps: Vec<ScriptedQueryId>) -> Self {
+            DNS_QUERY_ID_SCRIPT.with(|script| {
+                let mut script = script.borrow_mut();
+                assert!(script.is_none(), "DNS query-ID script was already active");
+                *script = Some(steps.into());
+            });
+            Self
+        }
+
+        fn assert_remaining(&self, expected: usize) {
+            DNS_QUERY_ID_SCRIPT.with(|script| {
+                let script = script.borrow();
+                let remaining = script
+                    .as_ref()
+                    .expect("DNS query-ID script disappeared")
+                    .len();
+                assert_eq!(remaining, expected, "DNS query-ID script length drifted");
+            });
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for QueryIdScriptGuard {
+        fn drop(&mut self) {
+            DNS_QUERY_ID_SCRIPT.with(|script| {
                 *script.borrow_mut() = None;
             });
         }
@@ -2581,6 +2634,19 @@ mod tests {
         resolver: DnsResolver,
         host: &'static str,
     ) -> io::Result<Vec<SocketAddr>> {
+        run_resolution_with_hosts_path(
+            resolver,
+            "/flowio-test-hosts-file-does-not-exist".to_owned(),
+            host.to_owned(),
+        )
+    }
+
+    #[cfg(not(miri))]
+    fn run_resolution_with_hosts_path(
+        resolver: DnsResolver,
+        hosts_path: String,
+        host: String,
+    ) -> io::Result<Vec<SocketAddr>> {
         let mut executor = Executor::new().expect("test executor construction failed");
         let result = Rc::new(RefCell::new(None));
         let task_result = Rc::clone(&result);
@@ -2588,11 +2654,7 @@ mod tests {
             .run(async move {
                 task_result.replace(Some(
                     resolver
-                        .resolve_host_with_hosts_path(
-                            "/flowio-test-hosts-file-does-not-exist",
-                            host,
-                            5432,
-                        )
+                        .resolve_host_with_hosts_path(&hosts_path, &host, 5432)
                         .await,
                 ));
             })
@@ -2721,7 +2783,6 @@ mod tests {
     }
 
     fn test_query_packet(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
-        validate_query_name(host)?;
         let mut query_storage = DnsQueryStorage::new();
         encode_query_packet(&mut query_storage.packet, host)?;
         patch_query_packet(&mut query_storage.packet, query_id, qtype)?;
@@ -3296,32 +3357,217 @@ nameserver 192.0.2.9\n",
         clock.assert_exhausted();
     }
 
+    fn run_query_id_script(steps: Vec<Result<([u8; 2], usize), i32>>) -> (io::Result<u16>, usize) {
+        let mut steps: VecDeque<_> = steps.into();
+        let result = random_query_id_with(|bytes| {
+            match steps
+                .pop_front()
+                .expect("query-ID helper consumed more scripted calls than expected")
+            {
+                Ok((value, len)) => {
+                    *bytes = value;
+                    Ok(len)
+                }
+                Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+            }
+        });
+        (result, steps.len())
+    }
+
     #[test]
-    fn fallback_query_id_mixer_is_not_sequential_counter() {
-        let seed = 0x1234_5678_9ABC_DEF0;
-        let mut state = 0u64;
-        let mut ids = [0u16; 4];
-        for id in &mut ids {
-            state = next_fallback_query_state(state, seed);
-            *id = query_id_from_state(state);
+    fn query_id_randomness_accepts_exact_bytes_including_zero() {
+        let (id, remaining) = run_query_id_script(vec![Ok(([0x12, 0x34], 2))]);
+        assert_eq!(
+            id.expect("exact randomness should succeed"),
+            u16::from_ne_bytes([0x12, 0x34])
+        );
+        assert_eq!(remaining, 0);
+
+        let (id, remaining) = run_query_id_script(vec![Ok(([0, 0], 2))]);
+        assert_eq!(id.expect("numeric query ID zero should remain valid"), 0);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn query_id_randomness_rejects_short_reads_and_os_errors_without_fallback() {
+        for len in [0, 1] {
+            let (result, remaining) =
+                run_query_id_script(vec![Ok(([0x12, 0x34], len)), Ok(([0x56, 0x78], 2))]);
+            let err = result.expect_err("short randomness should fail terminally");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "length {len}");
+            assert_eq!(err.to_string(), "unexpected end of file", "length {len}");
+            assert_eq!(remaining, 1, "short reads must not be accumulated");
         }
 
-        assert_ne!(ids, [1, 2, 3, 4]);
-        assert!(
-            ids.windows(2)
-                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
-            "fallback query IDs should not retain sequential AtomicU16 behavior"
+        for errno in [libc::EAGAIN, libc::ENOSYS] {
+            let (result, remaining) = run_query_id_script(vec![Err(errno), Ok(([1, 2], 2))]);
+            assert_eq!(
+                result
+                    .expect_err("OS randomness error should propagate")
+                    .raw_os_error(),
+                Some(errno)
+            );
+            assert_eq!(remaining, 1, "non-EINTR error must not retry");
+        }
+    }
+
+    #[test]
+    fn query_id_randomness_allows_only_three_eintr_retries() {
+        for interrupts in [1, 3] {
+            let mut steps = (0..interrupts)
+                .map(|_| Err(libc::EINTR))
+                .collect::<Vec<_>>();
+            steps.push(Ok(([0xAA, 0x55], 2)));
+            let (id, remaining) = run_query_id_script(steps);
+            assert_eq!(
+                id.expect("in-budget EINTR retry should succeed"),
+                u16::from_ne_bytes([0xAA, 0x55])
+            );
+            assert_eq!(remaining, 0);
+        }
+
+        let (result, remaining) = run_query_id_script(vec![
+            Err(libc::EINTR),
+            Err(libc::EINTR),
+            Err(libc::EINTR),
+            Err(libc::EINTR),
+            Ok(([0xAA, 0x55], 2)),
+        ]);
+        assert_eq!(
+            result
+                .expect_err("fourth EINTR should exhaust the fixed budget")
+                .raw_os_error(),
+            Some(libc::EINTR)
+        );
+        assert_eq!(remaining, 1, "a fifth randomness call is forbidden");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn query_id_failures_prevent_every_dns_family_and_nameserver_attempt() {
+        fn run_failure_case(
+            steps: Vec<ScriptedQueryId>,
+            expected_errno: i32,
+            expected_remaining_ids: usize,
+        ) {
+            let first = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+            let second = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 54), DNS_PORT));
+            let clock =
+                DeadlineClockGuard::install(vec![(DnsDeadlineCheckpoint::Start, Duration::ZERO)]);
+            let queries = QueryScriptGuard::install(Vec::new());
+            let ids = QueryIdScriptGuard::install(steps);
+            let mut resolver = resolver_with_scripted_queries(vec![first, second]);
+            resolver.query_id_source = Some(scripted_query_id_source);
+
+            let err = run_scripted_resolution(resolver, "randomness.flowio.invalid")
+                .expect_err("query-ID failure should terminate the lookup");
+            assert_eq!(err.raw_os_error(), Some(expected_errno));
+            ids.assert_remaining(expected_remaining_ids);
+            queries.assert_exhausted();
+            clock.assert_exhausted();
+        }
+
+        // The first failure must not consume the second family ID or reach any
+        // nameserver.
+        run_failure_case(
+            vec![ScriptedQueryId::Error(libc::EAGAIN), ScriptedQueryId::Id(7)],
+            libc::EAGAIN,
+            1,
+        );
+        // Both IDs are preflighted before A work, so a second-family source
+        // failure cannot be hidden by a completed A address.
+        run_failure_case(
+            vec![ScriptedQueryId::Id(7), ScriptedQueryId::Error(libc::ENOSYS)],
+            libc::ENOSYS,
+            0,
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn local_and_invalid_names_never_request_dns_query_randomness() {
+        fn resolver() -> DnsResolver {
+            let mut resolver = DnsResolver::new(vec![SocketAddr::from((
+                Ipv4Addr::new(192, 0, 2, 53),
+                DNS_PORT,
+            ))])
+            .expect("test resolver construction failed");
+            resolver.query_id_source = Some(panic_query_id_source);
+            resolver
+        }
+
+        let literal = run_scripted_resolution(resolver(), "192.0.2.44")
+            .expect("literal address should bypass query IDs");
+        assert_eq!(
+            literal,
+            [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 5432))]
+        );
+
+        let localhost = run_scripted_resolution(resolver(), "localhost")
+            .expect("localhost should bypass query IDs");
+        assert_eq!(
+            localhost,
+            [
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 5432)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 5432)),
+            ]
+        );
+
+        let invalid = run_scripted_resolution(resolver(), "invalid..name")
+            .expect_err("invalid name should fail before query IDs");
+        assert_eq!(invalid.kind(), io::ErrorKind::InvalidInput);
+
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock should follow the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "flowio-slice314-hosts-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"192.0.2.55 local-id.flowio.invalid\n")
+            .expect("hosts fixture write failed");
+        let _remove = RemoveFile(path.clone());
+        let local = run_resolution_with_hosts_path(
+            resolver(),
+            path.to_string_lossy().into_owned(),
+            "local-id.flowio.invalid".to_owned(),
+        )
+        .expect("hosts-file result should bypass query IDs");
+        assert_eq!(
+            local,
+            [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 55), 5432))]
         );
     }
 
     #[test]
-    fn encoded_query_packet_carries_selected_query_id() {
-        let packet =
-            test_query_packet(0xBEEF, "db.example.test", DNS_TYPE_A).expect("query encode");
+    fn encoded_query_packet_carries_exact_utf8_labels_header_and_question() {
+        let packet = test_query_packet(0xBEEF, "é.test", DNS_TYPE_A).expect("query encode");
         assert_eq!(
-            read_u16_be_at(&packet, 0).expect("encoded query ID should fit"),
-            0xBEEF
+            packet,
+            [
+                0xBE, 0xEF, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC3,
+                0xA9, 0x04, b't', b'e', b's', b't', 0x00, 0x00, 0x01, 0x00, 0x01,
+            ]
         );
+    }
+
+    #[test]
+    fn invalid_query_name_fails_before_mutating_reusable_packet() {
+        let original = vec![0xA5, 0x5A, 0xC3];
+        let mut packet = original.clone();
+        let err = encode_query_packet(&mut packet, "invalid..example")
+            .expect_err("empty label should fail at the encoder boundary");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "host name contained an empty DNS label");
+        assert_eq!(packet, original);
     }
 
     #[test]
@@ -3775,6 +4021,62 @@ nameserver 192.0.2.9\n",
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn rr_header_carries_checked_rdata_end_at_packet_boundaries() {
+        fn rr_packet(packet_len: usize, offset: usize, rr_type: u16, rdlength: u16) -> Vec<u8> {
+            let mut packet = vec![0u8; packet_len];
+            packet[offset..offset + 2].copy_from_slice(&rr_type.to_be_bytes());
+            packet[offset + 2..offset + 4].copy_from_slice(&DNS_CLASS_IN.to_be_bytes());
+            packet[offset + 8..offset + 10].copy_from_slice(&rdlength.to_be_bytes());
+            packet
+        }
+
+        let cases = [
+            ("zero unknown RDATA", 65_000, 0usize),
+            ("exact A RDATA", DNS_TYPE_A, DNS_A_RDATA_LEN),
+            ("exact AAAA RDATA", DNS_TYPE_AAAA, DNS_AAAA_RDATA_LEN),
+            ("opaque unknown RDATA", 65_000, 3usize),
+        ];
+        for (label, rr_type, rdata_len) in cases {
+            let offset = DNS_UDP_RESPONSE_BUFFER_SIZE - DNS_RR_FIXED_FIELDS_LEN - rdata_len;
+            let packet = rr_packet(
+                DNS_UDP_RESPONSE_BUFFER_SIZE,
+                offset,
+                rr_type,
+                u16::try_from(rdata_len).expect("test RDATA length should fit"),
+            );
+            let rr = parse_rr_header(&packet, offset)
+                .unwrap_or_else(|err| panic!("{label} failed: {err}"));
+            assert_eq!(rr.rr_type, rr_type, "{label}");
+            assert_eq!(rr.class, DNS_CLASS_IN, "{label}");
+            assert_eq!(usize::from(rr.rdlength), rdata_len, "{label}");
+            assert_eq!(rr.data_offset, offset + DNS_RR_FIXED_FIELDS_LEN, "{label}",);
+            assert_eq!(rr.data_end, DNS_UDP_RESPONSE_BUFFER_SIZE, "{label}");
+        }
+
+        let a_offset = DNS_UDP_RESPONSE_BUFFER_SIZE - DNS_RR_FIXED_FIELDS_LEN - DNS_A_RDATA_LEN;
+        let one_byte_short = rr_packet(
+            DNS_UDP_RESPONSE_BUFFER_SIZE - 1,
+            a_offset,
+            DNS_TYPE_A,
+            u16::try_from(DNS_A_RDATA_LEN).expect("A RDATA length should fit"),
+        );
+        let err = match parse_rr_header(&one_byte_short, a_offset) {
+            Ok(_) => panic!("one-byte-short RDATA passed its checked endpoint"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "DNS packet ended unexpectedly");
+
+        let maximum_declared = rr_packet(DNS_RR_FIXED_FIELDS_LEN, 0, 65_000, u16::MAX);
+        let err = match parse_rr_header(&maximum_declared, 0) {
+            Ok(_) => panic!("maximum declared RDATA extended past the packet"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "DNS packet ended unexpectedly");
     }
 
     #[test]

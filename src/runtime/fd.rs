@@ -16,9 +16,13 @@ use crate::runtime::executor::{
     note_close_direct, note_close_linger_classification_failure, note_close_linger_query,
     note_close_linger_waiver, try_admit_close, try_submit_close,
 };
+use crate::runtime::op::CompletionState;
 use std::cell::Cell;
 use std::io;
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::ptr::NonNull;
 use std::rc::Rc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -30,6 +34,16 @@ const DISTINCTIVE_TEST_FD_STRIDE: RawFd = 8;
 #[cfg(any(test, feature = "test-support"))]
 static NEXT_DISTINCTIVE_TEST_FD_BASE: AtomicI32 = AtomicI32::new(DISTINCTIVE_TEST_FD_START);
 
+#[cfg(test)]
+thread_local! {
+    static FINAL_CORE_DROP_HOOK: Cell<Option<fn(RawFd)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_final_core_drop_hook_for_test(hook: Option<fn(RawFd)>) {
+    FINAL_CORE_DROP_HOOK.with(|slot| slot.set(hook));
+}
+
 /// Last trustworthy knowledge about a runtime socket's linger state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LingerProvenance {
@@ -40,23 +54,114 @@ pub(crate) enum LingerProvenance {
     Uncertain,
 }
 
-/// Thin owner for a descriptor managed by the runtime.
-pub(crate) struct RuntimeFd {
+/// Sole descriptor owner shared by owner-thread handles and in-flight leases.
+pub(crate) struct RuntimeFdCore {
     /// Raw descriptor value, or `INVALID` after ownership has been moved out.
     fd: RawFd,
     /// Owner-thread monotonic uncertainty bit updated through shared access.
     linger_uncertain: Cell<bool>,
 }
 
-impl RuntimeFd {
+impl RuntimeFdCore {
     const INVALID: RawFd = -1;
 
     #[inline(always)]
-    pub(crate) const fn from_fresh_raw_fd(fd: RawFd) -> Self {
+    fn new(fd: RawFd, provenance: LingerProvenance) -> Self {
         Self {
             fd,
-            linger_uncertain: Cell::new(false),
+            linger_uncertain: Cell::new(provenance == LingerProvenance::Uncertain),
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    #[inline(always)]
+    fn mark_linger_uncertain(&self) {
+        self.linger_uncertain.set(true);
+    }
+
+    #[inline(always)]
+    fn linger_provenance(&self) -> LingerProvenance {
+        if self.linger_uncertain.get() {
+            LingerProvenance::Uncertain
+        } else {
+            LingerProvenance::KnownNonPositive
+        }
+    }
+
+    /// Moves the raw descriptor and its provenance out, leaving this core
+    /// empty so its ordinary destructor becomes a no-op.
+    #[inline(always)]
+    fn take_for_drop(&mut self) -> (RawFd, LingerProvenance) {
+        let fd = self.fd;
+        self.fd = Self::INVALID;
+        (fd, self.linger_provenance())
+    }
+
+    /// Closes this sole core without immediately submitting to the active
+    /// ring. This is reserved for a final listener lease released while a
+    /// completion view still borrows that ring.
+    fn close_without_ring(mut self) {
+        self.close_taken(false);
+    }
+
+    fn close_taken(&mut self, allow_ring: bool) {
+        let (fd, provenance) = self.take_for_drop();
+        if fd == Self::INVALID {
+            return;
+        }
+        #[cfg(test)]
+        FINAL_CORE_DROP_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook(fd);
+            }
+        });
+        if fd < 0 {
+            return;
+        }
+
+        // SAFETY: `take_for_drop` moved this core's sole valid descriptor
+        // ownership into the temporary owner.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        if !has_active_close_context() {
+            drop(owned);
+            return;
+        }
+
+        close_owned_in_active_context(owned, provenance, allow_ring);
+    }
+}
+
+impl Drop for RuntimeFdCore {
+    fn drop(&mut self) {
+        self.close_taken(true);
+    }
+}
+
+/// One-word, four-byte-aligned owner-thread handle for a descriptor core.
+///
+/// `core` is the pointer returned by `Rc::into_raw` and therefore owns exactly
+/// one non-atomic strong count. The packed alignment preserves the established
+/// x86-64 public handle layout. Every access copies the pointer with an
+/// unaligned raw read; code must never form a reference to the packed field.
+/// Allocation failure follows `Rc::new` and the process global allocation-error
+/// handler.
+#[repr(C, packed(4))]
+pub(crate) struct RuntimeFd {
+    core: NonNull<RuntimeFdCore>,
+    _owner_thread_only: PhantomData<Rc<()>>,
+}
+
+impl RuntimeFd {
+    pub(crate) const INVALID: RawFd = RuntimeFdCore::INVALID;
+
+    #[inline(always)]
+    pub(crate) fn from_fresh_raw_fd(fd: RawFd) -> Self {
+        Self::from_raw_fd_with_provenance(fd, LingerProvenance::KnownNonPositive)
     }
 
     #[inline(always)]
@@ -71,15 +176,39 @@ impl RuntimeFd {
 
     #[inline(always)]
     pub(crate) fn from_owned_with_provenance(fd: OwnedFd, provenance: LingerProvenance) -> Self {
+        Self::from_raw_fd_with_provenance(fd.into_raw_fd(), provenance)
+    }
+
+    #[inline(always)]
+    fn from_raw_fd_with_provenance(fd: RawFd, provenance: LingerProvenance) -> Self {
+        let core = Rc::new(RuntimeFdCore::new(fd, provenance));
+        // SAFETY: `Rc::into_raw` never returns null.
+        let core = unsafe { NonNull::new_unchecked(Rc::into_raw(core).cast_mut()) };
         Self {
-            fd: fd.into_raw_fd(),
-            linger_uncertain: Cell::new(provenance == LingerProvenance::Uncertain),
+            core,
+            _owner_thread_only: PhantomData,
         }
+    }
+
+    /// Copies the packed pointer without ever borrowing its under-aligned
+    /// field. The returned pointer carries the allocation provenance created by
+    /// `Rc::into_raw` and remains valid while this handle owns its strong count.
+    #[inline(always)]
+    fn core_ptr(&self) -> NonNull<RuntimeFdCore> {
+        // SAFETY: `addr_of!` does not create a packed-field reference, and the
+        // field is initialized for the full lifetime of `self`.
+        unsafe { std::ptr::addr_of!(self.core).read_unaligned() }
+    }
+
+    #[inline(always)]
+    fn core(&self) -> &RuntimeFdCore {
+        // SAFETY: this handle owns one live strong count for `core_ptr()`.
+        unsafe { self.core_ptr().as_ref() }
     }
 
     #[inline(always)]
     pub(crate) fn raw_fd(&self) -> RawFd {
-        self.fd
+        self.runtime_ref().raw_fd()
     }
 
     /// Returns the public raw descriptor and permanently invalidates the proof
@@ -87,66 +216,425 @@ impl RuntimeFd {
     #[inline(always)]
     pub(crate) fn expose_raw_fd(&self) -> RawFd {
         self.mark_linger_uncertain();
-        self.fd
+        self.raw_fd()
     }
 
     #[inline(always)]
     pub(crate) fn mark_linger_uncertain(&self) {
-        self.linger_uncertain.set(true);
+        self.core().mark_linger_uncertain();
     }
 
     #[inline(always)]
     pub(crate) fn linger_provenance(&self) -> LingerProvenance {
-        if self.linger_uncertain.get() {
-            LingerProvenance::Uncertain
-        } else {
-            LingerProvenance::KnownNonPositive
-        }
+        self.core().linger_provenance()
     }
 
-    /// Moves the raw descriptor and its provenance out, leaving this wrapper
-    /// empty.
     #[inline(always)]
-    fn take_for_drop(&mut self) -> (RawFd, LingerProvenance) {
-        let fd = self.fd;
-        self.fd = Self::INVALID;
-        (fd, self.linger_provenance())
+    pub(crate) fn runtime_ref(&self) -> RuntimeFdRef<'_> {
+        RuntimeFdRef {
+            core: self.core_ptr(),
+            _borrow: PhantomData,
+        }
     }
 
-    /// Closes this owner without immediately submitting to the active ring.
-    ///
-    /// Retained listener owners can be released while the reactor still holds
-    /// a mutable completion-queue view. Proven nonpositive owners defer until
-    /// that view is gone; overflow or later submission failure closes directly.
-    /// Uncertain positive linger still uses the bounded close worker.
-    fn close_without_ring(mut self) {
-        self.close_taken(false);
+    #[inline(always)]
+    pub(crate) fn op_state(&self) -> RuntimeFdOpState<'_> {
+        self.runtime_ref().into_op_state()
     }
 
-    fn close_taken(&mut self, allow_ring: bool) {
-        let (fd, provenance) = self.take_for_drop();
-        if fd < 0 {
-            return;
+    #[inline(always)]
+    pub(crate) fn lease(&self) -> RuntimeFdLease {
+        self.runtime_ref().lease()
+    }
+
+    #[inline(always)]
+    pub(crate) fn clone_handle(&self) -> Self {
+        let core = self.core_ptr();
+        // SAFETY: `core` is the exact provenance-preserving pointer returned by
+        // `Rc::into_raw`, and this handle keeps its associated strong count live.
+        unsafe { Rc::increment_strong_count(core.as_ptr()) };
+        Self {
+            core,
+            _owner_thread_only: PhantomData,
         }
+    }
 
-        // SAFETY: `take_for_drop` moved this wrapper's sole valid descriptor
-        // ownership into the temporary owner.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn strong_count_for_test(&self) -> usize {
+        let core = self.core_ptr();
+        // SAFETY: temporarily materialize one additional strong owner from the
+        // original `Rc::into_raw` pointer, then drop it before returning.
+        unsafe { Rc::increment_strong_count(core.as_ptr()) };
+        let probe = unsafe { Rc::from_raw(core.as_ptr()) };
+        let count = Rc::strong_count(&probe) - 1;
+        drop(probe);
+        count
+    }
 
-        if !has_active_close_context() {
-            drop(owned);
-            return;
-        }
-
-        close_owned_in_active_context(owned, provenance, allow_ring);
+    #[cfg(all(test, not(miri)))]
+    #[inline(always)]
+    pub(crate) fn weak_for_test(&self) -> std::rc::Weak<RuntimeFdCore> {
+        let core = self.core_ptr();
+        // SAFETY: the temporary owner is paired with `drop` below, leaving this
+        // handle's original raw strong owner unchanged.
+        unsafe { Rc::increment_strong_count(core.as_ptr()) };
+        let probe = unsafe { Rc::from_raw(core.as_ptr()) };
+        let weak = Rc::downgrade(&probe);
+        drop(probe);
+        weak
     }
 }
 
 impl Drop for RuntimeFd {
+    #[inline(always)]
     fn drop(&mut self) {
-        self.close_taken(true);
+        let core = self.core_ptr();
+        // SAFETY: each RuntimeFd owns exactly one raw strong count, created by
+        // construction or `clone_handle`, and Drop consumes it exactly once.
+        drop(unsafe { Rc::from_raw(core.as_ptr()) });
     }
 }
+
+// `Cell<bool>` records only monotonic owner-thread provenance. A panic cannot
+// expose a partially updated multi-field invariant through these wrappers, so
+// preserve the previous handle/future `UnwindSafe` contract. `RefUnwindSafe`
+// deliberately remains absent because shared provenance can change.
+impl std::panic::UnwindSafe for RuntimeFd {}
+
+/// Copy, owner-local borrow of one runtime descriptor core.
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeFdRef<'a> {
+    core: NonNull<RuntimeFdCore>,
+    _borrow: PhantomData<&'a RuntimeFd>,
+}
+
+impl<'a> RuntimeFdRef<'a> {
+    #[inline(always)]
+    pub(crate) fn raw_fd(self) -> RawFd {
+        // SAFETY: the borrowed RuntimeFd keeps one strong owner live for `'a`.
+        unsafe { self.core.as_ref().raw_fd() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn lease(self) -> RuntimeFdLease {
+        // SAFETY: this is the original provenance-preserving `Rc::into_raw`
+        // pointer and the borrowed handle keeps its strong count live.
+        unsafe { Rc::increment_strong_count(self.core.as_ptr()) };
+        RuntimeFdLease::from_core(unsafe { Rc::from_raw(self.core.as_ptr()) })
+    }
+
+    #[inline(always)]
+    pub(crate) fn into_op_state(self) -> RuntimeFdOpState<'a> {
+        RuntimeFdOpState::from_borrowed(self)
+    }
+}
+
+impl std::panic::UnwindSafe for RuntimeFdRef<'_> {}
+
+/// Owned non-atomic strong lease retained through a target CQE.
+#[repr(transparent)]
+pub(crate) struct RuntimeFdLease {
+    core: Rc<RuntimeFdCore>,
+}
+
+impl RuntimeFdLease {
+    #[inline(always)]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.core.raw_fd()
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn linger_provenance(&self) -> LingerProvenance {
+        self.core.linger_provenance()
+    }
+
+    #[inline(always)]
+    pub(crate) fn into_op_state(self) -> RuntimeFdOpState<'static> {
+        RuntimeFdOpState::from_owned(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn into_core(self) -> Rc<RuntimeFdCore> {
+        self.core
+    }
+
+    #[inline(always)]
+    pub(crate) fn from_core(core: Rc<RuntimeFdCore>) -> Self {
+        Self { core }
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    fn strong_count_for_test(&self) -> usize {
+        Rc::strong_count(&self.core)
+    }
+}
+
+impl std::panic::UnwindSafe for RuntimeFdLease {}
+
+/// One-word descriptor-operation state replacing the future's raw state slot.
+///
+/// Before initial submission, an untagged core pointer borrows the parent
+/// descriptor, while tag one owns a staged `Rc::into_raw` lease. After a
+/// successful userspace-SQ push, tags two and three identify a live
+/// [`CompletionState`] submitted from borrowed and owned initial state,
+/// respectively. Retiring a borrowed submission restores its initial
+/// capability so owner-borrowing internal futures can submit a fresh operation;
+/// retiring an owned submission leaves terminal empty state. Thus public
+/// futures retain their established raw-fd field and pointer-word footprint
+/// instead of adding a capability field.
+pub(crate) struct RuntimeFdOpState<'a> {
+    tagged: Option<NonNull<()>>,
+    _borrow: PhantomData<&'a RuntimeFd>,
+}
+
+impl<'a> RuntimeFdOpState<'a> {
+    const TAG_MASK: usize = 0b11;
+    const BORROWED_TAG: usize = 0;
+    const OWNED_TAG: usize = 1;
+    const SUBMITTED_BORROWED_TAG: usize = 2;
+    const SUBMITTED_OWNED_TAG: usize = 3;
+
+    #[inline(always)]
+    fn from_borrowed(fd: RuntimeFdRef<'a>) -> Self {
+        debug_assert_eq!(fd.core.addr().get() & Self::TAG_MASK, 0);
+        Self {
+            tagged: Some(fd.core.cast()),
+            _borrow: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn from_owned(lease: RuntimeFdLease) -> RuntimeFdOpState<'static> {
+        let ptr = unsafe { NonNull::new_unchecked(Rc::into_raw(lease.into_core()).cast_mut()) };
+        debug_assert_eq!(ptr.addr().get() & Self::TAG_MASK, 0);
+        RuntimeFdOpState {
+            tagged: Some(Self::with_tag(ptr.cast(), Self::OWNED_TAG)),
+            _borrow: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        match self.tag() {
+            Some(Self::BORROWED_TAG) | Some(Self::OWNED_TAG) => {
+                // SAFETY: both initial representations point at a live core;
+                // borrowed lifetime or owned raw count keeps it allocated.
+                unsafe { self.untagged_ptr::<RuntimeFdCore>().as_ref().raw_fd() }
+            }
+            Some(Self::SUBMITTED_BORROWED_TAG) | Some(Self::SUBMITTED_OWNED_TAG) => {
+                // SAFETY: successful publication installs a live state pointer
+                // whose typed submission invariant includes one fd lease.
+                unsafe {
+                    self.untagged_ptr::<CompletionState>()
+                        .as_ref()
+                        .fd_lease_raw_fd()
+                }
+            }
+            _ => RuntimeFd::INVALID,
+        }
+    }
+
+    /// Clones a borrowed capability or moves a staged owned capability.
+    ///
+    /// # Safety
+    ///
+    /// This operation state must still contain its initial borrowed or owned
+    /// core representation. It must not be empty or already published.
+    #[inline(always)]
+    pub(crate) unsafe fn take_initial_lease(&mut self) -> RuntimeFdLease {
+        let ptr = self.core_ptr().as_ptr();
+        if self.tag() == Some(Self::OWNED_TAG) {
+            self.tagged = None;
+            // SAFETY: the owned representation was created by exactly one
+            // `Rc::into_raw` and clearing the state transfers that ownership.
+            return RuntimeFdLease::from_core(unsafe { Rc::from_raw(ptr) });
+        }
+
+        debug_assert_eq!(self.tag(), Some(Self::BORROWED_TAG));
+        // SAFETY: the borrowed pointer is the original `Rc::into_raw` pointer,
+        // and the capability lifetime keeps its associated owner live.
+        unsafe { Rc::increment_strong_count(ptr) };
+        // SAFETY: the increment above created exactly one transferable owner.
+        RuntimeFdLease::from_core(unsafe { Rc::from_raw(ptr) })
+    }
+
+    #[inline(always)]
+    fn core_ptr(&self) -> NonNull<RuntimeFdCore> {
+        debug_assert!(
+            matches!(self.tag(), Some(Self::BORROWED_TAG) | Some(Self::OWNED_TAG)),
+            "fd operation state has no initial capability"
+        );
+        self.untagged_ptr()
+    }
+
+    #[inline(always)]
+    pub(crate) fn state_ptr(&self) -> *mut CompletionState {
+        if matches!(
+            self.tag(),
+            Some(Self::SUBMITTED_BORROWED_TAG) | Some(Self::SUBMITTED_OWNED_TAG)
+        ) {
+            self.untagged_ptr::<CompletionState>().as_ptr()
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_null(&self) -> bool {
+        self.state_ptr().is_null()
+    }
+
+    /// Publishes the completion state immediately after a successful SQ push.
+    ///
+    /// # Safety
+    ///
+    /// `state_ptr` must be a live, aligned completion state holding the lease
+    /// just taken from this initial representation. A borrowed initial state
+    /// must still carry its untagged core pointer; an owned initial state must
+    /// be empty because taking its lease moved the raw owner. No fallible or
+    /// panicking work may occur between the successful push and this call.
+    #[inline(always)]
+    pub(crate) unsafe fn publish_submitted_state(&mut self, state_ptr: *mut CompletionState) {
+        let submitted_tag = if self.tag() == Some(Self::BORROWED_TAG) {
+            Self::SUBMITTED_BORROWED_TAG
+        } else {
+            // SAFETY: callers promise that any non-borrowed representation is
+            // the empty state left by moving an owned initial lease.
+            Self::SUBMITTED_OWNED_TAG
+        };
+        // Deliberately no post-push assertion: publication must be infallible.
+        unsafe { self.install_submitted_state(state_ptr, submitted_tag) };
+    }
+
+    #[inline(always)]
+    unsafe fn install_submitted_state(&mut self, state_ptr: *mut CompletionState, tag: usize) {
+        let ptr = unsafe { NonNull::new_unchecked(state_ptr) }.cast();
+        self.tagged = Some(Self::with_tag(ptr, tag));
+    }
+
+    /// Takes a published completion pointer and restores its initial state.
+    ///
+    /// Borrowed submissions recover their provenance-preserving core pointer
+    /// from the still-attached completion lease. Their lifetime guarantees the
+    /// parent handle remains live after that lease is reclaimed. Owned
+    /// submissions become terminal empty state because their sole staged owner
+    /// moved into the completion.
+    #[inline(always)]
+    pub(crate) fn take_state_ptr(&mut self) -> *mut CompletionState {
+        match self.tag() {
+            Some(Self::SUBMITTED_BORROWED_TAG) => {
+                let state_ptr = self.untagged_ptr::<CompletionState>();
+                // SAFETY: the submitted-borrowed tag is installed only after
+                // typed submission attached the matching descriptor lease.
+                // `take_state_ptr` runs before completion-state reclamation.
+                let core = unsafe { state_ptr.as_ref().fd_lease_core_ptr() };
+                self.tagged = Some(core.cast());
+                state_ptr.as_ptr()
+            }
+            Some(Self::SUBMITTED_OWNED_TAG) => {
+                let state_ptr = self.untagged_ptr::<CompletionState>().as_ptr();
+                self.tagged = None;
+                state_ptr
+            }
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    #[inline(always)]
+    fn tag(&self) -> Option<usize> {
+        self.tagged.map(|ptr| ptr.addr().get() & Self::TAG_MASK)
+    }
+
+    #[inline(always)]
+    fn with_tag(ptr: NonNull<()>, tag: usize) -> NonNull<()> {
+        ptr.map_addr(|addr| {
+            // SAFETY: all source pointers have at least four-byte alignment;
+            // replacing only those reserved low bits preserves nonzero.
+            unsafe { NonZeroUsize::new_unchecked((addr.get() & !Self::TAG_MASK) | tag) }
+        })
+    }
+
+    #[inline(always)]
+    fn untagged_ptr<T>(&self) -> NonNull<T> {
+        // SAFETY: callers require a nonempty state and select `T` from its tag.
+        let tagged = unsafe { self.tagged.unwrap_unchecked() };
+        tagged
+            .map_addr(|addr| {
+                // SAFETY: each representation began as an aligned nonzero
+                // allocation pointer; this removes only our low tag bits.
+                unsafe { NonZeroUsize::new_unchecked(addr.get() & !Self::TAG_MASK) }
+            })
+            .cast()
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    fn owns_staged_lease_for_test(&self) -> bool {
+        self.tag() == Some(Self::OWNED_TAG)
+    }
+}
+
+impl Drop for RuntimeFdOpState<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.tag() != Some(Self::OWNED_TAG) {
+            return;
+        }
+        let ptr = self.core_ptr().as_ptr();
+        self.tagged = None;
+        // SAFETY: this tagged representation still owns the one Rc raw owner
+        // created by `from_owned`, and it has not been moved into a state.
+        drop(unsafe { Rc::from_raw(ptr) });
+    }
+}
+
+impl std::panic::UnwindSafe for RuntimeFdOpState<'_> {}
+
+/// Candidate-only codegen probe for one descriptor-lease clone.
+///
+/// # Safety
+///
+/// `runtime_fd` must point to a live [`RuntimeFd`] on its owner thread. The
+/// returned opaque pointer owns exactly one raw `Rc` strong count and must be
+/// consumed once by the matching non-final-drop probe while another owner is
+/// still live.
+#[cfg(feature = "test-support")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn flowio_slice305_probe_clone_lease(runtime_fd: *const ()) -> *const () {
+    let runtime_fd = unsafe { &*runtime_fd.cast::<RuntimeFd>() };
+    Rc::into_raw(runtime_fd.lease().into_core()).cast()
+}
+
+/// Candidate-only codegen probe for one known-non-final lease release.
+///
+/// # Safety
+///
+/// `lease_core` must be the exact raw owner returned by
+/// [`flowio_slice305_probe_clone_lease`], and another strong owner for that
+/// same core must remain live until this function returns.
+#[cfg(feature = "test-support")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn flowio_slice305_probe_drop_nonfinal_lease(lease_core: *const ()) {
+    let core = lease_core.cast::<RuntimeFdCore>();
+    // SAFETY: the probe contract transfers exactly one `Rc::into_raw` owner
+    // into this matching release, while a separate base owner keeps it
+    // non-final.
+    drop(RuntimeFdLease::from_core(unsafe { Rc::from_raw(core) }));
+}
+
+const _: [(); std::mem::size_of::<usize>()] = [(); std::mem::size_of::<RuntimeFd>()];
+const _: [(); std::mem::size_of::<usize>()] = [(); std::mem::size_of::<RuntimeFdRef<'static>>()];
+const _: [(); std::mem::size_of::<usize>()] = [(); std::mem::size_of::<RuntimeFdLease>()];
+const _: [(); std::mem::size_of::<usize>()] =
+    [(); std::mem::size_of::<RuntimeFdOpState<'static>>()];
+const _: () = assert!(std::mem::align_of::<RuntimeFd>() == std::mem::align_of::<RawFd>());
+const _: () = assert!(std::mem::align_of::<RuntimeFdCore>() > RuntimeFdOpState::TAG_MASK);
+const _: () = assert!(std::mem::align_of::<CompletionState>() > RuntimeFdOpState::TAG_MASK);
 
 /// Listener owner retained by a readiness SQE.
 ///
@@ -155,14 +643,14 @@ impl Drop for RuntimeFd {
 /// close ownership is retained in the exact reactor's bounded post-view FIFO
 /// rather than re-entering its borrowed completion ring.
 pub(crate) struct RetainedListenerFd {
-    fd: Option<Rc<RuntimeFd>>,
+    fd: Option<RuntimeFdLease>,
 }
 
 impl RetainedListenerFd {
     #[inline(always)]
-    pub(crate) fn new(fd: &Rc<RuntimeFd>) -> Self {
+    pub(crate) fn new(fd: &RuntimeFd) -> Self {
         Self {
-            fd: Some(Rc::clone(fd)),
+            fd: Some(fd.lease()),
         }
     }
 
@@ -170,7 +658,7 @@ impl RetainedListenerFd {
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.fd
             .as_ref()
-            .map_or(RuntimeFd::INVALID, |fd| fd.raw_fd())
+            .map_or(RuntimeFd::INVALID, RuntimeFdLease::raw_fd)
     }
 }
 
@@ -180,9 +668,9 @@ impl Drop for RetainedListenerFd {
             return;
         };
 
-        match Rc::try_unwrap(fd) {
-            Ok(fd) => fd.close_without_ring(),
-            Err(fd) => drop(fd),
+        match Rc::try_unwrap(fd.into_core()) {
+            Ok(core) => core.close_without_ring(),
+            Err(core) => drop(core),
         }
     }
 }
@@ -498,7 +986,7 @@ mod tests {
     #[test]
     fn final_retained_listener_owner_closes_without_reentering_the_ring() {
         let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
-        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(raw));
+        let listener = RuntimeFd::from_fresh_raw_fd(raw);
         let retained = RetainedListenerFd::new(&listener);
         drop(listener);
 
@@ -625,11 +1113,146 @@ mod tests {
 #[cfg(test)]
 mod policy_tests {
     use super::{
-        CloseRoute, LingerProvenance, RetainedListenerFd, RuntimeFd, classify_linger_result,
-        classify_linger_value,
+        CloseRoute, LingerProvenance, RetainedListenerFd, RuntimeFd, RuntimeFdLease,
+        RuntimeFdOpState, RuntimeFdRef, classify_linger_result, classify_linger_value,
     };
+    use crate::runtime::op::CompletionState;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
     use std::io;
-    use std::rc::Rc;
+    use std::panic::UnwindSafe;
+
+    assert_impl_all!(RuntimeFd: UnwindSafe);
+    assert_impl_all!(RuntimeFdRef<'static>: UnwindSafe);
+    assert_impl_all!(RuntimeFdLease: UnwindSafe);
+    assert_impl_all!(RuntimeFdOpState<'static>: UnwindSafe);
+    assert_not_impl_any!(RuntimeFd: Send, Sync, std::panic::RefUnwindSafe);
+    assert_not_impl_any!(RuntimeFdRef<'static>: Send, Sync, std::panic::RefUnwindSafe);
+    assert_not_impl_any!(RuntimeFdLease: Send, Sync, std::panic::RefUnwindSafe);
+    assert_not_impl_any!(RuntimeFdOpState<'static>: Send, Sync, std::panic::RefUnwindSafe);
+
+    #[test]
+    fn runtime_fd_and_operation_state_layouts_match_frozen_words() {
+        let word = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<RuntimeFd>(), word);
+        assert_eq!(std::mem::align_of::<RuntimeFd>(), 4);
+        assert_eq!(std::mem::size_of::<RuntimeFdRef<'static>>(), word);
+        assert_eq!(std::mem::size_of::<RuntimeFdLease>(), word);
+        assert_eq!(std::mem::size_of::<RuntimeFdOpState<'static>>(), word);
+    }
+
+    #[test]
+    fn borrowed_capability_clones_exactly_one_initial_lease() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-1);
+        assert_eq!(runtime.strong_count_for_test(), 1);
+        let mut fd_state = runtime.op_state();
+        assert_eq!(fd_state.raw_fd(), -1);
+        assert_eq!(runtime.strong_count_for_test(), 1);
+
+        let lease = unsafe { fd_state.take_initial_lease() };
+        assert_eq!(runtime.strong_count_for_test(), 2);
+        assert_eq!(lease.strong_count_for_test(), 2);
+        assert_eq!(fd_state.raw_fd(), -1);
+
+        drop(lease);
+        assert_eq!(runtime.strong_count_for_test(), 1);
+    }
+
+    #[test]
+    fn staged_capability_moves_one_lease_without_a_second_clone() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-1);
+        let lease = runtime.lease();
+        assert_eq!(runtime.strong_count_for_test(), 2);
+        let mut fd_state = lease.into_op_state();
+        assert!(fd_state.owns_staged_lease_for_test());
+        assert_eq!(runtime.strong_count_for_test(), 2);
+
+        let lease = unsafe { fd_state.take_initial_lease() };
+        assert!(!fd_state.owns_staged_lease_for_test());
+        assert_eq!(runtime.strong_count_for_test(), 2);
+        assert_eq!(lease.raw_fd(), -1);
+
+        drop(lease);
+        assert_eq!(runtime.strong_count_for_test(), 1);
+    }
+
+    #[test]
+    fn unsubmitted_staged_capability_releases_its_owned_lease() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-1);
+        let fd_state = runtime.lease().into_op_state();
+        assert!(fd_state.owns_staged_lease_for_test());
+        assert_eq!(runtime.strong_count_for_test(), 2);
+        drop(fd_state);
+        assert_eq!(runtime.strong_count_for_test(), 1);
+    }
+
+    #[test]
+    fn borrowed_submission_retirement_restores_fresh_capability() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-7);
+        let mut fd_state = runtime.op_state();
+        let mut first_completion = CompletionState::empty();
+        first_completion.attach_fd_lease(unsafe { fd_state.take_initial_lease() });
+        let first_ptr = std::ptr::from_mut(&mut first_completion);
+        unsafe { fd_state.publish_submitted_state(first_ptr) };
+
+        assert_eq!(fd_state.take_state_ptr(), first_ptr);
+        assert!(fd_state.state_ptr().is_null());
+        assert_eq!(fd_state.raw_fd(), -7);
+        drop(first_completion.take_fd_lease());
+        assert_eq!(runtime.strong_count_for_test(), 1);
+
+        let mut second_completion = CompletionState::empty();
+        second_completion.attach_fd_lease(unsafe { fd_state.take_initial_lease() });
+        let second_ptr = std::ptr::from_mut(&mut second_completion);
+        unsafe { fd_state.publish_submitted_state(second_ptr) };
+
+        assert_eq!(fd_state.state_ptr(), second_ptr);
+        assert_eq!(fd_state.take_state_ptr(), second_ptr);
+        assert_eq!(fd_state.raw_fd(), -7);
+        drop(second_completion.take_fd_lease());
+        assert_eq!(runtime.strong_count_for_test(), 1);
+    }
+
+    #[test]
+    fn owned_submission_retirement_leaves_terminal_state() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-7);
+        let mut fd_state = runtime.lease().into_op_state();
+        let mut completion = CompletionState::empty();
+        completion.attach_fd_lease(unsafe { fd_state.take_initial_lease() });
+        let completion_ptr = std::ptr::from_mut(&mut completion);
+        unsafe { fd_state.publish_submitted_state(completion_ptr) };
+
+        assert_eq!(fd_state.take_state_ptr(), completion_ptr);
+        assert!(fd_state.state_ptr().is_null());
+        assert_eq!(fd_state.raw_fd(), RuntimeFd::INVALID);
+        drop(completion.take_fd_lease());
+        assert_eq!(runtime.strong_count_for_test(), 1);
+    }
+
+    #[test]
+    fn borrowed_and_owned_states_preserve_provenance_across_move_and_publication() {
+        let runtime = RuntimeFd::from_fresh_raw_fd(-1);
+        let moved_runtime = runtime;
+        let borrowed = moved_runtime.op_state();
+        let mut borrowed = borrowed;
+        let mut completion = CompletionState::empty();
+        completion.attach_fd_lease(unsafe { borrowed.take_initial_lease() });
+
+        let completion_ptr = std::ptr::from_mut(&mut completion);
+        unsafe { borrowed.publish_submitted_state(completion_ptr) };
+        assert_eq!(borrowed.state_ptr(), completion_ptr);
+        assert_eq!(borrowed.raw_fd(), -1);
+        assert_eq!(borrowed.take_state_ptr(), completion_ptr);
+        assert!(borrowed.state_ptr().is_null());
+
+        let staged = moved_runtime.lease().into_op_state();
+        assert!(staged.owns_staged_lease_for_test());
+        let moved_staged = staged;
+        drop(moved_staged);
+        assert_eq!(moved_runtime.strong_count_for_test(), 2);
+
+        drop(completion.take_fd_lease());
+        assert_eq!(moved_runtime.strong_count_for_test(), 1);
+    }
 
     #[test]
     fn linger_provenance_is_monotonic_after_raw_exposure() {
@@ -646,7 +1269,7 @@ mod policy_tests {
 
     #[test]
     fn retained_listener_observes_late_provenance_taint() {
-        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(-1));
+        let listener = RuntimeFd::from_fresh_raw_fd(-1);
         let retained = RetainedListenerFd::new(&listener);
 
         listener.mark_linger_uncertain();

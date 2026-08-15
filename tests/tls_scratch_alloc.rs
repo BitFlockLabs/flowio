@@ -148,7 +148,9 @@ fn tls_scratch_reservation_failures_return_out_of_memory_and_reclaim_partial_wor
         io::ErrorKind::OutOfMemory,
     );
     assert_allocation_failure_consumed();
-    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 0);
+    // The snapshot starts after fixture setup; failed construction consumes
+    // the stream and records its pre-existing RuntimeFdCore's final deallocation.
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 1);
     drop(first_config);
 
     let second_fixture = constructor_fixture();
@@ -160,7 +162,7 @@ fn tls_scratch_reservation_failures_return_out_of_memory_and_reclaim_partial_wor
         io::ErrorKind::OutOfMemory,
     );
     assert_allocation_failure_consumed();
-    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 2);
     drop(second_config);
 }
 
@@ -180,7 +182,9 @@ fn oversized_read_scratch_reserves_one_wire_record_and_keeps_write_independent()
     let before = ThreadLocalAllocationSnapshot::current();
     expect_error_kind(construct(read_fixture, options), io::ErrorKind::OutOfMemory);
     assert_allocation_failure_consumed();
-    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 0);
+    // The snapshot starts after fixture setup; failed construction consumes
+    // the stream and records its pre-existing RuntimeFdCore's final deallocation.
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 0, 1);
     drop(read_config);
 
     let write_fixture = constructor_fixture();
@@ -192,7 +196,7 @@ fn oversized_read_scratch_reserves_one_wire_record_and_keeps_write_independent()
         io::ErrorKind::OutOfMemory,
     );
     assert_allocation_failure_consumed();
-    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 1);
+    ThreadLocalAllocationSnapshot::current().assert_delta_since(before, 1, 2);
     drop(write_config);
 }
 

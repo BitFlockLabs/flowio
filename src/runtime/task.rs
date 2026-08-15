@@ -57,6 +57,10 @@ pub struct TaskHeader {
     /// The task keeps the owner and its pools alive until the final task,
     /// join-handle, or waker reference is released.
     pub(crate) owner: Option<Rc<ExecutorOwner>>,
+    /// Type-erased destruction entry used after callback-capable state is
+    /// published for this task. Ordinary no-drop tasks retain the direct
+    /// vtable above until they are armed on the owner thread.
+    pub(crate) iterative_vtable: &'static TaskVTable,
 }
 
 impl TaskHeader {
@@ -77,6 +81,7 @@ impl TaskHeader {
             cached_waker: MaybeUninit::uninit(),
             vtable: &DUMMY_VTABLE,
             owner: None,
+            iterative_vtable: &DUMMY_VTABLE,
         }
     }
 
@@ -105,6 +110,7 @@ impl TaskHeader {
     }
 }
 
+#[repr(C)]
 #[doc(hidden)]
 pub struct TaskVTable {
     /// Polls the concrete future stored in the task.
@@ -117,6 +123,27 @@ pub struct TaskVTable {
     /// Destroys the full task allocation after the final reference is released.
     pub destroy: unsafe fn(*mut TaskHeader),
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(TaskVTable, poll) == 0);
+    assert!(std::mem::offset_of!(TaskVTable, finish) == 8);
+    assert!(std::mem::offset_of!(TaskVTable, cancel) == 16);
+    assert!(std::mem::offset_of!(TaskVTable, destroy) == 24);
+    assert!(std::mem::size_of::<TaskVTable>() == 32);
+    assert!(std::mem::align_of::<TaskVTable>() == 8);
+
+    assert!(std::mem::offset_of!(TaskHeader, ready_link) == 0);
+    assert!(std::mem::offset_of!(TaskHeader, all_link) == 16);
+    assert!(std::mem::offset_of!(TaskHeader, refs) == 32);
+    assert!(std::mem::offset_of!(TaskHeader, flags) == 40);
+    assert!(std::mem::offset_of!(TaskHeader, cached_waker) == 48);
+    assert!(std::mem::offset_of!(TaskHeader, vtable) == 64);
+    assert!(std::mem::offset_of!(TaskHeader, owner) == 72);
+    assert!(std::mem::offset_of!(TaskHeader, iterative_vtable) == 80);
+    assert!(std::mem::size_of::<TaskHeader>() == 128);
+    assert!(std::mem::align_of::<TaskHeader>() == 64);
+};
 
 #[repr(C, align(64))]
 #[doc(hidden)]
@@ -419,5 +446,33 @@ pub(crate) mod tests {
         unsafe { (*task_ptr).refs.set(1) };
         unsafe { release_task(task_ptr) };
         DESTROY_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn task_header_and_vtable_geometry_and_dummy_pair_are_exact() {
+        assert_eq!(std::mem::offset_of!(TaskVTable, poll), 0);
+        assert_eq!(std::mem::offset_of!(TaskVTable, finish), 8);
+        assert_eq!(std::mem::offset_of!(TaskVTable, cancel), 16);
+        assert_eq!(std::mem::offset_of!(TaskVTable, destroy), 24);
+        assert_eq!(std::mem::size_of::<TaskVTable>(), 32);
+        assert_eq!(std::mem::align_of::<TaskVTable>(), 8);
+
+        assert_eq!(std::mem::offset_of!(TaskHeader, ready_link), 0);
+        assert_eq!(std::mem::offset_of!(TaskHeader, all_link), 16);
+        assert_eq!(std::mem::offset_of!(TaskHeader, refs), 32);
+        assert_eq!(std::mem::offset_of!(TaskHeader, flags), 40);
+        assert_eq!(std::mem::offset_of!(TaskHeader, cached_waker), 48);
+        assert_eq!(std::mem::offset_of!(TaskHeader, vtable), 64);
+        assert_eq!(std::mem::offset_of!(TaskHeader, owner), 72);
+        assert_eq!(std::mem::offset_of!(TaskHeader, iterative_vtable), 80);
+        assert_eq!(std::mem::size_of::<TaskHeader>(), 128);
+        assert_eq!(std::mem::align_of::<TaskHeader>(), 64);
+        assert_eq!(std::mem::offset_of!(Task<4096>, data), 128);
+        assert_eq!(std::mem::size_of::<Task<4096>>(), 4224);
+        assert_eq!(std::mem::align_of::<Task<4096>>(), 64);
+
+        let header = TaskHeader::new();
+        assert!(std::ptr::eq(header.vtable, &DUMMY_VTABLE));
+        assert!(std::ptr::eq(header.iterative_vtable, &DUMMY_VTABLE));
     }
 }

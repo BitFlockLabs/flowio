@@ -4,6 +4,7 @@ use crate::runtime::executor::{
     CompletionDrainGuard, ExecutorOwner, PanicPayload, RuntimeState, completion_drain_active,
     retain_first_panic, run_cleanup_preserving_panic,
 };
+use crate::runtime::fd::RuntimeFdLease;
 use crate::runtime::op::CompletionState;
 #[cfg(all(test, not(miri)))]
 use crate::runtime::retained::RetainedIovecScratch;
@@ -345,10 +346,16 @@ unsafe fn drop_payload_and_return_op_slot(
     retained_pool: *mut RetainedPayloadPool,
     op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
     ptr: *mut CompletionState,
+    fd_lease: Option<RuntimeFdLease>,
 ) {
     let slot = unsafe { OpSlotReturnGuard::new(op_pool, ptr) };
     unsafe { CompletionState::drop_retained_payload_unchecked(ptr, retained_pool) };
     unsafe { slot.finish() };
+    // The operation-pool borrow ended when `slot.finish()` returned. A final
+    // descriptor release may now route a close through this reactor without
+    // re-entering a borrowed pool. If payload destruction unwinds, the slot
+    // guard runs before this function parameter is dropped.
+    drop(fd_lease);
 }
 
 /// Owns complete operation reclamation while waiter destruction can unwind.
@@ -361,6 +368,9 @@ struct OpReclaimGuard {
     retained_pool: *mut RetainedPayloadPool,
     op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
     ptr: *mut CompletionState,
+    /// Taken before waiter/payload destruction so state Drop cannot release a
+    /// final descriptor while the operation pool remains borrowed.
+    fd_lease: Option<RuntimeFdLease>,
 }
 
 impl OpReclaimGuard {
@@ -370,18 +380,21 @@ impl OpReclaimGuard {
         op_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
         ptr: *mut CompletionState,
     ) -> Self {
+        let fd_lease = unsafe { (*ptr).take_fd_lease() };
         Self {
             retained_pool,
             op_pool,
             ptr,
+            fd_lease,
         }
     }
 
     #[inline(always)]
-    unsafe fn finish(self) {
+    unsafe fn finish(mut self) {
+        let fd_lease = self.fd_lease.take();
         let this = disarm_unwind_guard(self);
         unsafe {
-            drop_payload_and_return_op_slot(this.retained_pool, this.op_pool, this.ptr);
+            drop_payload_and_return_op_slot(this.retained_pool, this.op_pool, this.ptr, fd_lease);
         }
     }
 }
@@ -390,8 +403,9 @@ impl Drop for OpReclaimGuard {
     #[cold]
     #[inline(never)]
     fn drop(&mut self) {
+        let fd_lease = self.fd_lease.take();
         run_cleanup_preserving_panic(|| unsafe {
-            drop_payload_and_return_op_slot(self.retained_pool, self.op_pool, self.ptr);
+            drop_payload_and_return_op_slot(self.retained_pool, self.op_pool, self.ptr, fd_lease);
         });
     }
 }
@@ -1270,18 +1284,20 @@ impl Reactor {
             return Err(err);
         }
 
-        let is_full = self.ring_mut()?.submission().is_full();
-        if is_full {
+        let ring = self
+            .ring
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        let mut sq = ring.submission();
+        if sq.is_full() {
+            drop(sq);
             self.submit_ring_for_sqe_capacity()?;
+            // SAFETY: capacity handling may submit or synchronize the ring,
+            // but cannot remove or replace it.
+            sq = unsafe { self.ring.as_mut().unwrap_unchecked() }.submission();
         }
 
-        // SAFETY: `ring_mut` above established that the ring is present.
-        // Capacity handling may submit or synchronize it, but cannot remove or
-        // replace the ring. No ring borrow is retained across that `&mut self`
-        // call, so this creates only the final submission-queue reborrow.
-        let ring = unsafe { self.ring.as_mut().unwrap_unchecked() };
         let next_sequence = &mut self.next_sequence;
-        let mut sq = ring.submission();
         unsafe {
             if sq.push(&sqe).is_err() {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
@@ -1311,28 +1327,29 @@ impl Reactor {
         let sqe = opcode::Close::new(types::Fd(fd.as_raw_fd()))
             .build()
             .user_data(user_data);
-        let is_full = match self.ring_mut() {
-            Ok(ring) => ring.submission().is_full(),
-            Err(err) => return Err((err, fd)),
+        let ring = match self.ring.as_mut() {
+            Some(ring) => ring,
+            None => return Err((io::Error::from(io::ErrorKind::BrokenPipe), fd)),
         };
-        if is_full && let Err(err) = self.submit_ring_for_sqe_capacity() {
-            return Err((err, fd));
+        let mut sq = ring.submission();
+        if sq.is_full() {
+            drop(sq);
+            if let Err(err) = self.submit_ring_for_sqe_capacity() {
+                return Err((err, fd));
+            }
+            // SAFETY: capacity handling may submit or synchronize the ring,
+            // but cannot remove or replace it.
+            sq = unsafe { self.ring.as_mut().unwrap_unchecked() }.submission();
         }
 
         if self.pending_closes.len() >= self.max_pending_closes {
             return Err((io::Error::from(io::ErrorKind::WouldBlock), fd));
         }
 
-        // SAFETY: `ring_mut` above established that the ring is present.
-        // Capacity handling may submit or synchronize it, and the marker-bound
-        // check reads only the close ledger; neither can remove or replace the
-        // ring. No ring borrow is retained across either operation.
-        let ring = unsafe { self.ring.as_mut().unwrap_unchecked() };
         let pending_closes = &mut self.pending_closes;
         let next_sequence = &mut self.next_sequence;
         let sequence = *next_sequence;
         pending_closes.push_back(PendingClose { sequence, fd });
-        let mut sq = ring.submission();
         if unsafe { sq.push(&sqe) }.is_err() {
             // SAFETY: this function appended exactly one marker immediately
             // before the failed push, and no code can mutate the deque between
@@ -1799,6 +1816,22 @@ impl Drop for Reactor {
             }
         }
     }
+}
+
+/// Candidate-only codegen probe for target-completion state reclamation.
+///
+/// # Safety
+///
+/// `reactor` must point to the owner-thread reactor that exclusively owns the
+/// live completed `state`. The state must be ready for exactly one ordinary
+/// target-CQE reclamation and may hold the final descriptor lease.
+#[cfg(feature = "test-support")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn flowio_slice305_probe_reclaim_target(reactor: *mut (), state: *mut ()) {
+    unsafe {
+        Reactor::free_op_unchecked(reactor.cast::<Reactor>(), state.cast::<CompletionState>())
+    };
 }
 
 #[cfg(any(feature = "test-support", all(test, not(miri))))]
@@ -2615,7 +2648,7 @@ mod completion_drain_probe {
         let runtime_raw = distinctive_closeable_test_fd()?;
         let listener_raw = distinctive_closeable_test_fd()?;
         let runtime_fd = RuntimeFd::from_fresh_raw_fd(runtime_raw);
-        let listener = Rc::new(RuntimeFd::from_fresh_raw_fd(listener_raw));
+        let listener = RuntimeFd::from_fresh_raw_fd(listener_raw);
         let retained_listener = RetainedListenerFd::new(&listener);
         drop(listener);
 
@@ -2748,8 +2781,7 @@ pub fn benchmark_completion_drain_close(
 
                     for _ in 0..batch {
                         let raw = crate::runtime::fd::distinctive_closeable_test_fd()?;
-                        let listener =
-                            std::rc::Rc::new(crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(raw));
+                        let listener = crate::runtime::fd::RuntimeFd::from_fresh_raw_fd(raw);
                         let retained = crate::runtime::fd::RetainedListenerFd::new(&listener);
                         drop(listener);
 
@@ -2990,7 +3022,10 @@ mod pending_cancel_tests {
     };
     #[cfg(not(miri))]
     use crate::runtime::executor::{Executor, ExecutorConfig};
-    use crate::runtime::fd::{RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed};
+    use crate::runtime::fd::{
+        RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed,
+        set_final_core_drop_hook_for_test,
+    };
     use crate::runtime::task::{TaskHeader, TaskVTable};
     use std::cell::Cell;
     use std::os::fd::AsRawFd;
@@ -3010,6 +3045,12 @@ mod pending_cancel_tests {
         static SHUTDOWN_REENTRY_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static SHUTDOWN_PANIC_REACTOR: Cell<*mut Reactor> =
             const { Cell::new(std::ptr::null_mut()) };
+        static FINAL_LEASE_REENTRY_POOL:
+            Cell<*mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>> =
+                const { Cell::new(std::ptr::null_mut()) };
+        static FINAL_LEASE_REENTRY_EXPECTED: Cell<*mut CompletionState> =
+            const { Cell::new(std::ptr::null_mut()) };
+        static FINAL_LEASE_REENTRY_REUSED: Cell<bool> = const { Cell::new(false) };
         static SHUTDOWN_PANIC_COMPLETED_STATE: Cell<*mut CompletionState> =
             const { Cell::new(std::ptr::null_mut()) };
         static SHUTDOWN_PANIC_APPENDED_STATE: Cell<*mut CompletionState> =
@@ -3018,6 +3059,20 @@ mod pending_cancel_tests {
         static SHUTDOWN_LATER_WAITER_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static SHUTDOWN_LATER_PANIC_PAYLOAD_DROPS: Cell<usize> = const { Cell::new(0) };
         static SHUTDOWN_RETIRED_PANIC_PAYLOAD_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn probe_final_lease_reentry_after_slot_return(_: i32) {
+        let pool = FINAL_LEASE_REENTRY_POOL.with(Cell::get);
+        let expected = FINAL_LEASE_REENTRY_EXPECTED.with(Cell::get);
+        if pool.is_null() || expected.is_null() {
+            return;
+        }
+        let replacement = unsafe { (*pool).alloc(()) };
+        let reused = replacement == Some(expected);
+        FINAL_LEASE_REENTRY_REUSED.with(|observed| observed.set(reused));
+        if let Some(replacement) = replacement {
+            unsafe { (*pool).free(replacement) };
+        }
     }
 
     unsafe fn panic_cancel_waiter_destroy(_: *mut TaskHeader) {
@@ -4430,6 +4485,78 @@ mod pending_cancel_tests {
     }
 
     #[test]
+    fn payload_panic_returns_slot_before_dropping_final_fd_lease() {
+        let payload_drops = Rc::new(Cell::new(0));
+        let mut pending_cancels = PendingCancelQueue::new();
+        let mut retained_pool =
+            RetainedPayloadPool::new().expect("retained payload pool construction failed");
+        let mut op_pool: ProviderOwnedPool<CompletionState, BasicMemoryProvider> =
+            ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+                .expect("operation pool construction failed");
+        op_pool.init();
+        let op_pool_ptr = std::ptr::addr_of_mut!(op_pool);
+        let mut live_registry = Vec::new();
+
+        let state = unsafe { op_pool.alloc(()) }.expect("operation allocation failed");
+        unsafe { (*state).bind_owner(None, 0) };
+        live_registry.push(state);
+
+        // `-2` is a deliberately non-closeable sentinel distinct from the
+        // core's post-take `-1`, so the final-drop hook runs exactly once.
+        let runtime = RuntimeFd::from_fresh_raw_fd(-2);
+        unsafe { (*state).attach_fd_lease(runtime.lease()) };
+        drop(runtime);
+        let payload = retained_pool.alloc(OpPayloadDropBomb {
+            drops: Rc::clone(&payload_drops),
+            panic_tag: Some("payload before final fd lease"),
+        });
+        unsafe { (*state).attach_retained_payload(payload) };
+
+        // Keep the re-entry probe and reclamation on the same raw provenance;
+        // creating a fresh `&mut op_pool` while the hook is armed would itself
+        // invalidate the raw capability the test is meant to exercise.
+        FINAL_LEASE_REENTRY_POOL.with(|slot| slot.set(op_pool_ptr));
+        FINAL_LEASE_REENTRY_EXPECTED.with(|slot| slot.set(state));
+        FINAL_LEASE_REENTRY_REUSED.with(|slot| slot.set(false));
+        set_final_core_drop_hook_for_test(Some(probe_final_lease_reentry_after_slot_return));
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+            free_op_fields(
+                &mut pending_cancels,
+                &mut retained_pool,
+                op_pool_ptr,
+                &mut live_registry,
+                state,
+            )
+            .expect("operation retirement failed before payload destruction");
+        }))
+        .expect_err("retained payload destructor did not panic");
+
+        set_final_core_drop_hook_for_test(None);
+        FINAL_LEASE_REENTRY_POOL.with(|slot| slot.set(std::ptr::null_mut()));
+        FINAL_LEASE_REENTRY_EXPECTED.with(|slot| slot.set(std::ptr::null_mut()));
+
+        let panic = unwind
+            .downcast_ref::<OpPayloadDropPanic>()
+            .expect("operation cleanup replaced the payload panic");
+        assert_eq!(panic.0, "payload before final fd lease");
+        assert_eq!(payload_drops.get(), 1);
+        assert!(live_registry.is_empty());
+        assert!(pending_cancels.is_empty());
+        FINAL_LEASE_REENTRY_REUSED.with(|reused| {
+            assert!(
+                reused.get(),
+                "final fd lease dropped before the operation slot returned"
+            );
+        });
+
+        let replacement =
+            unsafe { op_pool.alloc(()) }.expect("post-reentry operation allocation failed");
+        assert_eq!(replacement, state);
+        unsafe { op_pool.free(replacement) };
+    }
+
+    #[test]
     fn free_op_reports_registry_removal_before_panicking_payload_and_address_reuse() {
         let payload_drops = Rc::new(Cell::new(0));
         let mut pending_cancels = PendingCancelQueue::new();
@@ -4750,6 +4877,73 @@ mod tests {
         assert!(cqe_consumes_poll_budget(u64::MAX));
     }
 
+    #[cfg(not(miri))]
+    #[test]
+    fn cancel_cqe_before_target_retains_payload_until_target_retirement() {
+        use std::io::Write;
+
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        let reactor_ptr = std::ptr::from_mut(&mut reactor);
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "operation allocation failed");
+
+        let (read_end, mut write_end) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair failed");
+        let retained_fd = OwnedFd::from(read_end);
+        let raw_fd = retained_fd.as_raw_fd();
+        let payload = reactor.alloc_retained_payload(retained_fd);
+        unsafe {
+            (*state).attach_retained_payload(payload);
+            (*state).set_detached();
+        }
+
+        // The unmatched cancel completes immediately with user_data zero;
+        // the target poll remains blocked until its peer becomes readable.
+        // This deterministically presents the cancel CQE first without
+        // inventing a synthetic completion path.
+        reactor
+            .submit_sqe(opcode::AsyncCancel::new(u64::MAX).build().user_data(0))
+            .expect("cancel submission failed");
+        reactor
+            .submit_sqe(
+                opcode::PollAdd::new(types::Fd(raw_fd), libc::POLLIN as u32)
+                    .build()
+                    .user_data(state as u64),
+            )
+            .expect("target submission failed");
+
+        let mut runtime_state = runtime_state_with_inflight(1);
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+
+        submit_and_wait_retry_eintr(&mut reactor, 1).expect("cancel completion wait failed");
+        let first = unsafe {
+            Reactor::poll_io_unchecked(reactor_ptr, 1, &mut runtime_state, &mut ready_queue)
+        }
+        .expect("cancel completion drain failed");
+        assert_eq!(first, 0, "cancel CQE consumed target-completion budget");
+        assert_eq!(runtime_state.inflight_ops, 1);
+        assert_eq!(reactor.live_op_count(), 1);
+        assert!(!unsafe { (*state).is_completed() });
+        assert!(!raw_fd_is_closed(raw_fd));
+
+        write_end
+            .write_all(&[0x5a])
+            .expect("target readiness write failed");
+        submit_and_wait_retry_eintr(&mut reactor, 1).expect("target completion wait failed");
+        let second = unsafe {
+            Reactor::poll_io_unchecked(reactor_ptr, 1, &mut runtime_state, &mut ready_queue)
+        }
+        .expect("target completion drain failed");
+        assert_eq!(second, 1);
+        assert_eq!(runtime_state.inflight_ops, 0);
+        assert_eq!(reactor.live_op_count(), 0);
+        assert!(raw_fd_is_closed(raw_fd));
+    }
+
     #[test]
     fn completion_state_pool_slots_are_cache_line_aligned() {
         const CACHE_LINE: usize = 64;
@@ -4958,6 +5152,103 @@ mod tests {
         assert!(raw_fd_is_closed(raw));
     }
 
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn initially_full_close_submission_reborrows_and_preserves_marker_order() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+        reactor
+            .submit_sqe(nop_sqe(1))
+            .expect("first nop submit failed");
+        reactor
+            .submit_sqe(nop_sqe(2))
+            .expect("second nop submit failed");
+        let (raw, owner) = distinctive_owner();
+
+        reactor
+            .submit_close_sqe(owner, 41)
+            .expect("full-queue close submission failed");
+
+        assert_eq!(reactor.queued_head, 0);
+        assert_eq!(reactor.next_sequence, 1);
+        assert_eq!(reactor.pending_closes.len(), 1);
+        assert_eq!(reactor.pending_closes[0].sequence, 0);
+        assert_eq!(reactor.pending_closes[0].fd.as_raw_fd(), raw);
+        assert!(!raw_fd_is_closed(raw));
+
+        assert_eq!(
+            reactor.flush_sqes().expect("close flush failed"),
+            ReactorSubmitStatus::Ready
+        );
+        assert!(reactor.pending_closes.is_empty());
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn initially_full_close_persistent_ebusy_returns_owner_without_marker() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+        reactor
+            .submit_sqe(nop_sqe(1))
+            .expect("first nop submit failed");
+        reactor
+            .submit_sqe(nop_sqe(2))
+            .expect("second nop submit failed");
+        let before_head = reactor.queued_head;
+        let before_sequence = reactor.next_sequence;
+        let (raw, owner) = distinctive_owner();
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+
+        let (err, returned) = reactor
+            .submit_close_sqe(owner, 41)
+            .expect_err("persistent full-queue pressure should return ownership");
+
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(returned.as_raw_fd(), raw);
+        assert!(!raw_fd_is_closed(raw));
+        assert_eq!(reactor.queued_head, before_head);
+        assert_eq!(reactor.next_sequence, before_sequence);
+        assert!(reactor.pending_closes.is_empty());
+        drop(returned);
+        assert!(raw_fd_is_closed(raw));
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn full_close_submission_error_precedes_marker_capacity() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
+        reactor.init();
+        reactor
+            .submit_sqe(nop_sqe(1))
+            .expect("first nop submit failed");
+        reactor
+            .submit_sqe(nop_sqe(2))
+            .expect("second nop submit failed");
+        reactor.max_pending_closes = 0;
+        let before_head = reactor.queued_head;
+        let before_sequence = reactor.next_sequence;
+        let (raw, owner) = distinctive_owner();
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EIO);
+
+        let (err, returned) = reactor
+            .submit_close_sqe(owner, 41)
+            .expect_err("full-queue submission error lost precedence");
+
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(returned.as_raw_fd(), raw);
+        assert!(!raw_fd_is_closed(raw));
+        assert_eq!(reactor.queued_head, before_head);
+        assert_eq!(reactor.next_sequence, before_sequence);
+        assert!(reactor.pending_closes.is_empty());
+        drop(returned);
+        assert!(raw_fd_is_closed(raw));
+    }
+
     #[test]
     fn retired_close_owner_cannot_close_a_reused_numeric_fd_at_teardown() {
         let mut reactor =
@@ -5104,6 +5395,25 @@ mod tests {
             reactor.has_queued_sqes(),
             "third NOP should remain pending after push"
         );
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn submit_sqe_success_wraps_sequence_after_push() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        reactor.queued_head = u64::MAX;
+        reactor.next_sequence = u64::MAX;
+
+        reactor
+            .submit_sqe(nop_sqe(41))
+            .expect("wrapped NOP submission failed");
+
+        assert_eq!(reactor.queued_head, u64::MAX);
+        assert_eq!(reactor.next_sequence, 0);
+        assert_eq!(reactor.queued_sqe_count(), 1);
+        assert!(reactor.has_queued_sqes());
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]

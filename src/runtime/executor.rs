@@ -38,6 +38,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+use crate::runtime::fd::RuntimeFdOpState;
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::{Reactor, ReactorConfig, ReactorSubmitStatus};
 use crate::runtime::retained::RetainedPayload;
@@ -87,6 +88,7 @@ const _: () = {
     assert!(TASK_DATA_ALIGN == 64);
     assert!(std::mem::offset_of!(Task<TASK_POOL_SIZE>, data) == 128);
     assert!(size_of::<Task<TASK_POOL_SIZE>>() == 4224);
+    assert!(align_of::<Task<TASK_POOL_SIZE>>() == 64);
 };
 
 #[cfg(any(test, feature = "test-support", debug_assertions))]
@@ -1464,6 +1466,12 @@ struct JoinTask<F: Future> {
     join_waker: Option<Waker>,
 }
 
+#[derive(Clone, Copy)]
+struct JoinTaskVTables {
+    direct: &'static TaskVTable,
+    iterative: &'static TaskVTable,
+}
+
 /// Initializes one join payload directly in its final fixed task slot.
 ///
 /// # Safety
@@ -1500,6 +1508,7 @@ unsafe fn init_task_slot_header(
     refs: usize,
     flags: u64,
     vtable: &'static TaskVTable,
+    iterative_vtable: &'static TaskVTable,
 ) {
     unsafe {
         (*task).ready_link = crate::utils::list::intrusive::dlist::Link::new_unlinked();
@@ -1508,6 +1517,7 @@ unsafe fn init_task_slot_header(
         (*task).refs.set(refs);
         (*task).flags.set(flags);
         init_cached_waker(task);
+        (*task).iterative_vtable = iterative_vtable;
         (*task).vtable = vtable;
     }
 }
@@ -1599,13 +1609,16 @@ pub(crate) fn stage_completed_task_output_for_benchmark<T: 'static>(
             _ => unreachable!("completed benchmark output was not published"),
         };
 
+        let vtables = join_task_vtable_for::<CompletedFuture<T>>();
+
         unsafe {
             init_task_slot_header(
                 std::ptr::addr_of_mut!((*slot).header),
                 owner,
                 1,
                 TaskHeader::FLAG_COMPLETED,
-                join_task_vtable_for::<CompletedFuture<T>>(),
+                vtables.iterative,
+                vtables.iterative,
             );
             #[cfg(debug_assertions)]
             {
@@ -1711,6 +1724,187 @@ unsafe fn drop_join_task_with_cleanup<F: Future, C: TaskDestroyCleanup + ?Sized>
         std::ptr::drop_in_place(join_task);
     }
     guard.finish();
+}
+
+/// Stack-resident owner-thread FIFO for zero-reference tasks whose join
+/// payload destruction can release another task's final reference.
+struct IterativeTaskDestroyQueue {
+    head: *mut crate::utils::list::intrusive::dlist::Link,
+    tail: *mut crate::utils::list::intrusive::dlist::Link,
+}
+
+impl IterativeTaskDestroyQueue {
+    const fn new() -> Self {
+        Self {
+            head: std::ptr::null_mut(),
+            tail: std::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn push_back(&mut self, task: *mut TaskHeader) {
+        let link = unsafe { std::ptr::addr_of_mut!((*task).ready_link) };
+        debug_assert!(unsafe { (*link).is_unlinked() });
+        unsafe {
+            (*link).next = std::ptr::null_mut();
+            (*link).prev = self.tail;
+            if self.tail.is_null() {
+                self.head = link;
+            } else {
+                (*self.tail).next = link;
+            }
+        }
+        self.tail = link;
+    }
+
+    unsafe fn pop_front(&mut self) -> Option<*mut TaskHeader> {
+        let link = self.head;
+        if link.is_null() {
+            return None;
+        }
+        self.head = unsafe { (*link).next };
+        if self.head.is_null() {
+            self.tail = std::ptr::null_mut();
+        } else {
+            unsafe {
+                (*self.head).prev = std::ptr::null_mut();
+            }
+        }
+        unsafe {
+            (*link).next = std::ptr::null_mut();
+            (*link).prev = std::ptr::null_mut();
+        }
+        Some(unsafe {
+            link.cast::<u8>()
+                .sub(TaskHeader::READY_LINK_OFFSET)
+                .cast::<TaskHeader>()
+        })
+    }
+}
+
+thread_local! {
+    static ITERATIVE_TASK_DESTROY_QUEUE: Cell<*mut IterativeTaskDestroyQueue> =
+        const { Cell::new(std::ptr::null_mut()) };
+    #[cfg(test)]
+    static ITERATIVE_TASK_DESTROY_ENTRIES: Cell<usize> = const { Cell::new(0) };
+}
+
+struct IterativeTaskDestroyRegistration<'cell> {
+    active: &'cell Cell<*mut IterativeTaskDestroyQueue>,
+}
+
+impl Drop for IterativeTaskDestroyRegistration<'_> {
+    fn drop(&mut self) {
+        self.active.set(std::ptr::null_mut());
+    }
+}
+
+/// Detaches one nested RAW task from registry ownership and appends it to the
+/// active destruction FIFO before returning to the outer raw destructor.
+unsafe fn enqueue_nested_task_destroy(
+    queue: *mut IterativeTaskDestroyQueue,
+    task: *mut TaskHeader,
+    raw_vtable: &'static TaskVTable,
+) {
+    debug_assert_eq!(unsafe { (*task).refs.get() }, 0);
+    debug_assert!(std::ptr::eq(unsafe { (*task).vtable }, raw_vtable));
+
+    debug_assert!(unsafe { (*task).owner.is_some() });
+    // SAFETY: ENTRY is installed only by the two real join-task constructors,
+    // both of which publish their stable executor owner before either vtable.
+    let owner = unsafe { (*task).owner.as_ref().unwrap_unchecked() };
+    owner.debug_assert_owner_thread();
+    let state = owner.state_ptr();
+    let all_link = unsafe { std::ptr::addr_of_mut!((*task).all_link) };
+    if unsafe { !(*all_link).is_unlinked() } {
+        unsafe {
+            (*state).all_tasks.remove(all_link);
+        }
+    }
+    unsafe {
+        (*queue).push_back(task);
+    }
+}
+
+/// Drains callback-capable task destruction without recursive final releases.
+///
+/// # Safety
+///
+/// `task` must identify a real initialized owner-thread task at zero
+/// references. `raw_vtable` must be the matching generic cleanup vtable.
+#[cold]
+#[inline(never)]
+unsafe fn destroy_task_iteratively(task: *mut TaskHeader, raw_vtable: &'static TaskVTable) {
+    unsafe {
+        (*task).vtable = raw_vtable;
+    }
+    #[cfg(test)]
+    ITERATIVE_TASK_DESTROY_ENTRIES.with(|entries| entries.set(entries.get() + 1));
+    ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
+        let active_queue = active.get();
+        if !active_queue.is_null() {
+            unsafe {
+                enqueue_nested_task_destroy(active_queue, task, raw_vtable);
+            }
+            return;
+        }
+
+        let mut queue = IterativeTaskDestroyQueue::new();
+        let queue_ptr = std::ptr::from_mut(&mut queue);
+        active.set(queue_ptr);
+        let registration = IterativeTaskDestroyRegistration { active };
+
+        let already_panicking = std::thread::panicking();
+        let mut first_panic = None;
+        let raw_destroy = unsafe { (*task).vtable.destroy };
+        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+            raw_destroy(task);
+        }));
+        if already_panicking {
+            if let Err(payload) = result {
+                std::mem::forget(payload);
+            }
+        } else {
+            retain_first_panic(&mut first_panic, result);
+        }
+
+        while let Some(next) = unsafe { (*queue_ptr).pop_front() } {
+            let raw_destroy = unsafe { (*next).vtable.destroy };
+            let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                raw_destroy(next);
+            }));
+            if already_panicking {
+                if let Err(payload) = result {
+                    std::mem::forget(payload);
+                }
+            } else {
+                retain_first_panic(&mut first_panic, result);
+            }
+        }
+        drop(registration);
+
+        if let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
+    });
+}
+
+/// Arms callback-capable destruction for one live owner-thread task.
+///
+/// # Safety
+///
+/// `task` must be a real initialized task with at least one reference, owned
+/// by the current executor thread.
+#[inline(always)]
+unsafe fn arm_task_destruction(task: *mut TaskHeader) {
+    debug_assert!(!task.is_null());
+    let header = unsafe { &*task };
+    debug_assert!(header.refs.get() > 0);
+    if let Some(owner) = header.owner.as_ref() {
+        owner.debug_assert_owner_thread();
+    }
+    unsafe {
+        (*task).vtable = (*task).iterative_vtable;
+    }
 }
 
 /// Clears a pinned future slot after destroying its value at the pinned
@@ -1912,12 +2106,16 @@ impl<T: 'static> Future for JoinHandle<T> {
             return Poll::Ready(value);
         }
 
-        let waker_slot = unsafe { &mut *this.waker_ptr };
-        if !waker_slot
+        let same_waker = unsafe { &*this.waker_ptr }
             .as_ref()
-            .is_some_and(|stored| stored.will_wake(cx.waker()))
-        {
-            *waker_slot = Some(cx.waker().clone());
+            .is_some_and(|stored| stored.will_wake(cx.waker()));
+        if !same_waker {
+            unsafe {
+                arm_task_destruction(this.task_ptr);
+            }
+            let replacement = cx.waker().clone();
+            let previous = unsafe { (&mut *this.waker_ptr).replace(replacement) };
+            drop(previous);
         }
         Poll::Pending
     }
@@ -1968,14 +2166,14 @@ fn timers_pending_after_processing(timers_pending: bool, recheck: impl FnOnce() 
 
 impl Executor {
     /// Returns the configured process quota for repository tests.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(not(miri), any(test, feature = "test-support")))]
     #[doc(hidden)]
     pub fn test_process_quota(&self) -> usize {
         self.process_quota
     }
 
     /// Returns the configured CPU affinity for repository tests.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(not(miri), any(test, feature = "test-support")))]
     #[doc(hidden)]
     pub fn test_cpu_affinity(&self) -> Option<usize> {
         self.cpu_affinity
@@ -2195,6 +2393,12 @@ impl Executor {
                 init_join_task_at(data_ptr, future);
                 let result_ptr = std::ptr::addr_of_mut!((*data_ptr).result);
                 let waker_ptr = std::ptr::addr_of_mut!((*data_ptr).join_waker);
+                let vtables = join_task_vtable_for::<F>();
+                let current_vtable = if std::mem::needs_drop::<F::Output>() {
+                    vtables.iterative
+                } else {
+                    vtables.direct
+                };
 
                 // Start with refcount 2: one for the executor, one for the JoinHandle.
                 init_task_slot_header(
@@ -2202,7 +2406,8 @@ impl Executor {
                     owner_ptr,
                     2,
                     TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED,
-                    join_task_vtable_for::<F>(),
+                    current_vtable,
+                    vtables.iterative,
                 );
 
                 (*state_ptr).runtime_state.live_tasks += 1;
@@ -2537,7 +2742,7 @@ impl Executor {
     ///
     /// In release builds this dev-only accessor returns an empty snapshot
     /// because the counters are not compiled in.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(not(miri), any(test, feature = "test-support")))]
     pub fn last_stats(&self) -> RuntimeStats {
         #[cfg(debug_assertions)]
         {
@@ -2568,6 +2773,18 @@ impl Executor {
             let Some(task_ptr) = task_ptr else {
                 break;
             };
+
+            if unsafe { (*task_ptr).refs.get() } == 0 {
+                debug_assert!(!std::ptr::eq(unsafe { (*task_ptr).vtable }, unsafe {
+                    (*task_ptr).iterative_vtable
+                },));
+                debug_assert!(task_is_completed(unsafe { (*task_ptr).flags.get() }));
+                debug_assert!(unsafe { (*task_ptr).ready_link.is_unlinked() });
+                continue;
+            }
+            unsafe {
+                arm_task_destruction(task_ptr);
+            }
 
             let ready_link = unsafe { std::ptr::addr_of_mut!((*task_ptr).ready_link) };
             if unsafe { !(*ready_link).is_unlinked() } {
@@ -2847,12 +3064,29 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
     }
 }
 
+/// Releases the submitted completion owned by an fd-operation state.
+///
+/// Borrowed initial state needs no cleanup, and an unsubmitted staged state
+/// releases its owned lease through [`RuntimeFdOpState`]'s destructor. This
+/// bridge handles only the published completion-pointer representation.
+///
+/// # Safety
+///
+/// A published pointer in `fd_state` must satisfy the ownership requirements
+/// of [`drop_op_ptr_unchecked`].
+#[inline(always)]
+pub(crate) unsafe fn drop_fd_op_state_unchecked(fd_state: &mut RuntimeFdOpState<'_>) {
+    let mut state_ptr = fd_state.take_state_ptr();
+    unsafe { drop_op_ptr_unchecked(&mut state_ptr) };
+}
+
 /// Owns an allocated completion-state slot until its target SQE is submitted.
 ///
 /// The guard is shared by I/O families that must keep the state local while
 /// fallible or user-controlled preparation runs. Dropping it returns the
 /// unsubmitted slot; successful submission consumes it without a conditional
-/// drop branch and publishes the state pointer to the future.
+/// drop branch. Typed fd submission publishes through `RuntimeFdOpState`, while
+/// older lease-free routes can still take the raw pointer directly.
 pub(crate) struct UnsubmittedOpGuard {
     /// Reactor that owns the allocated completion-state slot.
     reactor: NonNull<Reactor>,
@@ -2885,10 +3119,18 @@ impl UnsubmittedOpGuard {
     }
 
     /// Transfers the successfully submitted state to its future owner.
+    #[cfg(all(not(miri), any(test, feature = "test-support")))]
     #[inline(always)]
     pub(crate) fn into_state_ptr(self) -> *mut CompletionState {
         let this = std::mem::ManuallyDrop::new(self);
         this.state.as_ptr()
+    }
+
+    /// Disarms the guard after typed fd submission published the state through
+    /// its [`RuntimeFdOpState`].
+    #[inline(always)]
+    pub(crate) fn disarm(self) {
+        let _this = std::mem::ManuallyDrop::new(self);
     }
 }
 
@@ -2979,9 +3221,29 @@ pub(crate) unsafe fn submit_tracked_sqe(
     pctx: &PollCtx,
     sqe: io_uring::squeue::Entry,
 ) -> io::Result<()> {
+    unsafe { submit_tracked_sqe_with_publication(pctx, sqe, || {}) }
+}
+
+/// Pushes one SQE, performs its infallible userspace publication callback at
+/// the exact successful-push boundary, then records ordinary accounting.
+#[inline(always)]
+unsafe fn submit_tracked_sqe_with_publication<F>(
+    pctx: &PollCtx,
+    sqe: io_uring::squeue::Entry,
+    publish: F,
+) -> io::Result<()>
+where
+    F: FnOnce(),
+{
+    // Compute the only fallible bookkeeping result before the irreversible
+    // userspace-SQ push. Saturated in-flight ownership cannot be represented.
+    let next_inflight = unsafe { (*pctx.runtime_state()).inflight_ops }
+        .checked_add(1)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
     unsafe { (*pctx.reactor()).submit_sqe(sqe)? };
+    publish();
     unsafe {
-        (*pctx.runtime_state()).inflight_ops += 1;
+        (*pctx.runtime_state()).inflight_ops = next_inflight;
         #[cfg(debug_assertions)]
         {
             let stats = &mut (*pctx.runtime_state()).stats;
@@ -2989,6 +3251,54 @@ pub(crate) unsafe fn submit_tracked_sqe(
         }
     }
     Ok(())
+}
+
+/// Build and publish the next SQE for a sequential operation using the exact
+/// lease retained by its original completion state.
+///
+/// # Safety
+///
+/// `fd_state` must contain the completed/reset state owned by `pctx`, with its
+/// original fd lease still attached. `build` must use the supplied fd.
+#[inline(always)]
+pub(crate) unsafe fn submit_resubmitted_fd_sqe<F>(
+    pctx: &PollCtx,
+    fd_state: &RuntimeFdOpState<'_>,
+    build: F,
+) -> io::Result<()>
+where
+    F: FnOnce(std::os::fd::RawFd) -> io::Result<squeue::Entry>,
+{
+    let state_ptr = fd_state.state_ptr();
+    debug_assert!(
+        !state_ptr.is_null(),
+        "fd resubmission requires a published completion state"
+    );
+    let fd = fd_state.raw_fd();
+    let sqe = build(fd)?;
+    // On any pre-push error, leave the lease attached. The caller retires the
+    // payload and state through ordinary reclamation, which takes the lease
+    // local before pool cleanup and drops it only after the pool borrow ends.
+    unsafe { submit_tracked_sqe(pctx, sqe) }
+}
+
+/// Candidate-only codegen probe for same-state typed fd resubmission.
+///
+/// # Safety
+///
+/// `fd_state` must point to a live published [`RuntimeFdOpState`] whose
+/// completion state retains its original descriptor lease. `poll_ctx` is a
+/// reserved opaque argument and may be null; the probe isolates only the
+/// ownership fragment used before the separately inspected ring submission.
+#[cfg(feature = "test-support")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn flowio_slice305_probe_resubmit_same_state(
+    _poll_ctx: *const (),
+    fd_state: *const (),
+) -> i32 {
+    let fd_state = unsafe { &*fd_state.cast::<RuntimeFdOpState<'static>>() };
+    fd_state.raw_fd()
 }
 
 /// Retain a kernel-visible payload, build the SQE from that stable storage,
@@ -3018,6 +3328,64 @@ where
     unsafe { submit_initialized_retained_sqe(pctx, state_ptr, payload, build) }
 }
 
+/// Retain a payload and publish an initial fd-backed SQE using the operation
+/// state's borrowed-or-staged ownership policy.
+///
+/// # Safety
+///
+/// The requirements of [`submit_retained_sqe`] apply. `fd_state` must still be
+/// in its initial borrowed or staged-owned representation, and `build` must
+/// derive its entry descriptor from the supplied typed raw fd.
+#[inline(always)]
+pub(crate) unsafe fn submit_retained_fd_sqe<T: 'static, F>(
+    pctx: &PollCtx,
+    state_ptr: *mut CompletionState,
+    fd_state: &mut RuntimeFdOpState<'_>,
+    payload_value: T,
+    build: F,
+) -> Result<(), (io::Error, T)>
+where
+    F: FnOnce(std::os::fd::RawFd, &mut T) -> io::Result<squeue::Entry>,
+{
+    let reactor = pctx.reactor();
+    let payload = unsafe { (*reactor).alloc_retained_payload(payload_value) };
+    unsafe { submit_initialized_retained_fd_sqe(pctx, state_ptr, fd_state, payload, build) }
+}
+
+/// Attach an initialized payload and publish an initial fd-backed SQE using
+/// the operation state's borrowed-or-staged ownership policy.
+///
+/// # Safety
+///
+/// The requirements of [`submit_initialized_retained_sqe`] apply. `fd_state`
+/// must still be in its initial borrowed or staged-owned representation, and
+/// `build` must derive its entry descriptor from the supplied typed raw fd.
+#[inline(always)]
+pub(crate) unsafe fn submit_initialized_retained_fd_sqe<T: 'static, F>(
+    pctx: &PollCtx,
+    state_ptr: *mut CompletionState,
+    fd_state: &mut RuntimeFdOpState<'_>,
+    payload: RetainedPayload<T>,
+    build: F,
+) -> Result<(), (io::Error, T)>
+where
+    F: FnOnce(std::os::fd::RawFd, &mut T) -> io::Result<squeue::Entry>,
+{
+    unsafe {
+        submit_initialized_retained_sqe_inner(
+            pctx,
+            state_ptr,
+            payload,
+            Some(fd_state),
+            |raw_fd, payload| {
+                // SAFETY: the typed fd branch always supplies its capability's
+                // raw descriptor to the builder.
+                build(raw_fd.unwrap_unchecked(), payload)
+            },
+        )
+    }
+}
+
 /// Attach an already initialized retained payload, build its SQE, and submit
 /// it with normal in-flight accounting.
 ///
@@ -3042,12 +3410,32 @@ pub(crate) unsafe fn submit_initialized_retained_sqe<T: 'static, F>(
 where
     F: FnOnce(&mut T) -> io::Result<squeue::Entry>,
 {
+    unsafe {
+        submit_initialized_retained_sqe_inner(pctx, state_ptr, payload, None, |_, payload| {
+            build(payload)
+        })
+    }
+}
+
+#[inline(always)]
+unsafe fn submit_initialized_retained_sqe_inner<T: 'static, F>(
+    pctx: &PollCtx,
+    state_ptr: *mut CompletionState,
+    payload: RetainedPayload<T>,
+    mut fd_state: Option<&mut RuntimeFdOpState<'_>>,
+    build: F,
+) -> Result<(), (io::Error, T)>
+where
+    F: FnOnce(Option<std::os::fd::RawFd>, &mut T) -> io::Result<squeue::Entry>,
+{
     let reactor = pctx.reactor();
     unsafe { (*state_ptr).attach_retained_payload(payload) };
     let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
     let payload_guard = unsafe { AttachedRetainedPayloadGuard::<T>::new(state_ptr, retained_pool) };
 
-    let sqe = match build(unsafe { (*state_ptr).retained_payload_mut::<T>() }) {
+    let sqe = match build(fd_state.as_ref().map(|state| state.raw_fd()), unsafe {
+        (*state_ptr).retained_payload_mut::<T>()
+    }) {
         Ok(sqe) => {
             payload_guard.disarm();
             sqe
@@ -3058,7 +3446,21 @@ where
         }
     };
 
-    if let Err(err) = unsafe { submit_tracked_sqe(pctx, sqe) } {
+    if let Some(fd_state) = fd_state.as_deref_mut() {
+        let lease = unsafe { fd_state.take_initial_lease() };
+        unsafe { (*state_ptr).attach_fd_lease(lease) };
+    }
+
+    if let Err(err) = unsafe {
+        submit_tracked_sqe_with_publication(pctx, sqe, || {
+            if let Some(fd_state) = fd_state {
+                // SAFETY: the successful push is the publication boundary.
+                // The state already owns the matching lease, and this pointer
+                // assignment is infallible and cannot unwind.
+                fd_state.publish_submitted_state(state_ptr);
+            }
+        })
+    } {
         let payload = unsafe { Reactor::take_retained_payload_unchecked::<T>(reactor, state_ptr) };
         return Err((err, payload));
     }
@@ -3361,7 +3763,7 @@ pub(crate) unsafe fn schedule_ctx_unchecked() -> ScheduleCtx {
     })
 }
 
-fn join_task_vtable_for<F>() -> &'static TaskVTable
+fn join_task_vtable_for<F>() -> JoinTaskVTables
 where
     F: Future + 'static,
     F::Output: 'static,
@@ -3442,9 +3844,21 @@ where
                 }
             },
         };
+
+        const ITERATIVE_VTABLE: TaskVTable = TaskVTable {
+            poll: Self::VTABLE.poll,
+            finish: Self::VTABLE.finish,
+            cancel: Self::VTABLE.cancel,
+            destroy: |ptr| unsafe {
+                destroy_task_iteratively(ptr, &Self::VTABLE);
+            },
+        };
     }
 
-    &VTableGen::<F>::VTABLE
+    JoinTaskVTables {
+        direct: &VTableGen::<F>::VTABLE,
+        iterative: &VTableGen::<F>::ITERATIVE_VTABLE,
+    }
 }
 
 /// Routes one task notification through the task's stable executor owner.
@@ -3680,9 +4094,7 @@ mod tests {
     use crate::runtime::test_hooks;
     #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
     use crate::runtime::timer::sleep;
-    use std::cell::Cell;
-    #[cfg(not(miri))]
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::mem::ManuallyDrop;
     #[cfg(not(miri))]
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -3722,6 +4134,185 @@ mod tests {
             if self.panic_on_drop {
                 panic!("staged task output drop panic");
             }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct SyntheticChainPanic(usize);
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct SyntheticOuterPanic;
+
+    #[derive(Default)]
+    struct SyntheticChainStats {
+        depth: Cell<usize>,
+        max_depth: Cell<usize>,
+        order: RefCell<Vec<usize>>,
+    }
+
+    struct SyntheticTaskRef {
+        task: *mut TaskHeader,
+    }
+
+    impl Drop for SyntheticTaskRef {
+        fn drop(&mut self) {
+            unsafe {
+                release_task(self.task);
+            }
+        }
+    }
+
+    struct ReentrantCloneWakerState {
+        armed_task: *mut TaskHeader,
+        iterative_vtable: &'static TaskVTable,
+        release_during_clone: RefCell<Option<SyntheticTaskRef>>,
+        clones: Cell<usize>,
+    }
+
+    unsafe fn reentrant_clone_waker_clone(data: *const ()) -> RawWaker {
+        let state = unsafe { Rc::<ReentrantCloneWakerState>::from_raw(data.cast()) };
+        assert!(std::ptr::eq(
+            unsafe { (*state.armed_task).vtable },
+            state.iterative_vtable,
+        ));
+        state.clones.set(state.clones.get() + 1);
+        let nested_release = state.release_during_clone.borrow_mut().take();
+        drop(nested_release);
+        let cloned = Rc::clone(&state);
+        let _ = Rc::into_raw(state);
+        RawWaker::new(Rc::into_raw(cloned).cast(), &REENTRANT_CLONE_WAKER_VTABLE)
+    }
+
+    unsafe fn reentrant_clone_waker_wake(data: *const ()) {
+        drop(unsafe { Rc::<ReentrantCloneWakerState>::from_raw(data.cast()) });
+    }
+
+    unsafe fn reentrant_clone_waker_wake_by_ref(data: *const ()) {
+        let state = unsafe { Rc::<ReentrantCloneWakerState>::from_raw(data.cast()) };
+        let _ = Rc::into_raw(state);
+    }
+
+    unsafe fn reentrant_clone_waker_drop(data: *const ()) {
+        drop(unsafe { Rc::<ReentrantCloneWakerState>::from_raw(data.cast()) });
+    }
+
+    static REENTRANT_CLONE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        reentrant_clone_waker_clone,
+        reentrant_clone_waker_wake,
+        reentrant_clone_waker_wake_by_ref,
+        reentrant_clone_waker_drop,
+    );
+
+    fn reentrant_clone_waker(state: &Rc<ReentrantCloneWakerState>) -> Waker {
+        let data = Rc::into_raw(Rc::clone(state)).cast();
+        unsafe { Waker::from_raw(RawWaker::new(data, &REENTRANT_CLONE_WAKER_VTABLE)) }
+    }
+
+    struct SyntheticChainNode {
+        id: usize,
+        next: Option<SyntheticTaskRef>,
+        stats: Rc<SyntheticChainStats>,
+        panic_mask: u64,
+    }
+
+    impl Drop for SyntheticChainNode {
+        fn drop(&mut self) {
+            let depth = self.stats.depth.get() + 1;
+            self.stats.depth.set(depth);
+            self.stats
+                .max_depth
+                .set(self.stats.max_depth.get().max(depth));
+            self.stats.order.borrow_mut().push(self.id);
+            drop(self.next.take());
+            self.stats.depth.set(depth - 1);
+            if self.id < u64::BITS as usize && (self.panic_mask & (1_u64 << self.id)) != 0 {
+                std::panic::panic_any(SyntheticChainPanic(self.id));
+            }
+        }
+    }
+
+    struct SyntheticBranchNode {
+        id: usize,
+        children: [Option<SyntheticTaskRef>; 2],
+        stats: Rc<SyntheticChainStats>,
+    }
+
+    impl Drop for SyntheticBranchNode {
+        fn drop(&mut self) {
+            let depth = self.stats.depth.get() + 1;
+            self.stats.depth.set(depth);
+            self.stats
+                .max_depth
+                .set(self.stats.max_depth.get().max(depth));
+            self.stats.order.borrow_mut().push(self.id);
+            drop(self.children[0].take());
+            drop(self.children[1].take());
+            self.stats.depth.set(depth - 1);
+        }
+    }
+
+    fn stage_synthetic_branch(
+        id: usize,
+        children: [Option<SyntheticTaskRef>; 2],
+        stats: &Rc<SyntheticChainStats>,
+    ) -> SyntheticTaskRef {
+        let mut staged = stage_completed_task_output_for_benchmark(SyntheticBranchNode {
+            id,
+            children,
+            stats: Rc::clone(stats),
+        })
+        .expect("synthetic branch task staging failed");
+        let task = staged.task;
+        staged.owns_reference = false;
+        drop(staged);
+        SyntheticTaskRef { task }
+    }
+
+    fn staged_synthetic_chain(
+        depth: usize,
+        stats: &Rc<SyntheticChainStats>,
+        panic_mask: u64,
+    ) -> (SyntheticTaskRef, *mut TaskHeader) {
+        assert!(depth > 0);
+        let mut next = None;
+        let mut leaf = std::ptr::null_mut();
+        for id in 0..depth {
+            let mut staged = stage_completed_task_output_for_benchmark(SyntheticChainNode {
+                id,
+                next,
+                stats: Rc::clone(stats),
+                panic_mask,
+            })
+            .expect("synthetic chain task staging failed");
+            if id == 0 {
+                leaf = staged.task;
+            }
+            let task = staged.task;
+            staged.owns_reference = false;
+            drop(staged);
+            next = Some(SyntheticTaskRef { task });
+        }
+        (next.expect("synthetic chain head is missing"), leaf)
+    }
+
+    #[cfg(not(miri))]
+    struct RealChainNode {
+        id: usize,
+        next: Option<Box<JoinHandle<RealChainNode>>>,
+        stats: Rc<SyntheticChainStats>,
+    }
+
+    #[cfg(not(miri))]
+    impl Drop for RealChainNode {
+        fn drop(&mut self) {
+            let depth = self.stats.depth.get() + 1;
+            self.stats.depth.set(depth);
+            self.stats
+                .max_depth
+                .set(self.stats.max_depth.get().max(depth));
+            self.stats.order.borrow_mut().push(self.id);
+            drop(self.next.take());
+            self.stats.depth.set(depth - 1);
         }
     }
 
@@ -3790,6 +4381,469 @@ mod tests {
                 assert_staged_tasks_reclaimed(owner, 2, 2);
             }
         });
+    }
+
+    #[test]
+    fn join_task_initial_destruction_policy_and_shutdown_arm_are_exact() {
+        struct DropOutput;
+
+        impl Drop for DropOutput {
+            fn drop(&mut self) {}
+        }
+
+        assert!(!std::mem::needs_drop::<JoinError>());
+
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let owner = Rc::as_ptr(&executor.owner);
+        let (plain, dropping) = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("ringless policy test context installation failed");
+            (
+                Executor::try_spawn(std::future::pending::<()>())
+                    .expect("plain task admission failed"),
+                Executor::try_spawn(std::future::pending::<DropOutput>())
+                    .expect("drop-output task admission failed"),
+            )
+        };
+
+        unsafe {
+            assert!(!std::ptr::eq(
+                (*plain.task_ptr).vtable,
+                (*plain.task_ptr).iterative_vtable,
+            ));
+            assert!(std::ptr::eq(
+                (*dropping.task_ptr).vtable,
+                (*dropping.task_ptr).iterative_vtable,
+            ));
+        }
+
+        executor.shutdown_owner();
+        unsafe {
+            assert!(std::ptr::eq(
+                (*plain.task_ptr).vtable,
+                (*plain.task_ptr).iterative_vtable,
+            ));
+            assert!(std::ptr::eq(
+                (*dropping.task_ptr).vtable,
+                (*dropping.task_ptr).iterative_vtable,
+            ));
+        }
+        drop(plain);
+        drop(dropping);
+        unsafe {
+            assert!((*executor.owner.state_ptr()).all_tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn shutdown_skips_reentrant_zero_ref_raw_task_without_rearming() {
+        type Completed = std::future::Ready<usize>;
+
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let owner = Rc::as_ptr(&executor.owner);
+        let task = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("ringless zero-ref shutdown context installation failed");
+            let mut staged = stage_completed_task_output_for_benchmark(29usize)
+                .expect("zero-ref shutdown task staging failed");
+            let task = staged.task;
+            let raw = join_task_vtable_for::<Completed>().direct;
+            unsafe {
+                (*task).vtable = raw;
+                (*task).refs.set(0);
+            }
+            staged.owns_reference = false;
+            drop(staged);
+            task
+        };
+        let raw_destroy = unsafe { (*task).vtable.destroy };
+        ITERATIVE_TASK_DESTROY_ENTRIES.with(|entries| entries.set(0));
+
+        executor.shutdown_owner();
+
+        ITERATIVE_TASK_DESTROY_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
+        unsafe {
+            assert!((*task).all_link.is_unlinked());
+            assert!((*task).ready_link.is_unlinked());
+            raw_destroy(task);
+            assert_staged_tasks_reclaimed(&executor.owner, 1, 1);
+        }
+    }
+
+    #[test]
+    fn iterative_task_destructor_can_reenter_its_executor_shutdown() {
+        struct ReentrantShutdownOutput {
+            executor: *mut Executor,
+            calls: Rc<Cell<usize>>,
+        }
+
+        impl Drop for ReentrantShutdownOutput {
+            fn drop(&mut self) {
+                self.calls.set(self.calls.get() + 1);
+                unsafe {
+                    (&mut *self.executor).shutdown_owner();
+                }
+            }
+        }
+
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let executor_ptr = std::ptr::from_mut(&mut executor);
+        let owner = Rc::as_ptr(&executor.owner);
+        let calls = Rc::new(Cell::new(0));
+        let staged = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("ringless reentrant-shutdown context installation failed");
+            stage_completed_task_output_for_benchmark(ReentrantShutdownOutput {
+                executor: executor_ptr,
+                calls: Rc::clone(&calls),
+            })
+            .expect("reentrant-shutdown task staging failed")
+        };
+
+        drop(staged);
+
+        assert_eq!(calls.get(), 1);
+        let state = executor.owner.state_ptr();
+        unsafe {
+            assert!((*state).shutdown_complete);
+            assert!((*state).all_tasks.is_empty());
+            assert!((*state).ready_queue.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_allocs, 1);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_frees, 1);
+        }
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+    }
+
+    #[test]
+    fn staged_no_drop_output_starts_entry_entry() {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let staged = stage_completed_task_output_for_benchmark(17usize)
+                .expect("completed task staging failed");
+            unsafe {
+                assert!(std::ptr::eq(
+                    (*staged.task).vtable,
+                    (*staged.task).iterative_vtable,
+                ));
+            }
+            drop(staged);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 1, 1);
+            }
+        });
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn completed_unpolled_unit_handle_uses_direct_destroy_and_reuses_slot() {
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<()>>));
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run({
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    let handle =
+                        Executor::spawn(async {}).expect("callback-free unit task spawn failed");
+                    *handle_slot.borrow_mut() = Some(handle);
+                }
+            })
+            .expect("callback-free unit task did not complete");
+
+        let handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("callback-free unit handle disappeared");
+        let task = handle.task_ptr;
+        unsafe {
+            assert_eq!((*task).refs.get(), 1);
+            assert!(!std::ptr::eq((*task).vtable, (*task).iterative_vtable,));
+            assert_eq!((*task).flags.get(), TaskHeader::FLAG_COMPLETED);
+            assert!((*task).ready_link.is_unlinked());
+        }
+        ITERATIVE_TASK_DESTROY_ENTRIES.with(|entries| entries.set(0));
+
+        drop(handle);
+
+        ITERATIVE_TASK_DESTROY_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
+        assert_destroyed_task_slot_is_reused(&mut executor, task);
+    }
+
+    #[test]
+    fn iterative_task_destroy_synthetic_chain_is_fifo_and_depth_one() {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let depth = if cfg!(miri) { 8 } else { 64 };
+            let stats = Rc::new(SyntheticChainStats::default());
+            let owner_refs = Rc::strong_count(owner);
+            let (head, leaf) = staged_synthetic_chain(depth, &stats, 0);
+            assert_eq!(unsafe { (*head.task).refs.get() }, 1);
+            assert_eq!(Rc::strong_count(owner), owner_refs + depth);
+
+            drop(head);
+
+            assert_eq!(stats.max_depth.get(), 1);
+            assert_eq!(*stats.order.borrow(), (0..depth).rev().collect::<Vec<_>>());
+            assert_eq!(Rc::strong_count(owner), owner_refs);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, depth, depth);
+            }
+
+            let replacement = stage_completed_task_output_for_benchmark(23usize)
+                .expect("replacement task staging failed");
+            assert_eq!(
+                replacement.task, leaf,
+                "iterative drain did not return the tail slot for immediate reuse"
+            );
+            drop(replacement);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, depth + 1, depth + 1);
+            }
+        });
+    }
+
+    #[test]
+    fn iterative_task_destroy_branch_is_true_fifo() {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let stats = Rc::new(SyntheticChainStats::default());
+            let grandchild = stage_synthetic_branch(3, [None, None], &stats);
+            let first = stage_synthetic_branch(1, [Some(grandchild), None], &stats);
+            let second = stage_synthetic_branch(2, [None, None], &stats);
+            let root = stage_synthetic_branch(0, [Some(first), Some(second)], &stats);
+
+            drop(root);
+
+            assert_eq!(stats.max_depth.get(), 1);
+            assert_eq!(*stats.order.borrow(), vec![0, 1, 2, 3]);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 4, 4);
+            }
+        });
+    }
+
+    #[test]
+    fn iterative_task_destroy_drains_every_panic_position_and_clears_tls() {
+        const DEPTH: usize = 8;
+        let cases = [
+            1_u64 << (DEPTH - 1),
+            1_u64 << (DEPTH / 2),
+            1,
+            (1_u64 << (DEPTH - 1)) | (1_u64 << (DEPTH / 2)) | 1,
+        ];
+
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let mut expected_total = 0;
+            for panic_mask in cases {
+                let stats = Rc::new(SyntheticChainStats::default());
+                let (head, _) = staged_synthetic_chain(DEPTH, &stats, panic_mask);
+                expected_total += DEPTH;
+                let panic = catch_unwind(AssertUnwindSafe(|| drop(head)))
+                    .expect_err("synthetic chain panic was not propagated");
+                let expected_first = (0..DEPTH)
+                    .rev()
+                    .find(|id| (panic_mask & (1_u64 << id)) != 0)
+                    .expect("panic case has no selected node");
+                assert_eq!(
+                    panic.downcast_ref::<SyntheticChainPanic>(),
+                    Some(&SyntheticChainPanic(expected_first))
+                );
+                assert_eq!(stats.max_depth.get(), 1);
+                assert_eq!(*stats.order.borrow(), (0..DEPTH).rev().collect::<Vec<_>>());
+                unsafe {
+                    assert_staged_tasks_reclaimed(owner, expected_total, expected_total);
+                }
+            }
+
+            let clean_stats = Rc::new(SyntheticChainStats::default());
+            let (clean_head, _) = staged_synthetic_chain(4, &clean_stats, 0);
+            expected_total += 4;
+            drop(clean_head);
+            assert_eq!(clean_stats.max_depth.get(), 1);
+            assert_eq!(*clean_stats.order.borrow(), vec![3, 2, 1, 0]);
+            ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, expected_total, expected_total);
+            }
+        });
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn iterative_task_destroy_preserves_an_active_outer_unwind() {
+        struct DropSyntheticHead(Option<SyntheticTaskRef>);
+
+        impl Drop for DropSyntheticHead {
+            fn drop(&mut self) {
+                drop(self.0.take());
+            }
+        }
+
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let stats = Rc::new(SyntheticChainStats::default());
+            let (head, _) = staged_synthetic_chain(4, &stats, u64::MAX);
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _head = DropSyntheticHead(Some(head));
+                std::panic::panic_any(SyntheticOuterPanic);
+            }))
+            .expect_err("outer synthetic unwind did not propagate");
+            assert!(panic.is::<SyntheticOuterPanic>());
+            assert_eq!(stats.max_depth.get(), 1);
+            assert_eq!(*stats.order.borrow(), vec![3, 2, 1, 0]);
+            ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 4, 4);
+            }
+        });
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn iterative_task_destroy_real_64_chain_survives_escaped_final_owner() {
+        const DEPTH: usize = 64;
+        let stats = Rc::new(SyntheticChainStats::default());
+        let head = Rc::new(RefCell::new(None::<Box<JoinHandle<RealChainNode>>>));
+        let leaf_task = Rc::new(Cell::new(std::ptr::null_mut()));
+        let mut executor =
+            ManuallyDrop::new(Executor::new().expect("executor construction failed"));
+        let weak_owner = Rc::downgrade(&executor.owner);
+
+        executor
+            .run({
+                let stats = Rc::clone(&stats);
+                let head = Rc::clone(&head);
+                let leaf_task = Rc::clone(&leaf_task);
+                async move {
+                    let mut next = None;
+                    for id in 0..DEPTH {
+                        let handle = Executor::spawn(std::future::ready(RealChainNode {
+                            id,
+                            next,
+                            stats: Rc::clone(&stats),
+                        }))
+                        .expect("real chain task spawn failed");
+                        if id == 0 {
+                            leaf_task.set(handle.task_ptr);
+                        }
+                        next = Some(Box::new(handle));
+                    }
+                    *head.borrow_mut() = next;
+                }
+            })
+            .expect("real chain tasks did not complete");
+
+        let state = executor.owner.state_ptr();
+        unsafe {
+            assert_eq!((*state).runtime_state.live_tasks, 0);
+            assert!((*state).ready_queue.is_empty());
+            assert!(!(*state).all_tasks.is_empty());
+        }
+
+        let mut head = head.borrow_mut().take().expect("real chain head missing");
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        const CLAIMED: usize = 4;
+        for expected_id in ((DEPTH - CLAIMED)..DEPTH).rev() {
+            let mut handle = *head;
+            let mut node = match Pin::new(&mut handle).poll(&mut cx) {
+                Poll::Ready(Ok(node)) => node,
+                _ => panic!("claimed chain result was not ready"),
+            };
+            assert_eq!(node.id, expected_id);
+            head = node.next.take().expect("claimed chain boundary missing");
+            drop(node);
+            drop(handle);
+        }
+        unsafe {
+            ManuallyDrop::drop(&mut executor);
+        }
+        assert_eq!(
+            weak_owner.strong_count(),
+            DEPTH - CLAIMED,
+            "each escaped completed task must retain one owner pin"
+        );
+
+        drop(head);
+
+        assert_eq!(stats.max_depth.get(), 1);
+        assert_eq!(*stats.order.borrow(), (0..DEPTH).rev().collect::<Vec<_>>());
+        assert!(weak_owner.upgrade().is_none());
+        assert!(!leaf_task.get().is_null());
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+    }
+
+    #[test]
+    fn iterative_task_destroy_drains_pending_cancellation_cross_executor_chain() {
+        let mut inner = ManuallyDrop::new(Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        });
+        let inner_weak = Rc::downgrade(&inner.owner);
+        let inner_owner = Rc::as_ptr(&inner.owner);
+        let inner_handle = {
+            let _active = ExecutorCtxGuard::install(inner_owner)
+                .expect("inner cross-executor context installation failed");
+            Executor::try_spawn(std::future::pending::<()>())
+                .expect("pending inner task spawn failed")
+        };
+        let inner_task = inner_handle.task_ptr;
+        let inner_result = inner_handle.result_ptr;
+
+        let mut outer = ManuallyDrop::new(Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        });
+        let outer_weak = Rc::downgrade(&outer.owner);
+        let owner = Rc::as_ptr(&outer.owner);
+        let staged = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("outer cross-executor context installation failed");
+            stage_completed_task_output_for_benchmark(inner_handle)
+                .expect("outer cross-executor task staging failed")
+        };
+
+        inner.shutdown_owner();
+        unsafe {
+            assert_eq!((*inner_task).flags.get(), TaskHeader::FLAG_COMPLETED);
+            assert_eq!((*inner_task).refs.get(), 1);
+            assert!(std::ptr::eq(
+                (*inner_task).vtable,
+                (*inner_task).iterative_vtable,
+            ));
+            assert!(matches!(&*inner_result, Some(Err(JoinError::Cancelled))));
+        }
+        unsafe { ManuallyDrop::drop(&mut inner) };
+        unsafe { ManuallyDrop::drop(&mut outer) };
+        assert_eq!(inner_weak.strong_count(), 1);
+        assert_eq!(outer_weak.strong_count(), 1);
+
+        drop(staged);
+
+        assert!(inner_weak.upgrade().is_none());
+        assert!(outer_weak.upgrade().is_none());
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
     }
 
     #[test]
@@ -4382,6 +5436,48 @@ mod tests {
     fn counted_waker(stats: &Rc<CountedWakerStats>) -> Waker {
         let data = Rc::into_raw(Rc::clone(stats)).cast();
         unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER_VTABLE)) }
+    }
+
+    #[derive(Debug)]
+    struct TaskWakerClonePanic;
+
+    unsafe fn panicking_clone_waker_clone(data: *const ()) -> RawWaker {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.clones.set(stats.clones.get() + 1);
+        let _ = Rc::into_raw(stats);
+        std::panic::panic_any(TaskWakerClonePanic);
+    }
+
+    static PANICKING_CLONE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        panicking_clone_waker_clone,
+        counted_waker_wake,
+        counted_waker_wake_by_ref,
+        counted_waker_drop,
+    );
+
+    fn panicking_clone_waker(stats: &Rc<CountedWakerStats>) -> Waker {
+        let data = Rc::into_raw(Rc::clone(stats)).cast();
+        unsafe { Waker::from_raw(RawWaker::new(data, &PANICKING_CLONE_WAKER_VTABLE)) }
+    }
+
+    unsafe fn replacement_drop_source_clone(data: *const ()) -> RawWaker {
+        let stats = unsafe { Rc::<CountedWakerStats>::from_raw(data.cast()) };
+        stats.clones.set(stats.clones.get() + 1);
+        let cloned = Rc::clone(&stats);
+        let _ = Rc::into_raw(stats);
+        RawWaker::new(Rc::into_raw(cloned).cast(), &PANICKING_DROP_WAKER_VTABLE)
+    }
+
+    static REPLACEMENT_DROP_SOURCE_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        replacement_drop_source_clone,
+        counted_waker_wake,
+        counted_waker_wake_by_ref,
+        counted_waker_drop,
+    );
+
+    fn replacement_drop_source_waker(stats: &Rc<CountedWakerStats>) -> Waker {
+        let data = Rc::into_raw(Rc::clone(stats)).cast();
+        unsafe { Waker::from_raw(RawWaker::new(data, &REPLACEMENT_DROP_SOURCE_VTABLE)) }
     }
 
     #[derive(Debug)]
@@ -5582,6 +6678,7 @@ mod tests {
         assert!(handle.is_finished());
         let task = handle.task_ptr;
         unsafe {
+            arm_task_destruction(task);
             let waker_slot = &mut *handle.waker_ptr;
             assert!(
                 waker_slot.is_none(),
@@ -6267,6 +7364,57 @@ mod tests {
     #[cfg(not(miri))]
     const CLOSE_LINGER_CHILD_TEST: &str =
         "runtime::executor::tests::close_worker_full_fallback_waives_positive_linger_child";
+    #[cfg(not(miri))]
+    const DATA_FD_REUSE_CHILD_ENV: &str = "FLOWIO_DATA_FD_REUSE_CHILD";
+    #[cfg(not(miri))]
+    const DATA_FD_REUSE_CHILD_TEST: &str = "runtime::executor::tests::unflushed_data_read_same_poll_drop_blocks_fd_reuse_until_target_cqe";
+
+    #[cfg(not(miri))]
+    fn run_exact_unit_test_child_with_watchdog(test_name: &str, child_env: &str, label: &str) {
+        use std::process::{Command, Stdio};
+
+        let current_exe = std::env::current_exe().expect("current unit-test executable");
+        let mut child = Command::new(current_exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_env, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {label} child: {err}"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+
+        loop {
+            if child
+                .try_wait()
+                .unwrap_or_else(|err| panic!("poll {label} child: {err}"))
+                .is_some()
+            {
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|err| panic!("collect {label} child output: {err}"));
+                assert!(
+                    output.status.success(),
+                    "{label} child failed: status={:?}, stdout={}, stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|err| panic!("reap timed-out {label} child: {err}"));
+                panic!(
+                    "{label} child exceeded watchdog; stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     #[cfg(not(miri))]
     fn replace_with_inert_close_worker(
@@ -6313,6 +7461,23 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "set positive SO_LINGER failed");
+    }
+
+    #[cfg(not(miri))]
+    fn descriptor_identity_for_test(fd: std::os::fd::RawFd) -> (libc::dev_t, libc::ino_t) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat is writable for the exact fstat result and fd is only
+        // observed, never consumed.
+        let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "fstat descriptor {fd} failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful fstat initialized the complete result.
+        let stat = unsafe { stat.assume_init() };
+        (stat.st_dev, stat.st_ino)
     }
 
     #[cfg(not(miri))]
@@ -6444,6 +7609,182 @@ mod tests {
         assert!(raw_fd_is_closed(raw));
     }
 
+    #[cfg(all(any(debug_assertions, feature = "test-support"), not(miri)))]
+    #[test]
+    fn unflushed_data_read_same_poll_drop_blocks_fd_reuse_until_target_cqe() {
+        if std::env::var_os(DATA_FD_REUSE_CHILD_ENV).is_none() {
+            run_exact_unit_test_child_with_watchdog(
+                DATA_FD_REUSE_CHILD_TEST,
+                DATA_FD_REUSE_CHILD_ENV,
+                "unflushed data-fd reuse",
+            );
+            return;
+        }
+
+        struct TargetCqeBuffer {
+            bytes: Vec<u8>,
+            fd: std::os::fd::RawFd,
+            identity: (libc::dev_t, libc::ino_t),
+            drops: Rc<Cell<usize>>,
+            saw_original_fd: Rc<Cell<bool>>,
+        }
+
+        impl Drop for TargetCqeBuffer {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.drops.replace(self.drops.get() + 1),
+                    0,
+                    "target-CQE payload dropped more than once"
+                );
+                assert_eq!(
+                    descriptor_identity_for_test(self.fd),
+                    self.identity,
+                    "target-CQE payload drop did not retain the original descriptor"
+                );
+                self.saw_original_fd.set(true);
+            }
+        }
+
+        // SAFETY: bytes owns pointer-stable writable capacity across moves.
+        // The runtime publishes no more than writable_len() initialized bytes.
+        unsafe impl IoBuffReadWrite for TargetCqeBuffer {
+            fn as_mut_ptr(&mut self) -> *mut u8 {
+                self.bytes.as_mut_ptr()
+            }
+
+            fn writable_len(&self) -> usize {
+                self.bytes.capacity()
+            }
+
+            unsafe fn set_written_len(&mut self, len: usize) {
+                assert!(len <= self.bytes.capacity());
+                unsafe { self.bytes.set_len(len) };
+            }
+        }
+
+        let mut executor = Executor::new().expect("executor construction failed");
+        replace_with_disconnected_close_worker(&mut executor);
+
+        // Isolated child execution makes Linux's lowest-free-fd allocation a
+        // deterministic oracle without racing sibling tests.
+        let predictor = std::fs::File::open("/dev/null").expect("open fd predictor");
+        let predicted_fd = predictor.as_raw_fd();
+        drop(predictor);
+
+        let (mut reader, peer) = UnixStream::pair().expect("data witness socketpair failed");
+        let reader_fd = reader.as_raw_fd();
+        assert_eq!(
+            reader_fd, predicted_fd,
+            "data witness did not acquire the predicted lowest descriptor"
+        );
+        let reader_identity = descriptor_identity_for_test(reader_fd);
+        set_positive_linger(reader_fd, 1);
+
+        let payload_drops = Rc::new(Cell::new(0));
+        let saw_original_fd = Rc::new(Cell::new(false));
+        let run_drops = Rc::clone(&payload_drops);
+        let run_saw_original_fd = Rc::clone(&saw_original_fd);
+
+        executor
+            .run(async move {
+                let buffer = TargetCqeBuffer {
+                    bytes: Vec::with_capacity(64),
+                    fd: reader_fd,
+                    identity: reader_identity,
+                    drops: Rc::clone(&run_drops),
+                    saw_original_fd: Rc::clone(&run_saw_original_fd),
+                };
+                let mut read = Box::pin(reader.read(buffer, 64));
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        read.as_mut().poll(cx).is_pending(),
+                        "first data read poll did not queue an SQE"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+
+                // Both drops occur before this task yields, so neither the
+                // read nor its cancellation SQE has reached a batch flush.
+                drop(read);
+                drop(reader);
+                assert_eq!(run_drops.get(), 0, "unflushed payload retired early");
+                assert_eq!(
+                    descriptor_identity_for_test(reader_fd),
+                    reader_identity,
+                    "same-poll stream drop released the queued read descriptor"
+                );
+
+                let held_probe = std::fs::File::open("/dev/null").expect("open held reuse probe");
+                assert_ne!(
+                    held_probe.as_raw_fd(),
+                    reader_fd,
+                    "queued data SQE allowed premature numeric-fd reuse"
+                );
+                assert_eq!(
+                    descriptor_identity_for_test(reader_fd),
+                    reader_identity,
+                    "reuse probe replaced the queued read descriptor"
+                );
+
+                // Closing the peer makes the read target retire promptly even
+                // if its same-batch cancellation loses the race.
+                drop(peer);
+                for _ in 0..100 {
+                    if run_drops.get() == 1 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5))
+                        .await
+                        .expect("target-CQE wait sleep failed");
+                }
+                assert_eq!(run_drops.get(), 1, "read target CQE did not retire");
+                assert!(
+                    run_saw_original_fd.get(),
+                    "target reclamation did not observe the original descriptor"
+                );
+                assert!(
+                    raw_fd_is_closed(reader_fd),
+                    "final data-operation lease did not close after target retirement"
+                );
+
+                let reused = std::fs::File::open("/dev/null").expect("force fd reuse");
+                assert_eq!(
+                    reused.as_raw_fd(),
+                    reader_fd,
+                    "retired data descriptor did not become the lowest reusable fd"
+                );
+                let reused_identity = descriptor_identity_for_test(reader_fd);
+                assert_ne!(reused_identity, reader_identity);
+
+                Nop::new().await.expect("post-reuse NOP failed");
+                assert_eq!(
+                    descriptor_identity_for_test(reader_fd),
+                    reused_identity,
+                    "a delayed second release closed the reused numeric descriptor"
+                );
+                assert_eq!(run_drops.get(), 1, "target payload dropped twice");
+
+                drop(reused);
+                assert!(raw_fd_is_closed(reader_fd));
+                drop(held_probe);
+            })
+            .expect("unflushed data-fd witness run failed");
+
+        assert_eq!(payload_drops.get(), 1);
+        assert!(saw_original_fd.get());
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(stats.close_worker_admissions, 0);
+            assert_eq!(stats.close_worker_disconnected_fallbacks, 1);
+            assert_eq!(stats.close_linger_queries, 1);
+            assert_eq!(stats.close_linger_waivers, 1);
+            assert_eq!(stats.close_linger_waiver_failures, 0);
+            assert_eq!(stats.close_direct_closes, 1);
+        }
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn close_worker_full_fallback_waives_positive_linger_child() {
@@ -6502,45 +7843,11 @@ mod tests {
     #[cfg(not(miri))]
     #[test]
     fn close_worker_full_fallback_positive_linger_has_process_watchdog() {
-        use std::process::{Command, Stdio};
-
-        let current_exe = std::env::current_exe().expect("current unit-test executable");
-        let mut child = Command::new(current_exe)
-            .args(["--exact", CLOSE_LINGER_CHILD_TEST, "--nocapture"])
-            .env(CLOSE_LINGER_CHILD_ENV, "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn positive-linger child");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-
-        loop {
-            if let Some(_status) = child.try_wait().expect("poll positive-linger child") {
-                let output = child
-                    .wait_with_output()
-                    .expect("collect positive-linger child output");
-                assert!(
-                    output.status.success(),
-                    "positive-linger child failed: status={:?}, stdout={}, stderr={}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child
-                    .wait_with_output()
-                    .expect("reap timed-out positive-linger child");
-                panic!(
-                    "positive-linger child exceeded watchdog; stdout={}, stderr={}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        run_exact_unit_test_child_with_watchdog(
+            CLOSE_LINGER_CHILD_TEST,
+            CLOSE_LINGER_CHILD_ENV,
+            "positive-linger",
+        );
     }
 
     #[cfg(not(miri))]
@@ -6970,31 +8277,37 @@ mod tests {
 
     #[test]
     fn join_handle_pending_poll_reuses_same_waker() {
-        let mut result = None::<Result<usize, JoinError>>;
-        let mut waker_slot = None::<Waker>;
-        let mut handle = ManuallyDrop::new(JoinHandle {
-            task_ptr: std::ptr::null_mut(),
-            result_ptr: &mut result,
-            waker_ptr: &mut waker_slot,
-        });
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let owner = Rc::as_ptr(&executor.owner);
+        let mut handle = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("ringless join-waker context installation failed");
+            Executor::try_spawn(std::future::pending::<usize>())
+                .expect("pending join task admission failed")
+        };
+        let task = handle.task_ptr;
+        let state = executor.owner.state_ptr();
+        let direct = unsafe { (*task).vtable };
+        let iterative = unsafe { (*task).iterative_vtable };
+        assert!(!std::ptr::eq(direct, iterative));
 
         let first_stats = Rc::new(CountedWakerStats::default());
         let first_waker = counted_waker(&first_stats);
         let mut first_cx = Context::from_waker(&first_waker);
 
-        assert!(
-            unsafe { Pin::new_unchecked(&mut *handle) }
-                .poll(&mut first_cx)
-                .is_pending()
-        );
+        assert!(Pin::new(&mut handle).poll(&mut first_cx).is_pending());
+        assert!(std::ptr::eq(unsafe { (*task).vtable }, iterative));
         assert_eq!(first_stats.clones.get(), 1);
         assert_eq!(first_stats.drops.get(), 0);
 
-        assert!(
-            unsafe { Pin::new_unchecked(&mut *handle) }
-                .poll(&mut first_cx)
-                .is_pending()
-        );
+        assert!(Pin::new(&mut handle).poll(&mut first_cx).is_pending());
+        assert!(std::ptr::eq(unsafe { (*task).vtable }, iterative));
         assert_eq!(
             first_stats.clones.get(),
             1,
@@ -7010,11 +8323,7 @@ mod tests {
         let second_waker = counted_waker(&second_stats);
         let mut second_cx = Context::from_waker(&second_waker);
 
-        assert!(
-            unsafe { Pin::new_unchecked(&mut *handle) }
-                .poll(&mut second_cx)
-                .is_pending()
-        );
+        assert!(Pin::new(&mut handle).poll(&mut second_cx).is_pending());
         assert_eq!(
             first_stats.drops.get(),
             1,
@@ -7022,13 +8331,254 @@ mod tests {
         );
         assert_eq!(second_stats.clones.get(), 1);
         assert!(
-            waker_slot
+            unsafe { &*handle.waker_ptr }
                 .as_ref()
                 .expect("join waker should be stored")
                 .will_wake(&second_waker)
         );
 
-        drop(waker_slot.take());
+        unsafe {
+            (*state)
+                .ready_queue
+                .remove(std::ptr::addr_of_mut!((*task).ready_link));
+        }
+        let panic = unsafe {
+            cancel_task_and_release_executor_ref(
+                task,
+                std::ptr::addr_of_mut!((*state).runtime_state),
+            )
+        };
+        assert!(panic.is_none());
+        assert_eq!(second_stats.wakes.get(), 1);
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut second_cx),
+            Poll::Ready(Err(JoinError::Cancelled))
+        ));
+        drop(handle);
+        unsafe {
+            assert!((*state).all_tasks.is_empty());
+        }
+        executor.shutdown_owner();
+    }
+
+    #[test]
+    fn join_handle_arms_before_clone_and_publishes_before_old_waker_drop() {
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let owner = Rc::as_ptr(&executor.owner);
+        let mut handle = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("ringless join panic context installation failed");
+            Executor::try_spawn(std::future::pending::<usize>())
+                .expect("pending join task admission failed")
+        };
+        let task = handle.task_ptr;
+        let state = executor.owner.state_ptr();
+        let iterative = unsafe { (*task).iterative_vtable };
+
+        let clone_stats = Rc::new(CountedWakerStats::default());
+        let clone_waker = panicking_clone_waker(&clone_stats);
+        let mut clone_cx = Context::from_waker(&clone_waker);
+        let first_clone_panic = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut handle).poll(&mut clone_cx)
+        }))
+        .expect_err("first join-waker clone did not panic");
+        assert!(first_clone_panic.is::<TaskWakerClonePanic>());
+        assert!(std::ptr::eq(unsafe { (*task).vtable }, iterative));
+        assert!(unsafe { (&*handle.waker_ptr).is_none() });
+
+        let first_stats = Rc::new(CountedWakerStats::default());
+        let first_waker = counted_waker(&first_stats);
+        let mut first_cx = Context::from_waker(&first_waker);
+        assert!(Pin::new(&mut handle).poll(&mut first_cx).is_pending());
+
+        let replacement_clone_panic = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut handle).poll(&mut clone_cx)
+        }))
+        .expect_err("replacement join-waker clone did not panic");
+        assert!(replacement_clone_panic.is::<TaskWakerClonePanic>());
+        assert!(
+            unsafe { &*handle.waker_ptr }
+                .as_ref()
+                .is_some_and(|stored| stored.will_wake(&first_waker))
+        );
+
+        let panicking_drop_stats = Rc::new(CountedWakerStats::default());
+        let panicking_drop_source = replacement_drop_source_waker(&panicking_drop_stats);
+        let mut panicking_drop_cx = Context::from_waker(&panicking_drop_source);
+        assert!(
+            Pin::new(&mut handle)
+                .poll(&mut panicking_drop_cx)
+                .is_pending()
+        );
+        assert_eq!(first_stats.drops.get(), 1);
+
+        let final_stats = Rc::new(CountedWakerStats::default());
+        let final_waker = counted_waker(&final_stats);
+        let mut final_cx = Context::from_waker(&final_waker);
+        let old_drop_panic = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut handle).poll(&mut final_cx)
+        }))
+        .expect_err("old stored join-waker drop did not panic");
+        assert!(old_drop_panic.is::<TaskWakerDropPanic>());
+        assert!(
+            unsafe { &*handle.waker_ptr }
+                .as_ref()
+                .is_some_and(|stored| stored.will_wake(&final_waker))
+        );
+        assert_eq!(panicking_drop_stats.drops.get(), 1);
+
+        unsafe {
+            (*state)
+                .ready_queue
+                .remove(std::ptr::addr_of_mut!((*task).ready_link));
+        }
+        let cleanup_panic = unsafe {
+            cancel_task_and_release_executor_ref(
+                task,
+                std::ptr::addr_of_mut!((*state).runtime_state),
+            )
+        };
+        assert!(cleanup_panic.is_none());
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut clone_cx),
+            Poll::Ready(Err(JoinError::Cancelled))
+        ));
+        assert_eq!(clone_stats.clones.get(), 2);
+        drop(handle);
+        unsafe {
+            assert!((*state).all_tasks.is_empty());
+        }
+        executor.shutdown_owner();
+    }
+
+    #[test]
+    fn join_waker_clone_reentrancy_observes_arm_and_reclaims_nested_task() {
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let owner = Rc::as_ptr(&executor.owner);
+        let drops = Rc::new(Cell::new(0));
+        let (mut handle, nested) = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("ringless reentrant-waker context installation failed");
+            let handle = Executor::try_spawn(std::future::pending::<()>())
+                .expect("reentrant-waker task admission failed");
+            let mut staged = stage_completed_task_output_for_benchmark(StagedTaskDropProbe::new(
+                Rc::clone(&drops),
+                false,
+            ))
+            .expect("nested callback task staging failed");
+            let nested = SyntheticTaskRef { task: staged.task };
+            staged.owns_reference = false;
+            drop(staged);
+            (handle, nested)
+        };
+        let task = handle.task_ptr;
+        let state = executor.owner.state_ptr();
+        let reentrant_state = Rc::new(ReentrantCloneWakerState {
+            armed_task: task,
+            iterative_vtable: unsafe { (*task).iterative_vtable },
+            release_during_clone: RefCell::new(Some(nested)),
+            clones: Cell::new(0),
+        });
+        let waker = reentrant_clone_waker(&reentrant_state);
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut handle).poll(&mut cx).is_pending());
+        assert_eq!(reentrant_state.clones.get(), 1);
+        assert!(reentrant_state.release_during_clone.borrow().is_none());
+        assert_eq!(drops.get(), 1);
+        assert!(std::ptr::eq(
+            unsafe { (*task).vtable },
+            reentrant_state.iterative_vtable,
+        ));
+
+        unsafe {
+            (*state)
+                .ready_queue
+                .remove(std::ptr::addr_of_mut!((*task).ready_link));
+        }
+        let cleanup_panic = unsafe {
+            cancel_task_and_release_executor_ref(
+                task,
+                std::ptr::addr_of_mut!((*state).runtime_state),
+            )
+        };
+        assert!(cleanup_panic.is_none());
+        assert!(matches!(
+            Pin::new(&mut handle).poll(&mut cx),
+            Poll::Ready(Err(JoinError::Cancelled))
+        ));
+        drop(handle);
+        unsafe {
+            assert!((*state).all_tasks.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_allocs, 2);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_frees, 2);
+        }
+        executor.shutdown_owner();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn join_handle_post_ready_repoll_arms_before_waker_clone() {
+        let handle_slot = Rc::new(RefCell::new(None::<JoinHandle<usize>>));
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run({
+                let handle_slot = Rc::clone(&handle_slot);
+                async move {
+                    *handle_slot.borrow_mut() = Some(
+                        Executor::spawn(async { 41usize }).expect("post-ready task spawn failed"),
+                    );
+                }
+            })
+            .expect("post-ready task did not complete");
+
+        let mut handle = handle_slot
+            .borrow_mut()
+            .take()
+            .expect("post-ready handle disappeared");
+        let task = handle.task_ptr;
+        let direct = unsafe { (*task).vtable };
+        let iterative = unsafe { (*task).iterative_vtable };
+        assert!(!std::ptr::eq(direct, iterative));
+
+        let ready_waker = Waker::noop();
+        let mut ready_cx = Context::from_waker(ready_waker);
+        assert_eq!(
+            Pin::new(&mut handle).poll(&mut ready_cx),
+            Poll::Ready(Ok(41))
+        );
+        assert!(std::ptr::eq(unsafe { (*task).vtable }, direct));
+        assert!(unsafe { (&*handle.waker_ptr).is_none() });
+
+        let clone_stats = Rc::new(CountedWakerStats::default());
+        let clone_waker = panicking_clone_waker(&clone_stats);
+        let mut clone_cx = Context::from_waker(&clone_waker);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut handle).poll(&mut clone_cx)
+        }))
+        .expect_err("post-ready repoll clone did not panic");
+        assert!(panic.is::<TaskWakerClonePanic>());
+        assert!(std::ptr::eq(unsafe { (*task).vtable }, iterative));
+        assert!(unsafe { (&*handle.waker_ptr).is_none() });
+
+        drop(handle);
+        unsafe {
+            assert!((*executor.owner.state_ptr()).all_tasks.is_empty());
+        }
     }
 
     #[cfg(not(miri))]
