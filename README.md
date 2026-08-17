@@ -516,7 +516,10 @@ effective bound. `transport_write_buffer_size` independently sets a hard upper
 bound for each FlowIO ciphertext chunk drained from rustls; output beyond that
 bound is sent in later chunks, so a smaller bound can require more raw TCP
 writes. Ordinary TLS I/O reuses both setup allocations without growing the
-wrapper scratch. `rustls_buffer_limit: None` remains a separate choice that
+wrapper scratch. If rustls accepts only a prefix of one completed raw read, the
+same read scratch retains its bounded unfed suffix and resumes it before any
+later socket read; authenticated `close_notify` retires later bytes coalesced
+in that chunk. `rustls_buffer_limit: None` remains a separate choice that
 permits unbounded rustls-internal buffering and does not relax the FlowIO
 write-chunk bound. Raising the read option above its cap therefore does not
 increase the raw read size or reservation request.

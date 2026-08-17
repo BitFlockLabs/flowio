@@ -9,7 +9,10 @@
 //! The wrapper keeps the socket ownership boundary clear and avoids adding an
 //! extra plaintext buffering layer on top of rustls. The only wrapper-owned
 //! buffers are reusable ciphertext scratch buffers used to move TLS records
-//! between rustls and the underlying TCP stream.
+//! between rustls and the underlying TCP stream. If rustls applies plaintext
+//! or handshake-output backpressure partway through one raw read, the read
+//! scratch retains its bounded unfed suffix and resumes it before another
+//! socket read.
 //!
 //! `rustls` still has its own internal protocol buffers. This wrapper exposes
 //! the public `rustls` write-direction limit via [`TlsClientOptions`] so that
@@ -134,9 +137,10 @@ type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMark
 const DER_SEQUENCE_TAG: u8 = 0x30;
 const DER_BIT_STRING_TAG: u8 = 0x03;
 
-/// rustls 0.23.42 deframer `MAX_WIRE_SIZE`; keep the reusable read scratch and
-/// each raw read to at most one TLS record so ciphertext and plaintext staging
-/// are both drained between feeds. Recheck this value when updating rustls.
+/// rustls 0.23.42 deframer `MAX_WIRE_SIZE`; bounds the reusable read scratch
+/// and its retained-suffix offset. A feed may be partial when rustls applies
+/// plaintext or handshake-output backpressure. Recheck this value when
+/// updating rustls.
 const TLS_MAX_WIRE_READ_SIZE: usize = 18_437;
 
 /// Marker type used when the shared stream futures are driving raw TLS record
@@ -247,6 +251,29 @@ fn take_or_reserve_tls_scratch(
 #[inline]
 fn tls_read_submission_len(buffer_capacity: usize, configured_bound: usize) -> usize {
     buffer_capacity.min(configured_bound)
+}
+
+#[inline(always)]
+fn tls_unfed_read_slice(buffer: &[u8], fed_offset: u16) -> io::Result<&[u8]> {
+    buffer
+        .get(usize::from(fed_offset)..)
+        .ok_or_else(|| tls_internal_error("tls read scratch offset exceeds its filled length"))
+}
+
+#[inline(always)]
+fn tls_advance_read_offset(fed_offset: u16, read: usize, filled: usize) -> io::Result<u16> {
+    let next = usize::from(fed_offset)
+        .checked_add(read)
+        .filter(|next| *next <= filled)
+        .ok_or_else(|| tls_internal_error("rustls consumed beyond the TLS read scratch"))?;
+    u16::try_from(next)
+        .map_err(|_| tls_internal_error("tls read scratch offset is not representable"))
+}
+
+#[inline(always)]
+fn tls_complete_read_offset(filled: usize) -> io::Result<u16> {
+    u16::try_from(filled)
+        .map_err(|_| tls_internal_error("tls read scratch length is not representable"))
 }
 
 /// Fixed-capacity append adapter for one reusable TLS ciphertext chunk.
@@ -491,6 +518,10 @@ pub struct TlsClientStream {
     write_shutdown: bool,
     /// True after the underlying TCP stream has been shutdown for writes.
     transport_write_shutdown: bool,
+    /// Bytes at the front of the available read scratch already accepted by
+    /// rustls. A nonzero value retains the unfed suffix across plaintext or
+    /// handshake-output backpressure.
+    read_tls_fed_offset: u16,
 }
 
 fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]]) -> bool {
@@ -746,6 +777,7 @@ impl TlsClientStream {
             transport_write_failed: false,
             write_shutdown: false,
             transport_write_shutdown: false,
+            read_tls_fed_offset: 0,
         })
     }
 
@@ -962,10 +994,17 @@ impl TlsClientStream {
         )
     }
 
-    // Returns a read scratch buffer to the stream after clearing any bytes
-    // that were filled by the last transport read attempt.
+    // Returns a read scratch buffer to the stream. A successfully short rustls
+    // feed keeps the same allocation and its unfed suffix for the next valid
+    // TLS operation; fully fed and terminal buffers are reset for raw reuse.
     fn restore_read_tls_buffer(&mut self, mut buffer: Vec<u8>) {
-        buffer.clear();
+        let fed = usize::from(self.read_tls_fed_offset);
+        debug_assert!(fed <= buffer.len());
+        if fed >= buffer.len() {
+            buffer.clear();
+            self.read_tls_fed_offset = 0;
+        }
+        debug_assert!(self.read_tls_buffer.is_none());
         if self.read_tls_buffer.is_none() {
             self.read_tls_buffer = Some(buffer);
         }
@@ -989,8 +1028,12 @@ impl TlsClientStream {
     }
 
     fn feed_transport_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut cursor = Cursor::new(bytes);
-        while (cursor.position() as usize) < bytes.len() {
+        let unfed = tls_unfed_read_slice(bytes, self.read_tls_fed_offset)?;
+        let mut cursor = Cursor::new(unfed);
+        while (cursor.position() as usize) < unfed.len() {
+            if !self.connection.wants_read() {
+                return Ok(());
+            }
             let read = self.connection.read_tls(&mut cursor)?;
             if read == 0 {
                 return Err(io::Error::new(
@@ -998,11 +1041,38 @@ impl TlsClientStream {
                     "rustls made no progress reading non-empty TLS transport input",
                 ));
             }
-            self.connection
+            self.read_tls_fed_offset =
+                tls_advance_read_offset(self.read_tls_fed_offset, read, bytes.len())?;
+            let state = self
+                .connection
                 .process_new_packets()
                 .map_err(tls_protocol_error)?;
+            if state.peer_has_closed() {
+                self.read_tls_fed_offset = tls_complete_read_offset(bytes.len())?;
+                return Ok(());
+            }
         }
         Ok(())
+    }
+
+    fn feed_read_tls_buffer(&mut self, mut buffer: Vec<u8>) -> io::Result<()> {
+        let result = self.feed_transport_bytes(&buffer);
+        if result.is_err() {
+            // A rustls packet-processing error is terminal. Preserve the
+            // existing error while retiring the wrapper-owned suffix: rustls
+            // explicitly forbids feeding more TLS bytes after that error.
+            match tls_complete_read_offset(buffer.len()) {
+                Ok(offset) => self.read_tls_fed_offset = offset,
+                Err(offset_err) => {
+                    buffer.clear();
+                    self.read_tls_fed_offset = 0;
+                    self.restore_read_tls_buffer(buffer);
+                    return Err(offset_err);
+                }
+            }
+        }
+        self.restore_read_tls_buffer(buffer);
+        result
     }
 
     fn feed_transport_eof(&mut self) -> io::Result<()> {
@@ -1093,13 +1163,17 @@ impl TlsClientStream {
             if let Some(future) = self.pending_read_tls.as_mut() {
                 match Pin::new(future).poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready((result, buffer)) => {
+                    Poll::Ready((result, mut buffer)) => {
                         self.pending_read_tls = None;
                         let result = match result {
                             Ok(0) => self.feed_transport_eof(),
-                            Ok(read) => self.feed_transport_bytes(&buffer[..read]),
+                            Ok(read) => {
+                                buffer.truncate(read);
+                                return Poll::Ready(self.feed_read_tls_buffer(buffer));
+                            }
                             Err(err) => Err(err),
                         };
+                        self.read_tls_fed_offset = 0;
                         self.restore_read_tls_buffer(buffer);
                         if let Err(err) = result {
                             return Poll::Ready(Err(err));
@@ -1108,6 +1182,15 @@ impl TlsClientStream {
                         }
                     }
                 }
+            }
+
+            if self
+                .read_tls_buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.is_empty())
+            {
+                let buffer = self.take_read_tls_buffer()?;
+                return Poll::Ready(self.feed_read_tls_buffer(buffer));
             }
 
             if !self.connection.wants_read() {
@@ -1129,6 +1212,8 @@ impl TlsClientStream {
             }
 
             let buffer = self.take_read_tls_buffer()?;
+            debug_assert!(buffer.is_empty());
+            debug_assert_eq!(self.read_tls_fed_offset, 0);
             let len = tls_read_submission_len(buffer.capacity(), self.transport_read_buffer_size);
             self.pending_read_tls = Some(stream::ReadFuture::new(
                 self.stream.staged_fd_op_state_for_internal_io(),
@@ -1729,8 +1814,9 @@ mod tests {
     use super::*;
     use super::{
         TLS_MAX_WIRE_READ_SIZE, TlsScratchKind, TlsWriteScratch, allocate_tls_scratch,
-        take_or_reserve_tls_scratch, tls_read_submission_len, tls_transport_eof_result,
-        tls_userspace_destination, tls_write_progress_result,
+        take_or_reserve_tls_scratch, tls_advance_read_offset, tls_read_submission_len,
+        tls_transport_eof_result, tls_unfed_read_slice, tls_userspace_destination,
+        tls_write_progress_result,
     };
     #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
@@ -1750,7 +1836,9 @@ mod tests {
     use std::task::Waker;
 
     #[cfg(not(miri))]
-    fn handshaken_tls_for_shutdown_tests() -> (TlsClientStream, std::net::TcpStream) {
+    fn handshaken_tls_connections(
+        transport_read_buffer_size: usize,
+    ) -> (TlsClientStream, ServerConnection, std::net::TcpStream) {
         let certified = generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("failed to generate self-signed test certificate");
         let certificate = certified.cert.der().clone();
@@ -1785,7 +1873,7 @@ mod tests {
             ServerName::try_from("localhost").expect("invalid test server name"),
             TlsClientOptions {
                 rustls_buffer_limit: Some(1024),
-                transport_read_buffer_size: 128,
+                transport_read_buffer_size,
                 transport_write_buffer_size: 128,
             },
         )
@@ -1845,11 +1933,17 @@ mod tests {
                     tls.connection.protocol_version(),
                     Some(rustls::ProtocolVersion::TLSv1_3)
                 );
-                return (tls, peer);
+                return (tls, server, peer);
             }
         }
 
         panic!("in-memory TLS handshake did not converge");
+    }
+
+    #[cfg(not(miri))]
+    fn handshaken_tls_for_shutdown_tests() -> (TlsClientStream, std::net::TcpStream) {
+        let (tls, _server, peer) = handshaken_tls_connections(128);
+        (tls, peer)
     }
 
     #[test]
@@ -1928,6 +2022,224 @@ mod tests {
         }
 
         assert_eq!(tls_read_submission_len(127, 128), 127);
+    }
+
+    #[test]
+    fn tls_retained_read_offset_is_bounded_and_allocation_preserving() {
+        let mut buffer = Vec::with_capacity(32);
+        buffer.extend(0u8..16);
+        let allocation = buffer.as_ptr();
+        let capacity = buffer.capacity();
+
+        assert_eq!(tls_unfed_read_slice(&buffer, 0).unwrap(), &buffer[..]);
+        assert_eq!(tls_unfed_read_slice(&buffer, 7).unwrap(), &buffer[7..]);
+        assert_eq!(tls_unfed_read_slice(&buffer, 16).unwrap(), &[]);
+        assert!(tls_unfed_read_slice(&buffer, 17).is_err());
+        assert_eq!(tls_advance_read_offset(0, 7, buffer.len()).unwrap(), 7);
+        assert_eq!(tls_advance_read_offset(7, 9, buffer.len()).unwrap(), 16);
+        assert!(tls_advance_read_offset(7, 10, buffer.len()).is_err());
+        assert_eq!(buffer.as_ptr(), allocation);
+        assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_coalesced_records_stop_at_plaintext_backpressure() {
+        const LARGE_RECORD_BYTES: usize = 16_384;
+        const SMALL_RECORD_BYTES: usize = 1_000;
+        const FINAL_RECORD_BYTES: usize = 15_000;
+        const PREFED_BYTES: usize = 15_000;
+
+        let (mut tls, mut server, _peer) = handshaken_tls_connections(TLS_MAX_WIRE_READ_SIZE);
+        let mut make_record = |payload: &[u8]| {
+            server
+                .writer()
+                .write_all(payload)
+                .expect("server plaintext write failed");
+            let mut record = Vec::new();
+            while server.wants_write() {
+                let written = server
+                    .write_tls(&mut record)
+                    .expect("server TLS record write failed");
+                assert!(written > 0, "server TLS record write made no progress");
+            }
+            record
+        };
+
+        let first_payload = vec![0x11; LARGE_RECORD_BYTES];
+        let second_payload = vec![0x22; SMALL_RECORD_BYTES];
+        let third_payload = vec![0x33; FINAL_RECORD_BYTES];
+        let first_record = make_record(&first_payload);
+        let second_record = make_record(&second_payload);
+        let third_record = make_record(&third_payload);
+        assert_eq!(first_record.len(), LARGE_RECORD_BYTES + 22);
+        assert_eq!(second_record.len(), SMALL_RECORD_BYTES + 22);
+        assert_eq!(third_record.len(), FINAL_RECORD_BYTES + 22);
+
+        let mut scratch = tls
+            .take_read_tls_buffer()
+            .expect("read scratch was unavailable");
+        let scratch_allocation = scratch.as_ptr();
+        let scratch_capacity = scratch.capacity();
+        scratch.extend_from_slice(&first_record[..PREFED_BYTES]);
+        tls.feed_read_tls_buffer(scratch)
+            .expect("partial first record prefeed failed");
+        assert_eq!(tls.read_tls_fed_offset, 0);
+        let mut no_plaintext = [0u8; 1];
+        assert_eq!(
+            tls.connection
+                .reader()
+                .read(&mut no_plaintext)
+                .expect_err("incomplete TLS record unexpectedly produced plaintext")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let mut scratch = tls
+            .take_read_tls_buffer()
+            .expect("prefeed did not restore the read scratch");
+        assert_eq!(scratch.as_ptr(), scratch_allocation);
+        assert_eq!(scratch.capacity(), scratch_capacity);
+        scratch.extend_from_slice(&first_record[PREFED_BYTES..]);
+        scratch.extend_from_slice(&second_record);
+        scratch.extend_from_slice(&third_record);
+        assert!(scratch.len() < TLS_MAX_WIRE_READ_SIZE);
+        let filled = scratch.len();
+        tls.feed_read_tls_buffer(scratch)
+            .expect("coalesced TLS input should stop cleanly at plaintext backpressure");
+
+        let retained = tls
+            .read_tls_buffer
+            .as_ref()
+            .expect("backpressured read scratch was not restored");
+        assert_eq!(retained.as_ptr(), scratch_allocation);
+        assert_eq!(retained.capacity(), scratch_capacity);
+        assert_eq!(retained.len(), filled);
+        assert!(tls.read_tls_fed_offset > 0);
+        assert!(usize::from(tls.read_tls_fed_offset) < retained.len());
+        let retained_state = (
+            retained.as_ptr(),
+            retained.len(),
+            retained.capacity(),
+            tls.read_tls_fed_offset,
+        );
+
+        let mut first = vec![0; LARGE_RECORD_BYTES];
+        tls.connection
+            .reader()
+            .read_exact(&mut first)
+            .expect("first plaintext record was not available");
+        assert_eq!(first, first_payload);
+        let mut second = vec![0; SMALL_RECORD_BYTES];
+        tls.connection
+            .reader()
+            .read_exact(&mut second)
+            .expect("second plaintext record was not available");
+        assert_eq!(second, second_payload);
+
+        let mut unavailable = [0u8; 1];
+        assert_eq!(
+            tls.connection
+                .reader()
+                .read(&mut unavailable)
+                .expect_err("third record became available before retained input resumed")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let mut rejected = Box::pin(tls.read(Vec::with_capacity(1), 1));
+        let mut cx = Context::from_waker(Waker::noop());
+        match rejected.as_mut().poll(&mut cx) {
+            Poll::Ready((Err(err), buffer)) => {
+                assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+                assert!(buffer.is_empty());
+                assert_eq!(buffer.capacity(), 1);
+            }
+            Poll::Ready((Ok(_), _)) => panic!("inactive TLS read unexpectedly succeeded"),
+            Poll::Pending => panic!("inactive TLS read unexpectedly remained pending"),
+        }
+        drop(rejected);
+        let retained = tls
+            .read_tls_buffer
+            .as_ref()
+            .expect("context rejection lost retained ciphertext");
+        assert_eq!(
+            (
+                retained.as_ptr(),
+                retained.len(),
+                retained.capacity(),
+                tls.read_tls_fed_offset,
+            ),
+            retained_state
+        );
+
+        match tls.poll_fill_tls_from_transport(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => panic!("retained TLS input resume failed: {err}"),
+            Poll::Pending => panic!("retained TLS input incorrectly submitted a raw read"),
+        }
+        assert!(tls.pending_read_tls.is_none());
+        assert_eq!(tls.read_tls_fed_offset, 0);
+        let restored = tls
+            .read_tls_buffer
+            .as_ref()
+            .expect("resumed input did not restore the read scratch");
+        assert!(restored.is_empty());
+        assert_eq!(restored.as_ptr(), scratch_allocation);
+        assert_eq!(restored.capacity(), scratch_capacity);
+
+        let mut third = vec![0; FINAL_RECORD_BYTES];
+        tls.connection
+            .reader()
+            .read_exact(&mut third)
+            .expect("third plaintext record was not available after resume");
+        assert_eq!(third, third_payload);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_close_notify_retires_coalesced_transport_residue() {
+        let (mut tls, mut server, _peer) = handshaken_tls_connections(TLS_MAX_WIRE_READ_SIZE);
+        server.send_close_notify();
+        let mut close_wire = Vec::new();
+        while server.wants_write() {
+            let written = server
+                .write_tls(&mut close_wire)
+                .expect("server close_notify write failed");
+            assert!(written > 0, "server close_notify write made no progress");
+        }
+
+        let mut scratch = tls
+            .take_read_tls_buffer()
+            .expect("read scratch was unavailable");
+        let scratch_allocation = scratch.as_ptr();
+        let scratch_capacity = scratch.capacity();
+        scratch.extend_from_slice(&close_wire);
+        scratch.extend(std::iter::repeat_n(0xA5, 5_000));
+        assert!(scratch.len() > 4_096);
+        assert!(scratch.len() <= TLS_MAX_WIRE_READ_SIZE);
+
+        tls.feed_read_tls_buffer(scratch)
+            .expect("authenticated close_notify should retire later transport residue");
+        assert!(!tls.connection.wants_read());
+        assert_eq!(tls.read_tls_fed_offset, 0);
+        assert!(tls.pending_read_tls.is_none());
+        let restored = tls
+            .read_tls_buffer
+            .as_ref()
+            .expect("close_notify did not restore the read scratch");
+        assert!(restored.is_empty());
+        assert_eq!(restored.as_ptr(), scratch_allocation);
+        assert_eq!(restored.capacity(), scratch_capacity);
+
+        let mut plaintext = [0u8; 1];
+        assert_eq!(
+            tls.connection
+                .reader()
+                .read(&mut plaintext)
+                .expect("authenticated close_notify should produce clean plaintext EOF"),
+            0
+        );
     }
 
     #[test]
