@@ -172,7 +172,7 @@ workload is faster without measurement.
 | Payload shape | Contiguous APIs for one byte range; vectored/projected APIs for existing segmentation | Building a chain for one contiguous range or coalescing segmented data just to call `write` | Match the API to existing ownership; vectored paths construct bounded iovec metadata, while coalescing copies bytes. |
 | Immediate deadline edge | `try_read`, `try_write`, and `try_writev_projected` only after a deadline has already reached zero | Polling `try_*` as the normal async path | `try_*` makes one direct nonblocking syscall and returns `WouldBlock`; normal async methods register reactor work and wake the task. |
 | UDP peer selection | Connected `send` / `recv` for a stable peer; `recv_msg` when truncation must be detected | `send_to` / `recv_from` for a fixed peer | Connected calls avoid per-datagram address handling. Use address-bearing methods when the peer actually varies. |
-| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. A data-configured `recv_msg` reports EOR/truncation with default ancillary fields. A FlowIO-configured socket that requested receive info rejects ordinary data that omits it; enable receive metadata when stream, PPID, TSN, association data, notifications, or partial-delivery recovery matter. |
+| SCTP data | `SctpSocketConfig::data()` plus `send` / `recv` when data sizing is guaranteed | Rich notification/metadata APIs when metadata is unused, or lean `recv` before rich recovery completes | The lean APIs avoid ancillary metadata and event processing, but `recv` does not expose EOR/truncation. A data-configured `recv_msg` reports EOR/truncation with default ancillary fields. After a partial/truncated rich result, continue with `recv_msg` / `recv_msg_vectored` until recovery completes; lean `recv` rejects locally meanwhile. A FlowIO-configured socket that requested receive info rejects ordinary data that omits it; enable receive metadata when stream, PPID, TSN, association data, notifications, or partial-delivery recovery matter. |
 | Timers | One `timeout_at` or `timeout` around a protocol phase when a deadline is required | A separate timeout around every tiny I/O step | Each armed deadline consumes timer-wheel state and expiry/cancellation work. Preserve finer timers when protocol semantics require them. |
 | DNS/TLS setup | Reuse `DnsResolver`, resolved addresses, connectors, and established TLS streams | Resolving names or handshaking in a per-message loop | Resolver setup/query construction and TLS handshakes may allocate and perform setup I/O. |
 
@@ -360,8 +360,14 @@ This includes empty or zero-readable vectored sends. After owner-context
 validation, an invalid metadata receive also leaves any prior dropped receive
 in the stream's one-entry recovery slot; the next valid metadata receive adopts
 it. Without a valid FlowIO context, `NotConnected` retains precedence and the
-slot is still untouched. A successful zero-byte result from the flag-less lean
-`recv` path therefore denotes clean peer EOF.
+slot is still untouched. A valid lean `recv` also returns allocation-free
+`InvalidInput` after local length validation while a dropped rich operation is
+stashed or rich receive is discarding a partial record tail. It returns the
+exact buffer without exposing its pointer or submitting an SQE and leaves the
+recovery state unchanged. After a partial/truncated rich result, continue with
+`recv_msg` or `recv_msg_vectored` until recovery completes. A successful
+zero-byte result from the flag-less lean `recv` path therefore denotes clean
+peer EOF.
 
 On sockets configured by FlowIO, enabling `recv_rcvinfo` also keeps the SCTP
 partial-delivery event subscribed even when the requested notification mask

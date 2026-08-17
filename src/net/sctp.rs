@@ -2684,11 +2684,11 @@ impl SctpRecvState {
         self.stashed.process_completed = None;
     }
 
-    /// Returns whether a dropped rich receive still owns this stream's receive
-    /// lineage, including pending, completed, and ring-abandoned states.
+    /// Returns whether rich receive work must restore record synchronization
+    /// before a lean receive may consume another kernel completion.
     #[inline(always)]
-    fn has_stashed_receive(&self) -> bool {
-        !self.stashed.state_ptr.is_null()
+    fn pending_metadata_recovery(&self) -> bool {
+        self.discarding_tail || !self.stashed.state_ptr.is_null()
     }
 }
 
@@ -2728,7 +2728,11 @@ where
 /// [`io::ErrorKind::InvalidData`] when the kernel reports a truncated receive
 /// or a non-empty receive without SCTP end-of-record. An oversized record
 /// returns that error once; later metadata receives discard its unrecoverable
-/// tail through the next record boundary before resuming delivery.
+/// tail through the next record boundary before resuming delivery. Until that
+/// boundary is restored, the data-only [`SctpStream::recv`] path returns
+/// [`io::ErrorKind::InvalidInput`] instead of consuming recovery bytes. Keep
+/// using [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until a
+/// rich receive completes recovery.
 ///
 /// A kernel zero-byte completion with no control message and no flags is clean
 /// peer EOF and resolves as
@@ -2767,16 +2771,15 @@ where
 /// receives retain the stream's single rich-receive lineage until they are
 /// adopted by the next valid metadata receive or reclaimed by stream
 /// destruction. While that rich operation occupies the stream-owned stash,
-/// whether pending, completed, or exceptionally ring-abandoned,
+/// whether pending, completed, or exceptionally ring-abandoned, or while rich
+/// receive is discarding an oversized record tail,
 /// [`SctpStream::recv`] returns allocation-free
 /// [`io::ErrorKind::InvalidInput`] with the exact rental buffer and submits no
 /// second receive. Repeated lean rejections do not consume or modify the
-/// retained rich operation. Adoption updates SCTP record-boundary
-/// resynchronization state from the retired completion. While a metadata
-/// receive is discarding an oversized record tail, keep using
+/// recovery state. Adoption updates SCTP record-boundary resynchronization
+/// state from the retired completion. Keep using
 /// [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until the next
-/// record boundary is reached; the data-only [`SctpStream::recv`] path does
-/// not participate in that resynchronization state. Dropping a lean receive
+/// record boundary is reached. Dropping a lean receive
 /// retains its established terminal-framing policy; a later receive cannot
 /// recover bytes consumed by that cancelled bare receive. Notifications
 /// observed during internal discard are consumed as control events, except an
@@ -3350,14 +3353,15 @@ impl SctpStream {
     /// caller requests are rejected before submission so they cannot
     /// masquerade as EOF.
     /// This data-only path does not drive metadata receive resynchronization.
-    /// If a dropped `recv_msg` / `recv_msg_vectored` operation occupies the
-    /// stream-owned recovery slot, this method rejects the request without
-    /// consuming that slot or submitting another receive.
+    /// If rich receive is discarding a record tail, or if a dropped
+    /// `recv_msg` / `recv_msg_vectored` operation occupies the stream-owned
+    /// recovery slot, this method rejects the request without changing that
+    /// recovery state or submitting another receive.
     ///
     /// # Errors
     /// Returns `InvalidInput` if `len` is zero, exceeds
-    /// `buffer.writable_len()`, or a dropped rich receive still owns the
-    /// stream's receive lineage. Local length validation retains precedence;
+    /// `buffer.writable_len()`, or rich receive recovery is pending. Local
+    /// length validation retains precedence;
     /// all three cases return the exact buffer after owner-context validation
     /// and before operation allocation, buffer-pointer access, or submission.
     /// Kernel receive errors are returned as `io::Error` values from the
@@ -3374,7 +3378,7 @@ impl SctpStream {
                 0
             }
         };
-        if input_error.is_none() && self.recv_state.has_stashed_receive() {
+        if input_error.is_none() && self.recv_state.pending_metadata_recovery() {
             input_error = Some(invalid_input_kind());
         }
         let state_ptr = self.fd.op_state();
@@ -11056,6 +11060,146 @@ mod tests {
         assert!(stream.recv_state.stashed.process_completed.is_some());
         drop(returned);
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn lean_receive_rejects_active_record_discard_without_a_stash() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let mut stream = ringless_sctp_stream();
+            stream.recv_state.discarding_tail = true;
+            assert!(stream.recv_state.stashed.state_ptr.is_null());
+
+            test_hooks::fail_next_op_alloc();
+            test_hooks::fail_next_raw_sqe_submit();
+            for attempt in 1..=2 {
+                let pointer_calls = Rc::new(Cell::new(0));
+                let drops = Rc::new(Cell::new(0));
+                let buffer = retained_constructor_buffer(
+                    None,
+                    Rc::clone(&pointer_calls),
+                    Rc::clone(&drops),
+                    false,
+                );
+                let backing = buffer.bytes.as_ptr();
+                let mut future = stream.recv(buffer, 16);
+                let Poll::Ready((result, returned)) = Pin::new(&mut future).poll(cx) else {
+                    panic!("active-discard lean receive attempt {attempt} remained pending");
+                };
+                let err = result.expect_err("lean receive bypassed active rich-record recovery");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(err.raw_os_error(), None);
+                assert_eq!(returned.bytes.as_ptr(), backing);
+                assert_eq!(pointer_calls.get(), 0, "lean rejection exposed its buffer");
+                assert_eq!(drops.get(), 0, "lean rejection dropped the exact owner");
+                assert!(future.state_ptr.is_null());
+                assert!(Pin::new(&mut future).poll(cx).is_pending());
+                drop(future);
+                assert!(stream.recv_state.discarding_tail);
+                assert!(stream.recv_state.stashed.state_ptr.is_null());
+                assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                assert_eq!(owner.inflight_op_count_for_test(), 0);
+                drop(returned);
+                assert_eq!(drops.get(), 1);
+            }
+            assert!(
+                test_hooks::take_op_alloc_failure(),
+                "active-discard rejection attempted operation allocation"
+            );
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 1);
+            let injected = test_hooks::take_raw_sqe_submit_failure()
+                .expect("active-discard rejection consumed the SQE sentinel");
+            assert_eq!(injected.kind(), io::ErrorKind::WouldBlock);
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 0);
+            assert_eq!(stats.heap_fallbacks, 0);
+
+            let zero_pointer_calls = Rc::new(Cell::new(0));
+            let zero_drops = Rc::new(Cell::new(0));
+            let zero_buffer = retained_constructor_buffer(
+                None,
+                Rc::clone(&zero_pointer_calls),
+                Rc::clone(&zero_drops),
+                false,
+            );
+            let mut zero = stream.recv(zero_buffer, 0);
+            let Poll::Ready((zero_result, returned_zero)) = Pin::new(&mut zero).poll(cx) else {
+                panic!("zero-length receive behind active discard remained pending");
+            };
+            assert_eq!(
+                zero_result
+                    .expect_err("zero-length receive unexpectedly succeeded")
+                    .to_string(),
+                ZERO_LENGTH_SCTP_RECV
+            );
+            assert_eq!(zero_pointer_calls.get(), 0);
+            drop(zero);
+            drop(returned_zero);
+            assert_eq!(zero_drops.get(), 1);
+            assert!(stream.recv_state.discarding_tail);
+
+            let context_pointer_calls = Rc::new(Cell::new(0));
+            let context_drops = Rc::new(Cell::new(0));
+            let context_buffer = retained_constructor_buffer(
+                None,
+                Rc::clone(&context_pointer_calls),
+                Rc::clone(&context_drops),
+                false,
+            );
+            let mut context_rejected = stream.recv(context_buffer, 16);
+            let mut rejected_cx = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready((context_result, returned_context)) =
+                Pin::new(&mut context_rejected).poll(&mut rejected_cx)
+            else {
+                panic!("invalid-context receive behind active discard remained pending");
+            };
+            assert_eq!(
+                context_result
+                    .expect_err("invalid-context receive unexpectedly succeeded")
+                    .kind(),
+                io::ErrorKind::NotConnected
+            );
+            assert_eq!(context_pointer_calls.get(), 0);
+            drop(context_rejected);
+            drop(returned_context);
+            assert_eq!(context_drops.get(), 1);
+            assert!(stream.recv_state.discarding_tail);
+
+            let eor = test_msghdr_with_flags(libc::MSG_EOR);
+            assert!(
+                stream.recv_state.should_consume_for_test(b"tail", &eor),
+                "rich recovery did not consume the pending record tail"
+            );
+            assert!(!stream.recv_state.discarding_tail);
+
+            let direct_pointer_calls = Rc::new(Cell::new(0));
+            let direct_drops = Rc::new(Cell::new(0));
+            let direct_buffer = retained_constructor_buffer(
+                None,
+                Rc::clone(&direct_pointer_calls),
+                Rc::clone(&direct_drops),
+                false,
+            );
+            test_hooks::fail_next_raw_sqe_submit();
+            let mut direct = stream.recv(direct_buffer, 16);
+            let Poll::Ready((direct_result, returned_direct)) = Pin::new(&mut direct).poll(cx)
+            else {
+                panic!("ordinary lean receive did not reach direct submission");
+            };
+            assert_eq!(
+                direct_result
+                    .expect_err("injected direct receive unexpectedly succeeded")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(direct_pointer_calls.get(), 1);
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
+            drop(direct);
+            drop(returned_direct);
+            assert_eq!(direct_drops.get(), 1);
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
     }
 
     fn assert_dropped_rich_receive_blocks_lean_and_recovers(

@@ -3258,6 +3258,20 @@ fn runtime_sctp_recv_msg_resynchronizes_after_oversized_record() {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(&recv_buf[..], b"0123");
 
+            let lean = vec![0u8; 8];
+            let lean_ptr = lean.as_ptr();
+            let (lean_result, returned_lean) =
+                timeout(Duration::from_millis(100), server.recv(lean, 8))
+                    .await
+                    .expect(
+                        "lean receive behind active rich-record recovery did not return locally",
+                    );
+            let err = lean_result.expect_err("lean receive bypassed active rich-record recovery");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.raw_os_error(), None);
+            assert_eq!(returned_lean.as_ptr(), lean_ptr);
+            assert_eq!(returned_lean, vec![0u8; 8]);
+
             let drops = Rc::new(Cell::new(0));
             let (zero_res, zero_buf) = server
                 .recv_msg(DropTrackedReadWrite::zeroed(4, &drops), 0)
