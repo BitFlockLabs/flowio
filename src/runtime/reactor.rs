@@ -1688,18 +1688,19 @@ impl Reactor {
         unsafe {
             (*state).result = result;
             (*state).set_completed();
-            retire_tracked_completion(&mut *runtime_state)?;
+            let accounting_result = retire_tracked_completion(&mut *runtime_state);
 
-            if (*state).is_runtime_shutdown() {
+            let discharge_result = if (*state).is_runtime_shutdown() {
                 (*state).result = -libc::ECANCELED;
                 if (*state).is_orphaned() || (*state).is_detached() {
-                    Self::try_free_op_unchecked(reactor, state)?;
+                    Self::try_free_op_unchecked(reactor, state)
                 } else {
                     (*std::ptr::addr_of_mut!((*reactor).pending_cancels)).unlink(state);
                     (*state).debug_assert_valid_flags();
+                    Ok(())
                 }
             } else if (*state).is_orphaned() || (*state).is_detached() {
-                Self::try_free_op_unchecked(reactor, state)?;
+                Self::try_free_op_unchecked(reactor, state)
             } else {
                 let waiter = CompletionState::take_waiter_unchecked(state);
                 if !waiter.is_null() {
@@ -1716,9 +1717,11 @@ impl Reactor {
                     );
                     release_task(waiter);
                 }
-            }
+                Ok(())
+            };
+
+            accounting_result.and(discharge_result)
         }
-        Ok(())
     }
 
     /// Drains completed CQEs, updates `CompletionState`, and wakes waiting
@@ -3609,6 +3612,293 @@ mod pending_cancel_tests {
                 assert!((*ptr).cancel_next.is_null());
             }
         }
+    }
+
+    fn assert_accounting_underflow(result: &io::Result<()>) {
+        let err = result
+            .as_ref()
+            .expect_err("accounting underflow unexpectedly succeeded");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            err.to_string(),
+            "CQE observed with no tracked in-flight operation"
+        );
+    }
+
+    fn next_allocation_reuses(reactor: &mut Reactor, expected: *mut CompletionState) -> bool {
+        let replacement = reactor.alloc_op();
+        assert!(!replacement.is_null(), "replacement allocation failed");
+        let reused = replacement == expected;
+        reactor.free_op(replacement);
+        reused
+    }
+
+    #[test]
+    fn accounting_underflow_still_discharges_live_waiter_once() {
+        let mut reactor = ringless_reactor();
+        let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "operation allocation failed");
+        let mut waiter = TaskHeader::new();
+        let waiter_ptr = std::ptr::addr_of_mut!(waiter);
+        unsafe {
+            (*state).register_waiter(waiter_ptr);
+        }
+
+        let mut runtime_state = runtime_state_with_shutdown_inflight(0);
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let retirement = unsafe {
+            Reactor::retire_completion_unchecked(
+                reactor_ptr,
+                reactor.owner,
+                state,
+                -libc::EIO,
+                &mut runtime_state,
+                &mut ready_queue,
+            )
+        };
+
+        let published_result = unsafe { (*state).result };
+        let published_completed = unsafe { (*state).is_completed() };
+        let waiter_transferred = unsafe { (*state).waiter.is_null() };
+        let waiter_refs_at_return = waiter.refs.get();
+        let waiter_flags_at_return = waiter.flags();
+        let popped = unsafe { ready_queue.pop_front(TaskHeader::READY_LINK_OFFSET) };
+        if popped.is_some() {
+            waiter.clear_flag(TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED);
+        }
+        #[cfg(debug_assertions)]
+        let counters_at_return = (
+            runtime_state.stats.cqe_completions,
+            runtime_state.stats.waiter_wakes,
+            runtime_state.stats.task_schedules,
+        );
+
+        let live_state_retained = reactor.live_registry == [state];
+        if live_state_retained {
+            reactor.free_op(state);
+        }
+        let exact_slot_reused = next_allocation_reuses(&mut reactor, state);
+
+        assert_accounting_underflow(&retirement);
+        assert_eq!(runtime_state.inflight_ops, 0);
+        assert_eq!(published_result, -libc::EIO);
+        assert!(published_completed);
+        assert!(live_state_retained);
+        assert!(waiter_transferred);
+        assert_eq!(waiter_refs_at_return, 1);
+        assert_eq!(
+            waiter_flags_at_return & (TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED),
+            TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED
+        );
+        assert_eq!(popped, Some(waiter_ptr));
+        #[cfg(debug_assertions)]
+        assert_eq!(counters_at_return, (0, 1, 1));
+        assert!(exact_slot_reused, "future-owned state was not reclaimable");
+        assert!(reactor.live_registry.is_empty());
+    }
+
+    #[test]
+    fn accounting_underflow_still_reclaims_orphaned_and_detached_retained_states() {
+        let mut observations = Vec::new();
+        for orphaned in [true, false] {
+            let mut reactor = ringless_reactor();
+            let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+            let state = reactor.alloc_op();
+            assert!(!state.is_null(), "operation allocation failed");
+            let payload_drops = Rc::new(Cell::new(0));
+            let payload = reactor.alloc_retained_payload(ShutdownRetainedPayload {
+                drops: Rc::clone(&payload_drops),
+                _bytes: [0; 8],
+            });
+            unsafe {
+                (*state).attach_retained_payload(payload);
+                if orphaned {
+                    (*state).set_orphaned();
+                } else {
+                    (*state).set_detached();
+                }
+            }
+            if orphaned {
+                reactor.queue_pending_cancel(state);
+            }
+            let pending_cancel_owned_before = !reactor.pending_cancels.is_empty();
+
+            let mut runtime_state = runtime_state_with_shutdown_inflight(0);
+            let mut ready_queue =
+                crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+            ready_queue.init();
+            let retirement = unsafe {
+                Reactor::retire_completion_unchecked(
+                    reactor_ptr,
+                    reactor.owner,
+                    state,
+                    -libc::EIO,
+                    &mut runtime_state,
+                    &mut ready_queue,
+                )
+            };
+
+            let drops_at_return = payload_drops.get();
+            let live_registry_empty_at_return = reactor.live_registry.is_empty();
+            let pending_cancel_empty_at_return = reactor.pending_cancels.is_empty();
+            let retained_frees_at_return = reactor.retained_payload_stats().pooled_frees;
+            #[cfg(debug_assertions)]
+            let cqe_completions_at_return = runtime_state.stats.cqe_completions;
+            let state_live_at_return = reactor.live_registry.contains(&state);
+            if state_live_at_return {
+                reactor.free_op(state);
+            }
+            let exact_slot_reused = next_allocation_reuses(&mut reactor, state);
+            let final_payload_drops = payload_drops.get();
+
+            assert_accounting_underflow(&retirement);
+            assert_eq!(runtime_state.inflight_ops, 0);
+            #[cfg(debug_assertions)]
+            assert_eq!(cqe_completions_at_return, 0);
+            assert!(ready_queue.is_empty());
+            assert!(reactor.live_registry.is_empty());
+            observations.push((
+                orphaned,
+                pending_cancel_owned_before,
+                drops_at_return,
+                live_registry_empty_at_return,
+                pending_cancel_empty_at_return,
+                retained_frees_at_return,
+                final_payload_drops,
+                exact_slot_reused,
+            ));
+        }
+
+        assert_eq!(
+            observations,
+            [
+                (true, true, 1, true, true, 1, 1, true),
+                (false, false, 1, true, true, 1, 1, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn accounting_underflow_still_unlinks_runtime_shutdown_pending_cancel() {
+        let mut reactor = ringless_reactor();
+        let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "operation allocation failed");
+        unsafe {
+            (*state).set_runtime_shutdown();
+        }
+        reactor.queue_pending_cancel(state);
+
+        let mut runtime_state = runtime_state_with_shutdown_inflight(0);
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let retirement = unsafe {
+            Reactor::retire_completion_unchecked(
+                reactor_ptr,
+                reactor.owner,
+                state,
+                -libc::EIO,
+                &mut runtime_state,
+                &mut ready_queue,
+            )
+        };
+
+        let published_result = unsafe { (*state).result };
+        let published_completed = unsafe { (*state).is_completed() };
+        let pending_cancel_empty_at_return = reactor.pending_cancels.is_empty();
+        let live_state_retained = reactor.live_registry == [state];
+        #[cfg(debug_assertions)]
+        let counters_at_return = (
+            runtime_state.stats.cqe_completions,
+            runtime_state.stats.waiter_wakes,
+            runtime_state.stats.task_schedules,
+        );
+
+        if live_state_retained {
+            reactor.free_op(state);
+        }
+        let exact_slot_reused = next_allocation_reuses(&mut reactor, state);
+
+        assert_accounting_underflow(&retirement);
+        assert_eq!(runtime_state.inflight_ops, 0);
+        assert_eq!(published_result, -libc::ECANCELED);
+        assert!(published_completed);
+        assert!(pending_cancel_empty_at_return);
+        assert!(live_state_retained);
+        #[cfg(debug_assertions)]
+        assert_eq!(counters_at_return, (0, 0, 0));
+        assert!(ready_queue.is_empty());
+        assert!(
+            exact_slot_reused,
+            "shutdown-owned state was not reclaimable"
+        );
+        assert!(reactor.live_registry.is_empty());
+    }
+
+    #[test]
+    fn accounting_underflow_preserves_retained_payload_panic_authority() {
+        let mut reactor = ringless_reactor();
+        let reactor_ptr = std::ptr::addr_of_mut!(reactor);
+        let state = reactor.alloc_op();
+        assert!(!state.is_null(), "operation allocation failed");
+        let payload_drops = Rc::new(Cell::new(0));
+        let payload = reactor.alloc_retained_payload(OpPayloadDropBomb {
+            drops: Rc::clone(&payload_drops),
+            panic_tag: Some("accounting underflow payload panic"),
+        });
+        unsafe {
+            (*state).attach_retained_payload(payload);
+            (*state).set_orphaned();
+        }
+        reactor.queue_pending_cancel(state);
+
+        let mut runtime_state = runtime_state_with_shutdown_inflight(0);
+        let mut ready_queue =
+            crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+        ready_queue.init();
+        let retirement = catch_unwind(AssertUnwindSafe(|| unsafe {
+            Reactor::retire_completion_unchecked(
+                reactor_ptr,
+                reactor.owner,
+                state,
+                -libc::EIO,
+                &mut runtime_state,
+                &mut ready_queue,
+            )
+        }));
+
+        let drops_at_return = payload_drops.get();
+        let registry_empty_at_return = reactor.live_registry.is_empty();
+        let cancel_empty_at_return = reactor.pending_cancels.is_empty();
+        let cleanup = catch_unwind(AssertUnwindSafe(|| {
+            if reactor.live_registry.contains(&state) {
+                reactor.free_op(state);
+            }
+        }));
+        let exact_slot_reused = next_allocation_reuses(&mut reactor, state);
+        let final_payload_drops = payload_drops.get();
+
+        let retirement_panic = retirement
+            .as_ref()
+            .err()
+            .and_then(|payload| payload.downcast_ref::<OpPayloadDropPanic>())
+            .map(|panic| panic.0);
+        assert_eq!(retirement_panic, Some("accounting underflow payload panic"));
+        assert!(cleanup.is_ok(), "payload panic escaped only from cleanup");
+        assert_eq!(drops_at_return, 1);
+        assert!(registry_empty_at_return);
+        assert!(cancel_empty_at_return);
+        assert_eq!(final_payload_drops, 1);
+        assert_eq!(runtime_state.inflight_ops, 0);
+        #[cfg(debug_assertions)]
+        assert_eq!(runtime_state.stats.cqe_completions, 0);
+        assert!(ready_queue.is_empty());
+        assert!(exact_slot_reused);
+        assert!(reactor.live_registry.is_empty());
     }
 
     #[test]
