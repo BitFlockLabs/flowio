@@ -1728,6 +1728,24 @@ unsafe fn drop_join_task_with_cleanup<F: Future, C: TaskDestroyCleanup + ?Sized>
 
 /// Stack-resident owner-thread FIFO for zero-reference tasks whose join
 /// payload destruction can release another task's final reference.
+///
+/// Items are completed, zero-reference [`TaskHeader`] allocations. Nested raw
+/// destructors on the owner thread produce entries; the outermost iterative
+/// destructor consumes them in FIFO order. The queue has no independent
+/// allocation, configured capacity, or full condition: it can contain at most
+/// the allocator-limited live task slots that nested destruction releases.
+/// Null head/tail terminates an empty drain. Shutdown and cancellation reach
+/// this queue only through the same unique final-reference path, and the outer
+/// drain keeps the first panic while clearing its TLS registration. No metric
+/// is emitted.
+///
+/// `ready_link` is the queue node and is detached from `all_tasks` before
+/// publication. A singleton node has null link fields even while head/tail own
+/// it, so the link itself does not encode membership. Valid task ownership
+/// makes duplicate publication unreachable: `release_task` dispatches the
+/// iterative destructor only on the unique 1-to-0 transition, which installs
+/// the RAW vtable before any nested publication. This unsafe contract is not
+/// repaired or coalesced on the fast path.
 struct IterativeTaskDestroyQueue {
     head: *mut crate::utils::list::intrusive::dlist::Link,
     tail: *mut crate::utils::list::intrusive::dlist::Link,
@@ -4137,6 +4155,21 @@ mod tests {
         }
     }
 
+    struct DestroyLinkDropProbe {
+        task: Rc<Cell<*mut TaskHeader>>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for DestroyLinkDropProbe {
+        fn drop(&mut self) {
+            let task = self.task.get();
+            assert!(!task.is_null(), "destroy-link probe lost its task");
+            assert!(unsafe { (*task).ready_link.is_unlinked() });
+            assert!(unsafe { (*task).all_link.is_unlinked() });
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct SyntheticChainPanic(usize);
 
@@ -4535,6 +4568,125 @@ mod tests {
     }
 
     #[test]
+    fn iterative_task_destroy_nonempty_fifo_survives_reentrant_shutdown() {
+        struct ReentrantShutdownWithQueuedTask {
+            executor: *mut Executor,
+            outer_task: Rc<Cell<*mut TaskHeader>>,
+            nested: Option<SyntheticTaskRef>,
+            nested_task: *mut TaskHeader,
+            calls: Rc<Cell<usize>>,
+            nested_drops: Rc<Cell<usize>>,
+        }
+
+        impl Drop for ReentrantShutdownWithQueuedTask {
+            fn drop(&mut self) {
+                self.calls.set(self.calls.get() + 1);
+                let outer_task = self.outer_task.get();
+                assert!(
+                    !outer_task.is_null(),
+                    "outer destroy task was not published"
+                );
+                assert!(
+                    unsafe { (*outer_task).ready_link.is_unlinked() },
+                    "the active outer RAW task became a destroy-FIFO member"
+                );
+                drop(self.nested.take());
+
+                ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
+                    let queue = active.get();
+                    assert!(!queue.is_null(), "outer destroy FIFO was not registered");
+                    let nested_link =
+                        unsafe { std::ptr::addr_of_mut!((*self.nested_task).ready_link) };
+                    assert_eq!(unsafe { (*queue).head }, nested_link);
+                    assert_eq!(unsafe { (*queue).tail }, nested_link);
+                    assert!(unsafe { (*nested_link).prev.is_null() });
+                    assert!(unsafe { (*nested_link).next.is_null() });
+                });
+                unsafe {
+                    let nested_link = std::ptr::addr_of_mut!((*self.nested_task).ready_link);
+                    assert!((*nested_link).prev.is_null());
+                    assert!((*nested_link).next.is_null());
+                    // A singleton is owned by the FIFO head/tail even though
+                    // the aliased intrusive link remains null/null.
+                    assert!((*nested_link).is_unlinked());
+                    assert!((*self.nested_task).all_link.is_unlinked());
+                    (&mut *self.executor).shutdown_owner();
+                    assert_eq!(
+                        self.nested_drops.get(),
+                        0,
+                        "reentrant shutdown destroyed the active FIFO node"
+                    );
+                    assert!((*nested_link).prev.is_null());
+                    assert!((*nested_link).next.is_null());
+                    ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
+                        let queue = active.get();
+                        assert!(!queue.is_null());
+                        assert_eq!((*queue).head, nested_link);
+                        assert_eq!((*queue).tail, nested_link);
+                    });
+                    assert!((*self.nested_task).all_link.is_unlinked());
+                }
+            }
+        }
+
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let executor_ptr = std::ptr::from_mut(&mut executor);
+        let owner = Rc::as_ptr(&executor.owner);
+        let owner_refs = Rc::strong_count(&executor.owner);
+        let calls = Rc::new(Cell::new(0));
+        let nested_drops = Rc::new(Cell::new(0));
+        let outer_task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
+        let nested_task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
+        let staged = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("nonempty reentrant-shutdown context installation failed");
+            let mut nested = stage_completed_task_output_for_benchmark(DestroyLinkDropProbe {
+                task: Rc::clone(&nested_task_slot),
+                drops: Rc::clone(&nested_drops),
+            })
+            .expect("nonempty reentrant-shutdown nested task staging failed");
+            nested_task_slot.set(nested.task);
+            let nested_ref = SyntheticTaskRef { task: nested.task };
+            nested.owns_reference = false;
+            drop(nested);
+
+            stage_completed_task_output_for_benchmark(ReentrantShutdownWithQueuedTask {
+                executor: executor_ptr,
+                outer_task: Rc::clone(&outer_task_slot),
+                nested: Some(nested_ref),
+                nested_task: nested_task_slot.get(),
+                calls: Rc::clone(&calls),
+                nested_drops: Rc::clone(&nested_drops),
+            })
+            .expect("nonempty reentrant-shutdown outer task staging failed")
+        };
+        outer_task_slot.set(staged.task);
+
+        drop(staged);
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(nested_drops.get(), 1);
+        assert_eq!(Rc::strong_count(&executor.owner), owner_refs);
+        let state = executor.owner.state_ptr();
+        unsafe {
+            assert!((*state).shutdown_complete);
+            assert!((*state).all_tasks.is_empty());
+            assert!((*state).ready_queue.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_allocs, 2);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_frees, 2);
+        }
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+    }
+
+    #[test]
     fn staged_no_drop_output_starts_entry_entry() {
         with_ringless_poll_context_for_test(1, |owner, _cx| {
             let staged = stage_completed_task_output_for_benchmark(17usize)
@@ -4615,6 +4767,144 @@ mod tests {
             drop(replacement);
             unsafe {
                 assert_staged_tasks_reclaimed(owner, depth + 1, depth + 1);
+            }
+        });
+    }
+
+    #[test]
+    fn iterative_destroy_queue_singleton_uses_head_tail_ownership() {
+        let mut queue = IterativeTaskDestroyQueue::new();
+        let mut task = TaskHeader::new();
+        task.refs.set(0);
+        task.flags.set(TaskHeader::FLAG_COMPLETED);
+        let task = std::ptr::from_mut(&mut task);
+
+        unsafe { queue.push_back(task) };
+
+        let link = unsafe { std::ptr::addr_of_mut!((*task).ready_link) };
+        assert_eq!(queue.head, link);
+        assert_eq!(queue.tail, link);
+        assert!(unsafe { (*link).is_unlinked() });
+        assert_eq!(unsafe { queue.pop_front() }, Some(task));
+        assert!(queue.head.is_null());
+        assert!(queue.tail.is_null());
+        assert!(unsafe { (*task).ready_link.is_unlinked() });
+        assert_eq!(unsafe { queue.pop_front() }, None);
+    }
+
+    #[test]
+    fn iterative_destroy_queue_three_nodes_preserve_fifo_and_empty_state() {
+        let mut queue = IterativeTaskDestroyQueue::new();
+        let mut tasks: [TaskHeader; 3] = std::array::from_fn(|_| {
+            let task = TaskHeader::new();
+            task.refs.set(0);
+            task.flags.set(TaskHeader::FLAG_COMPLETED);
+            task
+        });
+        let task_ptrs = tasks.each_mut().map(std::ptr::from_mut);
+
+        for task in task_ptrs {
+            unsafe { queue.push_back(task) };
+            assert!(unsafe { (*task).all_link.is_unlinked() });
+        }
+
+        assert!(unsafe { (*task_ptrs[0]).ready_link.prev.is_null() });
+        assert_eq!(unsafe { (*task_ptrs[0]).ready_link.next }, unsafe {
+            std::ptr::addr_of_mut!((*task_ptrs[1]).ready_link)
+        });
+        assert_eq!(unsafe { (*task_ptrs[1]).ready_link.prev }, unsafe {
+            std::ptr::addr_of_mut!((*task_ptrs[0]).ready_link)
+        });
+        assert_eq!(unsafe { (*task_ptrs[1]).ready_link.next }, unsafe {
+            std::ptr::addr_of_mut!((*task_ptrs[2]).ready_link)
+        });
+        assert_eq!(unsafe { (*task_ptrs[2]).ready_link.prev }, unsafe {
+            std::ptr::addr_of_mut!((*task_ptrs[1]).ready_link)
+        });
+        assert_eq!(
+            unsafe { (*task_ptrs[2]).ready_link.next },
+            std::ptr::null_mut()
+        );
+
+        for (index, task) in task_ptrs.into_iter().enumerate() {
+            let link = unsafe { std::ptr::addr_of_mut!((*task).ready_link) };
+            assert_eq!(queue.head, link);
+            assert!(unsafe { (*link).prev.is_null() });
+            assert_eq!(unsafe { queue.pop_front() }, Some(task));
+            assert!(unsafe { (*task).ready_link.is_unlinked() });
+            if let Some(next) = task_ptrs.get(index + 1) {
+                let next_link = unsafe { std::ptr::addr_of_mut!((**next).ready_link) };
+                assert_eq!(queue.head, next_link);
+                assert!(unsafe { (*next_link).prev.is_null() });
+            }
+        }
+        assert!(queue.head.is_null());
+        assert!(queue.tail.is_null());
+        assert_eq!(unsafe { queue.pop_front() }, None);
+    }
+
+    #[test]
+    fn iterative_destroy_detaches_registry_and_clears_links_before_raw_destroy() {
+        type Completed = std::future::Ready<DestroyLinkDropProbe>;
+
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
+            let drops = Rc::new(Cell::new(0));
+            let mut staged = stage_completed_task_output_for_benchmark(DestroyLinkDropProbe {
+                task: Rc::clone(&task_slot),
+                drops: Rc::clone(&drops),
+            })
+            .expect("destroy-link task staging failed");
+            let task = staged.task;
+            task_slot.set(task);
+            let raw_vtable = join_task_vtable_for::<Completed>().direct;
+            unsafe {
+                (*task).vtable = raw_vtable;
+                (*task).refs.set(0);
+            }
+            staged.owns_reference = false;
+            drop(staged);
+
+            let state = owner.state_ptr();
+            let mut queue = IterativeTaskDestroyQueue::new();
+            unsafe {
+                enqueue_nested_task_destroy(std::ptr::from_mut(&mut queue), task, raw_vtable);
+            }
+            unsafe {
+                assert!((*state).all_tasks.is_empty());
+                assert!((*state).ready_queue.is_empty());
+                assert!((*task).all_link.is_unlinked());
+                let ready_link = std::ptr::addr_of_mut!((*task).ready_link);
+                assert_eq!(queue.head, ready_link);
+                assert_eq!(queue.tail, ready_link);
+                assert!((*ready_link).is_unlinked());
+                assert!(!task_can_enter_ready_queue((*task).flags.get()));
+                set_task_flag_unchecked(task, TaskHeader::FLAG_NOTIFIED);
+                assert!(!enqueue_notified_task_unchecked(
+                    task,
+                    std::ptr::addr_of_mut!((*state).ready_queue),
+                    std::ptr::addr_of_mut!((*state).runtime_state),
+                ));
+                assert!((*state).ready_queue.is_empty());
+            }
+
+            assert_eq!(unsafe { queue.pop_front() }, Some(task));
+            assert!(unsafe { (*task).ready_link.is_unlinked() });
+            let raw_destroy = raw_vtable.destroy;
+            unsafe {
+                raw_destroy(task);
+            }
+            assert_eq!(drops.get(), 1);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 1, 1);
+            }
+
+            let replacement = stage_completed_task_output_for_benchmark(31usize)
+                .expect("destroy-link replacement staging failed");
+            assert_eq!(replacement.task, task, "destroyed slot was not reused");
+            drop(replacement);
+            unsafe {
+                assert_staged_tasks_reclaimed(owner, 2, 2);
             }
         });
     }
