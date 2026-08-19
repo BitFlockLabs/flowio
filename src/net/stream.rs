@@ -44,8 +44,9 @@ use crate::runtime::fd::RuntimeFdOpState;
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::{
-    RETAINED_IOVEC_INLINE_COUNT, RETAINED_IOVEC_MAX_COUNT, RetainedIovecScratch,
-    RetainedIovecScratchInit, RetainedPayload, RetainedPayloadPool, with_raw_retained_slot,
+    RETAINED_IOVEC_INLINE_COUNT, RETAINED_IOVEC_MAX_COUNT, RETAINED_IOVEC_OVERSIZE_MESSAGE,
+    RetainedIovecScratch, RetainedIovecScratchInit, RetainedPayload, RetainedPayloadPool,
+    with_raw_retained_slot,
 };
 use crate::runtime::task::TaskHeader;
 use io_uring::{opcode, squeue, types};
@@ -719,6 +720,12 @@ fn uninit_iovecs<const N: usize>() -> [MaybeUninit<libc::iovec>; N] {
     unsafe { MaybeUninit::uninit().assume_init() }
 }
 
+#[cold]
+#[inline(never)]
+fn retained_iovec_oversize_error() -> io::Error {
+    invalid_input(RETAINED_IOVEC_OVERSIZE_MESSAGE)
+}
+
 /// Reinterprets an `iovec` scratch slice as initialized `libc::iovec`s.
 ///
 /// # Safety
@@ -761,6 +768,8 @@ mod write_buffer_chain_sealed {
     use super::*;
 
     pub trait Sealed<const N: usize>: Sized {
+        /// Returns at most `N` active entries. For an unchanged chain,
+        /// `fill_write_iovecs` must report the same bounded active count.
         fn write_iovec_count_and_len(&self) -> Option<(usize, usize)>;
         fn fill_write_iovecs(
             &self,
@@ -2483,7 +2492,8 @@ pub struct ReadvFuture<'a, const N: usize, S> {
     writable: usize,
     /// Stream descriptor read from by this future.
     fd: RawFd,
-    /// Whether the sizing pass found an unrepresentable writable aggregate.
+    /// Whether the sizing pass found an unrepresentable writable aggregate or
+    /// active count.
     invalid_aggregate: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
@@ -2494,7 +2504,11 @@ impl<'a, const N: usize, S> ReadvFuture<'a, N, S> {
         let fd = fd_state.raw_fd();
         let (iov_count, writable, invalid_aggregate) =
             match buffer.checked_read_iovec_count_and_writable_len() {
-                Some((iov_count, writable)) => (iov_count, writable, false),
+                Some((iov_count, writable)) => (
+                    iov_count,
+                    writable,
+                    N > RETAINED_IOVEC_MAX_COUNT && iov_count > RETAINED_IOVEC_MAX_COUNT,
+                ),
                 None => (0, 0, true),
             };
         Self {
@@ -2536,7 +2550,13 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
         }
 
         if this.state_ptr.state_ptr().is_null() && this.invalid_aggregate {
-            let result = validate_local_io_result(cx, Err(invalid_readv_aggregate()));
+            let error = if N > RETAINED_IOVEC_MAX_COUNT && this.iov_count > RETAINED_IOVEC_MAX_COUNT
+            {
+                retained_iovec_oversize_error()
+            } else {
+                invalid_readv_aggregate()
+            };
+            let result = validate_local_io_result(cx, Err(error));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
@@ -2862,6 +2882,10 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             if total == 0 {
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Ok(0), buffer));
+            }
+            if N > RETAINED_IOVEC_MAX_COUNT && iov_count > RETAINED_IOVEC_MAX_COUNT {
+                let buffer = unsafe { opt_take(&mut this.buffer) };
+                return Poll::Ready((Err(retained_iovec_oversize_error()), buffer));
             }
         }
 
@@ -3401,6 +3425,13 @@ impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
                 }
             }
         };
+        if N > RETAINED_IOVEC_MAX_COUNT
+            && input_error.is_none()
+            && target != 0
+            && iov_count > RETAINED_IOVEC_MAX_COUNT
+        {
+            input_error = Some(retained_iovec_oversize_error());
+        }
 
         Self {
             state_ptr: fd_state,
@@ -3875,6 +3906,272 @@ mod tests {
         initial: [1, 1],
         materialized: [2, 1],
     };
+
+    const OVERSIZED_RETAINED_IOVEC_COUNT: usize = RETAINED_IOVEC_MAX_COUNT + 1;
+    #[derive(Clone, Copy)]
+    struct OversizedWriteItem(u8);
+
+    impl WriteBufferItem for OversizedWriteItem {
+        fn write_ptr(&self) -> *const u8 {
+            std::ptr::addr_of!(self.0)
+        }
+
+        fn write_len(&self) -> usize {
+            1
+        }
+    }
+
+    struct OversizedWriteChain {
+        token: Box<u8>,
+        sizing_calls: Rc<Cell<usize>>,
+        fill_calls: Rc<Cell<usize>>,
+        items: [OversizedWriteItem; OVERSIZED_RETAINED_IOVEC_COUNT],
+    }
+
+    impl OversizedWriteChain {
+        fn new(sizing_calls: &Rc<Cell<usize>>, fill_calls: &Rc<Cell<usize>>) -> Self {
+            Self {
+                token: Box::new(0xA5),
+                sizing_calls: Rc::clone(sizing_calls),
+                fill_calls: Rc::clone(fill_calls),
+                items: [OversizedWriteItem(0x5A); OVERSIZED_RETAINED_IOVEC_COUNT],
+            }
+        }
+
+        fn token_ptr(&self) -> *const u8 {
+            self.token.as_ref()
+        }
+    }
+
+    impl write_buffer_chain_sealed::Sealed<OVERSIZED_RETAINED_IOVEC_COUNT> for OversizedWriteChain {
+        fn write_iovec_count_and_len(&self) -> Option<(usize, usize)> {
+            self.sizing_calls.set(self.sizing_calls.get() + 1);
+            checked_write_iovec_count_and_len(self.items.iter())
+        }
+
+        fn fill_write_iovecs(
+            &self,
+            _dst: &mut [MaybeUninit<libc::iovec>],
+        ) -> io::Result<(usize, usize)> {
+            self.fill_calls.set(self.fill_calls.get() + 1);
+            panic!("oversized write chain reached iovec materialization");
+        }
+    }
+
+    fn oversized_read_chain() -> IoBuffVecMut<OVERSIZED_RETAINED_IOVEC_COUNT> {
+        let mut chain = IoBuffVecMut::new();
+        for _ in 0..OVERSIZED_RETAINED_IOVEC_COUNT {
+            let segment =
+                IoBuffMut::new(0, 1, 0).expect("oversized read segment allocation failed");
+            chain
+                .push(segment)
+                .expect("oversized read chain exceeded its const capacity");
+        }
+        chain
+    }
+
+    fn oversized_read_chain_endpoint_ptrs(
+        chain: &mut IoBuffVecMut<OVERSIZED_RETAINED_IOVEC_COUNT>,
+    ) -> (usize, usize) {
+        let first = chain
+            .get_mut(0)
+            .expect("oversized read chain first segment missing")
+            .as_mut_ptr() as usize;
+        let last = chain
+            .get_mut(OVERSIZED_RETAINED_IOVEC_COUNT - 1)
+            .expect("oversized read chain last segment missing")
+            .as_mut_ptr() as usize;
+        (first, last)
+    }
+
+    fn observed_error(result: io::Result<usize>) -> Option<(io::ErrorKind, String)> {
+        result.err().map(|err| (err.kind(), err.to_string()))
+    }
+
+    struct OverlimitObservation {
+        error: Option<(io::ErrorKind, String)>,
+        owner_ok: bool,
+        fault_remaining: bool,
+    }
+
+    fn poll_overlimit_readv(cx: &mut Context<'_>) -> OverlimitObservation {
+        let mut future = ReadvFuture::<OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            oversized_read_chain(),
+        );
+        let expected = oversized_read_chain_endpoint_ptrs(
+            future.buffer.as_mut().expect("readv chain missing"),
+        );
+        crate::runtime::test_hooks::fail_next_op_alloc();
+        let output = match Pin::new(&mut future).poll(cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        };
+        let fault_remaining = crate::runtime::test_hooks::take_op_alloc_failure();
+        let (error, owner_ok) = match output {
+            Some((result, mut chain)) => (
+                observed_error(result),
+                chain.segments() == OVERSIZED_RETAINED_IOVEC_COUNT
+                    && oversized_read_chain_endpoint_ptrs(&mut chain) == expected,
+            ),
+            None => (None, false),
+        };
+        OverlimitObservation {
+            error,
+            owner_ok,
+            fault_remaining,
+        }
+    }
+
+    fn poll_overlimit_readv_exact(cx: &mut Context<'_>) -> OverlimitObservation {
+        let mut future = ReadvExactFuture::<OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            oversized_read_chain(),
+            1,
+        );
+        let expected = oversized_read_chain_endpoint_ptrs(
+            future.buffer.as_mut().expect("readv_exact chain missing"),
+        );
+        crate::runtime::test_hooks::fail_next_op_alloc();
+        let output = match Pin::new(&mut future).poll(cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        };
+        let fault_remaining = crate::runtime::test_hooks::take_op_alloc_failure();
+        let (error, owner_ok) = match output {
+            Some((result, mut chain)) => (
+                observed_error(result),
+                chain.segments() == OVERSIZED_RETAINED_IOVEC_COUNT
+                    && oversized_read_chain_endpoint_ptrs(&mut chain) == expected,
+            ),
+            None => (None, false),
+        };
+        OverlimitObservation {
+            error,
+            owner_ok,
+            fault_remaining,
+        }
+    }
+
+    struct WriteOverlimitObservation {
+        base: OverlimitObservation,
+        sizing_calls: usize,
+        fill_calls: usize,
+    }
+
+    fn poll_overlimit_writev_all(cx: &mut Context<'_>) -> WriteOverlimitObservation {
+        let sizing_calls = Rc::new(Cell::new(0));
+        let fill_calls = Rc::new(Cell::new(0));
+        let chain = OversizedWriteChain::new(&sizing_calls, &fill_calls);
+        let expected = chain.token_ptr();
+        let mut future = WritevAllFuture::<_, OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            chain,
+        );
+        crate::runtime::test_hooks::fail_next_op_alloc();
+        let output = match Pin::new(&mut future).poll(cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        };
+        let fault_remaining = crate::runtime::test_hooks::take_op_alloc_failure();
+        let (error, owner_ok) = match output {
+            Some((result, chain)) => (observed_error(result), chain.token_ptr() == expected),
+            None => (None, false),
+        };
+        WriteOverlimitObservation {
+            base: OverlimitObservation {
+                error,
+                owner_ok,
+                fault_remaining,
+            },
+            sizing_calls: sizing_calls.get(),
+            fill_calls: fill_calls.get(),
+        }
+    }
+
+    fn poll_outside_overlimit_readv(cx: &mut Context<'_>) -> (Option<io::ErrorKind>, bool) {
+        let mut future = ReadvFuture::<OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            oversized_read_chain(),
+        );
+        let expected = oversized_read_chain_endpoint_ptrs(
+            future.buffer.as_mut().expect("readv chain missing"),
+        );
+        match Pin::new(&mut future).poll(cx) {
+            Poll::Ready((result, mut chain)) => (
+                result.err().map(|err| err.kind()),
+                chain.segments() == OVERSIZED_RETAINED_IOVEC_COUNT
+                    && oversized_read_chain_endpoint_ptrs(&mut chain) == expected,
+            ),
+            Poll::Pending => (None, false),
+        }
+    }
+
+    fn poll_outside_overlimit_readv_exact(cx: &mut Context<'_>) -> (Option<io::ErrorKind>, bool) {
+        let mut future = ReadvExactFuture::<OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            oversized_read_chain(),
+            1,
+        );
+        let expected = oversized_read_chain_endpoint_ptrs(
+            future.buffer.as_mut().expect("readv_exact chain missing"),
+        );
+        match Pin::new(&mut future).poll(cx) {
+            Poll::Ready((result, mut chain)) => (
+                result.err().map(|err| err.kind()),
+                chain.segments() == OVERSIZED_RETAINED_IOVEC_COUNT
+                    && oversized_read_chain_endpoint_ptrs(&mut chain) == expected,
+            ),
+            Poll::Pending => (None, false),
+        }
+    }
+
+    fn poll_outside_overlimit_writev_all(
+        cx: &mut Context<'_>,
+    ) -> (Option<io::ErrorKind>, bool, usize, usize) {
+        let sizing_calls = Rc::new(Cell::new(0));
+        let fill_calls = Rc::new(Cell::new(0));
+        let chain = OversizedWriteChain::new(&sizing_calls, &fill_calls);
+        let expected = chain.token_ptr();
+        let mut future = WritevAllFuture::<_, OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            chain,
+        );
+        let (error, owner_ok) = match Pin::new(&mut future).poll(cx) {
+            Poll::Ready((result, chain)) => (
+                result.err().map(|err| err.kind()),
+                chain.token_ptr() == expected,
+            ),
+            Poll::Pending => (None, false),
+        };
+        (error, owner_ok, sizing_calls.get(), fill_calls.get())
+    }
+
+    fn poll_overlimit_zero_target(cx: &mut Context<'_>) -> (Option<io::Result<usize>>, bool, bool) {
+        let mut future = ReadvExactFuture::<OVERSIZED_RETAINED_IOVEC_COUNT, ()>::new(
+            invalid_fd_capability(),
+            oversized_read_chain(),
+            0,
+        );
+        let expected = oversized_read_chain_endpoint_ptrs(
+            future.buffer.as_mut().expect("zero-target chain missing"),
+        );
+        crate::runtime::test_hooks::fail_next_op_alloc();
+        let output = match Pin::new(&mut future).poll(cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        };
+        let fault_remaining = crate::runtime::test_hooks::take_op_alloc_failure();
+        let (result, owner_ok) = match output {
+            Some((result, mut chain)) => (
+                Some(result),
+                chain.segments() == OVERSIZED_RETAINED_IOVEC_COUNT
+                    && oversized_read_chain_endpoint_ptrs(&mut chain) == expected,
+            ),
+            None => (None, false),
+        };
+        (result, owner_ok, fault_remaining)
+    }
 
     struct AggregateLengthItem(usize);
 
@@ -4688,6 +4985,117 @@ mod tests {
                 .segments(),
             4
         );
+    }
+
+    #[test]
+    fn vectored_overlimit_precedes_op_allocation_and_preserves_owners() {
+        with_ringless_poll_context_for_test(0, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let read = poll_overlimit_readv(cx);
+            let exact = poll_overlimit_readv_exact(cx);
+            let write = poll_overlimit_writev_all(cx);
+
+            let expected = Some((io::ErrorKind::InvalidInput, RETAINED_IOVEC_OVERSIZE_MESSAGE));
+            assert_eq!(
+                read.error
+                    .as_ref()
+                    .map(|(kind, message)| (*kind, message.as_str())),
+                expected,
+                "readv over-limit error changed"
+            );
+            assert_eq!(
+                write
+                    .base
+                    .error
+                    .as_ref()
+                    .map(|(kind, message)| (*kind, message.as_str())),
+                expected,
+                "writev_all over-limit error changed"
+            );
+            assert_eq!(
+                exact
+                    .error
+                    .as_ref()
+                    .map(|(kind, message)| (*kind, message.as_str())),
+                expected,
+                "readv_exact over-limit error changed"
+            );
+            assert!(read.owner_ok, "readv did not return its exact owner");
+            assert!(
+                write.base.owner_ok,
+                "writev_all did not return its exact owner"
+            );
+            assert!(exact.owner_ok, "readv_exact did not return its exact owner");
+            assert!(read.fault_remaining, "readv attempted op allocation");
+            assert!(
+                write.base.fault_remaining,
+                "writev_all attempted op allocation"
+            );
+            assert!(exact.fault_remaining, "readv_exact attempted op allocation");
+            assert_eq!(write.sizing_calls, 1, "writev_all repeated its sizing pass");
+            assert_eq!(write.fill_calls, 0, "writev_all materialized scratch");
+
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 0);
+            assert_eq!(stats.heap_fallbacks, 0);
+            assert_eq!(stats.writev_scratch_inline_allocs, 0);
+            assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+            assert_eq!(stats.writev_scratch_oversize_rejections, 0);
+        });
+    }
+
+    #[test]
+    fn vectored_overlimit_preserves_context_and_zero_target_precedence() {
+        let mut outside_cx = Context::from_waker(std::task::Waker::noop());
+        let (read_error, read_owner_ok) = poll_outside_overlimit_readv(&mut outside_cx);
+        assert_eq!(
+            read_error,
+            Some(io::ErrorKind::NotConnected),
+            "context rejection must precede readv limit"
+        );
+        assert!(read_owner_ok, "readv context rejection changed its owner");
+
+        let (write_error, write_owner_ok, sizing_calls, fill_calls) =
+            poll_outside_overlimit_writev_all(&mut outside_cx);
+        assert_eq!(
+            write_error,
+            Some(io::ErrorKind::NotConnected),
+            "context rejection must precede writev_all limit"
+        );
+        assert!(
+            write_owner_ok,
+            "writev_all context rejection changed its owner"
+        );
+        assert_eq!(sizing_calls, 0, "context rejection ran sizing");
+        assert_eq!(fill_calls, 0, "context rejection materialized scratch");
+
+        let (exact_error, exact_owner_ok) = poll_outside_overlimit_readv_exact(&mut outside_cx);
+        assert_eq!(
+            exact_error,
+            Some(io::ErrorKind::NotConnected),
+            "context rejection must precede readv_exact limit"
+        );
+        assert!(
+            exact_owner_ok,
+            "readv_exact context rejection changed its owner"
+        );
+
+        with_ringless_poll_context_for_test(0, |_owner, cx| {
+            let (result, owner_ok, fault_remaining) = poll_overlimit_zero_target(cx);
+            assert_eq!(
+                result
+                    .expect("zero-target readv_exact remained pending")
+                    .expect("zero-target readv_exact failed"),
+                0
+            );
+            assert!(owner_ok, "zero-target readv_exact changed its owner");
+            assert!(
+                fault_remaining,
+                "zero-target readv_exact attempted op allocation"
+            );
+        });
     }
 
     fn aggregate_rejection_test_chain() -> IoBuffVecMut<1> {

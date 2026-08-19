@@ -46,6 +46,8 @@ pub(crate) const RETAINED_IOVEC_INLINE_COUNT: usize = 16;
 const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
 pub(crate) const RETAINED_IOVEC_MAX_COUNT: usize =
     RETAINED_IOVEC_SIZE_CLASSES[RETAINED_IOVEC_SIZE_CLASSES.len() - 1];
+pub(crate) const RETAINED_IOVEC_OVERSIZE_MESSAGE: &str =
+    "active iovec count exceeds retained scratch capacity";
 
 const _: () = {
     assert!(RETAINED_IOVEC_INLINE_COUNT < RETAINED_IOVEC_SIZE_CLASSES[0]);
@@ -592,7 +594,7 @@ impl RetainedPayloadPool {
                 self.iovec_pool.record_oversize_rejection();
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "active iovec count exceeds retained scratch capacity",
+                    RETAINED_IOVEC_OVERSIZE_MESSAGE,
                 ));
             }
         };

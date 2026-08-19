@@ -700,6 +700,79 @@ pub fn make_read_chain<const N: usize>(capacities: [usize; N]) -> IoBuffVecMut<N
     chain
 }
 
+/// Active-iovec count immediately above retained stream scratch capacity.
+#[allow(dead_code)]
+pub const OVERSIZED_VECTORED_IOVECS: usize = 1025;
+
+/// Stack reserved by exact child processes that instantiate 1,025-entry
+/// inline vectored futures.
+#[allow(dead_code)]
+pub const OVERSIZED_VECTORED_TEST_STACK_BYTES: &str = "33554432";
+
+/// Exact allocation-free diagnostic for retained stream scratch overflow.
+#[allow(dead_code)]
+pub const OVERSIZED_VECTORED_ERROR: &str = "active iovec count exceeds retained scratch capacity";
+
+/// Builds a genuine mutable chain with 1,025 active one-byte entries.
+#[allow(dead_code)]
+pub fn make_oversized_read_chain() -> IoBuffVecMut<OVERSIZED_VECTORED_IOVECS> {
+    let mut chain = IoBuffVecMut::new();
+    for _ in 0..OVERSIZED_VECTORED_IOVECS {
+        chain
+            .push(TestIoBuffMut::new(0, 1, 0))
+            .expect("oversized read chain exceeded its const capacity");
+    }
+    chain
+}
+
+/// Builds a genuine frozen chain with 1,025 active one-byte entries.
+#[allow(dead_code)]
+pub fn make_oversized_write_chain() -> IoBuffVec<OVERSIZED_VECTORED_IOVECS> {
+    let mut chain = IoBuffVecMut::new();
+    for _ in 0..OVERSIZED_VECTORED_IOVECS {
+        let mut segment = TestIoBuffMut::new(0, 1, 0);
+        segment
+            .payload_append(&[0x5A])
+            .expect("oversized write segment initialization failed");
+        chain
+            .push(segment)
+            .expect("oversized write chain exceeded its const capacity");
+    }
+    chain.freeze()
+}
+
+/// Returns stable endpoint pointers for an exact-owner mutable-chain oracle.
+#[allow(dead_code)]
+pub fn oversized_read_chain_endpoints(
+    chain: &mut IoBuffVecMut<OVERSIZED_VECTORED_IOVECS>,
+) -> (usize, usize) {
+    let first = chain
+        .get_mut(0)
+        .expect("oversized read chain first segment missing")
+        .as_mut_ptr() as usize;
+    let last = chain
+        .get_mut(OVERSIZED_VECTORED_IOVECS - 1)
+        .expect("oversized read chain last segment missing")
+        .as_mut_ptr() as usize;
+    (first, last)
+}
+
+/// Returns stable endpoint pointers for an exact-owner frozen-chain oracle.
+#[allow(dead_code)]
+pub fn oversized_write_chain_endpoints(
+    chain: &IoBuffVec<OVERSIZED_VECTORED_IOVECS>,
+) -> (usize, usize) {
+    let first = chain
+        .get(0)
+        .expect("oversized write chain first segment missing")
+        .as_ptr() as usize;
+    let last = chain
+        .get(OVERSIZED_VECTORED_IOVECS - 1)
+        .expect("oversized write chain last segment missing")
+        .as_ptr() as usize;
+    (first, last)
+}
+
 /// Repeatedly invokes one nonblocking owned-buffer write until the socket
 /// reports `WouldBlock`, retaining the source buffer between attempts.
 #[allow(dead_code)]

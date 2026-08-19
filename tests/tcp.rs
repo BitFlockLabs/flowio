@@ -2,12 +2,14 @@ mod common;
 
 use common::{
     BoundedTcpListener, BoundedTcpPeer, BoundedTcpStream, DYNAMIC_PROJECTED_PIECES,
-    DropTrackedProjected17, EmptyProjected, ProjectedSourceWitness, TestIoBuffMut as IoBuffMut,
+    DropTrackedProjected17, EmptyProjected, OVERSIZED_VECTORED_ERROR, OVERSIZED_VECTORED_IOVECS,
+    OVERSIZED_VECTORED_TEST_STACK_BYTES, ProjectedSourceWitness, TestIoBuffMut as IoBuffMut,
     TestProjected, TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
     connect_bounded_tcp_peer, fill_try_send_buffer, ipv6_loopback_capability_unavailable,
-    lowest_available_fd, make_payload_chain, make_read_chain, make_read_only_chain,
-    poll_once_pending, raw_fd_is_open, run_test, run_test_output, set_positive_linger,
-    spawn_bounded_tcp_peer,
+    lowest_available_fd, make_oversized_read_chain, make_oversized_write_chain, make_payload_chain,
+    make_read_chain, make_read_only_chain, oversized_read_chain_endpoints,
+    oversized_write_chain_endpoints, poll_once_pending, raw_fd_is_open, run_test, run_test_output,
+    set_positive_linger, spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -15,6 +17,7 @@ use flowio::runtime::executor::{Executor, ExecutorConfig};
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{sleep, timeout};
 use flowio::test_support::net::tcp::test_accept_slot_drop_cached_state_preserves_unrelated_fd;
+use flowio::test_support::runtime::io::Nop;
 use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -47,6 +50,8 @@ const TCP_OWNED_CONNECT_REUSE_TEST: &str =
 const TCP_REUSABLE_CONNECT_REUSE_CHILD_ENV: &str = "FLOWIO_TCP_REUSABLE_CONNECT_REUSE_CHILD";
 const TCP_REUSABLE_CONNECT_REUSE_TEST: &str =
     "runtime_tcp_reusable_dropped_connect_retains_socket_until_connect_cqe";
+const TCP_VECTORED_OVERLIMIT_CHILD_ENV: &str = "FLOWIO_TCP_VECTORED_OVERLIMIT_CHILD";
+const TCP_VECTORED_OVERLIMIT_TEST: &str = "runtime_tcp_vectored_overlimit_precedes_op_pressure";
 const TCP_IPV6_FLOWIO_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn bind_std_ipv6_tcp_listener_or_skip(test_name: &str) -> Option<BoundedTcpListener> {
@@ -2682,6 +2687,117 @@ fn runtime_tcp_writev_readv() {
         .expect("executor run failed");
 
     peer.finish();
+}
+
+#[test]
+fn runtime_tcp_vectored_overlimit_precedes_op_pressure() {
+    if std::env::var_os(TCP_VECTORED_OVERLIMIT_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog_env(
+            TCP_VECTORED_OVERLIMIT_TEST,
+            TCP_VECTORED_OVERLIMIT_CHILD_ENV,
+            Duration::from_secs(30),
+            &[("RUST_MIN_STACK", OVERSIZED_VECTORED_TEST_STACK_BYTES)],
+        );
+        return;
+    }
+
+    fn assert_overlimit(result: io::Result<usize>, operation: &str) {
+        let err = result.expect_err(operation);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), OVERSIZED_VECTORED_ERROR);
+    }
+
+    fn assert_fault_probe(result: io::Result<i32>, operation: &str) {
+        let err = result.expect_err(operation);
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    let (stream, _peer) = connected_try_tcp_stream();
+    let mut read_chain = make_oversized_read_chain();
+    let read_endpoints = oversized_read_chain_endpoints(&mut read_chain);
+    let write_chain = make_oversized_write_chain();
+    let write_endpoints = oversized_write_chain_endpoints(&write_chain);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    let (_stream, mut read_chain, write_chain) = run_test_output(
+        &mut executor,
+        Box::pin(async move {
+            let mut stream = stream;
+
+            test_hooks::fail_next_op_alloc();
+            let (read_result, returned_read) = stream.readv(read_chain).await;
+            let read_probe = Nop::new().await;
+            assert_overlimit(
+                read_result,
+                "over-limit TCP readv should fail intrinsically",
+            );
+            assert_fault_probe(
+                read_probe,
+                "TCP readv consumed the forced op-allocation fault",
+            );
+            read_chain = returned_read;
+
+            test_hooks::fail_next_op_alloc();
+            let (exact_result, returned_read) = stream.readv_exact(read_chain, 1).await;
+            let exact_probe = Nop::new().await;
+            assert_overlimit(
+                exact_result,
+                "over-limit TCP readv_exact should fail intrinsically",
+            );
+            assert_fault_probe(
+                exact_probe,
+                "TCP readv_exact consumed the forced op-allocation fault",
+            );
+            read_chain = returned_read;
+
+            test_hooks::fail_next_op_alloc();
+            let (zero_result, returned_read) = stream.readv_exact(read_chain, 0).await;
+            let zero_probe = Nop::new().await;
+            assert_eq!(zero_result.expect("zero-target TCP readv_exact failed"), 0);
+            assert_fault_probe(
+                zero_probe,
+                "zero-target TCP readv_exact consumed the forced op-allocation fault",
+            );
+            read_chain = returned_read;
+
+            test_hooks::fail_next_op_alloc();
+            let (write_result, write_chain) = stream.writev_all(write_chain).await;
+            let write_probe = Nop::new().await;
+            assert_overlimit(
+                write_result,
+                "over-limit TCP writev_all should fail intrinsically",
+            );
+            assert_fault_probe(
+                write_probe,
+                "TCP writev_all consumed the forced op-allocation fault",
+            );
+
+            assert_eq!(Nop::new().await.expect("final TCP NOP failed"), 0);
+            (stream, read_chain, write_chain)
+        }),
+    );
+
+    assert_eq!(read_chain.segments(), OVERSIZED_VECTORED_IOVECS);
+    assert_eq!(
+        oversized_read_chain_endpoints(&mut read_chain),
+        read_endpoints
+    );
+    assert_eq!(write_chain.segments(), OVERSIZED_VECTORED_IOVECS);
+    assert_eq!(
+        oversized_write_chain_endpoints(&write_chain),
+        write_endpoints
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 1);
+        assert_eq!(stats.cqe_completions, 1);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(stats.writev_scratch_inline_allocs, 0);
+        assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+    }
 }
 
 #[test]

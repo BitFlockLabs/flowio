@@ -8,18 +8,26 @@ use common::{
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{
+    OVERSIZED_VECTORED_ERROR, OVERSIZED_VECTORED_IOVECS, OVERSIZED_VECTORED_TEST_STACK_BYTES,
     SparseOversizedReadOnly, assert_oversized_send_rejected, assert_oversized_try_send_rejected,
-    run_test_output,
+    make_oversized_read_chain, make_oversized_write_chain, oversized_read_chain_endpoints,
+    oversized_write_chain_endpoints, run_test_output,
 };
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+use flowio::test_support::runtime::{io::Nop, test_hooks};
 use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::Duration;
+
+const UNIX_VECTORED_OVERLIMIT_CHILD_ENV: &str = "FLOWIO_UNIX_VECTORED_OVERLIMIT_CHILD";
+const UNIX_VECTORED_OVERLIMIT_TEST: &str = "runtime_unix_vectored_overlimit_precedes_op_pressure";
 
 /// Returns a FlowIO UnixStream wrapping one nonblocking socketpair endpoint
 /// plus its connected std peer for one-shot tests that do not need a reactor.
@@ -1499,6 +1507,118 @@ fn runtime_unix_writev_readv_echo() {
             assert_eq!(chain.get(1).expect("seg1").payload_bytes(), b"world");
         })
         .expect("executor run failed");
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn runtime_unix_vectored_overlimit_precedes_op_pressure() {
+    if std::env::var_os(UNIX_VECTORED_OVERLIMIT_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog_env(
+            UNIX_VECTORED_OVERLIMIT_TEST,
+            UNIX_VECTORED_OVERLIMIT_CHILD_ENV,
+            Duration::from_secs(30),
+            &[("RUST_MIN_STACK", OVERSIZED_VECTORED_TEST_STACK_BYTES)],
+        );
+        return;
+    }
+
+    fn assert_overlimit(result: io::Result<usize>, operation: &str) {
+        let err = result.expect_err(operation);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), OVERSIZED_VECTORED_ERROR);
+    }
+
+    fn assert_fault_probe(result: io::Result<i32>, operation: &str) {
+        let err = result.expect_err(operation);
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    let (stream, _peer) = connected_try_unix_stream();
+    let mut read_chain = make_oversized_read_chain();
+    let read_endpoints = oversized_read_chain_endpoints(&mut read_chain);
+    let write_chain = make_oversized_write_chain();
+    let write_endpoints = oversized_write_chain_endpoints(&write_chain);
+    let mut executor = Executor::new().expect("failed to construct runtime executor");
+
+    let (_stream, mut read_chain, write_chain) = run_test_output(
+        &mut executor,
+        Box::pin(async move {
+            let mut stream = stream;
+
+            test_hooks::fail_next_op_alloc();
+            let (read_result, returned_read) = stream.readv(read_chain).await;
+            let read_probe = Nop::new().await;
+            assert_overlimit(
+                read_result,
+                "over-limit Unix readv should fail intrinsically",
+            );
+            assert_fault_probe(
+                read_probe,
+                "Unix readv consumed the forced op-allocation fault",
+            );
+            read_chain = returned_read;
+
+            test_hooks::fail_next_op_alloc();
+            let (exact_result, returned_read) = stream.readv_exact(read_chain, 1).await;
+            let exact_probe = Nop::new().await;
+            assert_overlimit(
+                exact_result,
+                "over-limit Unix readv_exact should fail intrinsically",
+            );
+            assert_fault_probe(
+                exact_probe,
+                "Unix readv_exact consumed the forced op-allocation fault",
+            );
+            read_chain = returned_read;
+
+            test_hooks::fail_next_op_alloc();
+            let (zero_result, returned_read) = stream.readv_exact(read_chain, 0).await;
+            let zero_probe = Nop::new().await;
+            assert_eq!(zero_result.expect("zero-target Unix readv_exact failed"), 0);
+            assert_fault_probe(
+                zero_probe,
+                "zero-target Unix readv_exact consumed the forced op-allocation fault",
+            );
+            read_chain = returned_read;
+
+            test_hooks::fail_next_op_alloc();
+            let (write_result, write_chain) = stream.writev_all(write_chain).await;
+            let write_probe = Nop::new().await;
+            assert_overlimit(
+                write_result,
+                "over-limit Unix writev_all should fail intrinsically",
+            );
+            assert_fault_probe(
+                write_probe,
+                "Unix writev_all consumed the forced op-allocation fault",
+            );
+
+            assert_eq!(Nop::new().await.expect("final Unix NOP failed"), 0);
+            (stream, read_chain, write_chain)
+        }),
+    );
+
+    assert_eq!(read_chain.segments(), OVERSIZED_VECTORED_IOVECS);
+    assert_eq!(
+        oversized_read_chain_endpoints(&mut read_chain),
+        read_endpoints
+    );
+    assert_eq!(write_chain.segments(), OVERSIZED_VECTORED_IOVECS);
+    assert_eq!(
+        oversized_write_chain_endpoints(&write_chain),
+        write_endpoints
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 1);
+        assert_eq!(stats.cqe_completions, 1);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+        assert_eq!(stats.writev_scratch_inline_allocs, 0);
+        assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+    }
 }
 
 #[test]
