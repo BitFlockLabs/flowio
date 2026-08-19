@@ -40,8 +40,30 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn set_final_core_drop_hook_for_test(hook: Option<fn(RawFd)>) {
-    FINAL_CORE_DROP_HOOK.with(|slot| slot.set(hook));
+struct FinalCoreDropHookScope {
+    previous: Option<fn(RawFd)>,
+    _owner_thread_only: PhantomData<Rc<()>>,
+}
+
+#[cfg(test)]
+impl Drop for FinalCoreDropHookScope {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        let _ = FINAL_CORE_DROP_HOOK.try_with(|slot| slot.set(previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_final_core_drop_hook_for_test<R>(
+    hook: fn(RawFd),
+    body: impl FnOnce() -> R,
+) -> R {
+    let previous = FINAL_CORE_DROP_HOOK.with(|slot| slot.replace(Some(hook)));
+    let _scope = FinalCoreDropHookScope {
+        previous,
+        _owner_thread_only: PhantomData,
+    };
+    body()
 }
 
 /// Last trustworthy knowledge about a runtime socket's linger state.
@@ -1115,11 +1137,26 @@ mod policy_tests {
     use super::{
         CloseRoute, LingerProvenance, RetainedListenerFd, RuntimeFd, RuntimeFdLease,
         RuntimeFdOpState, RuntimeFdRef, classify_linger_result, classify_linger_value,
+        with_final_core_drop_hook_for_test,
     };
     use crate::runtime::op::CompletionState;
     use static_assertions::{assert_impl_all, assert_not_impl_any};
+    use std::cell::Cell;
     use std::io;
-    use std::panic::UnwindSafe;
+    use std::panic::{AssertUnwindSafe, UnwindSafe, catch_unwind};
+
+    thread_local! {
+        static OUTER_FINAL_CORE_DROPS: Cell<usize> = const { Cell::new(0) };
+        static INNER_FINAL_CORE_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_outer_final_core_drop(_: i32) {
+        OUTER_FINAL_CORE_DROPS.with(|count| count.set(count.get() + 1));
+    }
+
+    fn count_inner_final_core_drop(_: i32) {
+        INNER_FINAL_CORE_DROPS.with(|count| count.set(count.get() + 1));
+    }
 
     assert_impl_all!(RuntimeFd: UnwindSafe);
     assert_impl_all!(RuntimeFdRef<'static>: UnwindSafe);
@@ -1129,6 +1166,30 @@ mod policy_tests {
     assert_not_impl_any!(RuntimeFdRef<'static>: Send, Sync, std::panic::RefUnwindSafe);
     assert_not_impl_any!(RuntimeFdLease: Send, Sync, std::panic::RefUnwindSafe);
     assert_not_impl_any!(RuntimeFdOpState<'static>: Send, Sync, std::panic::RefUnwindSafe);
+
+    #[test]
+    fn final_core_drop_hook_scope_restores_previous_hook_after_unwind() {
+        OUTER_FINAL_CORE_DROPS.with(|count| count.set(0));
+        INNER_FINAL_CORE_DROPS.with(|count| count.set(0));
+
+        let unwind = with_final_core_drop_hook_for_test(count_outer_final_core_drop, || {
+            let unwind = catch_unwind(AssertUnwindSafe(|| {
+                with_final_core_drop_hook_for_test(count_inner_final_core_drop, || {
+                    drop(RuntimeFd::from_fresh_raw_fd(-2));
+                    panic!("nested final-core hook panic");
+                });
+            }));
+
+            drop(RuntimeFd::from_fresh_raw_fd(-2));
+            unwind
+        });
+
+        drop(RuntimeFd::from_fresh_raw_fd(-2));
+
+        assert!(unwind.is_err(), "nested hook scope did not unwind");
+        INNER_FINAL_CORE_DROPS.with(|count| assert_eq!(count.get(), 1));
+        OUTER_FINAL_CORE_DROPS.with(|count| assert_eq!(count.get(), 1));
+    }
 
     #[test]
     fn runtime_fd_and_operation_state_layouts_match_frozen_words() {

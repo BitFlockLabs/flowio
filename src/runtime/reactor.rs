@@ -3027,7 +3027,7 @@ mod pending_cancel_tests {
     use crate::runtime::executor::{Executor, ExecutorConfig};
     use crate::runtime::fd::{
         RuntimeFd, distinctive_closeable_test_fd, raw_fd_is_closed,
-        set_final_core_drop_hook_for_test,
+        with_final_core_drop_hook_for_test,
     };
     use crate::runtime::task::{TaskHeader, TaskVTable};
     use std::cell::Cell;
@@ -3076,6 +3076,138 @@ mod pending_cancel_tests {
         if let Some(replacement) = replacement {
             unsafe { (*pool).free(replacement) };
         }
+    }
+
+    struct FinalLeaseReentrySlots {
+        previous_pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+        previous_expected: *mut CompletionState,
+        previous_reused: bool,
+    }
+
+    impl FinalLeaseReentrySlots {
+        fn install(
+            pool: *mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+            expected: *mut CompletionState,
+        ) -> Self {
+            let (previous_pool, previous_expected, previous_reused) = FINAL_LEASE_REENTRY_POOL
+                .with(|pool_slot| {
+                    FINAL_LEASE_REENTRY_EXPECTED.with(|expected_slot| {
+                        FINAL_LEASE_REENTRY_REUSED.with(|reused_slot| {
+                            let previous_pool = pool_slot.replace(pool);
+                            let previous_expected = expected_slot.replace(expected);
+                            let previous_reused = reused_slot.replace(false);
+                            (previous_pool, previous_expected, previous_reused)
+                        })
+                    })
+                });
+            Self {
+                previous_pool,
+                previous_expected,
+                previous_reused,
+            }
+        }
+    }
+
+    impl Drop for FinalLeaseReentrySlots {
+        fn drop(&mut self) {
+            let _ = FINAL_LEASE_REENTRY_POOL.try_with(|pool_slot| {
+                let _ = FINAL_LEASE_REENTRY_EXPECTED.try_with(|expected_slot| {
+                    let _ = FINAL_LEASE_REENTRY_REUSED.try_with(|reused_slot| {
+                        pool_slot.set(self.previous_pool);
+                        expected_slot.set(self.previous_expected);
+                        reused_slot.set(self.previous_reused);
+                    });
+                });
+            });
+        }
+    }
+
+    fn with_final_lease_reentry_hook_for_test<R>(
+        pool: &mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>,
+        expected: *mut CompletionState,
+        body: impl FnOnce(*mut ProviderOwnedPool<CompletionState, BasicMemoryProvider>) -> R,
+    ) -> R {
+        let pool_ptr = std::ptr::from_mut(pool);
+        let slots = FinalLeaseReentrySlots::install(pool_ptr, expected);
+        let result =
+            with_final_core_drop_hook_for_test(probe_final_lease_reentry_after_slot_return, || {
+                body(pool_ptr)
+            });
+        drop(slots);
+        result
+    }
+
+    #[test]
+    fn final_lease_reentry_fixture_unwind_restores_tls_before_unrelated_core_drop() {
+        let mut outer_pool: ProviderOwnedPool<CompletionState, BasicMemoryProvider> =
+            ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+                .expect("outer operation pool construction failed");
+        outer_pool.init();
+        let outer_expected =
+            unsafe { outer_pool.alloc(()) }.expect("outer operation allocation failed");
+        unsafe { outer_pool.free(outer_expected) };
+
+        let mut inner_pool: ProviderOwnedPool<CompletionState, BasicMemoryProvider> =
+            ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
+                .expect("inner operation pool construction failed");
+        inner_pool.init();
+        let inner_expected =
+            unsafe { inner_pool.alloc(()) }.expect("inner operation allocation failed");
+        unsafe { inner_pool.free(inner_expected) };
+
+        let (unwind, observed_pool, observed_expected, observed_outer_reuse) =
+            with_final_lease_reentry_hook_for_test(
+                &mut outer_pool,
+                outer_expected,
+                |_outer_pool_ptr| {
+                    let unwind = catch_unwind(AssertUnwindSafe(|| {
+                        with_final_lease_reentry_hook_for_test(
+                            &mut inner_pool,
+                            inner_expected,
+                            |_| panic!("final-lease fixture panic"),
+                        );
+                    }));
+                    let observed_pool = FINAL_LEASE_REENTRY_POOL.with(Cell::get);
+                    let observed_expected = FINAL_LEASE_REENTRY_EXPECTED.with(Cell::get);
+                    drop(RuntimeFd::from_fresh_raw_fd(-2));
+                    let observed_outer_reuse = FINAL_LEASE_REENTRY_REUSED.with(Cell::get);
+                    (
+                        unwind,
+                        observed_pool,
+                        observed_expected,
+                        observed_outer_reuse,
+                    )
+                },
+            );
+
+        let restored_pool = FINAL_LEASE_REENTRY_POOL.with(Cell::get);
+        let restored_expected = FINAL_LEASE_REENTRY_EXPECTED.with(Cell::get);
+        let restored_reuse = FINAL_LEASE_REENTRY_REUSED.with(Cell::get);
+        drop(RuntimeFd::from_fresh_raw_fd(-2));
+        let reuse_after_unrelated_drop = FINAL_LEASE_REENTRY_REUSED.with(Cell::get);
+
+        let panic = unwind.expect_err("re-entry fixture did not unwind");
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("final-lease fixture panic"),
+            "re-entry fixture surfaced the wrong panic"
+        );
+        assert_eq!(observed_pool, std::ptr::addr_of_mut!(outer_pool));
+        assert_eq!(observed_expected, outer_expected);
+        assert!(
+            observed_outer_reuse,
+            "restored outer hook did not reuse the outer expected slot"
+        );
+        assert!(restored_pool.is_null(), "outer pool TLS was not restored");
+        assert!(
+            restored_expected.is_null(),
+            "outer expected TLS was not restored"
+        );
+        assert!(!restored_reuse, "outer reuse TLS was not restored");
+        assert!(
+            !reuse_after_unrelated_drop,
+            "an unrelated final-core drop reached a stale re-entry fixture"
+        );
     }
 
     unsafe fn panic_cancel_waiter_destroy(_: *mut TaskHeader) {
@@ -4784,7 +4916,6 @@ mod pending_cancel_tests {
             ProviderOwnedPool::new(BasicMemoryProvider::new(), OP_POOL_OBJS_PER_SLAB)
                 .expect("operation pool construction failed");
         op_pool.init();
-        let op_pool_ptr = std::ptr::addr_of_mut!(op_pool);
         let mut live_registry = Vec::new();
 
         let state = unsafe { op_pool.alloc(()) }.expect("operation allocation failed");
@@ -4805,26 +4936,22 @@ mod pending_cancel_tests {
         // Keep the re-entry probe and reclamation on the same raw provenance;
         // creating a fresh `&mut op_pool` while the hook is armed would itself
         // invalidate the raw capability the test is meant to exercise.
-        FINAL_LEASE_REENTRY_POOL.with(|slot| slot.set(op_pool_ptr));
-        FINAL_LEASE_REENTRY_EXPECTED.with(|slot| slot.set(state));
-        FINAL_LEASE_REENTRY_REUSED.with(|slot| slot.set(false));
-        set_final_core_drop_hook_for_test(Some(probe_final_lease_reentry_after_slot_return));
-
-        let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
-            free_op_fields(
-                &mut pending_cancels,
-                &mut retained_pool,
-                op_pool_ptr,
-                &mut live_registry,
-                state,
-            )
-            .expect("operation retirement failed before payload destruction");
-        }))
-        .expect_err("retained payload destructor did not panic");
-
-        set_final_core_drop_hook_for_test(None);
-        FINAL_LEASE_REENTRY_POOL.with(|slot| slot.set(std::ptr::null_mut()));
-        FINAL_LEASE_REENTRY_EXPECTED.with(|slot| slot.set(std::ptr::null_mut()));
+        let (unwind, reused) =
+            with_final_lease_reentry_hook_for_test(&mut op_pool, state, |op_pool_ptr| {
+                let unwind = catch_unwind(AssertUnwindSafe(|| unsafe {
+                    free_op_fields(
+                        &mut pending_cancels,
+                        &mut retained_pool,
+                        op_pool_ptr,
+                        &mut live_registry,
+                        state,
+                    )
+                    .expect("operation retirement failed before payload destruction");
+                }))
+                .expect_err("retained payload destructor did not panic");
+                let reused = FINAL_LEASE_REENTRY_REUSED.with(Cell::get);
+                (unwind, reused)
+            });
 
         let panic = unwind
             .downcast_ref::<OpPayloadDropPanic>()
@@ -4833,12 +4960,10 @@ mod pending_cancel_tests {
         assert_eq!(payload_drops.get(), 1);
         assert!(live_registry.is_empty());
         assert!(pending_cancels.is_empty());
-        FINAL_LEASE_REENTRY_REUSED.with(|reused| {
-            assert!(
-                reused.get(),
-                "final fd lease dropped before the operation slot returned"
-            );
-        });
+        assert!(
+            reused,
+            "final fd lease dropped before the operation slot returned"
+        );
 
         let replacement =
             unsafe { op_pool.alloc(()) }.expect("post-reentry operation allocation failed");

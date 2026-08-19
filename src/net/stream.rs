@@ -3638,7 +3638,7 @@ mod tests {
     use crate::runtime::executor::{CompletionDrainGuard, with_ringless_poll_context_for_test};
     #[cfg(not(miri))]
     use crate::runtime::executor::{Executor, ExecutorConfig};
-    use crate::runtime::fd::{RuntimeFd, set_final_core_drop_hook_for_test};
+    use crate::runtime::fd::{RuntimeFd, with_final_core_drop_hook_for_test};
     #[cfg(not(miri))]
     use crate::runtime::reactor::ReactorConfig;
     use crate::runtime::task::release_task;
@@ -3766,11 +3766,11 @@ mod tests {
                 future.state_ptr.publish_submitted_state(state);
             }
 
-            set_final_core_drop_hook_for_test(Some(panic_on_final_fd_core_drop));
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = Pin::new(&mut future).poll(cx);
+                with_final_core_drop_hook_for_test(panic_on_final_fd_core_drop, || {
+                    let _ = Pin::new(&mut future).poll(cx);
+                });
             }));
-            set_final_core_drop_hook_for_test(None);
 
             assert!(unwind.is_err(), "final descriptor release did not panic");
             assert!(
