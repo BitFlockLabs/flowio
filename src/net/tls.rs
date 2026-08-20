@@ -142,6 +142,7 @@ const DER_BIT_STRING_TAG: u8 = 0x03;
 /// plaintext or handshake-output backpressure. Recheck this value when
 /// updating rustls.
 const TLS_MAX_WIRE_READ_SIZE: usize = 18_437;
+const _: () = assert!(TLS_MAX_WIRE_READ_SIZE <= u16::MAX as usize);
 
 /// Marker type used when the shared stream futures are driving raw TLS record
 /// I/O for the wrapper instead of borrowing a public transport object.
@@ -1989,6 +1990,11 @@ mod tests {
 
     #[test]
     fn tls_read_scratch_capacity_clamps_only_above_one_wire_record() {
+        assert_eq!(
+            TLS_MAX_WIRE_READ_SIZE, 18_437,
+            "rustls 0.23.42 wire-record cap changed; review the stored u16 offset",
+        );
+
         for (requested, expected) in [
             (TLS_MAX_WIRE_READ_SIZE - 1, TLS_MAX_WIRE_READ_SIZE - 1),
             (TLS_MAX_WIRE_READ_SIZE, TLS_MAX_WIRE_READ_SIZE),
