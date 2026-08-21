@@ -58,6 +58,10 @@ fn assert_snapshot_consumer_routes_are_explicit() {
             "resolver_name_alloc",
             include_str!("resolver_name_alloc.rs"),
         ),
+        (
+            "resolver_record_alloc",
+            include_str!("resolver_record_alloc.rs"),
+        ),
         ("tls_scratch_alloc", include_str!("tls_scratch_alloc.rs")),
     ];
     for (name, source) in thread_local_consumers {

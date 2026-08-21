@@ -186,9 +186,6 @@ pub(crate) struct IoBuffPoolInner {
     free_list: SList<u8>,
     /// Move-safe chain of all allocated slab pages.
     slab_pages: SlabPageChain,
-    /// Size of each slot: the maximum live-buffer/free-link footprint, rounded
-    /// up to the maximum alignment of `IoBuffHeader` and `SListLink`.
-    slot_size: usize,
     /// Headroom size for each buffer produced by this pool.
     headroom: usize,
     /// Payload size for each buffer produced by this pool.
@@ -253,7 +250,6 @@ impl IoBuffPoolInner {
             pool_ptr: std::ptr::null_mut(),
             free_list: SList::new_uninit(),
             slab_pages: SlabPageChain::new(),
-            slot_size,
             headroom: config.headroom,
             payload: config.payload,
             tailroom: config.tailroom,
@@ -280,7 +276,6 @@ impl IoBuffPoolInner {
         let slot_ptr = if let Some(link_ptr) = unsafe { (*free_list).pop_front() } {
             link_ptr
         } else {
-            let slot_size = unsafe { (*pool_ptr).slot_size };
             let slab_pages = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_pages) };
             let slab_factory = unsafe { std::ptr::addr_of_mut!((*pool_ptr).slab_factory) };
             let allocation = unsafe {
@@ -288,13 +283,12 @@ impl IoBuffPoolInner {
                 {
                     (*slab_pages).alloc_or_grow_with_debug_rejection(
                         &mut *slab_factory,
-                        slot_size,
                         crate::runtime::test_hooks::take_iobuff_pool_slab_alloc_failure,
                     )
                 }
                 #[cfg(not(debug_assertions))]
                 {
-                    (*slab_pages).alloc_or_grow(&mut *slab_factory, slot_size)
+                    (*slab_pages).alloc_or_grow(&mut *slab_factory)
                 }
             }
             .ok_or(IoBuffError::AllocFailed)?;
@@ -485,7 +479,10 @@ mod layout_tests {
         .expect("pool geometry should be valid");
         let (slot_size, slab_align) = unsafe {
             let inner = &*pool.inner.as_ptr();
-            (inner.slot_size, inner.slab_factory.get_slab_alignment())
+            (
+                inner.slab_factory.object_stride(),
+                inner.slab_factory.get_slab_alignment(),
+            )
         };
         assert_eq!(
             slot_size,

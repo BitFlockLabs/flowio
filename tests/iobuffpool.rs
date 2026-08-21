@@ -504,19 +504,28 @@ fn pool_single_obj_per_slab() {
 #[test]
 fn pool_drop_cleans_up() {
     println!("--- Pool drop releases all slab pages ---");
+    const OBJS_PER_SLAB: usize = 4;
     let mut pool = new_pool(IoBuffPoolConfig {
         headroom: 0,
         payload: 256,
         tailroom: 0,
-        objs_per_slab: 4,
+        objs_per_slab: OBJS_PER_SLAB,
     });
     pool.init();
 
-    // Allocate and drop many buffers to create multiple slabs.
-    for _ in 0..100 {
-        let buf = pool.alloc().unwrap();
-        drop(buf);
+    // Keep one more buffer alive than a slab can hold so teardown must free
+    // more than one slab page.
+    let mut buffers = Vec::with_capacity(OBJS_PER_SLAB + 1);
+    for _ in 0..=OBJS_PER_SLAB {
+        buffers.push(pool.alloc().unwrap());
     }
+    assert_eq!(
+        pool.live_slots_for_test(),
+        OBJS_PER_SLAB + 1,
+        "cleanup fixture must retain enough live slots to allocate two slabs"
+    );
+    drop(buffers);
+    assert_eq!(pool.live_slots_for_test(), 0);
 
     // Explicit drop — now safe because slab tracking uses a singly-linked
     // list with no self-referential sentinel.

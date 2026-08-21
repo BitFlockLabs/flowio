@@ -29,6 +29,103 @@ fn expect_chain_full<T>(result: Result<(), PushError<T>>) -> T {
     value
 }
 
+struct NoDiagnosticTraits;
+
+fn assert_display<T: std::fmt::Display>() {}
+
+fn assert_error<T: std::error::Error>() {}
+
+#[test]
+fn iobuff_error_static_display_matrix_and_error_trait_are_complete() {
+    assert_display::<IoBuffError>();
+    assert_error::<IoBuffError>();
+
+    let cases = [
+        (
+            IoBuffError::LayoutOverflow,
+            "buffer layout overflowed addressable memory",
+        ),
+        (
+            IoBuffError::HeadroomFull,
+            "buffer headroom has insufficient capacity",
+        ),
+        (
+            IoBuffError::PayloadFull,
+            "buffer payload has insufficient capacity",
+        ),
+        (
+            IoBuffError::ChainFull,
+            "vectored buffer chain is at capacity",
+        ),
+        (
+            IoBuffError::AllocFailed,
+            "buffer backing storage allocation failed",
+        ),
+        (
+            IoBuffError::PoolNotInitialized,
+            "buffer pool is not initialized",
+        ),
+        (
+            IoBuffError::PayloadSealed,
+            "buffer payload is sealed by active tailroom",
+        ),
+        (
+            IoBuffError::TailroomFull,
+            "buffer tailroom has insufficient capacity",
+        ),
+        (
+            IoBuffError::TailroomInsufficient,
+            "buffer tailroom cannot satisfy the requested payload extension",
+        ),
+        (
+            IoBuffError::AdvanceOutOfBounds,
+            "buffer advance exceeds the active window",
+        ),
+        (
+            IoBuffError::SharedBuffer,
+            "shared buffer cannot be converted to mutable ownership",
+        ),
+        (
+            IoBuffError::SliceOutOfBounds,
+            "buffer slice is outside the readable window",
+        ),
+        (
+            IoBuffError::IndexOutOfBounds,
+            "buffer segment index is outside the initialized chain",
+        ),
+        (
+            IoBuffError::PayloadUninitialized,
+            "buffer payload growth would expose uninitialized bytes",
+        ),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(error.to_string(), expected);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[test]
+fn push_error_delegates_display_and_source_without_value_trait_bounds() {
+    assert_display::<PushError<NoDiagnosticTraits>>();
+    assert_error::<PushError<NoDiagnosticTraits>>();
+
+    let mut chain = IoBuffReadOnlyVec::<Vec<u8>, 0>::new();
+    let rejected = b"still owned".to_vec();
+    let ptr = rejected.as_ptr();
+    let error = chain
+        .push(rejected)
+        .expect_err("zero-capacity chain must reject the value");
+
+    assert_eq!(error.to_string(), "vectored buffer chain is at capacity");
+    assert_eq!(error.value().as_ptr(), ptr);
+    assert_eq!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<IoBuffError>()),
+        Some(&IoBuffError::ChainFull)
+    );
+    assert_eq!(error.into_value(), b"still owned".to_vec());
+}
+
 #[derive(Debug)]
 struct InlineDropPanic(usize);
 

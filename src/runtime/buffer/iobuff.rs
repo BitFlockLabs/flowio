@@ -86,6 +86,10 @@ use std::ptr::NonNull;
 ///     .freeze()
 ///     .into_owned_view(5..6);
 /// assert!(matches!(err, Err((_buf, IoBuffError::SliceOutOfBounds))));
+/// assert_eq!(
+///     IoBuffError::SliceOutOfBounds.to_string(),
+///     "buffer slice is outside the readable window"
+/// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -119,6 +123,31 @@ pub enum IoBuffError {
     /// Safe payload growth would expose bytes not known to be initialized.
     PayloadUninitialized,
 }
+
+impl std::fmt::Display for IoBuffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LayoutOverflow => "buffer layout overflowed addressable memory",
+            Self::HeadroomFull => "buffer headroom has insufficient capacity",
+            Self::PayloadFull => "buffer payload has insufficient capacity",
+            Self::ChainFull => "vectored buffer chain is at capacity",
+            Self::AllocFailed => "buffer backing storage allocation failed",
+            Self::PoolNotInitialized => "buffer pool is not initialized",
+            Self::PayloadSealed => "buffer payload is sealed by active tailroom",
+            Self::TailroomFull => "buffer tailroom has insufficient capacity",
+            Self::TailroomInsufficient => {
+                "buffer tailroom cannot satisfy the requested payload extension"
+            }
+            Self::AdvanceOutOfBounds => "buffer advance exceeds the active window",
+            Self::SharedBuffer => "shared buffer cannot be converted to mutable ownership",
+            Self::SliceOutOfBounds => "buffer slice is outside the readable window",
+            Self::IndexOutOfBounds => "buffer segment index is outside the initialized chain",
+            Self::PayloadUninitialized => "buffer payload growth would expose uninitialized bytes",
+        })
+    }
+}
+
+impl std::error::Error for IoBuffError {}
 
 #[inline(always)]
 fn resolve_slice_bounds(

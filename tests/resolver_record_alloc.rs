@@ -2,7 +2,8 @@
 mod counting_allocator;
 
 use counting_allocator::{
-    CountingAllocator, finish_counting_allocations_of_size, start_counting_allocations_of_size,
+    CountingAllocator, ThreadLocalAllocationSnapshot, finish_counting_allocations_of_size,
+    start_counting_allocations_of_size,
 };
 use flowio::test_support::net::resolver::parse_ipv4_response;
 
@@ -67,6 +68,37 @@ fn cname_response_with_class(
     packet
 }
 
+fn zero_answer_many_ignored_response() -> (Vec<u8>, usize) {
+    const AUTHORITY_RECORDS: u16 = 8;
+    const ADDITIONAL_RECORDS: u16 = 8;
+    const QUESTION_OFFSET: u16 = 12;
+    const UNKNOWN_RR_TYPE: u16 = 65_000;
+
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&QUERY_ID.to_be_bytes());
+    packet.extend_from_slice(&0x8180u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&AUTHORITY_RECORDS.to_be_bytes());
+    packet.extend_from_slice(&ADDITIONAL_RECORDS.to_be_bytes());
+    push_wire_name(&mut packet, QUERY_HOST);
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+
+    let mut last_type_offset = 0;
+    for value in 0..AUTHORITY_RECORDS + ADDITIONAL_RECORDS {
+        packet.extend_from_slice(&(0xC000 | QUESTION_OFFSET).to_be_bytes());
+        last_type_offset = packet.len();
+        packet.extend_from_slice(&UNKNOWN_RR_TYPE.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.push(value as u8);
+    }
+
+    (packet, last_type_offset)
+}
+
 fn counted_name_allocations(packet: &[u8], name_len: usize) -> usize {
     counted_name_allocations_for_host(packet, name_len, QUERY_HOST)
 }
@@ -77,6 +109,28 @@ fn counted_name_allocations_for_host(packet: &[u8], name_len: usize, query_host:
     let allocations = finish_counting_allocations_of_size();
     result.expect("valid DNS response should parse");
     allocations
+}
+
+#[test]
+fn zero_answer_many_ignored_records_validate_without_result_reservation() {
+    let (packet, last_type_offset) = zero_answer_many_ignored_response();
+
+    // Warm the exact parser seam before observing its calling-thread allocator.
+    parse_ipv4_response(&packet, QUERY_ID, QUERY_HOST).expect("warmup response should parse");
+    let before = ThreadLocalAllocationSnapshot::current();
+    let result = parse_ipv4_response(&packet, QUERY_ID, QUERY_HOST);
+    let after = ThreadLocalAllocationSnapshot::current();
+    result.expect("valid ignored records should produce an empty successful result");
+    // The echoed question is the sole allocation. The old all-section reserve
+    // added one result-vector allocation and matching deallocation here.
+    after.assert_delta_since(before, 1, 1);
+
+    let mut malformed = packet;
+    malformed[last_type_offset..last_type_offset + 2].copy_from_slice(&1u16.to_be_bytes());
+    let error = parse_ipv4_response(&malformed, QUERY_ID, QUERY_HOST)
+        .expect_err("the final ignored A record has invalid one-byte RDATA");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "DNS A RDATA length was not 4 bytes");
 }
 
 #[test]

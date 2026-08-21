@@ -2439,16 +2439,118 @@ impl Drop for SctpConnector {
     }
 }
 
-type StashedSctpRecvProcessor = unsafe fn(*mut Reactor, *mut CompletionState, usize, &mut bool);
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SctpRecordSync {
+    Synced,
+    DataTail,
+    NotificationTail,
+}
 
-/// Dropped metadata receive retained by the stream until its CQE is processed.
+impl SctpRecordSync {
+    #[inline(always)]
+    const fn is_synced(self) -> bool {
+        matches!(self, Self::Synced)
+    }
+
+    /// Advances internal recovery without interpreting notification-tail
+    /// bytes as a fresh notification header.
+    #[inline(always)]
+    fn after_recovery_completion(
+        self,
+        header: SctpRecvHeader,
+        partial_delivery_abort: bool,
+    ) -> Self {
+        match self {
+            Self::Synced => Self::Synced,
+            Self::NotificationTail => {
+                if sctp_msg_end_of_record(header.msg_flags) {
+                    Self::Synced
+                } else {
+                    Self::NotificationTail
+                }
+            }
+            Self::DataTail => {
+                if sctp_msg_notification(header.msg_flags) {
+                    if partial_delivery_abort {
+                        Self::Synced
+                    } else {
+                        Self::DataTail
+                    }
+                } else if sctp_msg_end_of_record(header.msg_flags) {
+                    Self::Synced
+                } else {
+                    Self::DataTail
+                }
+            }
+        }
+    }
+
+    /// Accounts for a successful completion whose bytes cannot be published
+    /// to the caller because its future was dropped or its context rejected.
+    #[inline(always)]
+    fn after_unpublished_completion(
+        self,
+        actual: usize,
+        header: SctpRecvHeader,
+        partial_delivery_abort: bool,
+    ) -> Self {
+        if sctp_msg_clean_eof(actual, header) {
+            return Self::Synced;
+        }
+
+        match self {
+            Self::Synced => {
+                if partial_delivery_abort || sctp_msg_end_of_record(header.msg_flags) || actual == 0
+                {
+                    Self::Synced
+                } else if sctp_msg_notification(header.msg_flags) {
+                    Self::NotificationTail
+                } else {
+                    Self::DataTail
+                }
+            }
+            pending => pending.after_recovery_completion(header, partial_delivery_abort),
+        }
+    }
+
+    /// Records a caller-visible metadata failure after the kernel consumed a
+    /// nonterminal completion. A complete PDAPI abort has already restored the
+    /// abandoned data-record boundary and must not be reclassified as a new
+    /// notification tail merely because it arrived without EOR.
+    #[inline(always)]
+    fn after_visible_error(
+        self,
+        actual: usize,
+        header: SctpRecvHeader,
+        partial_delivery_abort: bool,
+    ) -> Self {
+        if partial_delivery_abort || !sctp_msg_partial_nonempty(actual, header.msg_flags) {
+            return self;
+        }
+
+        if sctp_msg_notification(header.msg_flags) {
+            Self::NotificationTail
+        } else {
+            Self::DataTail
+        }
+    }
+}
+
+type StashedSctpRecvProcessor =
+    unsafe fn(*mut Reactor, *mut CompletionState, usize, &mut SctpRecordSync);
+
+/// Dropped metadata receive retained by the stream until its CQE is processed
+/// or its origin ring is terminally abandoned.
 struct StashedSctpRecv {
-    /// In-flight or completed operation state adopted from the dropped future.
+    /// In-flight/completed operation state or the opaque ownership marker for
+    /// a terminally ring-abandoned operation.
     state_ptr: *mut CompletionState,
     /// Initialized iovec count needed by the vectored completion processor.
     iov_count: usize,
     /// Type-specific function that consumes the retained payload and updates
-    /// record-tail discard state.
+    /// record synchronization state. `None` with a non-null `state_ptr` is the
+    /// terminal ring-abandonment poison marker; that pointer must stay opaque.
     process_completed: Option<StashedSctpRecvProcessor>,
 }
 
@@ -2460,12 +2562,38 @@ impl StashedSctpRecv {
             process_completed: None,
         }
     }
+
+    /// Returns whether the live stash became terminally ring-abandoned.
+    #[inline(always)]
+    fn has_abandoned_marker(&self) -> bool {
+        !self.state_ptr.is_null() && self.process_completed.is_none()
+    }
+
+    /// Converts a live stash into its terminal opaque ownership marker.
+    #[inline(always)]
+    fn mark_abandoned(&mut self) {
+        debug_assert!(!self.state_ptr.is_null(), "abandoned SCTP stash is missing");
+        debug_assert!(
+            self.process_completed.is_some(),
+            "SCTP stash was already terminally abandoned"
+        );
+        self.iov_count = 0;
+        self.process_completed = None;
+    }
+
+    /// Clears only stream-local stash metadata without following the marker.
+    #[inline(always)]
+    fn clear_local(&mut self) {
+        self.state_ptr = std::ptr::null_mut();
+        self.iov_count = 0;
+        self.process_completed = None;
+    }
 }
 
 struct SctpRecvState {
-    /// Whether a prior metadata receive consumed the head of an oversized
-    /// record and future metadata receives must discard through MSG_EOR.
-    discarding_tail: bool,
+    /// Record origin whose unpublished tail must be consumed before another
+    /// caller-visible metadata completion can be classified.
+    record_sync: SctpRecordSync,
     /// Whether ordinary data completions are expected to carry SCTP_RCVINFO.
     ///
     /// This records FlowIO's configured policy rather than querying a socket
@@ -2483,7 +2611,8 @@ struct SctpRecvState {
     /// the complete notification in a short caller buffer.
     any_notification_visible: Cell<bool>,
     /// Dropped metadata receive completion that must be adopted before the
-    /// next metadata receive can preserve record-boundary state.
+    /// next metadata receive can preserve record-boundary state, or terminal
+    /// opaque poison retained after origin-ring abandonment.
     stashed: StashedSctpRecv,
 }
 
@@ -2494,7 +2623,7 @@ impl SctpRecvState {
     /// preserves the historical behavior of surfacing valid notifications.
     const fn external() -> Self {
         Self {
-            discarding_tail: false,
+            record_sync: SctpRecordSync::Synced,
             recv_rcvinfo_requested: Cell::new(false),
             partial_delivery_visible: Cell::new(true),
             any_notification_visible: Cell::new(true),
@@ -2505,7 +2634,7 @@ impl SctpRecvState {
     /// Creates receive state from the caller-requested FlowIO socket policy.
     const fn configured(config: SctpSocketConfig) -> Self {
         Self {
-            discarding_tail: false,
+            record_sync: SctpRecordSync::Synced,
             recv_rcvinfo_requested: Cell::new(config.recv_rcvinfo),
             partial_delivery_visible: Cell::new(config.notifications.partial_delivery),
             any_notification_visible: Cell::new(config.notifications.any()),
@@ -2539,31 +2668,63 @@ impl SctpRecvState {
         )
     }
 
-    /// Updates discard state and returns true when this completion is internal
-    /// recovery work rather than caller-visible metadata.
+    /// Parses a notification head unless this completion is known to be an
+    /// opaque continuation of an earlier notification.
+    #[inline(always)]
+    fn parse_notification_for_completion(
+        &self,
+        data_slice: &[u8],
+        msg_flags: libc::c_int,
+    ) -> Option<io::Result<SctpRecvMeta>> {
+        if matches!(self.record_sync, SctpRecordSync::NotificationTail) {
+            None
+        } else {
+            parse_sctp_notification_once(data_slice, msg_flags)
+        }
+    }
+
+    /// Updates record synchronization and returns true when this completion
+    /// is internal recovery work rather than caller-visible metadata.
     fn should_consume_metadata_completion(
         &mut self,
+        actual: usize,
         header: SctpRecvHeader,
         parsed_notification: Option<&io::Result<SctpRecvMeta>>,
     ) -> bool {
         let partial_delivery_abort = sctp_notification_retires_discard(parsed_notification);
-        if sctp_msg_notification(header.msg_flags) && !self.any_notification_visible.get() {
-            self.discarding_tail = sctp_discarding_after_completion(header, partial_delivery_abort);
-            return true;
+        match self.record_sync {
+            SctpRecordSync::NotificationTail => {
+                self.record_sync = self
+                    .record_sync
+                    .after_recovery_completion(header, partial_delivery_abort);
+                true
+            }
+            SctpRecordSync::DataTail => {
+                self.record_sync = self
+                    .record_sync
+                    .after_recovery_completion(header, partial_delivery_abort);
+                !(partial_delivery_abort && self.partial_delivery_visible.get())
+            }
+            SctpRecordSync::Synced => {
+                if sctp_msg_notification(header.msg_flags) && !self.any_notification_visible.get() {
+                    self.record_sync = self.record_sync.after_unpublished_completion(
+                        actual,
+                        header,
+                        partial_delivery_abort,
+                    );
+                    true
+                } else {
+                    partial_delivery_abort && !self.partial_delivery_visible.get()
+                }
+            }
         }
-
-        if self.discarding_tail {
-            self.discarding_tail = sctp_discarding_after_completion(header, partial_delivery_abort);
-            return !(partial_delivery_abort && self.partial_delivery_visible.get());
-        }
-
-        partial_delivery_abort && !self.partial_delivery_visible.get()
     }
 
     #[cfg(test)]
     fn should_consume_for_test(&mut self, data_slice: &[u8], msg: &libc::msghdr) -> bool {
-        let parsed_notification = parse_sctp_notification_once(data_slice, msg.msg_flags);
+        let parsed_notification = self.parse_notification_for_completion(data_slice, msg.msg_flags);
         self.should_consume_metadata_completion(
+            data_slice.len(),
             SctpRecvHeader::from_msghdr(msg),
             parsed_notification.as_ref(),
         )
@@ -2613,10 +2774,14 @@ impl SctpRecvState {
     ///
     /// # Safety
     ///
-    /// A non-null stashed pointer must identify a live completion state that
-    /// this receive state exclusively owns.
+    /// A non-null live stashed pointer must identify a completion state that
+    /// this receive state exclusively owns. A terminal abandonment marker is
+    /// opaque and is deliberately not dereferenced.
     unsafe fn clear_stashed_waiter_unchecked(recv_state: *mut Self) {
         debug_assert!(!recv_state.is_null(), "SCTP receive state is missing");
+        if unsafe { (*recv_state).stashed.has_abandoned_marker() } {
+            return;
+        }
         let state_ptr = unsafe { (*recv_state).stashed.state_ptr };
         if !state_ptr.is_null() {
             let waiter = unsafe { CompletionState::take_waiter_unchecked(state_ptr) };
@@ -2630,18 +2795,22 @@ impl SctpRecvState {
     ///
     /// # Safety
     ///
-    /// Any stashed pointer and processor must satisfy
-    /// [`SctpRecvState::stash_unchecked`],
-    /// and `cx` must carry the FlowIO waker for the owning reactor.
+    /// A live stashed pointer and processor must satisfy
+    /// [`SctpRecvState::stash_unchecked`], and `cx` must carry the FlowIO waker
+    /// for the owning reactor. A terminal abandonment marker is opaque and
+    /// returns before either pointer or waker is inspected.
     unsafe fn poll_stashed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let state_ptr = self.stashed.state_ptr;
         if state_ptr.is_null() {
             return Poll::Ready(Ok(()));
         }
+        if self.stashed.has_abandoned_marker() {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+        }
 
         if unsafe { !(*state_ptr).is_completed() } {
             if unsafe { refresh_op_waiter_from_waker(cx, state_ptr) } {
-                unsafe { self.drop_stashed() };
+                self.stashed.mark_abandoned();
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
             }
             return Poll::Pending;
@@ -2662,7 +2831,7 @@ impl SctpRecvState {
                 op_ctx.reactor(),
                 state_ptr,
                 iov_count,
-                &mut self.discarding_tail,
+                &mut self.record_sync,
             )
         };
         if op_ctx.context_rejected() {
@@ -2672,23 +2841,28 @@ impl SctpRecvState {
         }
     }
 
-    /// Orphans/cancels a stashed receive during stream teardown.
+    /// Orphans/cancels a live stashed receive during stream teardown, or
+    /// clears a terminal abandonment marker without dereferencing it.
     ///
     /// # Safety
     ///
-    /// A non-null stashed pointer must identify the exclusively owned live
-    /// operation transferred by [`SctpRecvState::stash_unchecked`].
+    /// A non-null live stashed pointer must identify the exclusively owned
+    /// operation transferred by [`SctpRecvState::stash_unchecked`]. A terminal
+    /// abandonment marker must remain opaque.
     unsafe fn drop_stashed(&mut self) {
+        if self.stashed.has_abandoned_marker() {
+            self.stashed.clear_local();
+            return;
+        }
         unsafe { drop_op_ptr_unchecked(&mut self.stashed.state_ptr) };
-        self.stashed.iov_count = 0;
-        self.stashed.process_completed = None;
+        self.stashed.clear_local();
     }
 
     /// Returns whether rich receive work must restore record synchronization
     /// before a lean receive may consume another kernel completion.
     #[inline(always)]
     fn pending_metadata_recovery(&self) -> bool {
-        self.discarding_tail || !self.stashed.state_ptr.is_null()
+        !self.record_sync.is_synced() || !self.stashed.state_ptr.is_null()
     }
 }
 
@@ -2776,10 +2950,17 @@ where
 /// [`SctpStream::recv`] returns allocation-free
 /// [`io::ErrorKind::InvalidInput`] with the exact rental buffer and submits no
 /// second receive. Repeated lean rejections do not consume or modify the
-/// recovery state. Adoption updates SCTP record-boundary resynchronization
-/// state from the retired completion. Keep using
+/// recovery state. If the stash's origin ring is abandoned before its target
+/// CQE is observed, the first rich recovery that detects abandonment converts
+/// the stash to a terminal opaque ownership marker. That receive and every
+/// later rich receive return [`io::ErrorKind::NotConnected`] with their exact
+/// unsubmitted buffer; stream destruction clears only the local marker while
+/// the abandoned operation and retained payload remain unreclaimed. Otherwise,
+/// adoption updates SCTP record-boundary resynchronization state from the
+/// retired completion. Keep using
 /// [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until the next
-/// record boundary is reached. Dropping a lean receive
+/// record boundary is reached unless rich recovery reports terminal
+/// abandonment. Dropping a lean receive
 /// retains its established terminal-framing policy; a later receive cannot
 /// recover bytes consumed by that cancelled bare receive. Notifications
 /// observed during internal discard are consumed as control events, except an
@@ -3436,6 +3617,10 @@ impl SctpStream {
     /// `buffer.writable_len()`. After owner-context validation, this local
     /// error returns the exact buffer before adopting a prior dropped metadata
     /// receive; that stash remains for the next valid request.
+    /// A ring-abandoned dropped receive is terminal: the detecting request and
+    /// every later metadata receive return `NotConnected` without submitting
+    /// the new caller buffer, and stream drop clears only the opaque local
+    /// marker.
     /// Shared metadata parsing, truncation, EOF, and record-tail recovery
     /// behavior is documented on [`SctpStream`].
     ///
@@ -3530,6 +3715,9 @@ impl SctpStream {
     /// returns unchanged before adopting a prior dropped metadata receive;
     /// that stash remains for the next valid request. Materialization and shape
     /// failures return the exact chain without submitting kernel I/O. Shared
+    /// metadata requests remain terminally `NotConnected` after a dropped
+    /// receive's origin ring is abandoned; they return the exact unsubmitted
+    /// chain until stream destruction clears the opaque local marker. Shared
     /// metadata parsing, truncation, EOF, and record-tail recovery behavior is
     /// documented on [`SctpStream`].
     ///
@@ -4437,37 +4625,20 @@ fn sctp_notification_retires_discard(
     )
 }
 
-fn sctp_discarding_after_completion(header: SctpRecvHeader, partial_delivery_abort: bool) -> bool {
-    // Linux requeues the truncated SCTP message tail at the receive-queue
-    // front. While discarding, the first EOR therefore belongs to that
-    // truncated message in normal mode; partial-delivery interleaving is
-    // covered by the PDAPI-abort notification retirement path below.
-    if sctp_msg_end_of_record(header.msg_flags) {
-        return false;
-    }
-
-    if sctp_msg_notification(header.msg_flags) {
-        return !partial_delivery_abort;
-    }
-
-    true
-}
-
-fn update_discarding_after_unpublished_completion(
-    discarding_tail: &mut bool,
+fn update_record_sync_after_unpublished_completion(
+    record_sync: &mut SctpRecordSync,
     actual: usize,
     header: SctpRecvHeader,
     data_slice: &[u8],
 ) {
-    let parsed_notification = parse_sctp_notification_once(data_slice, header.msg_flags);
+    let parsed_notification = if matches!(*record_sync, SctpRecordSync::NotificationTail) {
+        None
+    } else {
+        parse_sctp_notification_once(data_slice, header.msg_flags)
+    };
     let partial_delivery_abort = sctp_notification_retires_discard(parsed_notification.as_ref());
-    if sctp_msg_clean_eof(actual, header) || partial_delivery_abort {
-        *discarding_tail = false;
-    } else if *discarding_tail {
-        *discarding_tail = sctp_discarding_after_completion(header, partial_delivery_abort);
-    } else if sctp_msg_partial_nonempty(actual, header.msg_flags) {
-        *discarding_tail = true;
-    }
+    *record_sync =
+        (*record_sync).after_unpublished_completion(actual, header, partial_delivery_abort);
 }
 
 /// Returns the initialized prefix consumed by a completed scalar receive.
@@ -4559,7 +4730,7 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
     reactor: *mut Reactor,
     state_ptr: *mut CompletionState,
     _iov_count: usize,
-    discarding_tail: &mut bool,
+    record_sync: &mut SctpRecordSync,
 ) {
     let state_return = unsafe { StashedSctpStateReturnGuard::new(reactor, state_ptr) };
     let result = unsafe { completion_cqe_result((*state_ptr).result) };
@@ -4572,8 +4743,8 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
             )
         };
         let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-        update_discarding_after_unpublished_completion(
-            discarding_tail,
+        update_record_sync_after_unpublished_completion(
+            record_sync,
             actual,
             completion.header,
             data_slice,
@@ -4594,7 +4765,7 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
     reactor: *mut Reactor,
     state_ptr: *mut CompletionState,
     iov_count: usize,
-    discarding_tail: &mut bool,
+    record_sync: &mut SctpRecordSync,
 ) {
     let result = unsafe { completion_cqe_result((*state_ptr).result) };
     if let Ok(actual) = result {
@@ -4606,8 +4777,8 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
             )
         };
         let data_slice = unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-        update_discarding_after_unpublished_completion(
-            discarding_tail,
+        update_record_sync_after_unpublished_completion(
+            record_sync,
             actual,
             completion.header,
             data_slice,
@@ -4932,7 +5103,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             Poll::Ready(Ok(())) => {}
         }
 
-        let inspect_metadata = !this.recv_state.discarding_tail;
+        let inspect_metadata = this.recv_state.record_sync.is_synced();
         if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedSctpRecvPayload<B>, _>(
                 cx,
@@ -4958,8 +5129,8 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                         // callback inside the shared slice helper.
                         let data_slice =
                             unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-                        update_discarding_after_unpublished_completion(
-                            &mut this.recv_state.discarding_tail,
+                        update_record_sync_after_unpublished_completion(
+                            &mut this.recv_state.record_sync,
                             actual,
                             header,
                             data_slice,
@@ -4978,7 +5149,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
 
             let header = completion.meta.header;
             if sctp_msg_clean_eof(actual, header) {
-                this.recv_state.discarding_tail = false;
+                this.recv_state.record_sync = SctpRecordSync::Synced;
                 let completed = unsafe {
                     complete_read_with_progress(
                         completion.buffer,
@@ -4991,10 +5162,16 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             }
 
             let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-            let parsed_notification = parse_sctp_notification_once(data_slice, header.msg_flags);
-            let consume_internal = this
+            let parsed_notification = this
                 .recv_state
-                .should_consume_metadata_completion(header, parsed_notification.as_ref());
+                .parse_notification_for_completion(data_slice, header.msg_flags);
+            let partial_delivery_abort =
+                sctp_notification_retires_discard(parsed_notification.as_ref());
+            let consume_internal = this.recv_state.should_consume_metadata_completion(
+                actual,
+                header,
+                parsed_notification.as_ref(),
+            );
             if consume_internal {
                 let (_, buffer) = unsafe {
                     complete_read_with_progress(completion.buffer, this.write_base_len, 0, Ok(()))
@@ -5007,7 +5184,6 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 return Poll::Pending;
             }
 
-            let partial_nonempty = sctp_msg_partial_nonempty(actual, header.msg_flags);
             let meta = this.recv_state.parse_completion_meta(
                 completion.meta.rcvinfo,
                 header.msg_flags,
@@ -5015,8 +5191,12 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                 parsed_notification,
             );
 
-            if meta.is_err() && partial_nonempty {
-                this.recv_state.discarding_tail = true;
+            if meta.is_err() {
+                this.recv_state.record_sync = this.recv_state.record_sync.after_visible_error(
+                    actual,
+                    header,
+                    partial_delivery_abort,
+                );
             }
             let result = meta.map(|meta| (actual, meta));
             let completed = unsafe {
@@ -5246,7 +5426,7 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
             Poll::Ready(Ok(())) => {}
         }
 
-        let inspect_metadata = !this.recv_state.discarding_tail;
+        let inspect_metadata = this.recv_state.record_sync.is_synced();
         if let Some(completion) = unsafe {
             take_completed_sctp_payload_with::<RetainedSctpRecvVectoredPayload<N>, _>(
                 cx,
@@ -5274,8 +5454,8 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                         let data_slice = unsafe {
                             sctp_first_iov_slice(completion.first_iovec.as_ref(), actual)
                         };
-                        update_discarding_after_unpublished_completion(
-                            &mut this.recv_state.discarding_tail,
+                        update_record_sync_after_unpublished_completion(
+                            &mut this.recv_state.record_sync,
                             actual,
                             header,
                             data_slice,
@@ -5293,7 +5473,7 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
             };
             let header = completion.meta.header;
             if sctp_msg_clean_eof(actual, header) {
-                this.recv_state.discarding_tail = false;
+                this.recv_state.record_sync = SctpRecordSync::Synced;
                 let mut buffer = completion.buffer;
                 unsafe {
                     buffer.distribute_written(0);
@@ -5303,10 +5483,16 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
 
             let data_slice =
                 unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-            let parsed_notification = parse_sctp_notification_once(data_slice, header.msg_flags);
-            let consume_internal = this
+            let parsed_notification = this
                 .recv_state
-                .should_consume_metadata_completion(header, parsed_notification.as_ref());
+                .parse_notification_for_completion(data_slice, header.msg_flags);
+            let partial_delivery_abort =
+                sctp_notification_retires_discard(parsed_notification.as_ref());
+            let consume_internal = this.recv_state.should_consume_metadata_completion(
+                actual,
+                header,
+                parsed_notification.as_ref(),
+            );
             if consume_internal {
                 let mut buffer = completion.buffer;
                 unsafe {
@@ -5332,7 +5518,6 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 return Poll::Pending;
             }
 
-            let partial_nonempty = sctp_msg_partial_nonempty(actual, header.msg_flags);
             let meta = this.recv_state.parse_completion_meta(
                 completion.meta.rcvinfo,
                 header.msg_flags,
@@ -5348,9 +5533,11 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
             return match meta {
                 Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
                 Err(err) => {
-                    if partial_nonempty {
-                        this.recv_state.discarding_tail = true;
-                    }
+                    this.recv_state.record_sync = this.recv_state.record_sync.after_visible_error(
+                        actual,
+                        header,
+                        partial_delivery_abort,
+                    );
                     Poll::Ready((Err(err), buffer))
                 }
             };
@@ -7716,7 +7903,7 @@ mod tests {
         _reactor: *mut Reactor,
         _state_ptr: *mut CompletionState,
         _iov_count: usize,
-        _discarding_tail: &mut bool,
+        _record_sync: &mut SctpRecordSync,
     ) {
         panic!("ring-abandoned stashed receive was processed as completed");
     }
@@ -7725,7 +7912,7 @@ mod tests {
         _reactor: *mut Reactor,
         _state_ptr: *mut CompletionState,
         _iov_count: usize,
-        _discarding_tail: &mut bool,
+        _record_sync: &mut SctpRecordSync,
     ) {
         panic!("invalid metadata receive processed the prior stash");
     }
@@ -7738,8 +7925,9 @@ mod tests {
         assert_eq!(recv_state.stashed.state_ptr, expected_state);
         assert_eq!(recv_state.stashed.iov_count, expected_iov_count);
         assert!(recv_state.stashed.process_completed.is_some());
-        assert!(
-            recv_state.discarding_tail,
+        assert_eq!(
+            recv_state.record_sync,
+            SctpRecordSync::DataTail,
             "invalid metadata receive changed record recovery state"
         );
     }
@@ -7757,7 +7945,7 @@ mod tests {
             RejectedContextRecvBuffer::new(Rc::clone(&pointer_calls), Rc::clone(&published_len));
         let original_buffer_ptr = buffer.backing_ptr();
         let mut recv_state = SctpRecvState::external();
-        recv_state.discarding_tail = true;
+        recv_state.record_sync = SctpRecordSync::DataTail;
         recv_state.stashed = StashedSctpRecv {
             state_ptr: stashed_state_ptr,
             iov_count: expected_iov_count,
@@ -7810,7 +7998,7 @@ mod tests {
         let original_segment_ptr = segment.as_mut_ptr();
         let chain = IoBuffVecMut::from_array([segment]);
         let mut vectored_recv_state = SctpRecvState::external();
-        vectored_recv_state.discarding_tail = true;
+        vectored_recv_state.record_sync = SctpRecordSync::DataTail;
         vectored_recv_state.stashed = StashedSctpRecv {
             state_ptr: stashed_vectored_state_ptr,
             iov_count: expected_iov_count,
@@ -7879,7 +8067,7 @@ mod tests {
             IoBuffMut::new(0, 8, 0).expect("over-limit receive segment allocation failed");
         let recv_ptr = recv_segment.as_mut_ptr();
         let mut recv_state = SctpRecvState::external();
-        recv_state.discarding_tail = true;
+        recv_state.record_sync = SctpRecordSync::DataTail;
         recv_state.stashed = StashedSctpRecv {
             state_ptr: stashed_state_ptr,
             iov_count: 11,
@@ -8030,39 +8218,144 @@ mod tests {
     }
 
     #[test]
-    fn ring_abandoned_stashed_receive_returns_unsubmitted_buffer() {
-        let mut abandoned = CompletionState::empty();
-        abandoned.set_ring_abandoned();
-        let mut recv_state = SctpRecvState::external();
-        recv_state.stashed = StashedSctpRecv {
-            state_ptr: &mut abandoned,
-            iov_count: 1,
-            process_completed: Some(reject_abandoned_stashed_processing),
+    fn ring_abandoned_stashed_receive_remains_terminal_until_stream_drop() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let mut abandoned = CompletionState::empty();
+            abandoned.set_ring_abandoned();
+            let abandoned_ptr = std::ptr::addr_of_mut!(abandoned);
+            let mut stream = ringless_sctp_stream();
+            stream.recv_state.stashed = StashedSctpRecv {
+                state_ptr: abandoned_ptr,
+                iov_count: 1,
+                process_completed: Some(reject_abandoned_stashed_processing),
+            };
+
+            test_hooks::fail_next_op_alloc();
+            test_hooks::fail_next_raw_sqe_submit();
+            for attempt in 1..=2 {
+                let pointer_calls = Rc::new(Cell::new(0));
+                let drops = Rc::new(Cell::new(0));
+                let buffer = retained_constructor_buffer(
+                    None,
+                    Rc::clone(&pointer_calls),
+                    Rc::clone(&drops),
+                    false,
+                );
+                let original_buffer_ptr = buffer.bytes.as_ptr();
+                let mut recv = stream.recv_msg(buffer, 16);
+                let Poll::Ready((Err(err), returned)) = Pin::new(&mut recv).poll(cx) else {
+                    panic!(
+                        "ring-abandoned stashed rich receive attempt {attempt} remained pending"
+                    );
+                };
+                assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+                assert_eq!(returned.bytes.as_ptr(), original_buffer_ptr);
+                assert_eq!(
+                    pointer_calls.get(),
+                    0,
+                    "terminal rich receive exposed its returned buffer"
+                );
+                assert_eq!(drops.get(), 0);
+                assert_eq!(recv.recv_state.stashed.state_ptr, abandoned_ptr);
+                assert_eq!(recv.recv_state.stashed.iov_count, 0);
+                assert!(recv.recv_state.stashed.process_completed.is_none());
+                assert!(Pin::new(&mut recv).poll(cx).is_pending());
+                drop(recv);
+                assert_eq!(stream.recv_state.stashed.state_ptr, abandoned_ptr);
+                assert!(stream.recv_state.stashed.process_completed.is_none());
+                drop(returned);
+                assert_eq!(drops.get(), 1);
+            }
+
+            let mut first = IoBuffMut::new(0, 8, 0)
+                .expect("terminal vectored receive first-segment allocation failed");
+            let first_ptr = first.as_mut_ptr();
+            let mut second = IoBuffMut::new(0, 8, 0)
+                .expect("terminal vectored receive second-segment allocation failed");
+            let second_ptr = second.as_mut_ptr();
+            let mut recv = stream.recv_msg_vectored(IoBuffVecMut::from_array([first, second]));
+            let Poll::Ready((Err(err), mut returned)) = Pin::new(&mut recv).poll(cx) else {
+                panic!("ring-abandoned stashed vectored receive remained pending");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(
+                returned
+                    .get_mut(0)
+                    .expect("returned first terminal segment missing")
+                    .as_mut_ptr(),
+                first_ptr
+            );
+            assert_eq!(
+                returned
+                    .get_mut(1)
+                    .expect("returned second terminal segment missing")
+                    .as_mut_ptr(),
+                second_ptr
+            );
+            assert!(Pin::new(&mut recv).poll(cx).is_pending());
+            drop(recv);
+            assert_eq!(stream.recv_state.stashed.state_ptr, abandoned_ptr);
+            assert!(stream.recv_state.stashed.process_completed.is_none());
+            drop(returned);
+
+            for _ in 0..2 {
+                assert_lean_stash_rejection(&mut stream, cx, abandoned_ptr, false);
+            }
+            assert!(
+                test_hooks::take_op_alloc_failure(),
+                "terminal stash recovery attempted operation allocation"
+            );
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 1);
+            let injected = test_hooks::take_raw_sqe_submit_failure()
+                .expect("terminal stash recovery consumed the SQE sentinel");
+            assert_eq!(injected.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+
+            unsafe { stream.recv_state.drop_stashed() };
+            assert!(stream.recv_state.stashed.state_ptr.is_null());
+            assert_eq!(stream.recv_state.stashed.iov_count, 0);
+            assert!(stream.recv_state.stashed.process_completed.is_none());
+            assert!(abandoned.is_ring_abandoned());
+            assert!(!abandoned.is_completed());
+        });
+    }
+
+    #[test]
+    fn terminally_abandoned_stash_marker_is_opaque_to_repoll_and_stream_drop() {
+        let marker = NonNull::<CompletionState>::dangling().as_ptr();
+        let mut stream = ringless_sctp_stream();
+        stream.recv_state.stashed = StashedSctpRecv {
+            state_ptr: marker,
+            iov_count: 0,
+            process_completed: None,
         };
-        let mut buffer = IoBuffMut::new(0, 16, 0).expect("receive buffer allocation failed");
-        let original_buffer_ptr = buffer.as_mut_ptr();
-        let mut recv = RecvFuture {
-            fd: RuntimeFd::INVALID,
-            state_ptr: invalid_fd_op_state(),
-            buffer: Some(buffer),
-            write_base_len: 0,
-            len: 16,
-            input_error: None,
-            recv_state: &mut recv_state,
-            _marker: PhantomData,
-        };
+        let pointer_calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let buffer =
+            retained_constructor_buffer(None, Rc::clone(&pointer_calls), Rc::clone(&drops), false);
+        let original_buffer_ptr = buffer.bytes.as_ptr();
+        let mut recv = stream.recv_msg(buffer, 16);
         let mut cx = Context::from_waker(std::task::Waker::noop());
 
-        let Poll::Ready((Err(err), mut returned)) = Pin::new(&mut recv).poll(&mut cx) else {
-            panic!("ring-abandoned stashed receive did not return a terminal error");
+        let Poll::Ready((Err(err), returned)) = Pin::new(&mut recv).poll(&mut cx) else {
+            panic!("opaque abandoned marker did not return a terminal error");
         };
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        assert_eq!(returned.as_mut_ptr(), original_buffer_ptr);
-        assert!(recv.recv_state.stashed.state_ptr.is_null());
-        assert_eq!(recv.recv_state.stashed.iov_count, 0);
+        assert_eq!(returned.bytes.as_ptr(), original_buffer_ptr);
+        assert_eq!(pointer_calls.get(), 0);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(recv.recv_state.stashed.state_ptr, marker);
         assert!(recv.recv_state.stashed.process_completed.is_none());
-        assert!(abandoned.is_ring_abandoned());
-        assert!(!abandoned.is_completed());
+        drop(recv);
+        assert_eq!(stream.recv_state.stashed.state_ptr, marker);
+        drop(returned);
+        assert_eq!(drops.get(), 1);
+
+        // Miri makes any attempt by future or stream destruction to follow
+        // this deliberately dangling marker an immediate failure.
+        drop(stream);
     }
 
     #[cfg(not(miri))]
@@ -9584,6 +9877,11 @@ mod tests {
     fn connected_sctp_recv_payload_footprints_pin_bounded_ancillary_cost() {
         #[cfg(all(target_pointer_width = "64", target_arch = "x86_64"))]
         {
+            assert_eq!(std::mem::size_of::<SctpRecordSync>(), 1);
+            assert_eq!(std::mem::align_of::<SctpRecordSync>(), 1);
+            assert_eq!(std::mem::size_of::<StashedSctpRecv>(), 24);
+            assert_eq!(std::mem::size_of::<SctpRecvState>(), 32);
+            assert_eq!(std::mem::align_of::<SctpRecvState>(), 8);
             assert_eq!(SCTP_RCVINFO_CONTROL_LEN, 48);
             assert_eq!(SCTP_RECV_CONTROL_LEN, 200);
             assert_eq!(
@@ -10535,6 +10833,24 @@ mod tests {
         bytes
     }
 
+    fn test_fragmented_stream_reset_notification() -> Vec<u8> {
+        const STREAMS: usize = 16;
+        let mut bytes = test_notification_buffer(
+            LOCAL_SCTP_STREAM_RESET_EVENT,
+            SCTP_STREAM_RESET_MIN_LEN + STREAMS * std::mem::size_of::<u16>(),
+        );
+        write_u16_ne(&mut bytes, SCTP_NOTIFICATION_FLAGS_OFFSET, 1);
+        write_i32_ne(&mut bytes, SCTP_STREAM_RESET_ASSOC_ID_OFFSET, 42);
+        for stream in 0..STREAMS {
+            write_u16_ne(
+                &mut bytes,
+                SCTP_STREAM_RESET_MIN_LEN + stream * std::mem::size_of::<u16>(),
+                stream as u16,
+            );
+        }
+        bytes
+    }
+
     fn notification_layout_cases() -> Vec<(&'static str, Vec<u8>, SctpRecvMeta)> {
         let mut cases = Vec::new();
 
@@ -11030,6 +11346,7 @@ mod tests {
         stream: &mut SctpStream,
         cx: &mut Context<'_>,
         expected_state: *mut CompletionState,
+        expected_processor: bool,
     ) {
         let pointer_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
@@ -11057,7 +11374,10 @@ mod tests {
         );
         drop(future);
         assert_eq!(stream.recv_state.stashed.state_ptr, expected_state);
-        assert!(stream.recv_state.stashed.process_completed.is_some());
+        assert_eq!(
+            stream.recv_state.stashed.process_completed.is_some(),
+            expected_processor
+        );
         drop(returned);
         assert_eq!(drops.get(), 1);
     }
@@ -11067,7 +11387,7 @@ mod tests {
         with_ringless_poll_context_for_test(1, |owner, cx| {
             let reactor = owner.reactor_ptr();
             let mut stream = ringless_sctp_stream();
-            stream.recv_state.discarding_tail = true;
+            stream.recv_state.record_sync = SctpRecordSync::DataTail;
             assert!(stream.recv_state.stashed.state_ptr.is_null());
 
             test_hooks::fail_next_op_alloc();
@@ -11095,7 +11415,7 @@ mod tests {
                 assert!(future.state_ptr.is_null());
                 assert!(Pin::new(&mut future).poll(cx).is_pending());
                 drop(future);
-                assert!(stream.recv_state.discarding_tail);
+                assert_eq!(stream.recv_state.record_sync, SctpRecordSync::DataTail);
                 assert!(stream.recv_state.stashed.state_ptr.is_null());
                 assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
                 assert_eq!(owner.inflight_op_count_for_test(), 0);
@@ -11136,7 +11456,7 @@ mod tests {
             drop(zero);
             drop(returned_zero);
             assert_eq!(zero_drops.get(), 1);
-            assert!(stream.recv_state.discarding_tail);
+            assert_eq!(stream.recv_state.record_sync, SctpRecordSync::DataTail);
 
             let context_pointer_calls = Rc::new(Cell::new(0));
             let context_drops = Rc::new(Cell::new(0));
@@ -11163,14 +11483,14 @@ mod tests {
             drop(context_rejected);
             drop(returned_context);
             assert_eq!(context_drops.get(), 1);
-            assert!(stream.recv_state.discarding_tail);
+            assert_eq!(stream.recv_state.record_sync, SctpRecordSync::DataTail);
 
             let eor = test_msghdr_with_flags(libc::MSG_EOR);
             assert!(
                 stream.recv_state.should_consume_for_test(b"tail", &eor),
                 "rich recovery did not consume the pending record tail"
             );
-            assert!(!stream.recv_state.discarding_tail);
+            assert_eq!(stream.recv_state.record_sync, SctpRecordSync::Synced);
 
             let direct_pointer_calls = Rc::new(Cell::new(0));
             let direct_drops = Rc::new(Cell::new(0));
@@ -11204,15 +11524,15 @@ mod tests {
 
     fn assert_dropped_rich_receive_blocks_lean_and_recovers(
         completion: SyntheticRecvCompletion<'_>,
-        initial_discarding: bool,
-        expected_discarding: bool,
+        initial_sync: SctpRecordSync,
+        expected_sync: SctpRecordSync,
     ) {
         with_ringless_poll_context_for_test(1, |owner, cx| {
             let reactor = owner.reactor_ptr();
             let rich_pointer_calls = Rc::new(Cell::new(0));
             let rich_drops = Rc::new(Cell::new(0));
             let mut stream = ringless_sctp_stream();
-            stream.recv_state.discarding_tail = initial_discarding;
+            stream.recv_state.record_sync = initial_sync;
             let state_ptr = stage_dropped_scalar_receive(
                 &mut stream,
                 reactor,
@@ -11229,7 +11549,7 @@ mod tests {
 
             test_hooks::fail_next_raw_sqe_submit();
             test_hooks::fail_next_op_alloc();
-            assert_lean_stash_rejection(&mut stream, cx, state_ptr);
+            assert_lean_stash_rejection(&mut stream, cx, state_ptr, true);
             assert!(
                 test_hooks::take_op_alloc_failure(),
                 "pending-stash rejection attempted operation allocation"
@@ -11244,7 +11564,7 @@ mod tests {
 
             unsafe { (*state_ptr).set_completed() };
             test_hooks::fail_next_op_alloc();
-            assert_lean_stash_rejection(&mut stream, cx, state_ptr);
+            assert_lean_stash_rejection(&mut stream, cx, state_ptr, true);
             assert!(
                 test_hooks::take_op_alloc_failure(),
                 "completed-stash rejection attempted operation allocation"
@@ -11286,7 +11606,7 @@ mod tests {
 
             assert!(stream.recv_state.stashed.state_ptr.is_null());
             assert!(stream.recv_state.stashed.process_completed.is_none());
-            assert_eq!(stream.recv_state.discarding_tail, expected_discarding);
+            assert_eq!(stream.recv_state.record_sync, expected_sync);
             assert_eq!(rich_pointer_calls.get(), 2);
             assert_eq!(rich_drops.get(), 1);
             assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
@@ -11312,19 +11632,25 @@ mod tests {
     fn dropped_rich_receive_blocks_lean_until_partial_eor_and_notification_recovery() {
         assert_dropped_rich_receive_blocks_lean_and_recovers(
             SyntheticRecvCompletion::success(b"tail", 0),
-            false,
-            true,
+            SctpRecordSync::Synced,
+            SctpRecordSync::DataTail,
         );
         assert_dropped_rich_receive_blocks_lean_and_recovers(
             SyntheticRecvCompletion::success(b"done", libc::MSG_EOR),
-            true,
-            false,
+            SctpRecordSync::DataTail,
+            SctpRecordSync::Synced,
         );
         let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
         assert_dropped_rich_receive_blocks_lean_and_recovers(
             SyntheticRecvCompletion::success(&abort, libc::MSG_NOTIFICATION),
-            true,
-            false,
+            SctpRecordSync::DataTail,
+            SctpRecordSync::Synced,
+        );
+        let notification_head = test_fragmented_stream_reset_notification();
+        assert_dropped_rich_receive_blocks_lean_and_recovers(
+            SyntheticRecvCompletion::success(&notification_head[..8], libc::MSG_NOTIFICATION),
+            SctpRecordSync::Synced,
+            SctpRecordSync::NotificationTail,
         );
     }
 
@@ -11419,7 +11745,7 @@ mod tests {
                 iov_count: 0,
                 process_completed: Some(reject_abandoned_stashed_processing),
             };
-            assert_lean_stash_rejection(&mut abandoned_stream, cx, abandoned_ptr);
+            assert_lean_stash_rejection(&mut abandoned_stream, cx, abandoned_ptr, true);
             assert_eq!(abandoned_stream.recv_state.stashed.state_ptr, abandoned_ptr);
             abandoned_stream.recv_state.stashed = StashedSctpRecv::empty();
             drop(abandoned_stream);
@@ -11689,7 +12015,7 @@ mod tests {
                 &mut recv_state,
                 SyntheticRecvCompletion::success(b"tail", 0),
             );
-            assert!(recv_state.discarding_tail);
+            assert_eq!(recv_state.record_sync, SctpRecordSync::DataTail);
 
             let (second_state, second_retained) = assert_rejected_scalar_completion(
                 reactor,
@@ -11697,39 +12023,75 @@ mod tests {
                 &mut recv_state,
                 SyntheticRecvCompletion::success(b"done", libc::MSG_EOR),
             );
-            assert!(!recv_state.discarding_tail);
+            assert_eq!(recv_state.record_sync, SctpRecordSync::Synced);
             assert_eq!(second_state, first_state);
             assert_eq!(second_retained, first_retained);
 
-            recv_state.discarding_tail = true;
+            recv_state.record_sync = SctpRecordSync::DataTail;
             let (third_state, third_retained) = assert_rejected_scalar_completion(
                 reactor,
                 origin_cx,
                 &mut recv_state,
                 SyntheticRecvCompletion::success(&[], 0),
             );
-            assert!(!recv_state.discarding_tail);
+            assert_eq!(recv_state.record_sync, SctpRecordSync::Synced);
             assert_eq!(third_state, first_state);
             assert_eq!(third_retained, first_retained);
 
-            recv_state.discarding_tail = true;
+            recv_state.record_sync = SctpRecordSync::DataTail;
             let (fourth_state, fourth_retained) = assert_rejected_scalar_completion(
                 reactor,
                 origin_cx,
                 &mut recv_state,
                 SyntheticRecvCompletion::error(-libc::EIO, libc::MSG_EOR),
             );
-            assert!(
-                recv_state.discarding_tail,
+            assert_eq!(
+                recv_state.record_sync,
+                SctpRecordSync::DataTail,
                 "failed CQE changed record-recovery state"
             );
             assert_eq!(fourth_state, first_state);
             assert_eq!(fourth_retained, first_retained);
 
+            recv_state.record_sync = SctpRecordSync::Synced;
+            let notification = test_fragmented_stream_reset_notification();
+            let (fifth_state, fifth_retained) = assert_rejected_scalar_completion(
+                reactor,
+                origin_cx,
+                &mut recv_state,
+                SyntheticRecvCompletion::success(&notification[..8], libc::MSG_NOTIFICATION),
+            );
+            assert_eq!(recv_state.record_sync, SctpRecordSync::NotificationTail);
+            let (sixth_state, sixth_retained) = assert_rejected_scalar_completion(
+                reactor,
+                origin_cx,
+                &mut recv_state,
+                SyntheticRecvCompletion::success(&notification[8..16], libc::MSG_NOTIFICATION),
+            );
+            assert_eq!(recv_state.record_sync, SctpRecordSync::NotificationTail);
+            let (seventh_state, seventh_retained) = assert_rejected_scalar_completion(
+                reactor,
+                origin_cx,
+                &mut recv_state,
+                SyntheticRecvCompletion::success(
+                    &notification[16..],
+                    libc::MSG_NOTIFICATION | libc::MSG_EOR,
+                ),
+            );
+            assert_eq!(recv_state.record_sync, SctpRecordSync::Synced);
+            for (state, retained) in [
+                (fifth_state, fifth_retained),
+                (sixth_state, sixth_retained),
+                (seventh_state, seventh_retained),
+            ] {
+                assert_eq!(state, first_state);
+                assert_eq!(retained, first_retained);
+            }
+
             let stats = unsafe { (&*reactor).retained_payload_stats() };
-            assert_eq!(stats.pooled_allocs, 4);
-            assert_eq!(stats.pooled_reuses, 3);
-            assert_eq!(stats.pooled_frees, 4);
+            assert_eq!(stats.pooled_allocs, 7);
+            assert_eq!(stats.pooled_reuses, 6);
+            assert_eq!(stats.pooled_frees, 7);
             assert_eq!(stats.heap_fallbacks, 0);
             assert_eq!(owner.inflight_op_count_for_test(), 0);
         });
@@ -11866,7 +12228,7 @@ mod tests {
             }
 
             let mut recv_state = SctpRecvState::external();
-            recv_state.discarding_tail = true;
+            recv_state.record_sync = SctpRecordSync::DataTail;
             recv_state.stashed = StashedSctpRecv {
                 state_ptr,
                 iov_count: 0,
@@ -11888,7 +12250,7 @@ mod tests {
                 Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::NotConnected
             ));
 
-            assert!(!recv_state.discarding_tail);
+            assert_eq!(recv_state.record_sync, SctpRecordSync::Synced);
             assert!(recv_state.stashed.state_ptr.is_null());
             assert_eq!(
                 pointer_calls.get(),
@@ -11917,7 +12279,7 @@ mod tests {
                 &mut recv_state,
                 SyntheticRecvCompletion::success(b"tail", 0),
             );
-            assert!(recv_state.discarding_tail);
+            assert_eq!(recv_state.record_sync, SctpRecordSync::DataTail);
 
             let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
             let (second_state, second_retained) = assert_rejected_vectored_completion(
@@ -11926,31 +12288,68 @@ mod tests {
                 &mut recv_state,
                 SyntheticRecvCompletion::success(&abort, libc::MSG_NOTIFICATION),
             );
-            assert!(
-                !recv_state.discarding_tail,
+            assert_eq!(
+                recv_state.record_sync,
+                SctpRecordSync::Synced,
                 "copied active iovec did not expose the PDAPI abort"
             );
             assert_eq!(second_state, first_state);
             assert_eq!(second_retained, first_retained);
 
-            recv_state.discarding_tail = true;
+            recv_state.record_sync = SctpRecordSync::DataTail;
             let (third_state, third_retained) = assert_rejected_vectored_completion(
                 reactor,
                 origin_cx,
                 &mut recv_state,
                 SyntheticRecvCompletion::error(-libc::EIO, libc::MSG_EOR),
             );
-            assert!(
-                recv_state.discarding_tail,
+            assert_eq!(
+                recv_state.record_sync,
+                SctpRecordSync::DataTail,
                 "failed rejected CQE changed record-recovery state"
             );
             assert_eq!(third_state, first_state);
             assert_eq!(third_retained, first_retained);
 
+            recv_state.record_sync = SctpRecordSync::Synced;
+            let notification = test_fragmented_stream_reset_notification();
+            let (fourth_state, fourth_retained) = assert_rejected_vectored_completion(
+                reactor,
+                origin_cx,
+                &mut recv_state,
+                SyntheticRecvCompletion::success(&notification[..16], libc::MSG_NOTIFICATION),
+            );
+            assert_eq!(recv_state.record_sync, SctpRecordSync::NotificationTail);
+            let (fifth_state, fifth_retained) = assert_rejected_vectored_completion(
+                reactor,
+                origin_cx,
+                &mut recv_state,
+                SyntheticRecvCompletion::success(&notification[16..32], libc::MSG_NOTIFICATION),
+            );
+            assert_eq!(recv_state.record_sync, SctpRecordSync::NotificationTail);
+            let (sixth_state, sixth_retained) = assert_rejected_vectored_completion(
+                reactor,
+                origin_cx,
+                &mut recv_state,
+                SyntheticRecvCompletion::success(
+                    &notification[32..],
+                    libc::MSG_NOTIFICATION | libc::MSG_EOR,
+                ),
+            );
+            assert_eq!(recv_state.record_sync, SctpRecordSync::Synced);
+            for (state, retained) in [
+                (fourth_state, fourth_retained),
+                (fifth_state, fifth_retained),
+                (sixth_state, sixth_retained),
+            ] {
+                assert_eq!(state, first_state);
+                assert_eq!(retained, first_retained);
+            }
+
             let stats = unsafe { (&*reactor).retained_payload_stats() };
-            assert_eq!(stats.pooled_allocs, 3);
-            assert_eq!(stats.pooled_reuses, 2);
-            assert_eq!(stats.pooled_frees, 3);
+            assert_eq!(stats.pooled_allocs, 6);
+            assert_eq!(stats.pooled_reuses, 5);
+            assert_eq!(stats.pooled_frees, 6);
             assert_eq!(stats.heap_fallbacks, 0);
             assert_eq!(owner.inflight_op_count_for_test(), 0);
         });
@@ -11961,11 +12360,15 @@ mod tests {
         sctp_notification_retires_discard(parsed_notification.as_ref())
     }
 
-    fn discarding_after_completion_for_test(msg: &libc::msghdr, data_slice: &[u8]) -> bool {
+    fn data_tail_after_completion_for_test(
+        msg: &libc::msghdr,
+        data_slice: &[u8],
+    ) -> SctpRecordSync {
         let parsed_notification = parse_sctp_notification_once(data_slice, msg.msg_flags);
         let partial_delivery_abort =
             sctp_notification_retires_discard(parsed_notification.as_ref());
-        sctp_discarding_after_completion(test_recv_header(msg), partial_delivery_abort)
+        SctpRecordSync::DataTail
+            .after_recovery_completion(test_recv_header(msg), partial_delivery_abort)
     }
 
     #[test]
@@ -11979,26 +12382,29 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
 
         assert!(notification_retires_discard_for_test(&data, msg.msg_flags));
-        assert!(!discarding_after_completion_for_test(&msg, &data));
+        assert_eq!(
+            data_tail_after_completion_for_test(&msg, &data),
+            SctpRecordSync::Synced
+        );
 
-        let mut discarding_tail = true;
-        update_discarding_after_unpublished_completion(
-            &mut discarding_tail,
+        let mut record_sync = SctpRecordSync::DataTail;
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
-        assert!(!discarding_tail);
+        assert_eq!(record_sync, SctpRecordSync::Synced);
 
-        let mut synchronized = false;
-        update_discarding_after_unpublished_completion(
-            &mut synchronized,
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
-        assert!(
-            !synchronized,
+        assert_eq!(
+            record_sync,
+            SctpRecordSync::Synced,
             "a dropped PDAPI abort must not start discard when none was active"
         );
     }
@@ -12012,30 +12418,250 @@ mod tests {
         let mut metadata_only = SctpSocketConfig::data(SctpInitConfig::default());
         metadata_only.recv_rcvinfo = true;
         let mut live = SctpRecvState::configured(metadata_only);
-        live.discarding_tail = true;
+        live.record_sync = SctpRecordSync::DataTail;
         assert!(
             live.should_consume_metadata_completion(
+                data.len(),
                 test_recv_header(&msg),
                 parsed_notification.as_ref(),
             ),
             "a FlowIO-forced PDAPI abort remains internal"
         );
 
-        let mut dropped = true;
-        update_discarding_after_unpublished_completion(
+        let mut dropped = SctpRecordSync::DataTail;
+        update_record_sync_after_unpublished_completion(
             &mut dropped,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
         assert_eq!(
-            live.discarding_tail, dropped,
+            live.record_sync, dropped,
             "live and dropped completion retirement must use one oracle"
         );
-        assert!(
-            !live.discarding_tail,
+        assert_eq!(
+            live.record_sync,
+            SctpRecordSync::Synced,
             "a complete PDAPI abort retires discard even without MSG_EOR"
         );
+    }
+
+    #[test]
+    fn internal_and_unpublished_record_sync_transitions_are_differentially_equal() {
+        let notification = test_fragmented_stream_reset_notification();
+        let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let non_abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED + 1);
+        let cases: &[(&str, SctpRecordSync, &[u8], libc::c_int, SctpRecordSync)] = &[
+            (
+                "hidden notification head",
+                SctpRecordSync::Synced,
+                &notification[..8],
+                libc::MSG_NOTIFICATION,
+                SctpRecordSync::NotificationTail,
+            ),
+            (
+                "opaque notification continuation",
+                SctpRecordSync::NotificationTail,
+                &abort,
+                libc::MSG_NOTIFICATION,
+                SctpRecordSync::NotificationTail,
+            ),
+            (
+                "terminal notification continuation",
+                SctpRecordSync::NotificationTail,
+                &notification[40..],
+                libc::MSG_NOTIFICATION | libc::MSG_EOR,
+                SctpRecordSync::Synced,
+            ),
+            (
+                "data continuation",
+                SctpRecordSync::DataTail,
+                b"tail",
+                0,
+                SctpRecordSync::DataTail,
+            ),
+            (
+                "terminal data continuation",
+                SctpRecordSync::DataTail,
+                b"tail",
+                libc::MSG_EOR,
+                SctpRecordSync::Synced,
+            ),
+            (
+                "complete PDAPI abort",
+                SctpRecordSync::DataTail,
+                &abort,
+                libc::MSG_NOTIFICATION,
+                SctpRecordSync::Synced,
+            ),
+            (
+                "unrelated notification EOR",
+                SctpRecordSync::DataTail,
+                &non_abort,
+                libc::MSG_NOTIFICATION | libc::MSG_EOR,
+                SctpRecordSync::DataTail,
+            ),
+        ];
+
+        let mut metadata_only = SctpSocketConfig::data(SctpInitConfig::default());
+        metadata_only.recv_rcvinfo = true;
+        for &(name, initial, data, flags, expected) in cases {
+            let msg = test_msghdr_with_flags(flags);
+            let mut live = SctpRecvState::configured(metadata_only);
+            live.record_sync = initial;
+            let parsed = live.parse_notification_for_completion(data, flags);
+            assert!(
+                live.should_consume_metadata_completion(
+                    data.len(),
+                    test_recv_header(&msg),
+                    parsed.as_ref(),
+                ),
+                "{name}: internal completion became caller-visible"
+            );
+
+            let mut unpublished = initial;
+            update_record_sync_after_unpublished_completion(
+                &mut unpublished,
+                data.len(),
+                test_recv_header(&msg),
+                data,
+            );
+            assert_eq!(live.record_sync, unpublished, "{name}: live/drop drift");
+            assert_eq!(live.record_sync, expected, "{name}: wrong transition");
+        }
+    }
+
+    #[test]
+    fn fragmented_stream_reset_tail_is_opaque_until_eor_then_parsing_resumes() {
+        let notification = test_fragmented_stream_reset_notification();
+        assert_eq!(notification.len(), 44, "live-derived event size drifted");
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+        let mut visible = SctpRecvState::external();
+
+        let head = &notification[..8];
+        let parsed_head = visible
+            .parse_notification_for_completion(head, partial.msg_flags)
+            .expect("a synchronized notification head must be parsed");
+        assert!(
+            parsed_head.is_err(),
+            "short variable-tail head parsed completely"
+        );
+        assert!(!visible.should_consume_metadata_completion(
+            head.len(),
+            test_recv_header(&partial),
+            Some(&parsed_head),
+        ));
+        let head_error =
+            visible.parse_completion_meta(Ok(None), partial.msg_flags, head, Some(parsed_head));
+        assert!(
+            head_error.is_err(),
+            "fragmented visible head did not fail closed"
+        );
+        visible.record_sync =
+            visible
+                .record_sync
+                .after_visible_error(head.len(), test_recv_header(&partial), false);
+        assert_eq!(visible.record_sync, SctpRecordSync::NotificationTail);
+
+        for start in (8..notification.len()).step_by(8) {
+            let end = std::cmp::min(start + 8, notification.len());
+            let msg = if end == notification.len() {
+                &terminal
+            } else {
+                &partial
+            };
+            let continuation = &notification[start..end];
+            assert!(
+                visible
+                    .parse_notification_for_completion(continuation, msg.msg_flags)
+                    .is_none(),
+                "notification continuation {start} was reparsed as a fresh header"
+            );
+            assert!(visible.should_consume_metadata_completion(
+                continuation.len(),
+                test_recv_header(msg),
+                None,
+            ));
+            assert_eq!(
+                visible.record_sync,
+                if end == notification.len() {
+                    SctpRecordSync::Synced
+                } else {
+                    SctpRecordSync::NotificationTail
+                }
+            );
+        }
+
+        let mut shutdown = test_notification_buffer(LOCAL_SCTP_SHUTDOWN_EVENT, 12);
+        write_u32_ne(&mut shutdown, 8, 7);
+        let shutdown_msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+        let parsed_shutdown = visible
+            .parse_notification_for_completion(&shutdown, shutdown_msg.msg_flags)
+            .expect("notification parsing did not resume after terminal EOR");
+        assert!(parsed_shutdown.is_ok());
+        assert!(!visible.should_consume_metadata_completion(
+            shutdown.len(),
+            test_recv_header(&shutdown_msg),
+            Some(&parsed_shutdown),
+        ));
+    }
+
+    #[test]
+    fn unpublished_stream_reset_fragments_recover_at_the_same_terminal_eor() {
+        let notification = test_fragmented_stream_reset_notification();
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+        let mut record_sync = SctpRecordSync::Synced;
+
+        for start in (0..notification.len()).step_by(8) {
+            let end = std::cmp::min(start + 8, notification.len());
+            let msg = if end == notification.len() {
+                &terminal
+            } else {
+                &partial
+            };
+            let completion = &notification[start..end];
+            update_record_sync_after_unpublished_completion(
+                &mut record_sync,
+                completion.len(),
+                test_recv_header(msg),
+                completion,
+            );
+            assert_eq!(
+                record_sync,
+                if end == notification.len() {
+                    SctpRecordSync::Synced
+                } else {
+                    SctpRecordSync::NotificationTail
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn notification_tail_does_not_interpret_pdapi_shaped_continuation() {
+        let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let mut state = SctpRecvState::external();
+        state.record_sync = SctpRecordSync::NotificationTail;
+
+        assert!(
+            state
+                .parse_notification_for_completion(&abort, partial.msg_flags)
+                .is_none(),
+            "opaque notification tail was parsed as a complete PDAPI abort"
+        );
+        assert!(state.should_consume_metadata_completion(
+            abort.len(),
+            test_recv_header(&partial),
+            None,
+        ));
+        assert_eq!(state.record_sync, SctpRecordSync::NotificationTail);
+
+        let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+        assert!(state.should_consume_metadata_completion(1, test_recv_header(&terminal), None,));
+        assert_eq!(state.record_sync, SctpRecordSync::Synced);
     }
 
     #[test]
@@ -12319,6 +12945,7 @@ mod tests {
         let parsed_notification = parse_sctp_notification_once(&data, msg.msg_flags)
             .expect("caller-visible notification should be parsed");
         assert!(!visible.should_consume_metadata_completion(
+            data.len(),
             test_recv_header(&msg),
             Some(&parsed_notification)
         ));
@@ -12344,6 +12971,7 @@ mod tests {
             .expect("caller-visible malformed notification should be parsed once");
         assert!(parsed_notification.is_err());
         assert!(!visible.should_consume_metadata_completion(
+            malformed.len(),
             test_recv_header(&msg),
             Some(&parsed_notification)
         ));
@@ -12372,6 +13000,7 @@ mod tests {
         let parsed_notification = parse_sctp_notification_once(&shutdown, truncated.msg_flags)
             .expect("visible notification should be parsed");
         assert!(!visible.should_consume_metadata_completion(
+            shutdown.len(),
             test_recv_header(&truncated),
             Some(&parsed_notification),
         ));
@@ -12394,6 +13023,7 @@ mod tests {
             .expect("visible malformed notification should be parsed");
         assert!(parsed_notification.is_err());
         assert!(!visible.should_consume_metadata_completion(
+            malformed.len(),
             test_recv_header(&partial),
             Some(&parsed_notification)
         ));
@@ -12421,14 +13051,15 @@ mod tests {
                 .expect("a hidden PDAPI fragment still drives discard policy");
         assert!(parsed_notification.is_err());
         assert!(hidden.should_consume_metadata_completion(
+            malformed.len(),
             test_recv_header(&hidden_fragment),
             Some(&parsed_notification),
         ));
-        assert!(hidden.discarding_tail);
+        assert_eq!(hidden.record_sync, SctpRecordSync::NotificationTail);
         let hidden_eor =
             test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_TRUNC | libc::MSG_EOR);
         assert!(hidden.should_consume_for_test(&malformed, &hidden_eor));
-        assert!(!hidden.discarding_tail);
+        assert_eq!(hidden.record_sync, SctpRecordSync::Synced);
 
         let abort_truncated =
             test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_TRUNC | libc::MSG_EOR);
@@ -12440,25 +13071,27 @@ mod tests {
             },
             ..SctpSocketConfig::data(SctpInitConfig::default())
         });
-        other_visible.discarding_tail = true;
+        other_visible.record_sync = SctpRecordSync::DataTail;
         let parsed_notification = parse_sctp_notification_once(&abort, abort_truncated.msg_flags)
             .expect("forced PDAPI should be parsed when another event is visible");
         assert!(other_visible.should_consume_metadata_completion(
+            abort.len(),
             test_recv_header(&abort_truncated),
             Some(&parsed_notification),
         ));
-        assert!(!other_visible.discarding_tail);
+        assert_eq!(other_visible.record_sync, SctpRecordSync::Synced);
 
         metadata_only.notifications.partial_delivery = true;
         let mut explicit = SctpRecvState::configured(metadata_only);
-        explicit.discarding_tail = true;
+        explicit.record_sync = SctpRecordSync::DataTail;
         let parsed_notification = parse_sctp_notification_once(&abort, abort_truncated.msg_flags)
             .expect("explicit PDAPI should be parsed");
         assert!(!explicit.should_consume_metadata_completion(
+            abort.len(),
             test_recv_header(&abort_truncated),
             Some(&parsed_notification),
         ));
-        assert!(!explicit.discarding_tail);
+        assert_eq!(explicit.record_sync, SctpRecordSync::Synced);
         assert_eq!(
             parse_recv_meta_with_notification_for_test(
                 &[],
@@ -12472,14 +13105,15 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        visible.discarding_tail = true;
+        visible.record_sync = SctpRecordSync::DataTail;
         let parsed_notification = parse_sctp_notification_once(&malformed, partial.msg_flags)
             .expect("visible malformed notification should be parsed");
         assert!(visible.should_consume_metadata_completion(
+            malformed.len(),
             test_recv_header(&partial),
             Some(&parsed_notification)
         ));
-        assert!(visible.discarding_tail);
+        assert_eq!(visible.record_sync, SctpRecordSync::DataTail);
     }
 
     #[test]
@@ -12495,21 +13129,23 @@ mod tests {
         assert!(parsed_notification.is_ok());
         assert!(
             forced.should_consume_metadata_completion(
+                data.len(),
                 test_recv_header(&msg),
                 Some(&parsed_notification),
             ),
             "FlowIO-only forced notifications remain internal"
         );
 
-        forced.discarding_tail = true;
+        forced.record_sync = SctpRecordSync::DataTail;
         assert!(forced.should_consume_for_test(&data, &msg));
-        assert!(!forced.discarding_tail);
+        assert_eq!(forced.record_sync, SctpRecordSync::Synced);
 
         metadata_only.notifications.partial_delivery = true;
         let mut explicit = SctpRecvState::configured(metadata_only);
         let parsed_notification = parse_sctp_notification_once(&data, msg.msg_flags)
             .expect("caller-visible PDAPI notification should be parsed");
         assert!(!explicit.should_consume_metadata_completion(
+            data.len(),
             test_recv_header(&msg),
             Some(&parsed_notification)
         ));
@@ -12529,9 +13165,9 @@ mod tests {
             ))
         ));
 
-        explicit.discarding_tail = true;
+        explicit.record_sync = SctpRecordSync::DataTail;
         assert!(!explicit.should_consume_for_test(&data, &msg));
-        assert!(!explicit.discarding_tail);
+        assert_eq!(explicit.record_sync, SctpRecordSync::Synced);
 
         explicit.set_receive_policy(SctpNotificationMask::none(), true);
         assert!(explicit.should_consume_for_test(&data, &msg));
@@ -12556,38 +13192,41 @@ mod tests {
             ..SctpSocketConfig::data(SctpInitConfig::default())
         });
         assert!(fragmented_forced.should_consume_for_test(&data[..1], &fragment));
-        assert!(fragmented_forced.discarding_tail);
+        assert_eq!(
+            fragmented_forced.record_sync,
+            SctpRecordSync::NotificationTail
+        );
         assert!(fragmented_forced.should_consume_for_test(&data[1..2], &msg));
-        assert!(!fragmented_forced.discarding_tail);
+        assert_eq!(fragmented_forced.record_sync, SctpRecordSync::Synced);
         let intact = test_msghdr_with_flags(libc::MSG_EOR);
         assert!(!fragmented_forced.should_consume_for_test(b"next", &intact));
 
-        let mut synchronized = false;
-        update_discarding_after_unpublished_completion(
-            &mut synchronized,
+        let mut record_sync = SctpRecordSync::Synced;
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
-        assert!(!synchronized);
+        assert_eq!(record_sync, SctpRecordSync::Synced);
 
         let eor = test_msghdr_with_flags(libc::MSG_EOR);
-        update_discarding_after_unpublished_completion(
-            &mut synchronized,
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             4,
             test_recv_header(&eor),
             b"next",
         );
-        assert!(!synchronized);
+        assert_eq!(record_sync, SctpRecordSync::Synced);
 
         let eof = test_msghdr_with_flags(0);
-        update_discarding_after_unpublished_completion(
-            &mut synchronized,
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             0,
             test_recv_header(&eof),
             &[],
         );
-        assert!(!synchronized);
+        assert_eq!(record_sync, SctpRecordSync::Synced);
     }
 
     #[test]
@@ -12596,16 +13235,19 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
 
         assert!(!notification_retires_discard_for_test(&data, msg.msg_flags));
-        assert!(discarding_after_completion_for_test(&msg, &data));
+        assert_eq!(
+            data_tail_after_completion_for_test(&msg, &data),
+            SctpRecordSync::DataTail
+        );
 
-        let mut discarding_tail = true;
-        update_discarding_after_unpublished_completion(
-            &mut discarding_tail,
+        let mut record_sync = SctpRecordSync::DataTail;
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
-        assert!(discarding_tail);
+        assert_eq!(record_sync, SctpRecordSync::DataTail);
     }
 
     #[test]
@@ -12614,14 +13256,14 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
 
         assert!(sctp_msg_partial_nonempty(data.len(), msg.msg_flags));
-        let mut discarding_tail = false;
-        update_discarding_after_unpublished_completion(
-            &mut discarding_tail,
+        let mut record_sync = SctpRecordSync::Synced;
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
-        assert!(discarding_tail);
+        assert_eq!(record_sync, SctpRecordSync::NotificationTail);
     }
 
     #[test]
@@ -12630,16 +13272,20 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
 
         assert!(!notification_retires_discard_for_test(&data, msg.msg_flags));
-        assert!(!discarding_after_completion_for_test(&msg, &data));
+        assert_eq!(
+            data_tail_after_completion_for_test(&msg, &data),
+            SctpRecordSync::DataTail,
+            "an unrelated notification EOR cannot retire a data-record tail"
+        );
 
-        let mut discarding_tail = true;
-        update_discarding_after_unpublished_completion(
-            &mut discarding_tail,
+        let mut record_sync = SctpRecordSync::NotificationTail;
+        update_record_sync_after_unpublished_completion(
+            &mut record_sync,
             data.len(),
             test_recv_header(&msg),
             &data,
         );
-        assert!(!discarding_tail);
+        assert_eq!(record_sync, SctpRecordSync::Synced);
     }
 
     fn assoc_ipv4_entry(ip: [u8; 4], port: u16, len: usize) -> Vec<u8> {

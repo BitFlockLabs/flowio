@@ -941,8 +941,9 @@ struct RetainedWritevPayload<C> {
     buffer: C,
     /// Kernel-facing `iovec` array pointing into `buffer` segments.
     scratch: RetainedIovecScratch,
-    /// Kernel-facing sendmsg header pointing at the active scratch window.
-    msg: libc::msghdr,
+    /// Kernel-facing sendmsg header, initialized only when an SQE uses SENDMSG.
+    /// Single-iovec SEND submissions never read this field.
+    msg: MaybeUninit<libc::msghdr>,
     /// Bytes confirmed by completed SQEs for `_all` retry futures.
     written: usize,
     /// First active `iovec` entry after partial write progress.
@@ -961,8 +962,9 @@ struct RetainedProjectedWritevPayload<T> {
     source: T,
     /// Kernel-facing `iovec` array pointing into `source` projections.
     scratch: RetainedIovecScratch,
-    /// Kernel-facing sendmsg header pointing at the active scratch window.
-    msg: libc::msghdr,
+    /// Kernel-facing sendmsg header, initialized only when an SQE uses SENDMSG.
+    /// Single-iovec SEND submissions never read this field.
+    msg: MaybeUninit<libc::msghdr>,
     /// Bytes confirmed by completed SQEs for projected `_all` retries.
     written: usize,
     /// First active projected `iovec` entry after partial write progress.
@@ -1030,11 +1032,9 @@ unsafe fn emplace_retained_writev_payload<C: WriteBufferChain<N>, const N: usize
     expected_total: usize,
     after_fill: impl FnOnce() -> io::Result<R>,
 ) -> io::Result<(RetainedPayload<RetainedWritevPayload<C>>, R)> {
-    let msg = empty_sendmsg_header();
     unsafe {
         with_raw_retained_slot::<RetainedWritevPayload<C>, _>(pool, |mut slot| {
             let dst = slot.as_mut_ptr();
-            std::ptr::addr_of_mut!((*dst).msg).write(msg);
             std::ptr::addr_of_mut!((*dst).written).write(0);
             std::ptr::addr_of_mut!((*dst).skip).write(0);
 
@@ -1076,11 +1076,9 @@ unsafe fn emplace_retained_projected_writev_payload<T: 'static>(
     source: &mut Option<T>,
     scratch_init: RetainedIovecScratchInit,
 ) -> RetainedPayload<RetainedProjectedWritevPayload<T>> {
-    let msg = empty_sendmsg_header();
     unsafe {
         with_raw_retained_slot::<RetainedProjectedWritevPayload<T>, _>(pool, |mut slot| {
             let dst = slot.as_mut_ptr();
-            std::ptr::addr_of_mut!((*dst).msg).write(msg);
             std::ptr::addr_of_mut!((*dst).written).write(0);
             std::ptr::addr_of_mut!((*dst).skip).write(0);
 
@@ -1161,31 +1159,18 @@ fn build_read_vectored_entry(
 }
 
 #[inline(always)]
-fn empty_sendmsg_header() -> libc::msghdr {
-    libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: std::ptr::null_mut(),
-        msg_iovlen: 0,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    }
-}
-
-#[inline(always)]
 fn build_write_entry(fd: RawFd, ptr: *const u8, len: u32, user_data: u64) -> squeue::Entry {
     build_send_entry(fd, ptr, len, user_data)
 }
 
 #[inline(always)]
 fn prepare_sendmsg_header(
-    msg: &mut libc::msghdr,
+    msg: &mut MaybeUninit<libc::msghdr>,
     iovecs: &[MaybeUninit<libc::iovec>],
     skip: usize,
     count: usize,
 ) -> *const libc::msghdr {
-    *msg = libc::msghdr {
+    msg.write(libc::msghdr {
         msg_name: std::ptr::null_mut(),
         msg_namelen: 0,
         msg_iov: unsafe { iovec_slice_ptr(iovecs, skip) as *mut libc::iovec },
@@ -1193,8 +1178,7 @@ fn prepare_sendmsg_header(
         msg_control: std::ptr::null_mut(),
         msg_controllen: 0,
         msg_flags: 0,
-    };
-    msg as *const libc::msghdr
+    }) as *const libc::msghdr
 }
 
 #[inline(always)]
@@ -1207,7 +1191,7 @@ fn build_write_vectored_entry(
     iovecs: &[MaybeUninit<libc::iovec>],
     skip: usize,
     count: usize,
-    msg: &mut libc::msghdr,
+    msg: &mut MaybeUninit<libc::msghdr>,
     user_data: u64,
 ) -> squeue::Entry {
     debug_assert!(count > 0, "writev submission requires at least one iovec");
@@ -5572,6 +5556,39 @@ mod tests {
     }
 
     #[test]
+    fn retained_projected_writev_unsubmitted_drop_does_not_read_message_header() {
+        struct DeferredProjection([u8; 4]);
+
+        impl WritevProjection for DeferredProjection {
+            fn writev_count_and_len(&self) -> (usize, usize) {
+                (1, self.0.len())
+            }
+
+            fn project_writev<'a>(&'a self, pieces: &mut WritevPieces<'a>) -> io::Result<()> {
+                pieces.push(&self.0)
+            }
+        }
+
+        let mut pool = RetainedPayloadPool::new().expect("retained pool creation failed");
+        let scratch_init = pool
+            .alloc_iovec_scratch_init(1)
+            .expect("inline scratch token allocation failed");
+        let pool_ptr = NonNull::from(&mut pool);
+        let mut source = Some(DeferredProjection([1, 2, 3, 4]));
+        let payload = unsafe {
+            emplace_retained_projected_writev_payload(pool_ptr, &mut source, scratch_init)
+        };
+        assert!(source.is_none(), "projected source was not transferred");
+
+        // This is the projection-failure/cancellation shape: retained storage
+        // retires before any SENDMSG builder initializes its message header.
+        let returned = unsafe { payload.take(&mut pool) };
+        assert_eq!(returned.source.0, [1, 2, 3, 4]);
+        drop(returned);
+        assert_eq!(pool.stats().pooled_frees, 1);
+    }
+
+    #[test]
     fn projected_try_write_scratch_reserves_to_target_capacity() {
         let mut scratch = Vec::<MaybeUninit<libc::iovec>>::with_capacity(300);
         assert_eq!(scratch.len(), 0);
@@ -6147,7 +6164,7 @@ mod tests {
     fn stream_write_vectored_single_entry_uses_send_with_nosignal() {
         let bytes = [1u8, 2, 3, 4];
         let iovecs = [initialized_iovec(bytes.as_ptr(), bytes.len())];
-        let mut msg = empty_sendmsg_header();
+        let mut msg = MaybeUninit::uninit();
 
         let entry = build_write_vectored_entry(7, &iovecs, 0, 1, &mut msg, 99);
         let sqe = sqe_prefix(&entry);
@@ -6158,6 +6175,64 @@ mod tests {
     }
 
     #[test]
+    fn stream_write_vectored_single_entry_leaves_message_header_untouched() {
+        let bytes = [1u8, 2, 3, 4];
+        let iovecs = [initialized_iovec(bytes.as_ptr(), bytes.len())];
+        let mut name = 0u8;
+        let mut control = 0u8;
+        let mut sentinel_iovec = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut _,
+            iov_len: bytes.len(),
+        };
+        let mut msg = MaybeUninit::new(libc::msghdr {
+            msg_name: std::ptr::addr_of_mut!(name).cast(),
+            msg_namelen: 7,
+            msg_iov: std::ptr::addr_of_mut!(sentinel_iovec),
+            msg_iovlen: 9,
+            msg_control: std::ptr::addr_of_mut!(control).cast(),
+            msg_controllen: 11,
+            msg_flags: 13,
+        });
+
+        let entry = build_write_vectored_entry(7, &iovecs, 0, 1, &mut msg, 99);
+        let sqe = sqe_prefix(&entry);
+        // SAFETY: this test initialized every field above; the single-iovec
+        // branch must leave those initialized bytes untouched.
+        let msg = unsafe { msg.assume_init_ref() };
+
+        assert_eq!(sqe.opcode, opcode::Send::CODE);
+        assert_eq!(msg.msg_name, std::ptr::addr_of_mut!(name).cast());
+        assert_eq!(msg.msg_namelen, 7);
+        assert_eq!(msg.msg_iov, std::ptr::addr_of_mut!(sentinel_iovec));
+        assert_eq!(msg.msg_iovlen, 9);
+        assert_eq!(msg.msg_control, std::ptr::addr_of_mut!(control).cast());
+        assert_eq!(msg.msg_controllen, 11);
+        assert_eq!(msg.msg_flags, 13);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn retained_writev_message_header_layout_is_exact() {
+        assert_eq!(std::mem::size_of::<libc::msghdr>(), 56);
+        assert_eq!(std::mem::align_of::<libc::msghdr>(), 8);
+        assert_eq!(std::mem::size_of::<MaybeUninit<libc::msghdr>>(), 56);
+        assert_eq!(std::mem::align_of::<MaybeUninit<libc::msghdr>>(), 8);
+
+        type Direct = RetainedWritevPayload<()>;
+        type Projected = RetainedProjectedWritevPayload<()>;
+        assert_eq!(std::mem::size_of::<Direct>(), 360);
+        assert_eq!(std::mem::align_of::<Direct>(), 8);
+        assert_eq!(std::mem::offset_of!(Direct, msg), 288);
+        assert_eq!(std::mem::offset_of!(Direct, written), 344);
+        assert_eq!(std::mem::offset_of!(Direct, skip), 352);
+        assert_eq!(std::mem::size_of::<Projected>(), 360);
+        assert_eq!(std::mem::align_of::<Projected>(), 8);
+        assert_eq!(std::mem::offset_of!(Projected, msg), 288);
+        assert_eq!(std::mem::offset_of!(Projected, written), 344);
+        assert_eq!(std::mem::offset_of!(Projected, skip), 352);
+    }
+
+    #[test]
     fn stream_write_vectored_multi_entry_uses_sendmsg_with_nosignal() {
         let first = [1u8, 2];
         let second = [3u8, 4, 5];
@@ -6165,18 +6240,24 @@ mod tests {
             initialized_iovec(first.as_ptr(), first.len()),
             initialized_iovec(second.as_ptr(), second.len()),
         ];
-        let mut msg = empty_sendmsg_header();
+        let mut msg = MaybeUninit::uninit();
 
         let entry = build_write_vectored_entry(7, &iovecs, 0, 2, &mut msg, 99);
         let sqe = sqe_prefix(&entry);
+        // SAFETY: the multi-iovec branch initializes the complete header
+        // before building an SQE that publishes its pointer.
+        let msg = unsafe { msg.assume_init_ref() };
 
         assert_eq!(sqe.opcode, opcode::SendMsg::CODE);
         assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
-        assert_eq!(sqe.addr, (&msg as *const libc::msghdr) as u64);
+        assert_eq!(sqe.addr, (msg as *const libc::msghdr) as u64);
         assert_eq!(sqe.user_data, 99);
         assert_eq!(msg.msg_iov, iovecs.as_ptr() as *mut libc::iovec);
         assert_eq!(msg.msg_iovlen, 2);
         assert!(msg.msg_name.is_null());
+        assert_eq!(msg.msg_namelen, 0);
         assert!(msg.msg_control.is_null());
+        assert_eq!(msg.msg_controllen, 0);
+        assert_eq!(msg.msg_flags, 0);
     }
 }

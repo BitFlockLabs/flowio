@@ -58,8 +58,6 @@ pub struct Pool<'a, T: InPlaceInit, P: super::provider::MemoryProvider> {
     free_list: utils::list::intrusive::slist::SList<T>,
     /// Move-safe chain of allocated slab pages.
     slab_pages: super::slab::SlabPageChain,
-    /// Size of each object slot after alignment and link accommodation.
-    obj_size: usize,
     #[cfg(debug_assertions)]
     /// Number of slots allocated from this pool that have not been freed.
     live_slots: usize,
@@ -142,17 +140,13 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         }
 
         let raw_size = std::mem::size_of::<T>();
-        let align = std::cmp::max(std::mem::align_of::<T>(), super::slab::SLAB_LINK_ALIGN);
-        let base_size = std::cmp::max(raw_size, super::slab::SLAB_LINK_SIZE);
-        let obj_size =
-            crate::utils::size_up(base_size, align).map_err(|_| PoolConfigError::SizeOverflow)?;
-
+        let align = std::mem::align_of::<T>();
         // Slab geometry is fixed up front and then reused across all slab
         // allocations from this pool.
         let slab_factory = unsafe {
             super::slab::SlabAllocator::new_uninit_from_raw(
                 provider,
-                obj_size,
+                raw_size,
                 align,
                 objs_per_slab,
             )
@@ -169,7 +163,6 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
             slab_factory,
             free_list: utils::list::intrusive::slist::SList::new_uninit(),
             slab_pages: super::slab::SlabPageChain::new(),
-            obj_size,
             #[cfg(debug_assertions)]
             live_slots: 0,
         })
@@ -196,11 +189,7 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
         let raw_ptr = if let Some(link_ptr) = unsafe { self.free_list.pop_front() } {
             link_ptr
         } else {
-            unsafe {
-                self.slab_pages
-                    .alloc_or_grow(&mut self.slab_factory, self.obj_size)?
-                    .ptr as *mut T
-            }
+            unsafe { self.slab_pages.alloc_or_grow(&mut self.slab_factory)?.ptr as *mut T }
         };
 
         unsafe {

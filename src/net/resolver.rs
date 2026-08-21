@@ -594,6 +594,10 @@ impl DnsResolver {
     /// root name remains allowed in an ignored record, but a root target
     /// reached while interpreting an Answer CNAME is upstream `InvalidData`
     /// and advances nameserver failover.
+    /// Positive-response record storage reserves at most the lesser of the
+    /// declared Answer count and the packet's minimum-record density. Authority
+    /// and Additional counts do not reserve result capacity, but every record
+    /// in those sections is still completely validated.
     ///
     /// # Bounds
     ///
@@ -1774,12 +1778,13 @@ fn parse_response_records(
         .question
         .as_ref()
         .map_or(DNS_HEADER_LEN, |question| question.end_offset);
-    let total_rrs = envelope.ancount + envelope.nscount + envelope.arcount;
-    let max_rrs_by_packet = packet.len().saturating_sub(offset) / DNS_MIN_RR_LEN;
-    // Bound the eager allocation by the packet's minimum possible RR density;
-    // forged header counts cannot reserve independently of packet size.
+    let max_answer_rrs_by_packet = packet.len().saturating_sub(offset) / DNS_MIN_RR_LEN;
+    // Only Answer records can enter the result vector. Bound that eager
+    // allocation by the packet's minimum possible RR density so neither forged
+    // Answer counts nor large ignored-section counts reserve independently of
+    // useful result capacity.
     let mut records = if retain_resolution_data {
-        Vec::with_capacity(total_rrs.min(max_rrs_by_packet))
+        Vec::with_capacity(envelope.ancount.min(max_answer_rrs_by_packet))
     } else {
         Vec::new()
     };
@@ -2028,6 +2033,17 @@ fn walk_dns_name(
     offset: usize,
     depth: usize,
 ) -> Result<(usize, usize), DnsNameWalkError> {
+    walk_dns_name_with_prefix(packet, offset, depth, 0)
+}
+
+/// Walks a possibly compressed suffix with the presentation length already
+/// validated before its first label.
+fn walk_dns_name_with_prefix(
+    packet: &[u8],
+    offset: usize,
+    depth: usize,
+    mut presentation_len: usize,
+) -> Result<(usize, usize), DnsNameWalkError> {
     if depth > MAX_NAME_COMPRESSION_DEPTH {
         return Err(DnsNameWalkError::CompressionDepthExceeded);
     }
@@ -2037,7 +2053,6 @@ fn walk_dns_name(
 
     let mut pos = offset;
     let mut consumed = 0usize;
-    let mut presentation_len = 0usize;
 
     loop {
         let len = *packet
@@ -2053,17 +2068,9 @@ fn walk_dns_name(
                 return Err(DnsNameWalkError::CompressionPointerNotBackward);
             }
             consumed += 2;
-            let (_, suffix_len) = walk_dns_name(packet, pointer, depth + 1)?;
-            if suffix_len != 0 {
-                if presentation_len != 0 {
-                    presentation_len = presentation_len
-                        .checked_add(1)
-                        .ok_or(DnsNameWalkError::NameLengthOverflow)?;
-                }
-                presentation_len = presentation_len
-                    .checked_add(suffix_len)
-                    .ok_or(DnsNameWalkError::NameLengthOverflow)?;
-            }
+            let (_, expanded_len) =
+                walk_dns_name_with_prefix(packet, pointer, depth + 1, presentation_len)?;
+            presentation_len = expanded_len;
             break;
         }
 
@@ -2079,12 +2086,13 @@ fn walk_dns_name(
         let label_len = len as usize;
         let label_start = checked_add_name_offset(pos, 1, packet.len())?;
         let label_end = checked_add_name_offset(label_start, label_len, packet.len())?;
-        if presentation_len != 0 {
-            presentation_len = presentation_len
+        let mut expanded_len = presentation_len;
+        if expanded_len != 0 {
+            expanded_len = expanded_len
                 .checked_add(1)
                 .ok_or(DnsNameWalkError::NameLengthOverflow)?;
         }
-        presentation_len = presentation_len
+        expanded_len = expanded_len
             .checked_add(label_len)
             .ok_or(DnsNameWalkError::NameLengthOverflow)?;
         let label = std::str::from_utf8(&packet[label_start..label_end])
@@ -2092,14 +2100,14 @@ fn walk_dns_name(
         if label.as_bytes().contains(&b'.') {
             return Err(DnsNameWalkError::LiteralDotLabel);
         }
+        // Validate the complete crossing label before applying the bound so
+        // its established UTF-8 and literal-dot diagnostics keep precedence.
+        if expanded_len > DNS_MAX_NAME_PRESENTATION_LEN {
+            return Err(DnsNameWalkError::NameTooLong);
+        }
+        presentation_len = expanded_len;
         consumed += 1 + label_len;
         pos = label_end;
-    }
-
-    // DNS name limits are defined on raw label octets plus separators, not
-    // Unicode scalar or character counts.
-    if presentation_len > DNS_MAX_NAME_PRESENTATION_LEN {
-        return Err(DnsNameWalkError::NameTooLong);
     }
 
     Ok((consumed, presentation_len))
@@ -3706,6 +3714,65 @@ nameserver 192.0.2.9\n",
         let err = decode_name(&packet, invalid_offset, 0)
             .expect_err("254-byte compressed name should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS name exceeded maximum length");
+    }
+
+    #[test]
+    fn repeated_pointer_expansion_enforces_253_byte_boundary() {
+        let mut accepted_labels = [27usize; MAX_NAME_COMPRESSION_DEPTH + 1];
+        accepted_labels[0] = 29;
+        assert_eq!(
+            accepted_labels.iter().sum::<usize>() + MAX_NAME_COMPRESSION_DEPTH,
+            DNS_MAX_NAME_PRESENTATION_LEN
+        );
+        let (accepted_packet, accepted_offset) = compression_label_pointer_chain(&accepted_labels);
+        let (name, consumed) = decode_name(&accepted_packet, accepted_offset, 0)
+            .expect("maximum-depth 253-byte compressed name should decode");
+        assert_eq!(name.len(), DNS_MAX_NAME_PRESENTATION_LEN);
+        assert_eq!(consumed, 30);
+
+        let mut rejected_labels = accepted_labels;
+        rejected_labels[0] += 1;
+        let (rejected_packet, rejected_offset) = compression_label_pointer_chain(&rejected_labels);
+        let err = decode_name(&rejected_packet, rejected_offset, 0)
+            .expect_err("maximum-depth 254-byte compressed name should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS name exceeded maximum length");
+    }
+
+    #[test]
+    fn compressed_overlength_keeps_crossing_label_and_pointer_diagnostics() {
+        const PREFIX_LABELS: [usize; 4] = [63, 63, 63, 60];
+
+        for (case, target, expected) in [
+            (
+                "invalid UTF-8",
+                vec![1, 0xff, 0],
+                "DNS label was not valid UTF-8",
+            ),
+            (
+                "literal dot",
+                vec![1, b'.', 0],
+                "DNS literal label contained a dot",
+            ),
+            (
+                "non-backward suffix pointer",
+                vec![0xc0, 0],
+                "DNS compression pointer did not point backward",
+            ),
+        ] {
+            let (packet, offset) = compressed_name_with_prefix(&target, &PREFIX_LABELS);
+            let err = decode_name(&packet, offset, 0)
+                .expect_err("the compressed name should retain its earlier diagnostic");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{case}");
+            assert_eq!(err.to_string(), expected, "{case}");
+        }
+
+        let (packet, offset) = compressed_name_with_prefix(&[1, b'x', 0], &PREFIX_LABELS);
+        let err = decode_name(&packet, offset, 0)
+            .expect_err("a valid suffix that expands the name to 254 bytes should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS name exceeded maximum length");
     }
 
     #[test]
@@ -4917,6 +4984,42 @@ nameserver 192.0.2.9\n",
             target = pointer_offset;
         }
         (packet, target)
+    }
+
+    fn compression_label_pointer_chain(label_lengths: &[usize]) -> (Vec<u8>, usize) {
+        assert!(!label_lengths.is_empty(), "test name needs one label");
+
+        let mut packet = Vec::new();
+        let mut target = 0usize;
+        for (index, label_len) in label_lengths.iter().copied().enumerate() {
+            assert!(label_len <= 63, "test label should fit the DNS wire field");
+            let label_offset = packet.len();
+            packet.push(label_len as u8);
+            packet.extend(std::iter::repeat_n(b'a' + index as u8, label_len));
+            if index == 0 {
+                packet.push(0);
+            } else {
+                assert!(target < 0x4000, "test compression pointer should fit");
+                packet.extend_from_slice(&(0xC000 | target as u16).to_be_bytes());
+            }
+            target = label_offset;
+        }
+        (packet, target)
+    }
+
+    fn compressed_name_with_prefix(
+        compressed_target: &[u8],
+        prefix_label_lengths: &[usize],
+    ) -> (Vec<u8>, usize) {
+        let mut packet = compressed_target.to_vec();
+        let name_offset = packet.len();
+        for (index, label_len) in prefix_label_lengths.iter().copied().enumerate() {
+            assert!(label_len <= 63, "test label should fit the DNS wire field");
+            packet.push(label_len as u8);
+            packet.extend(std::iter::repeat_n(b'p' + index as u8, label_len));
+        }
+        packet.extend_from_slice(&0xC000u16.to_be_bytes());
+        (packet, name_offset)
     }
 
     #[test]

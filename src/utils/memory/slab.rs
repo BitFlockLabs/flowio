@@ -141,12 +141,15 @@ impl SlabPageChain {
     /// Any live current slab must belong to this chain and must have been
     /// allocated by the same slab allocator used to grow and free the chain.
     #[inline(always)]
-    pub(crate) unsafe fn try_alloc_current(&mut self, obj_size: usize) -> Option<*mut u8> {
+    pub(crate) unsafe fn try_alloc_current<P: super::provider::MemoryProvider>(
+        &mut self,
+        slab_factory: &SlabAllocator<'_, P>,
+    ) -> Option<*mut u8> {
         if self.current.is_null() {
             return None;
         }
 
-        unsafe { (*self.current).try_alloc(obj_size) }
+        unsafe { (*self.current).try_alloc(slab_factory.object_stride) }
     }
 
     /// Requests one new slab page, links it into the chain, and allocates the
@@ -160,16 +163,27 @@ impl SlabPageChain {
     pub(crate) unsafe fn alloc_from_new_slab<P: super::provider::MemoryProvider>(
         &mut self,
         slab_factory: &mut SlabAllocator<'_, P>,
-        obj_size: usize,
     ) -> Option<*mut u8> {
         let slab_ptr = slab_factory.provide_slab()?;
+        let ptr = unsafe { (*slab_ptr).try_alloc(slab_factory.object_stride) };
+        debug_assert!(
+            ptr.is_some(),
+            "fresh slab must contain its checked non-zero first stride"
+        );
+        // SAFETY: construction rejects zero slot counts and computes
+        // `payload_bytes = object_stride * objs_per_slab` without overflow.
+        // `provide_slab` gives this fresh page exactly that payload range, so
+        // its first checked non-zero stride always fits. A provider that does
+        // not supply the promised writable allocation already violates the
+        // unsafe `MemoryProvider` contract.
+        let ptr = unsafe { ptr.unwrap_unchecked() };
         unsafe {
             (*slab_ptr).link.next = self.head as *mut utils::list::intrusive::slist::Link;
         }
         self.head = slab_ptr;
         self.current = slab_ptr;
 
-        unsafe { (*slab_ptr).try_alloc(obj_size) }
+        Some(ptr)
     }
 
     /// Allocates from the current slab page or grows the chain by one page.
@@ -180,9 +194,8 @@ impl SlabPageChain {
     pub(crate) unsafe fn alloc_or_grow<P: super::provider::MemoryProvider>(
         &mut self,
         slab_factory: &mut SlabAllocator<'_, P>,
-        obj_size: usize,
     ) -> Option<SlabPageAlloc> {
-        unsafe { self.alloc_or_grow_inner(slab_factory, obj_size, || false) }
+        unsafe { self.alloc_or_grow_inner(slab_factory, || false) }
     }
 
     /// Debug-only allocation variant that can reject a required page growth
@@ -201,20 +214,18 @@ impl SlabPageChain {
     >(
         &mut self,
         slab_factory: &mut SlabAllocator<'_, P>,
-        obj_size: usize,
         reject_growth: F,
     ) -> Option<SlabPageAlloc> {
-        unsafe { self.alloc_or_grow_inner(slab_factory, obj_size, reject_growth) }
+        unsafe { self.alloc_or_grow_inner(slab_factory, reject_growth) }
     }
 
     #[inline(always)]
     unsafe fn alloc_or_grow_inner<P: super::provider::MemoryProvider, F: FnOnce() -> bool>(
         &mut self,
         slab_factory: &mut SlabAllocator<'_, P>,
-        obj_size: usize,
         reject_growth: F,
     ) -> Option<SlabPageAlloc> {
-        if let Some(ptr) = unsafe { self.try_alloc_current(obj_size) } {
+        if let Some(ptr) = unsafe { self.try_alloc_current(slab_factory) } {
             return Some(SlabPageAlloc {
                 ptr,
                 #[cfg(any(debug_assertions, test, feature = "test-support"))]
@@ -226,7 +237,7 @@ impl SlabPageChain {
             return None;
         }
 
-        let ptr = unsafe { self.alloc_from_new_slab(slab_factory, obj_size) }?;
+        let ptr = unsafe { self.alloc_from_new_slab(slab_factory) }?;
         Some(SlabPageAlloc {
             ptr,
             #[cfg(any(debug_assertions, test, feature = "test-support"))]
@@ -274,6 +285,8 @@ pub struct SlabAllocator<'a, P: super::provider::MemoryProvider> {
     header_padded_size: usize,
     /// Usable payload bytes reserved for configured object slots.
     payload_bytes: usize,
+    /// Checked non-zero spacing used for every object slot.
+    object_stride: usize,
     /// Alignment required for the slab allocation as a whole.
     slab_align: usize,
     /// Whether the provider has accepted this allocator's alignment contract.
@@ -327,26 +340,33 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
             return Err(SlabAllocatorConfigError::ObjsPerSlabZero);
         }
 
-        let provider_align = unsafe { provider.as_ref() }.alignment_guarantee();
-
-        // The slab page must satisfy the provider's base guarantee, the slab
-        // header alignment, and the requested object alignment.
-        let slab_align = std::cmp::max(std::cmp::max(provider_align, SLAB_ALIGN), obj_align);
-
         if !obj_align.is_power_of_two() {
             return Err(SlabAllocatorConfigError::InvalidObjectAlign);
         }
 
+        let provider_align = unsafe { provider.as_ref() }.alignment_guarantee();
+        let object_align = std::cmp::max(obj_align, SLAB_LINK_ALIGN);
+
+        // The slab page must satisfy the provider's base guarantee, the slab
+        // header alignment, and both live-object and inactive-link alignment.
+        let slab_align = std::cmp::max(std::cmp::max(provider_align, SLAB_ALIGN), object_align);
+
         // The slab page itself starts at `slab_align`, so the header only
-        // needs to be rounded up to the object alignment before payload slots
-        // begin.
+        // needs to be rounded up to the effective object/link alignment before
+        // payload slots begin.
         let header_padded_size =
-            crate::utils::size_up(SLAB_HDR_SIZE, obj_align).map_err(|err| match err {
+            crate::utils::size_up(SLAB_HDR_SIZE, object_align).map_err(|err| match err {
                 utils::SizeUpError::InvalidAlign => SlabAllocatorConfigError::InvalidObjectAlign,
                 utils::SizeUpError::SizeOverflow => SlabAllocatorConfigError::SizeOverflow,
             })?;
 
-        let payload_bytes = obj_size
+        let object_min = std::cmp::max(obj_size, SLAB_LINK_SIZE);
+        let object_stride =
+            crate::utils::size_up(object_min, object_align).map_err(|err| match err {
+                utils::SizeUpError::InvalidAlign => SlabAllocatorConfigError::InvalidObjectAlign,
+                utils::SizeUpError::SizeOverflow => SlabAllocatorConfigError::SizeOverflow,
+            })?;
+        let payload_bytes = object_stride
             .checked_mul(objs_per_slab)
             .ok_or(SlabAllocatorConfigError::SizeOverflow)?;
         let min_required = header_padded_size
@@ -364,6 +384,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
             total_slab_size,
             header_padded_size,
             payload_bytes,
+            object_stride,
             slab_align,
             initialized: false,
         })
@@ -430,6 +451,12 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn get_slab_alignment(&self) -> usize {
         self.slab_align
+    }
+
+    /// Returns the authoritative checked slot spacing for crate-unit tests.
+    #[cfg(test)]
+    pub(crate) fn object_stride(&self) -> usize {
+        self.object_stride
     }
 
     #[cfg(test)]
@@ -557,25 +584,26 @@ mod tests {
 
         let first = unsafe {
             chain
-                .alloc_or_grow(&mut allocator, 16)
+                .alloc_or_grow(&mut allocator)
                 .expect("first slot should allocate")
         };
         assert!(first.new_slab);
         let second = unsafe {
             chain
-                .alloc_or_grow(&mut allocator, 16)
+                .alloc_or_grow(&mut allocator)
                 .expect("second slot should allocate")
         };
         assert!(!second.new_slab);
         let third = unsafe {
             chain
-                .alloc_or_grow(&mut allocator, 16)
+                .alloc_or_grow(&mut allocator)
                 .expect("third slot should allocate from a new slab")
         };
         assert!(third.new_slab);
 
         assert_ne!(first.ptr, second.ptr);
         assert_ne!(first.ptr, third.ptr);
+        assert_eq!(second.ptr as usize - first.ptr as usize, 16);
         assert_eq!(stats.requests.get(), 2);
 
         unsafe { chain.free_all(&mut allocator) };
@@ -583,5 +611,56 @@ mod tests {
 
         unsafe { chain.free_all(&mut allocator) };
         assert_eq!(stats.frees.get(), 2, "free_all must leave the chain empty");
+    }
+
+    #[test]
+    fn slab_allocator_zero_size_uses_aligned_link_stride_for_second_slot() {
+        let stats = Rc::new(CountingStats::default());
+        let mut provider = CountingProvider::new(Rc::clone(&stats));
+        let mut allocator = SlabAllocator::new_uninit(&mut provider, 0, 1, 2)
+            .expect("zero-size object geometry should use the free-link stride");
+        assert_eq!(allocator.object_stride, SLAB_LINK_SIZE);
+        allocator.init();
+
+        let mut chain = SlabPageChain::new();
+        let first = unsafe {
+            chain
+                .alloc_or_grow(&mut allocator)
+                .expect("first zero-size slot should allocate")
+        };
+        let second = unsafe {
+            chain
+                .alloc_or_grow(&mut allocator)
+                .expect("second zero-size slot should allocate")
+        };
+
+        assert!(first.new_slab);
+        assert!(!second.new_slab);
+        assert_eq!(first.ptr as usize % SLAB_LINK_ALIGN, 0);
+        assert_eq!(second.ptr as usize % SLAB_LINK_ALIGN, 0);
+        assert_eq!(second.ptr as usize - first.ptr as usize, SLAB_LINK_SIZE);
+
+        unsafe { chain.free_all(&mut allocator) };
+        assert_eq!(stats.requests.get(), 1);
+        assert_eq!(stats.frees.get(), 1);
+    }
+
+    #[test]
+    fn slab_allocator_rejects_stride_and_payload_overflow() {
+        let stats = Rc::new(CountingStats::default());
+        let mut provider = CountingProvider::new(stats);
+
+        assert_eq!(
+            SlabAllocator::new_uninit(&mut provider, usize::MAX, 8, 1)
+                .err()
+                .expect("stride rounding must overflow"),
+            SlabAllocatorConfigError::SizeOverflow
+        );
+        assert_eq!(
+            SlabAllocator::new_uninit(&mut provider, 16, 8, usize::MAX)
+                .err()
+                .expect("payload multiplication must overflow"),
+            SlabAllocatorConfigError::SizeOverflow
+        );
     }
 }

@@ -50,6 +50,21 @@ pub(crate) const RETAINED_IOVEC_OVERSIZE_MESSAGE: &str =
     "active iovec count exceeds retained scratch capacity";
 
 const _: () = {
+    assert!(RETAINED_BLOCK_ALIGN.is_power_of_two());
+    let mut class_index = 0;
+    while class_index < RETAINED_SIZE_CLASSES.len() {
+        assert!(RETAINED_SIZE_CLASSES[class_index] >= std::mem::size_of::<Link>());
+        assert!(RETAINED_SIZE_CLASSES[class_index].is_multiple_of(RETAINED_BLOCK_ALIGN));
+        class_index += 1;
+    }
+    let mut iovec_class_index = 0;
+    while iovec_class_index < RETAINED_IOVEC_SIZE_CLASSES.len() {
+        let block_size =
+            RETAINED_IOVEC_SIZE_CLASSES[iovec_class_index] * std::mem::size_of::<libc::iovec>();
+        assert!(block_size >= std::mem::size_of::<Link>());
+        assert!(block_size.is_multiple_of(RETAINED_BLOCK_ALIGN));
+        iovec_class_index += 1;
+    }
     assert!(RETAINED_IOVEC_INLINE_COUNT < RETAINED_IOVEC_SIZE_CLASSES[0]);
     assert!(RETAINED_IOVEC_SIZE_CLASSES[0] < RETAINED_IOVEC_SIZE_CLASSES[1]);
     assert!(RETAINED_IOVEC_SIZE_CLASSES[1] < RETAINED_IOVEC_SIZE_CLASSES[2]);
@@ -1118,8 +1133,6 @@ impl<T: 'static> RetainedPayload<T> {
 }
 
 struct RetainedSizeClass {
-    /// Usable bytes in each block belonging to this class.
-    block_size: usize,
     /// Returned blocks ready for reuse.
     free_list: SList<u8>,
     /// Move-safe chain of slab pages owned by this class.
@@ -1151,7 +1164,6 @@ impl RetainedSizeClass {
         slab_factory.init();
 
         Ok(Self {
-            block_size,
             free_list: SList::new(),
             slab_pages: SlabPageChain::new(),
             slab_factory,
@@ -1175,10 +1187,7 @@ impl RetainedSizeClass {
             });
         }
 
-        let result = unsafe {
-            self.slab_pages
-                .alloc_or_grow(&mut self.slab_factory, self.block_size)
-        }?;
+        let result = unsafe { self.slab_pages.alloc_or_grow(&mut self.slab_factory) }?;
 
         Some(ClassAllocResult {
             ptr: result.ptr,

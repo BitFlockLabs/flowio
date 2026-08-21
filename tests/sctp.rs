@@ -51,6 +51,11 @@ use std::time::Duration;
 const SCTP_SHUTDOWN_FALLBACK_CHILD_ENV: &str = "FLOWIO_SCTP_SHUTDOWN_FALLBACK_CHILD";
 const SCTP_SHUTDOWN_FALLBACK_TEST: &str =
     "runtime_sctp_shutdown_fallback_abandons_unretired_readiness_state_with_watchdog";
+#[cfg(any(debug_assertions, feature = "test-support"))]
+const SCTP_ABANDONED_STASH_CHILD_ENV: &str = "FLOWIO_SCTP_ABANDONED_STASH_CHILD";
+#[cfg(any(debug_assertions, feature = "test-support"))]
+const SCTP_ABANDONED_STASH_TEST: &str =
+    "runtime_sctp_abandoned_stash_remains_terminal_through_stream_drop_with_watchdog";
 const SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD_ENV: &str = "FLOWIO_SCTP_EXTERNAL_ADOPTION_CLOSE_CHILD";
 const SCTP_EXTERNAL_ADOPTION_CLOSE_TEST: &str =
     "runtime_sctp_external_adoption_classifies_then_uses_ring_close";
@@ -1113,6 +1118,105 @@ fn runtime_sctp_shutdown_fallback_abandons_unretired_readiness_state_with_watchd
         "ring-abandoned SCTP readiness owner was released without its target CQE: {}",
         std::io::Error::last_os_error()
     );
+    drop(client);
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_sctp_abandoned_stash_remains_terminal_through_stream_drop_with_watchdog() {
+    if std::env::var_os(SCTP_ABANDONED_STASH_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            SCTP_ABANDONED_STASH_TEST,
+            SCTP_ABANDONED_STASH_CHILD_ENV,
+            Duration::from_secs(15),
+        );
+        return;
+    }
+
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(listener) = bind_sctp_listener_or_skip(SCTP_ABANDONED_STASH_TEST, config) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(config);
+    let stream_slot = Rc::new(RefCell::new(None));
+    let client_slot = Rc::new(RefCell::new(None));
+    let stream_output = Rc::clone(&stream_slot);
+    let client_output = Rc::clone(&client_slot);
+    let stashed_pointer_calls = Rc::new(Cell::new(0));
+    let stashed_drops = Rc::new(Cell::new(0));
+    let staged_pointer_calls = Rc::clone(&stashed_pointer_calls);
+    let staged_drops = Rc::clone(&stashed_drops);
+    let mut executor = Executor::new().expect("failed to construct SCTP stash executor");
+
+    let err = executor
+        .run(async move {
+            let (client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            let buffer = PointerTrackedReadWrite::new(32, 1, &staged_pointer_calls, &staged_drops);
+            let mut recv = Box::pin(server.recv_msg(buffer, 16));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    recv.as_mut().poll(cx).is_pending(),
+                    "staged SCTP metadata receive completed before teardown"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            drop(recv);
+            assert_eq!(staged_pointer_calls.get(), 1);
+            assert_eq!(staged_drops.get(), 0);
+            *stream_output.borrow_mut() = Some(server);
+            *client_output.borrow_mut() = Some(client);
+            test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            std::future::pending::<()>().await;
+        })
+        .expect_err("injected wait failure should stop the SCTP stash executor");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+    let mut server = stream_slot
+        .borrow_mut()
+        .take()
+        .expect("stashed SCTP stream did not escape the failed run");
+    let client = client_slot
+        .borrow_mut()
+        .take()
+        .expect("SCTP stash peer did not escape the failed run");
+    test_hooks::force_next_reactor_shutdown_fallback();
+    drop(executor);
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "forced SCTP stash shutdown fallback was not consumed"
+    );
+    assert_eq!(stashed_drops.get(), 0);
+
+    let returned_pointer_calls = Rc::new(Cell::new(0));
+    let returned_drops = Rc::new(Cell::new(0));
+    let mut cx = Context::from_waker(Waker::noop());
+    for attempt in 1..=2 {
+        let buffer =
+            PointerTrackedReadWrite::new(16, attempt + 1, &returned_pointer_calls, &returned_drops);
+        let original_ptr = buffer.bytes.as_ptr();
+        let mut recv = Box::pin(server.recv_msg(buffer, 16));
+        let Poll::Ready((Err(err), returned)) = recv.as_mut().poll(&mut cx) else {
+            panic!("post-abandonment rich receive attempt {attempt} remained pending");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+        assert_eq!(returned.identity, attempt + 1);
+        assert_eq!(returned.bytes.as_ptr(), original_ptr);
+        assert_eq!(
+            returned_pointer_calls.get(),
+            0,
+            "terminal stash recovery exposed a new caller buffer"
+        );
+        assert_eq!(returned_drops.get(), attempt - 1);
+        drop(recv);
+        drop(returned);
+        assert_eq!(returned_drops.get(), attempt);
+    }
+
+    drop(server);
+    assert_eq!(stashed_drops.get(), 0);
     drop(client);
 }
 
@@ -3331,6 +3435,150 @@ fn runtime_sctp_recv_msg_resynchronizes_after_oversized_record() {
                     panic!("expected clean EOF data shape, got {notification:?}");
                 }
             }
+        })
+        .expect("executor run failed");
+}
+
+#[test]
+fn runtime_sctp_fragmented_notification_tail_recovers_only_at_eor() {
+    const TEST_NAME: &str = "runtime_sctp_fragmented_notification_tail_recovers_only_at_eor";
+    let init = SctpInitConfig::diameter_default();
+    let mut socket_config = SctpSocketConfig::data(init);
+    socket_config.recv_rcvinfo = true;
+    socket_config.notifications.stream_reset = true;
+
+    let Some(listener) = bind_sctp_listener_or_skip(TEST_NAME, socket_config) else {
+        return;
+    };
+    let addr = listener.local_addr();
+    let connector = SctpConnector::with_config(socket_config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+
+    executor
+        .run(async move {
+            let (mut client, mut server) = accepted_sctp_pair(listener, connector, addr).await;
+            let client_reconfig = match client.reconfig_supported() {
+                Ok(reconfig) => reconfig,
+                Err(err) if capability_unavailable(&err) => {
+                    eprintln!("skipping {TEST_NAME}: SCTP reconfiguration unavailable ({err})");
+                    return;
+                }
+                Err(err) => panic!("failed to query SCTP reconfiguration for {TEST_NAME}: {err}"),
+            };
+            if let Err(err) = client.enable_stream_reset(SctpReconfigFlags {
+                assoc_id: client_reconfig.assoc_id,
+                flags: SctpReconfigFlags::RESET_STREAMS,
+            }) {
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EOPNOTSUPP)
+                        | Some(libc::ENOPROTOOPT)
+                        | Some(libc::EINVAL)
+                        | Some(libc::EPERM)
+                        | Some(libc::EACCES)
+                ) {
+                    eprintln!("skipping {TEST_NAME}: SCTP stream reset unavailable ({err})");
+                    return;
+                }
+                panic!("failed to enable SCTP stream reset for {TEST_NAME}: {err}");
+            }
+
+            let server_reconfig = match server.reconfig_supported() {
+                Ok(reconfig) => reconfig,
+                Err(err) if capability_unavailable(&err) => {
+                    eprintln!(
+                        "skipping {TEST_NAME}: peer SCTP reconfiguration unavailable ({err})"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    panic!("failed to query peer SCTP reconfiguration for {TEST_NAME}: {err}")
+                }
+            };
+            if let Err(err) = server.enable_stream_reset(SctpReconfigFlags {
+                assoc_id: server_reconfig.assoc_id,
+                flags: SctpReconfigFlags::RESET_STREAMS,
+            }) {
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EOPNOTSUPP)
+                        | Some(libc::ENOPROTOOPT)
+                        | Some(libc::EINVAL)
+                        | Some(libc::EPERM)
+                        | Some(libc::EACCES)
+                ) {
+                    eprintln!("skipping {TEST_NAME}: peer SCTP stream reset unavailable ({err})");
+                    return;
+                }
+                panic!("failed to enable peer SCTP stream reset for {TEST_NAME}: {err}");
+            }
+
+            let streams = (0_u16..16).collect::<Vec<_>>();
+            if let Err(err) = client.reset_streams(&SctpResetStreams::outgoing(&streams)) {
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EOPNOTSUPP)
+                        | Some(libc::ENOPROTOOPT)
+                        | Some(libc::EINVAL)
+                        | Some(libc::EPERM)
+                        | Some(libc::EACCES)
+                ) {
+                    eprintln!("skipping {TEST_NAME}: SCTP reset request unavailable ({err})");
+                    return;
+                }
+                panic!("failed to request SCTP stream reset for {TEST_NAME}: {err}");
+            }
+
+            let first = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 8], 8))
+                .await
+                .expect("fragmented stream-reset head timed out");
+            let (first_result, first_buffer) = first;
+            let err = first_result.expect_err("fragmented notification head parsed completely");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                err.to_string(),
+                "SCTP recvmsg payload was partial before end-of-record"
+            );
+            assert_eq!(
+                u16::from_ne_bytes([first_buffer[0], first_buffer[1]]),
+                test_stream_reset_event_type() as u16
+            );
+            assert_eq!(
+                u32::from_ne_bytes(first_buffer[4..8].try_into().expect("header length slice")),
+                44
+            );
+
+            let lean = timeout(Duration::from_millis(100), server.recv(vec![0u8; 8], 8))
+                .await
+                .expect("lean receive behind notification tail did not return locally");
+            let err = lean
+                .0
+                .expect_err("lean receive bypassed notification-tail recovery");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+            let (send_result, _payload) = client
+                .send_msg(b"after".to_vec(), test_send_info(0, 0x0102_0304))
+                .await;
+            assert_eq!(send_result.expect("post-reset send failed"), 5);
+
+            let recovered = timeout(Duration::from_secs(1), server.recv_msg(vec![0u8; 64], 64))
+                .await
+                .expect("notification-tail recovery timed out");
+            let (recovered_result, recovered_buffer) = recovered;
+            let (received, meta) = recovered_result.expect("post-notification receive failed");
+            assert_eq!(received, 5);
+            assert_eq!(&recovered_buffer[..received], b"after");
+            match meta {
+                SctpRecvMeta::Data(info) => {
+                    assert_eq!(info.stream_id, 0);
+                    assert_eq!(info.ppid, 0x0102_0304);
+                    assert!(info.end_of_record);
+                }
+                SctpRecvMeta::Notification(notification) => {
+                    panic!("expected post-recovery data, got {notification:?}");
+                }
+            }
+            eprintln!("{TEST_NAME}: exercised=1 declared_len=44 capacity=8 recovered=1");
         })
         .expect("executor run failed");
 }

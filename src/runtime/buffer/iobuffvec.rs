@@ -91,12 +91,19 @@ pub(crate) fn invalid_read_iovec_shape() -> io::Error {
 /// # Example
 /// ```
 /// use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
-/// use flowio::runtime::buffer::{IoBuffMut, IoBuffReadWrite};
+/// use flowio::runtime::buffer::{IoBuffError, IoBuffMut, IoBuffReadWrite};
+/// use std::error::Error;
 ///
 /// let mut chain = IoBuffVecMut::<1>::new();
 /// chain.push(IoBuffMut::new(0, 8, 0).unwrap()).unwrap();
 ///
 /// let err = chain.push(IoBuffMut::new(0, 8, 0).unwrap()).unwrap_err();
+/// assert_eq!(err.to_string(), "vectored buffer chain is at capacity");
+/// assert_eq!(
+///     err.source()
+///         .and_then(|source| source.downcast_ref::<IoBuffError>()),
+///     Some(&IoBuffError::ChainFull)
+/// );
 /// let recovered = err.into_value();
 /// assert_eq!(recovered.writable_len(), 8);
 /// ```
@@ -151,6 +158,18 @@ impl<T> std::fmt::Debug for PushError<T> {
             .field("error", &self.error)
             .field("value", &"<returned>")
             .finish()
+    }
+}
+
+impl<T> std::fmt::Display for PushError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl<T> std::error::Error for PushError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
