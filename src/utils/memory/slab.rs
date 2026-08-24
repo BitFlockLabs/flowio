@@ -159,7 +159,8 @@ impl SlabPageChain {
     /// `slab_factory` must be the allocator that owns all pages in this chain.
     /// The returned slot must not outlive the chain or be used after
     /// [`Self::free_all`] returns the pages to the provider.
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     pub(crate) unsafe fn alloc_from_new_slab<P: super::provider::MemoryProvider>(
         &mut self,
         slab_factory: &mut SlabAllocator<'_, P>,
