@@ -705,6 +705,12 @@ struct ExecutorState {
     shutting_down: bool,
     /// Set only after tasks, timers, reactor, and close worker all shut down.
     shutdown_complete: bool,
+    /// Intrusive link used while an active iterative task-destruction drain
+    /// defers this state's remaining shutdown phases.
+    deferred_shutdown_next: *mut ExecutorState,
+    /// Temporary self-pin keeping this state alive until deferred teardown has
+    /// shut down the runtime and joined the existing close worker.
+    deferred_shutdown_owner: Option<Rc<ExecutorOwner>>,
 }
 
 /// Cancels timers after task shutdown.
@@ -895,6 +901,8 @@ fn ringless_owner_for_test(max_live_ops: usize) -> Rc<ExecutorOwner> {
             initialized: false,
             shutting_down: false,
             shutdown_complete: false,
+            deferred_shutdown_next: std::ptr::null_mut(),
+            deferred_shutdown_owner: None,
         }),
         #[cfg(debug_assertions)]
         owner_thread: std::thread::current().id(),
@@ -1758,8 +1766,13 @@ unsafe fn drop_join_task_with_cleanup<F: Future, C: TaskDestroyCleanup + ?Sized>
 /// the allocator-limited live task slots that nested destruction releases.
 /// Null head/tail terminates an empty drain. Shutdown and cancellation reach
 /// this queue only through the same unique final-reference path, and the outer
-/// drain keeps the first panic while clearing its TLS registration. No metric
-/// is emitted.
+/// drain keeps the first panic while clearing its TLS registration. Reentrant
+/// executor shutdown also uses one embedded node per distinct live executor:
+/// task cancellation runs immediately, but timer/reactor teardown and the
+/// existing terminal-descriptor worker join wait until callback-capable task
+/// destruction has drained under each task's exact owner context. A temporary
+/// self-pin keeps each deferred state alive; it adds no allocation, queue
+/// storage, thread, or worker responsibility. No metric is emitted.
 ///
 /// `ready_link` is the queue node and is detached from `all_tasks` before
 /// publication. A singleton node has null link fields even while head/tail own
@@ -1771,14 +1784,89 @@ unsafe fn drop_join_task_with_cleanup<F: Future, C: TaskDestroyCleanup + ?Sized>
 struct IterativeTaskDestroyQueue {
     head: *mut crate::utils::list::intrusive::dlist::Link,
     tail: *mut crate::utils::list::intrusive::dlist::Link,
+    /// Exact owner for callback-capable destruction currently in progress.
+    callback_owner: *const ExecutorOwner,
+    /// Thread context restored after all deferred teardown has completed.
+    initial_active_owner: *const ExecutorOwner,
+    /// Executor states awaiting timer and reactor shutdown.
+    deferred_runtime_head: *mut ExecutorState,
+    /// Executor states whose runtime is down and whose existing close worker
+    /// must be joined after every callback-capable destruction has drained.
+    deferred_worker_head: *mut ExecutorState,
 }
 
 impl IterativeTaskDestroyQueue {
-    const fn new() -> Self {
+    const fn new(initial_active_owner: *const ExecutorOwner) -> Self {
         Self {
             head: std::ptr::null_mut(),
             tail: std::ptr::null_mut(),
+            callback_owner: std::ptr::null(),
+            initial_active_owner,
+            deferred_runtime_head: std::ptr::null_mut(),
+            deferred_worker_head: std::ptr::null_mut(),
         }
+    }
+
+    #[inline(always)]
+    fn has_deferred_shutdown(&self) -> bool {
+        !self.deferred_runtime_head.is_null() || !self.deferred_worker_head.is_null()
+    }
+
+    /// Records the exact owner whose callback-capable destruction is running.
+    /// Once any shutdown is deferred, it also publishes that owner as the
+    /// active teardown context without disturbing completion-drain state.
+    unsafe fn set_callback_owner(&mut self, owner: *const ExecutorOwner) {
+        debug_assert!(!owner.is_null());
+        self.callback_owner = owner;
+        if self.has_deferred_shutdown() {
+            set_active_owner_for_iterative_destroy(owner);
+        }
+    }
+
+    /// Registers one executor exactly once for deferred shutdown. The state is
+    /// its own bounded intrusive node; the temporary `Rc` is only a lifetime
+    /// pin and allocates no additional storage.
+    unsafe fn defer_shutdown(&mut self, owner: &Rc<ExecutorOwner>) {
+        let state = owner.state_ptr();
+        debug_assert!(unsafe { (*state).deferred_shutdown_owner.is_none() });
+        debug_assert!(unsafe { (*state).deferred_shutdown_next.is_null() });
+        unsafe {
+            (*state).deferred_shutdown_owner = Some(Rc::clone(owner));
+            (*state).deferred_shutdown_next = self.deferred_runtime_head;
+        }
+        self.deferred_runtime_head = state;
+    }
+
+    unsafe fn pop_deferred_runtime(&mut self) -> Option<*mut ExecutorState> {
+        let state = self.deferred_runtime_head;
+        if state.is_null() {
+            return None;
+        }
+        self.deferred_runtime_head = unsafe { (*state).deferred_shutdown_next };
+        unsafe {
+            (*state).deferred_shutdown_next = std::ptr::null_mut();
+        }
+        Some(state)
+    }
+
+    unsafe fn push_deferred_worker(&mut self, state: *mut ExecutorState) {
+        debug_assert!(unsafe { (*state).deferred_shutdown_next.is_null() });
+        unsafe {
+            (*state).deferred_shutdown_next = self.deferred_worker_head;
+        }
+        self.deferred_worker_head = state;
+    }
+
+    unsafe fn pop_deferred_worker(&mut self) -> Option<*mut ExecutorState> {
+        let state = self.deferred_worker_head;
+        if state.is_null() {
+            return None;
+        }
+        self.deferred_worker_head = unsafe { (*state).deferred_shutdown_next };
+        unsafe {
+            (*state).deferred_shutdown_next = std::ptr::null_mut();
+        }
+        Some(state)
     }
 
     unsafe fn push_back(&mut self, task: *mut TaskHeader) {
@@ -1830,12 +1918,28 @@ thread_local! {
 
 struct IterativeTaskDestroyRegistration<'cell> {
     active: &'cell Cell<*mut IterativeTaskDestroyQueue>,
+    initial_active_owner: *const ExecutorOwner,
 }
 
 impl Drop for IterativeTaskDestroyRegistration<'_> {
     fn drop(&mut self) {
         self.active.set(std::ptr::null_mut());
+        set_active_owner_for_iterative_destroy(self.initial_active_owner);
     }
+}
+
+/// Replaces only the active executor identity while retaining any nested
+/// completion-drain state. The iterative-destruction registration restores the
+/// original identity on every exit path.
+#[inline(always)]
+fn set_active_owner_for_iterative_destroy(owner: *const ExecutorOwner) {
+    EXECUTOR_CTX.with(|context| {
+        let current = context.get();
+        context.set(ExecutorThreadContext {
+            active_owner: owner,
+            ..current
+        });
+    });
 }
 
 /// Detaches one nested RAW task from registry ownership and appends it to the
@@ -1888,13 +1992,21 @@ unsafe fn destroy_task_iteratively(task: *mut TaskHeader, raw_vtable: &'static T
             return;
         }
 
-        let mut queue = IterativeTaskDestroyQueue::new();
+        let initial_active_owner = EXECUTOR_CTX.with(|context| context.get().active_owner);
+        let mut queue = IterativeTaskDestroyQueue::new(initial_active_owner);
         let queue_ptr = std::ptr::from_mut(&mut queue);
         active.set(queue_ptr);
-        let registration = IterativeTaskDestroyRegistration { active };
+        let registration = IterativeTaskDestroyRegistration {
+            active,
+            initial_active_owner: unsafe { (*queue_ptr).initial_active_owner },
+        };
 
         let already_panicking = std::thread::panicking();
         let mut first_panic = None;
+        let owner = unsafe { (*task).owner.as_ref().unwrap_unchecked() };
+        unsafe {
+            (*queue_ptr).set_callback_owner(Rc::as_ptr(owner));
+        }
         let raw_destroy = unsafe { (*task).vtable.destroy };
         let result = catch_unwind(AssertUnwindSafe(|| unsafe {
             raw_destroy(task);
@@ -1907,10 +2019,39 @@ unsafe fn destroy_task_iteratively(task: *mut TaskHeader, raw_vtable: &'static T
             retain_first_panic(&mut first_panic, result);
         }
 
-        while let Some(next) = unsafe { (*queue_ptr).pop_front() } {
-            let raw_destroy = unsafe { (*next).vtable.destroy };
-            let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                raw_destroy(next);
+        loop {
+            while let Some(next) = unsafe { (*queue_ptr).pop_front() } {
+                let owner = unsafe { (*next).owner.as_ref().unwrap_unchecked() };
+                unsafe {
+                    (*queue_ptr).set_callback_owner(Rc::as_ptr(owner));
+                }
+                let raw_destroy = unsafe { (*next).vtable.destroy };
+                let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                    raw_destroy(next);
+                }));
+                if already_panicking {
+                    if let Err(payload) = result {
+                        std::mem::forget(payload);
+                    }
+                } else {
+                    retain_first_panic(&mut first_panic, result);
+                }
+            }
+
+            let Some(state) = (unsafe { (*queue_ptr).pop_deferred_runtime() }) else {
+                break;
+            };
+            // Keep the state visibly deferred while timer/reactor cleanup can
+            // itself release tasks or request another executor shutdown.
+            unsafe {
+                (*queue_ptr).push_deferred_worker(state);
+            }
+            let owner = unsafe { (*state).deferred_shutdown_owner.as_ref().unwrap_unchecked() };
+            unsafe {
+                (*queue_ptr).set_callback_owner(Rc::as_ptr(owner));
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _runtime_shutdown_guard = RuntimeShutdownGuard::new(state);
             }));
             if already_panicking {
                 if let Err(payload) = result {
@@ -1919,6 +2060,22 @@ unsafe fn destroy_task_iteratively(task: *mut TaskHeader, raw_vtable: &'static T
             } else {
                 retain_first_panic(&mut first_panic, result);
             }
+        }
+
+        while let Some(state) = unsafe { (*queue_ptr).pop_deferred_worker() } {
+            let owner_ptr =
+                unsafe { Rc::as_ptr((*state).deferred_shutdown_owner.as_ref().unwrap_unchecked()) };
+            unsafe {
+                (*queue_ptr).set_callback_owner(owner_ptr);
+                set_active_owner_for_iterative_destroy(owner_ptr);
+                (*state).close_worker.shutdown();
+                (*state).shutdown_complete = true;
+            }
+            // Taking the self-pin leaves a local strong reference, so state
+            // remains alive through the last mutation and worker join. Do not
+            // access `state` after this owner is dropped.
+            let owner = unsafe { (*state).deferred_shutdown_owner.take() };
+            drop(owner);
         }
         drop(registration);
 
@@ -2283,6 +2440,8 @@ impl Executor {
                 initialized: false,
                 shutting_down: false,
                 shutdown_complete: false,
+                deferred_shutdown_next: std::ptr::null_mut(),
+                deferred_shutdown_owner: None,
             }),
             // The owner is constructed on the executor's owner thread.
             #[cfg(debug_assertions)]
@@ -2869,21 +3028,47 @@ impl Executor {
 
     fn shutdown_owner(&mut self) {
         let state_ptr = self.owner.state_ptr();
-        if unsafe { !(*state_ptr).initialized || (*state_ptr).shutdown_complete } {
+        if unsafe {
+            !(*state_ptr).initialized
+                || (*state_ptr).shutdown_complete
+                || (*state_ptr).deferred_shutdown_owner.is_some()
+        } {
             return;
         }
 
         let owner_ptr = Rc::as_ptr(&self.owner);
         let mut first_panic = None;
-        let teardown_result = catch_unwind(AssertUnwindSafe(|| {
-            let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
-            let _shutdown_complete_guard = ShutdownCompleteGuard::new(state_ptr);
-            let _close_worker_guard = CloseWorkerShutdownGuard::new(unsafe {
-                std::ptr::addr_of_mut!((*state_ptr).close_worker)
-            });
-            let _runtime_shutdown_guard = RuntimeShutdownGuard::new(state_ptr);
-            first_panic = self.shutdown_tasks();
-        }));
+        let destroy_queue = ITERATIVE_TASK_DESTROY_QUEUE.with(Cell::get);
+        let teardown_result = if destroy_queue.is_null() {
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
+                let _shutdown_complete_guard = ShutdownCompleteGuard::new(state_ptr);
+                let _close_worker_guard = CloseWorkerShutdownGuard::new(unsafe {
+                    std::ptr::addr_of_mut!((*state_ptr).close_worker)
+                });
+                let _runtime_shutdown_guard = RuntimeShutdownGuard::new(state_ptr);
+                first_panic = self.shutdown_tasks();
+            }))
+        } else {
+            let previous_callback_owner = unsafe { (*destroy_queue).callback_owner };
+            debug_assert!(!previous_callback_owner.is_null());
+            // Register before cancellation so any shutdown re-entry observes
+            // the in-progress state and cannot run a teardown phase twice.
+            unsafe {
+                (*destroy_queue).defer_shutdown(&self.owner);
+                (*destroy_queue).set_callback_owner(owner_ptr);
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ctx_guard = ExecutorCtxGuard::install_for_shutdown(owner_ptr);
+                first_panic = self.shutdown_tasks();
+            }));
+            // Cancellation callbacks belong to the shutdown target; execution
+            // now returns to the task destructor that invoked shutdown.
+            unsafe {
+                (*destroy_queue).set_callback_owner(previous_callback_owner);
+            }
+            result
+        };
         retain_first_panic(&mut first_panic, teardown_result);
 
         if let Some(payload) = first_panic {
@@ -4177,16 +4362,50 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct DeferredShutdownDropExpectation {
+        owner: *const ExecutorOwner,
+        state: *mut ExecutorState,
+    }
+
+    fn assert_deferred_shutdown_drop_context(expected: DeferredShutdownDropExpectation) {
+        EXECUTOR_CTX.with(|context| {
+            assert_eq!(context.get().active_owner, expected.owner);
+        });
+        unsafe {
+            assert!((*expected.state).shutting_down);
+            assert!(!(*expected.state).shutdown_complete);
+            assert_eq!(
+                (*expected.state)
+                    .deferred_shutdown_owner
+                    .as_ref()
+                    .map(Rc::as_ptr),
+                Some(expected.owner),
+            );
+        }
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
+            let queue = active.get();
+            assert!(!queue.is_null(), "deferred shutdown lost its destroy FIFO");
+            unsafe {
+                assert_eq!((*queue).callback_owner, expected.owner);
+                assert!((*queue).has_deferred_shutdown());
+            }
+        });
+    }
+
     struct DestroyLinkDropProbe {
         task: Rc<Cell<*mut TaskHeader>>,
-        drops: Rc<Cell<usize>>,
         id: usize,
         order: Rc<RefCell<Vec<usize>>>,
         remaining_task: Rc<Cell<*mut TaskHeader>>,
+        shutdown_context: Option<DeferredShutdownDropExpectation>,
     }
 
     impl Drop for DestroyLinkDropProbe {
         fn drop(&mut self) {
+            if let Some(expected) = self.shutdown_context {
+                assert_deferred_shutdown_drop_context(expected);
+            }
             let task = self.task.get();
             assert!(!task.is_null(), "destroy-link probe lost its task");
             let remaining_task = self.remaining_task.get();
@@ -4207,13 +4426,11 @@ mod tests {
             assert!(unsafe { (*task).ready_link.is_unlinked() });
             assert!(unsafe { (*task).all_link.is_unlinked() });
             let mut order = self.order.borrow_mut();
-            assert_eq!(self.drops.get(), order.len());
             assert!(
                 !order.contains(&self.id),
                 "destroy-link probe dropped twice"
             );
             order.push(self.id);
-            self.drops.set(order.len());
         }
     }
 
@@ -4238,6 +4455,28 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 release_task(self.task);
+            }
+        }
+    }
+
+    struct DeferredShutdownTrigger {
+        executor: *mut Executor,
+        nested: Option<SyntheticTaskRef>,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl Drop for DeferredShutdownTrigger {
+        fn drop(&mut self) {
+            self.calls.set(self.calls.get() + 1);
+            drop(self.nested.take());
+            unsafe {
+                (&mut *self.executor).shutdown_owner();
+                let owner = Rc::as_ptr(&(*self.executor).owner);
+                let state = (*self.executor).owner.state_ptr();
+                assert_deferred_shutdown_drop_context(DeferredShutdownDropExpectation {
+                    owner,
+                    state,
+                });
             }
         }
     }
@@ -4574,6 +4813,12 @@ mod tests {
                 self.calls.set(self.calls.get() + 1);
                 unsafe {
                     (&mut *self.executor).shutdown_owner();
+                    let owner = Rc::as_ptr(&(*self.executor).owner);
+                    let state = (*self.executor).owner.state_ptr();
+                    assert_deferred_shutdown_drop_context(DeferredShutdownDropExpectation {
+                        owner,
+                        state,
+                    });
                 }
             }
         }
@@ -4604,6 +4849,8 @@ mod tests {
         let state = executor.owner.state_ptr();
         unsafe {
             assert!((*state).shutdown_complete);
+            assert!((*state).deferred_shutdown_owner.is_none());
+            assert!((*state).deferred_shutdown_next.is_null());
             assert!((*state).all_tasks.is_empty());
             assert!((*state).ready_queue.is_empty());
             #[cfg(debug_assertions)]
@@ -4622,7 +4869,6 @@ mod tests {
             nested: [Option<SyntheticTaskRef>; 2],
             nested_tasks: [*mut TaskHeader; 2],
             calls: Rc<Cell<usize>>,
-            nested_drops: Rc<Cell<usize>>,
             nested_order: Rc<RefCell<Vec<usize>>>,
         }
 
@@ -4661,17 +4907,20 @@ mod tests {
                 };
 
                 assert_two_member_fifo();
-                assert_eq!(self.nested_drops.get(), 0);
                 assert!(self.nested_order.borrow().is_empty());
                 unsafe {
                     (&mut *self.executor).shutdown_owner();
+                    let owner = Rc::as_ptr(&(*self.executor).owner);
+                    let state = (*self.executor).owner.state_ptr();
+                    assert_deferred_shutdown_drop_context(DeferredShutdownDropExpectation {
+                        owner,
+                        state,
+                    });
                 }
-                assert_eq!(
-                    self.nested_drops.get(),
-                    0,
+                assert!(
+                    self.nested_order.borrow().is_empty(),
                     "reentrant shutdown destroyed active FIFO nodes"
                 );
-                assert!(self.nested_order.borrow().is_empty());
                 assert_two_member_fifo();
             }
         }
@@ -4685,9 +4934,9 @@ mod tests {
         };
         let executor_ptr = std::ptr::from_mut(&mut executor);
         let owner = Rc::as_ptr(&executor.owner);
+        let state = executor.owner.state_ptr();
         let owner_refs = Rc::strong_count(&executor.owner);
         let calls = Rc::new(Cell::new(0));
-        let nested_drops = Rc::new(Cell::new(0));
         let nested_order = Rc::new(RefCell::new(Vec::new()));
         let outer_task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
         let nested_task_slots: [Rc<Cell<*mut TaskHeader>>; 2] =
@@ -4698,10 +4947,10 @@ mod tests {
                 .expect("nonempty reentrant-shutdown context installation failed");
             let mut first = stage_completed_task_output_for_benchmark(DestroyLinkDropProbe {
                 task: Rc::clone(&nested_task_slots[0]),
-                drops: Rc::clone(&nested_drops),
                 id: 0,
                 order: Rc::clone(&nested_order),
                 remaining_task: Rc::clone(&nested_task_slots[1]),
+                shutdown_context: Some(DeferredShutdownDropExpectation { owner, state }),
             })
             .expect("first reentrant-shutdown nested task staging failed");
             nested_task_slots[0].set(first.task);
@@ -4711,10 +4960,10 @@ mod tests {
 
             let mut second = stage_completed_task_output_for_benchmark(DestroyLinkDropProbe {
                 task: Rc::clone(&nested_task_slots[1]),
-                drops: Rc::clone(&nested_drops),
                 id: 1,
                 order: Rc::clone(&nested_order),
                 remaining_task: Rc::clone(&empty_task_slot),
+                shutdown_context: Some(DeferredShutdownDropExpectation { owner, state }),
             })
             .expect("second reentrant-shutdown nested task staging failed");
             nested_task_slots[1].set(second.task);
@@ -4728,7 +4977,6 @@ mod tests {
                 nested: [Some(first_ref), Some(second_ref)],
                 nested_tasks: [nested_task_slots[0].get(), nested_task_slots[1].get()],
                 calls: Rc::clone(&calls),
-                nested_drops: Rc::clone(&nested_drops),
                 nested_order: Rc::clone(&nested_order),
             })
             .expect("nonempty reentrant-shutdown outer task staging failed")
@@ -4738,12 +4986,13 @@ mod tests {
         drop(staged);
 
         assert_eq!(calls.get(), 1);
-        assert_eq!(nested_drops.get(), 2);
+        assert_eq!(nested_order.borrow().len(), 2);
         assert_eq!(*nested_order.borrow(), vec![0, 1]);
         assert_eq!(Rc::strong_count(&executor.owner), owner_refs);
-        let state = executor.owner.state_ptr();
         unsafe {
             assert!((*state).shutdown_complete);
+            assert!((*state).deferred_shutdown_owner.is_none());
+            assert!((*state).deferred_shutdown_next.is_null());
             assert!((*state).all_tasks.is_empty());
             assert!((*state).ready_queue.is_empty());
             #[cfg(debug_assertions)]
@@ -4751,6 +5000,365 @@ mod tests {
             #[cfg(debug_assertions)]
             assert_eq!((*state).runtime_state.stats.task_frees, 3);
         }
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+    }
+
+    #[test]
+    fn reentrant_shutdown_cancellation_drains_completed_task_under_owner_context() {
+        struct CancelReleasesCompletedTask {
+            completed: Option<SyntheticTaskRef>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Future for CancelReleasesCompletedTask {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for CancelReleasesCompletedTask {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                drop(self.completed.take());
+            }
+        }
+
+        struct ShutdownDuringOuterDestroy {
+            executor: *mut Executor,
+            completed_task: *mut TaskHeader,
+            cancelled_task: *mut TaskHeader,
+            output_order: Rc<RefCell<Vec<usize>>>,
+        }
+
+        impl Drop for ShutdownDuringOuterDestroy {
+            fn drop(&mut self) {
+                ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
+                    let queue = active.get();
+                    assert!(!queue.is_null(), "outer destroy FIFO was not registered");
+                    unsafe {
+                        assert!((*queue).head.is_null());
+                        assert!((*queue).tail.is_null());
+                    }
+                });
+
+                unsafe {
+                    (&mut *self.executor).shutdown_owner();
+                    let owner = Rc::as_ptr(&(*self.executor).owner);
+                    let state = (*self.executor).owner.state_ptr();
+                    assert_deferred_shutdown_drop_context(DeferredShutdownDropExpectation {
+                        owner,
+                        state,
+                    });
+                }
+                assert!(
+                    self.output_order.borrow().is_empty(),
+                    "shutdown consumed a task from the active outer FIFO"
+                );
+
+                ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
+                    let queue = active.get();
+                    let completed_link =
+                        unsafe { std::ptr::addr_of_mut!((*self.completed_task).ready_link) };
+                    let cancelled_link =
+                        unsafe { std::ptr::addr_of_mut!((*self.cancelled_task).ready_link) };
+                    unsafe {
+                        assert_eq!((*queue).head, completed_link);
+                        assert_eq!((*queue).tail, cancelled_link);
+                        assert!((*completed_link).prev.is_null());
+                        assert_eq!((*completed_link).next, cancelled_link);
+                        assert_eq!((*cancelled_link).prev, completed_link);
+                        assert!((*cancelled_link).next.is_null());
+                        assert!((*self.completed_task).all_link.is_unlinked());
+                        assert!((*self.cancelled_task).all_link.is_unlinked());
+                    }
+                });
+            }
+        }
+
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let executor_ptr = std::ptr::from_mut(&mut executor);
+        let owner = Rc::as_ptr(&executor.owner);
+        let state = executor.owner.state_ptr();
+        let owner_refs = Rc::strong_count(&executor.owner);
+        let cancellation_drops = Rc::new(Cell::new(0));
+        let output_order = Rc::new(RefCell::new(Vec::new()));
+        let completed_task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
+        let cancelled_task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
+
+        let outer = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("cancellation FIFO test context installation failed");
+            let mut completed = stage_completed_task_output_for_benchmark(DestroyLinkDropProbe {
+                task: Rc::clone(&completed_task_slot),
+                id: 0,
+                order: Rc::clone(&output_order),
+                remaining_task: Rc::clone(&cancelled_task_slot),
+                shutdown_context: Some(DeferredShutdownDropExpectation { owner, state }),
+            })
+            .expect("shutdown-owned completed task staging failed");
+            completed_task_slot.set(completed.task);
+            let completed_ref = SyntheticTaskRef {
+                task: completed.task,
+            };
+            completed.owns_reference = false;
+            drop(completed);
+
+            let cancelled = Executor::try_spawn(CancelReleasesCompletedTask {
+                completed: Some(completed_ref),
+                drops: Rc::clone(&cancellation_drops),
+            })
+            .expect("shutdown-owned pending task admission failed");
+            cancelled_task_slot.set(cancelled.task_ptr);
+            drop(cancelled);
+
+            stage_completed_task_output_for_benchmark(ShutdownDuringOuterDestroy {
+                executor: executor_ptr,
+                completed_task: completed_task_slot.get(),
+                cancelled_task: cancelled_task_slot.get(),
+                output_order: Rc::clone(&output_order),
+            })
+            .expect("outer shutdown trigger staging failed")
+        };
+
+        drop(outer);
+
+        assert_eq!(cancellation_drops.get(), 1);
+        assert_eq!(*output_order.borrow(), vec![0]);
+        assert_eq!(Rc::strong_count(&executor.owner), owner_refs);
+        unsafe {
+            assert!((*state).shutdown_complete);
+            assert!((*state).deferred_shutdown_owner.is_none());
+            assert!((*state).deferred_shutdown_next.is_null());
+            assert!((*state).all_tasks.is_empty());
+            assert!((*state).ready_queue.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_allocs, 3);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_frees, 3);
+        }
+        EXECUTOR_CTX.with(|context| assert!(context.get().active_owner.is_null()));
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+    }
+
+    #[test]
+    fn deferred_shutdown_switches_exact_owner_and_restores_prior_context() {
+        struct CrossExecutorTail {
+            expected: DeferredShutdownDropExpectation,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Drop for CrossExecutorTail {
+            fn drop(&mut self) {
+                assert_deferred_shutdown_drop_context(self.expected);
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        struct CrossExecutorShutdownTrigger {
+            owner_executor: *mut Executor,
+            foreign_executor: *mut Executor,
+            tail: Option<SyntheticTaskRef>,
+            calls: Rc<Cell<usize>>,
+        }
+
+        impl Drop for CrossExecutorShutdownTrigger {
+            fn drop(&mut self) {
+                self.calls.set(self.calls.get() + 1);
+                drop(self.tail.take());
+                unsafe {
+                    (&mut *self.foreign_executor).shutdown_owner();
+                    let callback_owner = Rc::as_ptr(&(*self.owner_executor).owner);
+                    EXECUTOR_CTX.with(|context| {
+                        assert_eq!(context.get().active_owner, callback_owner);
+                    });
+                    let foreign_owner = Rc::as_ptr(&(*self.foreign_executor).owner);
+                    let foreign_state = (*self.foreign_executor).owner.state_ptr();
+                    assert!((*foreign_state).shutting_down);
+                    assert!(!(*foreign_state).shutdown_complete);
+                    assert_eq!(
+                        (*foreign_state)
+                            .deferred_shutdown_owner
+                            .as_ref()
+                            .map(Rc::as_ptr),
+                        Some(foreign_owner),
+                    );
+
+                    (&mut *self.owner_executor).shutdown_owner();
+                    let owner_state = (*self.owner_executor).owner.state_ptr();
+                    assert_deferred_shutdown_drop_context(DeferredShutdownDropExpectation {
+                        owner: callback_owner,
+                        state: owner_state,
+                    });
+                    assert!(!(*foreign_state).shutdown_complete);
+                }
+            }
+        }
+
+        let mut owner_executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let mut foreign_executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let prior_owner = ringless_owner_for_test(1);
+        let owner_ptr = Rc::as_ptr(&owner_executor.owner);
+        let owner_state = owner_executor.owner.state_ptr();
+        let foreign_state = foreign_executor.owner.state_ptr();
+        let owner_refs = Rc::strong_count(&owner_executor.owner);
+        let foreign_refs = Rc::strong_count(&foreign_executor.owner);
+        let tail_drops = Rc::new(Cell::new(0));
+        let trigger_calls = Rc::new(Cell::new(0));
+
+        let outer = {
+            let _active = ExecutorCtxGuard::install(owner_ptr)
+                .expect("cross-executor staging context installation failed");
+            let mut tail = stage_completed_task_output_for_benchmark(CrossExecutorTail {
+                expected: DeferredShutdownDropExpectation {
+                    owner: owner_ptr,
+                    state: owner_state,
+                },
+                drops: Rc::clone(&tail_drops),
+            })
+            .expect("cross-executor tail staging failed");
+            let tail_ref = SyntheticTaskRef { task: tail.task };
+            tail.owns_reference = false;
+            drop(tail);
+
+            stage_completed_task_output_for_benchmark(CrossExecutorShutdownTrigger {
+                owner_executor: std::ptr::from_mut(&mut owner_executor),
+                foreign_executor: std::ptr::from_mut(&mut foreign_executor),
+                tail: Some(tail_ref),
+                calls: Rc::clone(&trigger_calls),
+            })
+            .expect("cross-executor shutdown trigger staging failed")
+        };
+
+        {
+            let prior_ptr = Rc::as_ptr(&prior_owner);
+            let _prior = ExecutorCtxGuard::install(prior_ptr)
+                .expect("prior executor context installation failed");
+            drop(outer);
+            EXECUTOR_CTX.with(|context| {
+                assert_eq!(context.get().active_owner, prior_ptr);
+            });
+        }
+
+        assert_eq!(trigger_calls.get(), 1);
+        assert_eq!(tail_drops.get(), 1);
+        assert_eq!(Rc::strong_count(&owner_executor.owner), owner_refs);
+        assert_eq!(Rc::strong_count(&foreign_executor.owner), foreign_refs);
+        unsafe {
+            for state in [owner_state, foreign_state] {
+                assert!((*state).shutdown_complete);
+                assert!((*state).deferred_shutdown_owner.is_none());
+                assert!((*state).deferred_shutdown_next.is_null());
+                assert!((*state).all_tasks.is_empty());
+                assert!((*state).ready_queue.is_empty());
+            }
+            #[cfg(debug_assertions)]
+            assert_eq!((*owner_state).runtime_state.stats.task_allocs, 2);
+            #[cfg(debug_assertions)]
+            assert_eq!((*owner_state).runtime_state.stats.task_frees, 2);
+        }
+        EXECUTOR_CTX.with(|context| assert!(context.get().active_owner.is_null()));
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
+    }
+
+    #[test]
+    fn deferred_shutdown_finishes_and_restores_context_before_resuming_output_panic() {
+        #[derive(Debug)]
+        struct DeferredOutputPanic;
+
+        struct PanickingDeferredOutput {
+            expected: DeferredShutdownDropExpectation,
+            drops: Rc<Cell<usize>>,
+        }
+
+        impl Drop for PanickingDeferredOutput {
+            fn drop(&mut self) {
+                assert_deferred_shutdown_drop_context(self.expected);
+                self.drops.set(self.drops.get() + 1);
+                std::panic::panic_any(DeferredOutputPanic);
+            }
+        }
+
+        let mut executor = Executor {
+            owner: ringless_owner_for_test(1),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            cpu_affinity: None,
+            #[cfg(debug_assertions)]
+            last_stats: RuntimeStats::default(),
+        };
+        let prior_owner = ringless_owner_for_test(1);
+        let owner = Rc::as_ptr(&executor.owner);
+        let state = executor.owner.state_ptr();
+        let owner_refs = Rc::strong_count(&executor.owner);
+        let output_drops = Rc::new(Cell::new(0));
+        let trigger_calls = Rc::new(Cell::new(0));
+
+        let outer = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("deferred panic staging context installation failed");
+            let mut nested = stage_completed_task_output_for_benchmark(PanickingDeferredOutput {
+                expected: DeferredShutdownDropExpectation { owner, state },
+                drops: Rc::clone(&output_drops),
+            })
+            .expect("panicking deferred output staging failed");
+            let nested_ref = SyntheticTaskRef { task: nested.task };
+            nested.owns_reference = false;
+            drop(nested);
+
+            stage_completed_task_output_for_benchmark(DeferredShutdownTrigger {
+                executor: std::ptr::from_mut(&mut executor),
+                nested: Some(nested_ref),
+                calls: Rc::clone(&trigger_calls),
+            })
+            .expect("deferred panic trigger staging failed")
+        };
+
+        let unwind = {
+            let prior_ptr = Rc::as_ptr(&prior_owner);
+            let _prior = ExecutorCtxGuard::install(prior_ptr)
+                .expect("deferred panic prior context installation failed");
+            let result = catch_unwind(AssertUnwindSafe(|| drop(outer)));
+            EXECUTOR_CTX.with(|context| {
+                assert_eq!(context.get().active_owner, prior_ptr);
+            });
+            result.expect_err("queued output destructor did not panic")
+        };
+
+        assert!(unwind.is::<DeferredOutputPanic>());
+        assert_eq!(trigger_calls.get(), 1);
+        assert_eq!(output_drops.get(), 1);
+        assert_eq!(Rc::strong_count(&executor.owner), owner_refs);
+        unsafe {
+            assert!((*state).shutdown_complete);
+            assert!((*state).deferred_shutdown_owner.is_none());
+            assert!((*state).deferred_shutdown_next.is_null());
+            assert!((*state).all_tasks.is_empty());
+            assert!((*state).ready_queue.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_allocs, 2);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_frees, 2);
+        }
+        EXECUTOR_CTX.with(|context| assert!(context.get().active_owner.is_null()));
         ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
     }
 
@@ -4841,7 +5449,7 @@ mod tests {
 
     #[test]
     fn iterative_destroy_queue_singleton_uses_head_tail_ownership() {
-        let mut queue = IterativeTaskDestroyQueue::new();
+        let mut queue = IterativeTaskDestroyQueue::new(std::ptr::null());
         let mut task = TaskHeader::new();
         task.refs.set(0);
         task.flags.set(TaskHeader::FLAG_COMPLETED);
@@ -4862,7 +5470,7 @@ mod tests {
 
     #[test]
     fn iterative_destroy_queue_three_nodes_preserve_fifo_and_empty_state() {
-        let mut queue = IterativeTaskDestroyQueue::new();
+        let mut queue = IterativeTaskDestroyQueue::new(std::ptr::null());
         let mut tasks: [TaskHeader; 3] = std::array::from_fn(|_| {
             let task = TaskHeader::new();
             task.refs.set(0);
@@ -4917,15 +5525,14 @@ mod tests {
 
         with_ringless_poll_context_for_test(1, |owner, _cx| {
             let task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
-            let drops = Rc::new(Cell::new(0));
             let order = Rc::new(RefCell::new(Vec::new()));
             let empty_task_slot = Rc::new(Cell::new(std::ptr::null_mut()));
             let mut staged = stage_completed_task_output_for_benchmark(DestroyLinkDropProbe {
                 task: Rc::clone(&task_slot),
-                drops: Rc::clone(&drops),
                 id: 0,
                 order: Rc::clone(&order),
                 remaining_task: Rc::clone(&empty_task_slot),
+                shutdown_context: None,
             })
             .expect("destroy-link task staging failed");
             let task = staged.task;
@@ -4939,12 +5546,16 @@ mod tests {
             drop(staged);
 
             let state = owner.state_ptr();
-            let mut queue = IterativeTaskDestroyQueue::new();
+            let initial_active_owner = EXECUTOR_CTX.with(|context| context.get().active_owner);
+            let mut queue = IterativeTaskDestroyQueue::new(initial_active_owner);
             let queue_ptr = std::ptr::from_mut(&mut queue);
             ITERATIVE_TASK_DESTROY_QUEUE.with(|active| {
                 assert!(active.get().is_null());
                 active.set(queue_ptr);
-                let registration = IterativeTaskDestroyRegistration { active };
+                let registration = IterativeTaskDestroyRegistration {
+                    active,
+                    initial_active_owner: unsafe { (*queue_ptr).initial_active_owner },
+                };
 
                 unsafe {
                     enqueue_nested_task_destroy(queue_ptr, task, raw_vtable);
@@ -4976,7 +5587,7 @@ mod tests {
                 drop(registration);
                 assert!(active.get().is_null());
             });
-            assert_eq!(drops.get(), 1);
+            assert_eq!(order.borrow().len(), 1);
             assert_eq!(*order.borrow(), vec![0]);
             ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
             unsafe {
@@ -7100,6 +7711,97 @@ mod tests {
             weak_owner.upgrade().is_none(),
             "stored-waker panic retained the final executor graph owner"
         );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn deferred_shutdown_keeps_close_worker_until_queued_output_is_destroyed() {
+        #[derive(Debug)]
+        struct DeferredWorkerOutputPanic;
+
+        struct DeferredWorkerOutput {
+            fd: Option<RuntimeFd>,
+            expected: DeferredShutdownDropExpectation,
+            observed: Rc<Cell<bool>>,
+        }
+
+        impl Drop for DeferredWorkerOutput {
+            fn drop(&mut self) {
+                assert_deferred_shutdown_drop_context(self.expected);
+                unsafe {
+                    assert!((*self.expected.state).close_worker.sender.is_some());
+                    assert!((*self.expected.state).close_worker.worker.is_some());
+                }
+                self.observed.set(true);
+                drop(self.fd.take());
+                std::panic::panic_any(DeferredWorkerOutputPanic);
+            }
+        }
+
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor.init().expect("executor initialization failed");
+        let owner = Rc::as_ptr(&executor.owner);
+        let state = executor.owner.state_ptr();
+        let owner_refs = Rc::strong_count(&executor.owner);
+        let raw = distinctive_closeable_test_fd().expect("distinctive fd failed");
+        set_positive_linger(raw, 1);
+        let observed = Rc::new(Cell::new(false));
+        let trigger_calls = Rc::new(Cell::new(0));
+
+        let outer = {
+            let _active = ExecutorCtxGuard::install(owner)
+                .expect("deferred worker staging context installation failed");
+            let mut nested = stage_completed_task_output_for_benchmark(DeferredWorkerOutput {
+                // SAFETY: the test transfers its sole open descriptor owner.
+                fd: Some(RuntimeFd::from_external_owned(unsafe {
+                    OwnedFd::from_raw_fd(raw)
+                })),
+                expected: DeferredShutdownDropExpectation { owner, state },
+                observed: Rc::clone(&observed),
+            })
+            .expect("deferred worker output staging failed");
+            let nested_ref = SyntheticTaskRef { task: nested.task };
+            nested.owns_reference = false;
+            drop(nested);
+
+            stage_completed_task_output_for_benchmark(DeferredShutdownTrigger {
+                executor: std::ptr::from_mut(&mut executor),
+                nested: Some(nested_ref),
+                calls: Rc::clone(&trigger_calls),
+            })
+            .expect("deferred worker trigger staging failed")
+        };
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| drop(outer)))
+            .expect_err("queued worker output did not panic");
+
+        assert!(unwind.is::<DeferredWorkerOutputPanic>());
+        assert!(observed.get(), "queued worker output did not run");
+        assert_eq!(trigger_calls.get(), 1);
+        assert_eq!(Rc::strong_count(&executor.owner), owner_refs);
+        unsafe {
+            assert!((*state).close_worker.sender.is_none());
+            assert!((*state).close_worker.worker.is_none());
+            assert!((*state).shutdown_complete);
+            assert!((*state).deferred_shutdown_owner.is_none());
+            assert!((*state).deferred_shutdown_next.is_null());
+            assert!((*state).all_tasks.is_empty());
+            assert!((*state).ready_queue.is_empty());
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.close_linger_queries, 1);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.close_worker_admissions, 1);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_allocs, 2);
+            #[cfg(debug_assertions)]
+            assert_eq!((*state).runtime_state.stats.task_frees, 2);
+        }
+        assert!(
+            raw_fd_is_closed(raw),
+            "deferred shutdown returned before the worker joined"
+        );
+        EXECUTOR_CTX.with(|context| assert!(context.get().active_owner.is_null()));
+        ITERATIVE_TASK_DESTROY_QUEUE.with(|active| assert!(active.get().is_null()));
     }
 
     #[cfg(not(miri))]
