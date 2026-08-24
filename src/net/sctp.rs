@@ -2540,8 +2540,22 @@ impl SctpRecordSync {
 type StashedSctpRecvProcessor =
     unsafe fn(*mut Reactor, *mut CompletionState, usize, &mut SctpRecordSync);
 
+/// Explicit lifecycle of the stream-owned dropped metadata receive.
+///
+/// This byte occupies existing natural padding in [`SctpRecvState`]; the
+/// pointer and processor are payload for `Live`, while an `Abandoned` pointer
+/// is deliberately opaque until stream drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum StashedSctpRecvState {
+    Empty,
+    Live,
+    Abandoned,
+}
+
 /// Dropped metadata receive retained by the stream until its CQE is processed
 /// or its origin ring is terminally abandoned.
+#[derive(Clone, Copy)]
 struct StashedSctpRecv {
     /// In-flight/completed operation state or the opaque ownership marker for
     /// a terminally ring-abandoned operation.
@@ -2549,8 +2563,8 @@ struct StashedSctpRecv {
     /// Initialized iovec count needed by the vectored completion processor.
     iov_count: usize,
     /// Type-specific function that consumes the retained payload and updates
-    /// record synchronization state. `None` with a non-null `state_ptr` is the
-    /// terminal ring-abandonment poison marker; that pointer must stay opaque.
+    /// record synchronization state. This is populated only while the explicit
+    /// state is `Live` and is never used to classify stash lifecycle.
     process_completed: Option<StashedSctpRecvProcessor>,
 }
 
@@ -2561,32 +2575,6 @@ impl StashedSctpRecv {
             iov_count: 0,
             process_completed: None,
         }
-    }
-
-    /// Returns whether the live stash became terminally ring-abandoned.
-    #[inline(always)]
-    fn has_abandoned_marker(&self) -> bool {
-        !self.state_ptr.is_null() && self.process_completed.is_none()
-    }
-
-    /// Converts a live stash into its terminal opaque ownership marker.
-    #[inline(always)]
-    fn mark_abandoned(&mut self) {
-        debug_assert!(!self.state_ptr.is_null(), "abandoned SCTP stash is missing");
-        debug_assert!(
-            self.process_completed.is_some(),
-            "SCTP stash was already terminally abandoned"
-        );
-        self.iov_count = 0;
-        self.process_completed = None;
-    }
-
-    /// Clears only stream-local stash metadata without following the marker.
-    #[inline(always)]
-    fn clear_local(&mut self) {
-        self.state_ptr = std::ptr::null_mut();
-        self.iov_count = 0;
-        self.process_completed = None;
     }
 }
 
@@ -2610,6 +2598,9 @@ struct SctpRecvState {
     /// forced PDAPI subscription and can be consumed without first assembling
     /// the complete notification in a short caller buffer.
     any_notification_visible: Cell<bool>,
+    /// Explicit lifecycle tag for `stashed`. This stays separate from the
+    /// payload so the full-width iovec count and existing layouts are retained.
+    stashed_state: StashedSctpRecvState,
     /// Dropped metadata receive completion that must be adopted before the
     /// next metadata receive can preserve record-boundary state, or terminal
     /// opaque poison retained after origin-ring abandonment.
@@ -2627,6 +2618,7 @@ impl SctpRecvState {
             recv_rcvinfo_requested: Cell::new(false),
             partial_delivery_visible: Cell::new(true),
             any_notification_visible: Cell::new(true),
+            stashed_state: StashedSctpRecvState::Empty,
             stashed: StashedSctpRecv::empty(),
         }
     }
@@ -2638,8 +2630,90 @@ impl SctpRecvState {
             recv_rcvinfo_requested: Cell::new(config.recv_rcvinfo),
             partial_delivery_visible: Cell::new(config.notifications.partial_delivery),
             any_notification_visible: Cell::new(config.notifications.any()),
+            stashed_state: StashedSctpRecvState::Empty,
             stashed: StashedSctpRecv::empty(),
         }
+    }
+
+    /// Publishes one live dropped receive into the stream-owned stash.
+    ///
+    /// # Safety
+    ///
+    /// `state_ptr` must identify a live operation whose retained payload
+    /// matches `process_completed`, and this receive state must be empty.
+    #[inline(always)]
+    unsafe fn publish_stashed_live_unchecked(
+        &mut self,
+        state_ptr: *mut CompletionState,
+        iov_count: usize,
+        process_completed: StashedSctpRecvProcessor,
+    ) {
+        debug_assert_eq!(self.stashed_state, StashedSctpRecvState::Empty);
+        debug_assert!(self.stashed.state_ptr.is_null());
+        debug_assert!(self.stashed.process_completed.is_none());
+        debug_assert!(!state_ptr.is_null(), "live SCTP stash is missing");
+        self.stashed = StashedSctpRecv {
+            state_ptr,
+            iov_count,
+            process_completed: Some(process_completed),
+        };
+        self.stashed_state = StashedSctpRecvState::Live;
+    }
+
+    /// Converts a live stash into its terminal opaque ownership marker.
+    #[inline(always)]
+    fn mark_stashed_abandoned(&mut self) {
+        debug_assert_eq!(self.stashed_state, StashedSctpRecvState::Live);
+        debug_assert!(!self.stashed.state_ptr.is_null());
+        debug_assert!(self.stashed.process_completed.is_some());
+        self.stashed.iov_count = 0;
+        self.stashed.process_completed = None;
+        self.stashed_state = StashedSctpRecvState::Abandoned;
+    }
+
+    /// Takes one live stash and publishes `Empty` before caller-owned payload
+    /// destruction or completion processing can run.
+    #[inline(always)]
+    fn take_stashed_live(&mut self) -> StashedSctpRecv {
+        debug_assert_eq!(self.stashed_state, StashedSctpRecvState::Live);
+        debug_assert!(!self.stashed.state_ptr.is_null());
+        debug_assert!(self.stashed.process_completed.is_some());
+        let stashed = self.stashed;
+        self.stashed = StashedSctpRecv::empty();
+        self.stashed_state = StashedSctpRecvState::Empty;
+        stashed
+    }
+
+    /// Clears only stream-local stash metadata without following an opaque
+    /// abandonment marker.
+    #[inline(always)]
+    fn clear_stashed_local(&mut self) {
+        self.stashed = StashedSctpRecv::empty();
+        self.stashed_state = StashedSctpRecvState::Empty;
+    }
+
+    #[cfg(test)]
+    unsafe fn set_stashed_live_for_test(
+        &mut self,
+        state_ptr: *mut CompletionState,
+        iov_count: usize,
+        process_completed: StashedSctpRecvProcessor,
+    ) {
+        unsafe {
+            self.publish_stashed_live_unchecked(state_ptr, iov_count, process_completed);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_stashed_abandoned_for_test(&mut self, marker: *mut CompletionState) {
+        debug_assert_eq!(self.stashed_state, StashedSctpRecvState::Empty);
+        debug_assert!(!marker.is_null());
+        self.stashed = StashedSctpRecv {
+            state_ptr: marker,
+            iov_count: 0,
+            process_completed: None,
+        };
+        self.stashed_state = StashedSctpRecvState::Abandoned;
     }
 
     /// Records a successfully applied caller-requested receive policy.
@@ -2750,17 +2824,16 @@ impl SctpRecvState {
         if state_ptr.is_null() {
             return;
         }
-        debug_assert!(
-            unsafe { (*recv_state).stashed.state_ptr.is_null() },
+        debug_assert_eq!(
+            unsafe { (*recv_state).stashed_state },
+            StashedSctpRecvState::Empty,
             "SCTP stream already has a stashed metadata receive"
         );
         unsafe {
             // Publish stream ownership before releasing the waiter. Its final
             // task reference may run user drop glue and synchronously re-enter
             // this receive state.
-            (*recv_state).stashed.state_ptr = state_ptr;
-            (*recv_state).stashed.iov_count = iov_count;
-            (*recv_state).stashed.process_completed = Some(process_completed);
+            (*recv_state).publish_stashed_live_unchecked(state_ptr, iov_count, process_completed);
             *state_slot = std::ptr::null_mut();
 
             let waiter = CompletionState::take_waiter_unchecked(state_ptr);
@@ -2779,7 +2852,7 @@ impl SctpRecvState {
     /// opaque and is deliberately not dereferenced.
     unsafe fn clear_stashed_waiter_unchecked(recv_state: *mut Self) {
         debug_assert!(!recv_state.is_null(), "SCTP receive state is missing");
-        if unsafe { (*recv_state).stashed.has_abandoned_marker() } {
+        if unsafe { (*recv_state).stashed_state != StashedSctpRecvState::Live } {
             return;
         }
         let state_ptr = unsafe { (*recv_state).stashed.state_ptr };
@@ -2800,37 +2873,35 @@ impl SctpRecvState {
     /// for the owning reactor. A terminal abandonment marker is opaque and
     /// returns before either pointer or waker is inspected.
     unsafe fn poll_stashed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let state_ptr = self.stashed.state_ptr;
-        if state_ptr.is_null() {
-            return Poll::Ready(Ok(()));
-        }
-        if self.stashed.has_abandoned_marker() {
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
-        }
+        let state_ptr = match self.stashed_state {
+            StashedSctpRecvState::Empty => return Poll::Ready(Ok(())),
+            StashedSctpRecvState::Abandoned => {
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
+            }
+            StashedSctpRecvState::Live => self.stashed.state_ptr,
+        };
 
         if unsafe { !(*state_ptr).is_completed() } {
             if unsafe { refresh_op_waiter_from_waker(cx, state_ptr) } {
-                self.stashed.mark_abandoned();
+                self.mark_stashed_abandoned();
                 return Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)));
             }
             return Poll::Pending;
         }
 
         let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
-        let process_completed = self.stashed.process_completed.take();
+        let stashed = self.take_stashed_live();
+        let process_completed = stashed.process_completed;
         debug_assert!(
             process_completed.is_some(),
             "stashed SCTP recv missing completion processor"
         );
         let process_completed = unsafe { process_completed.unwrap_unchecked() };
-        let iov_count = self.stashed.iov_count;
-        self.stashed.state_ptr = std::ptr::null_mut();
-        self.stashed.iov_count = 0;
         unsafe {
             process_completed(
                 op_ctx.reactor(),
                 state_ptr,
-                iov_count,
+                stashed.iov_count,
                 &mut self.record_sync,
             )
         };
@@ -2850,19 +2921,21 @@ impl SctpRecvState {
     /// operation transferred by [`SctpRecvState::stash_unchecked`]. A terminal
     /// abandonment marker must remain opaque.
     unsafe fn drop_stashed(&mut self) {
-        if self.stashed.has_abandoned_marker() {
-            self.stashed.clear_local();
-            return;
+        match self.stashed_state {
+            StashedSctpRecvState::Empty => {}
+            StashedSctpRecvState::Abandoned => self.clear_stashed_local(),
+            StashedSctpRecvState::Live => {
+                let mut state_ptr = self.take_stashed_live().state_ptr;
+                unsafe { drop_op_ptr_unchecked(&mut state_ptr) };
+            }
         }
-        unsafe { drop_op_ptr_unchecked(&mut self.stashed.state_ptr) };
-        self.stashed.clear_local();
     }
 
     /// Returns whether rich receive work must restore record synchronization
     /// before a lean receive may consume another kernel completion.
     #[inline(always)]
     fn pending_metadata_recovery(&self) -> bool {
-        !self.record_sync.is_synced() || !self.stashed.state_ptr.is_null()
+        !self.record_sync.is_synced() || self.stashed_state != StashedSctpRecvState::Empty
     }
 }
 
@@ -7268,6 +7341,17 @@ pub(crate) mod test_support {
         pub buffer_locks: Option<libc::c_int>,
     }
 
+    /// Feature-gated snapshot of the stream-owned dropped-receive lifecycle.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SctpStashedRecvStateSnapshot {
+        /// No dropped metadata receive is retained.
+        Empty,
+        /// One live in-flight or completed metadata receive is retained.
+        Live,
+        /// The origin ring was abandoned and only an opaque marker remains.
+        Abandoned,
+    }
+
     /// Returns whether a general SCTP capability probe may be treated as
     /// unavailable rather than as a test or benchmark failure.
     ///
@@ -7420,6 +7504,18 @@ pub(crate) mod test_support {
             stream.recv_state.partial_delivery_visible.get(),
             stream.recv_state.any_notification_visible.get(),
         )
+    }
+
+    /// Returns the stream's explicit dropped-receive lifecycle without
+    /// exposing or following its operation pointer.
+    pub fn test_sctp_stream_stashed_recv_state(
+        stream: &SctpStream,
+    ) -> SctpStashedRecvStateSnapshot {
+        match stream.recv_state.stashed_state {
+            StashedSctpRecvState::Empty => SctpStashedRecvStateSnapshot::Empty,
+            StashedSctpRecvState::Live => SctpStashedRecvStateSnapshot::Live,
+            StashedSctpRecvState::Abandoned => SctpStashedRecvStateSnapshot::Abandoned,
+        }
     }
 
     fn test_accept_slot_drop_preserves_readiness_mask(cached: bool) -> io::Result<()> {
@@ -7739,6 +7835,11 @@ mod tests {
         );
         unsafe {
             assert_eq!(
+                (*recv_state).stashed_state,
+                StashedSctpRecvState::Live,
+                "stream stash state was not live before waiter destruction"
+            );
+            assert_eq!(
                 (*recv_state).stashed.state_ptr,
                 expected_state,
                 "stream ownership was not published before waiter destruction"
@@ -7922,6 +8023,7 @@ mod tests {
         expected_state: *mut CompletionState,
         expected_iov_count: usize,
     ) {
+        assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Live);
         assert_eq!(recv_state.stashed.state_ptr, expected_state);
         assert_eq!(recv_state.stashed.iov_count, expected_iov_count);
         assert!(recv_state.stashed.process_completed.is_some());
@@ -7946,11 +8048,13 @@ mod tests {
         let original_buffer_ptr = buffer.backing_ptr();
         let mut recv_state = SctpRecvState::external();
         recv_state.record_sync = SctpRecordSync::DataTail;
-        recv_state.stashed = StashedSctpRecv {
-            state_ptr: stashed_state_ptr,
-            iov_count: expected_iov_count,
-            process_completed: Some(reject_invalid_request_stash_processing),
-        };
+        unsafe {
+            recv_state.set_stashed_live_for_test(
+                stashed_state_ptr,
+                expected_iov_count,
+                reject_invalid_request_stash_processing,
+            );
+        }
         let mut recv = RecvFuture {
             fd: RuntimeFd::INVALID,
             state_ptr: invalid_fd_op_state(),
@@ -7999,11 +8103,13 @@ mod tests {
         let chain = IoBuffVecMut::from_array([segment]);
         let mut vectored_recv_state = SctpRecvState::external();
         vectored_recv_state.record_sync = SctpRecordSync::DataTail;
-        vectored_recv_state.stashed = StashedSctpRecv {
-            state_ptr: stashed_vectored_state_ptr,
-            iov_count: expected_iov_count,
-            process_completed: Some(reject_invalid_request_stash_processing),
-        };
+        unsafe {
+            vectored_recv_state.set_stashed_live_for_test(
+                stashed_vectored_state_ptr,
+                expected_iov_count,
+                reject_invalid_request_stash_processing,
+            );
+        }
         let mut recv = RecvVectoredFuture {
             fd: RuntimeFd::INVALID,
             state_ptr: invalid_fd_op_state(),
@@ -8068,11 +8174,13 @@ mod tests {
         let recv_ptr = recv_segment.as_mut_ptr();
         let mut recv_state = SctpRecvState::external();
         recv_state.record_sync = SctpRecordSync::DataTail;
-        recv_state.stashed = StashedSctpRecv {
-            state_ptr: stashed_state_ptr,
-            iov_count: 11,
-            process_completed: Some(reject_invalid_request_stash_processing),
-        };
+        unsafe {
+            recv_state.set_stashed_live_for_test(
+                stashed_state_ptr,
+                11,
+                reject_invalid_request_stash_processing,
+            );
+        }
         let mut recv = RecvVectoredFuture {
             fd: RuntimeFd::INVALID,
             state_ptr: invalid_fd_op_state(),
@@ -8176,6 +8284,37 @@ mod tests {
     }
 
     #[test]
+    fn stashed_recv_state_transitions_preserve_full_width_iov_count() {
+        let marker = NonNull::<CompletionState>::dangling().as_ptr();
+        let mut recv_state = SctpRecvState::external();
+        assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Empty);
+
+        unsafe {
+            recv_state.set_stashed_live_for_test(
+                marker,
+                usize::MAX,
+                reject_abandoned_stashed_processing,
+            );
+        }
+        assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Live);
+        assert_eq!(recv_state.stashed.state_ptr, marker);
+        assert_eq!(recv_state.stashed.iov_count, usize::MAX);
+        assert!(recv_state.stashed.process_completed.is_some());
+
+        recv_state.mark_stashed_abandoned();
+        assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Abandoned);
+        assert_eq!(recv_state.stashed.state_ptr, marker);
+        assert_eq!(recv_state.stashed.iov_count, 0);
+        assert!(recv_state.stashed.process_completed.is_none());
+
+        // The dangling marker makes any accidental abandonment dereference a
+        // focused Miri failure; stream-local clear must only reset metadata.
+        unsafe { recv_state.drop_stashed() };
+        assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Empty);
+        assert!(recv_state.stashed.state_ptr.is_null());
+    }
+
+    #[test]
     fn sctp_stash_publishes_ownership_before_waiter_destruction() {
         STASH_PUBLICATION_DESTROYS.with(|count| count.set(0));
         let mut recv_state = SctpRecvState::external();
@@ -8211,6 +8350,7 @@ mod tests {
 
         STASH_PUBLICATION_DESTROYS.with(|count| assert_eq!(count.get(), 1));
         assert!(state_slot.is_null());
+        assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Live);
         assert_eq!(recv_state.stashed.state_ptr, state_ptr);
         assert_eq!(recv_state.stashed.iov_count, 7);
         assert!(recv_state.stashed.process_completed.is_some());
@@ -8225,11 +8365,13 @@ mod tests {
             abandoned.set_ring_abandoned();
             let abandoned_ptr = std::ptr::addr_of_mut!(abandoned);
             let mut stream = ringless_sctp_stream();
-            stream.recv_state.stashed = StashedSctpRecv {
-                state_ptr: abandoned_ptr,
-                iov_count: 1,
-                process_completed: Some(reject_abandoned_stashed_processing),
-            };
+            unsafe {
+                stream.recv_state.set_stashed_live_for_test(
+                    abandoned_ptr,
+                    1,
+                    reject_abandoned_stashed_processing,
+                );
+            }
 
             test_hooks::fail_next_op_alloc();
             test_hooks::fail_next_raw_sqe_submit();
@@ -8250,6 +8392,10 @@ mod tests {
                     );
                 };
                 assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+                assert_eq!(
+                    recv.recv_state.stashed_state,
+                    StashedSctpRecvState::Abandoned
+                );
                 assert_eq!(returned.bytes.as_ptr(), original_buffer_ptr);
                 assert_eq!(
                     pointer_calls.get(),
@@ -8262,6 +8408,10 @@ mod tests {
                 assert!(recv.recv_state.stashed.process_completed.is_none());
                 assert!(Pin::new(&mut recv).poll(cx).is_pending());
                 drop(recv);
+                assert_eq!(
+                    stream.recv_state.stashed_state,
+                    StashedSctpRecvState::Abandoned
+                );
                 assert_eq!(stream.recv_state.stashed.state_ptr, abandoned_ptr);
                 assert!(stream.recv_state.stashed.process_completed.is_none());
                 drop(returned);
@@ -8295,12 +8445,21 @@ mod tests {
             );
             assert!(Pin::new(&mut recv).poll(cx).is_pending());
             drop(recv);
+            assert_eq!(
+                stream.recv_state.stashed_state,
+                StashedSctpRecvState::Abandoned
+            );
             assert_eq!(stream.recv_state.stashed.state_ptr, abandoned_ptr);
             assert!(stream.recv_state.stashed.process_completed.is_none());
             drop(returned);
 
             for _ in 0..2 {
-                assert_lean_stash_rejection(&mut stream, cx, abandoned_ptr, false);
+                assert_lean_stash_rejection(
+                    &mut stream,
+                    cx,
+                    abandoned_ptr,
+                    StashedSctpRecvState::Abandoned,
+                );
             }
             assert!(
                 test_hooks::take_op_alloc_failure(),
@@ -8314,6 +8473,7 @@ mod tests {
             assert_eq!(owner.inflight_op_count_for_test(), 0);
 
             unsafe { stream.recv_state.drop_stashed() };
+            assert_eq!(stream.recv_state.stashed_state, StashedSctpRecvState::Empty);
             assert!(stream.recv_state.stashed.state_ptr.is_null());
             assert_eq!(stream.recv_state.stashed.iov_count, 0);
             assert!(stream.recv_state.stashed.process_completed.is_none());
@@ -8326,11 +8486,7 @@ mod tests {
     fn terminally_abandoned_stash_marker_is_opaque_to_repoll_and_stream_drop() {
         let marker = NonNull::<CompletionState>::dangling().as_ptr();
         let mut stream = ringless_sctp_stream();
-        stream.recv_state.stashed = StashedSctpRecv {
-            state_ptr: marker,
-            iov_count: 0,
-            process_completed: None,
-        };
+        stream.recv_state.set_stashed_abandoned_for_test(marker);
         let pointer_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
         let buffer =
@@ -8343,12 +8499,20 @@ mod tests {
             panic!("opaque abandoned marker did not return a terminal error");
         };
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            recv.recv_state.stashed_state,
+            StashedSctpRecvState::Abandoned
+        );
         assert_eq!(returned.bytes.as_ptr(), original_buffer_ptr);
         assert_eq!(pointer_calls.get(), 0);
         assert_eq!(drops.get(), 0);
         assert_eq!(recv.recv_state.stashed.state_ptr, marker);
         assert!(recv.recv_state.stashed.process_completed.is_none());
         drop(recv);
+        assert_eq!(
+            stream.recv_state.stashed_state,
+            StashedSctpRecvState::Abandoned
+        );
         assert_eq!(stream.recv_state.stashed.state_ptr, marker);
         drop(returned);
         assert_eq!(drops.get(), 1);
@@ -9036,11 +9200,13 @@ mod tests {
             }
 
             let mut recv_state = SctpRecvState::external();
-            recv_state.stashed = StashedSctpRecv {
-                state_ptr,
-                iov_count: 0,
-                process_completed: Some(process_stashed_sctp_recv::<RetainedConstructorBuffer>),
-            };
+            unsafe {
+                recv_state.set_stashed_live_for_test(
+                    state_ptr,
+                    0,
+                    process_stashed_sctp_recv::<RetainedConstructorBuffer>,
+                );
+            }
 
             test_hooks::fail_next_raw_sqe_submit();
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -9879,9 +10045,13 @@ mod tests {
         {
             assert_eq!(std::mem::size_of::<SctpRecordSync>(), 1);
             assert_eq!(std::mem::align_of::<SctpRecordSync>(), 1);
+            assert_eq!(std::mem::size_of::<StashedSctpRecvState>(), 1);
+            assert_eq!(std::mem::align_of::<StashedSctpRecvState>(), 1);
             assert_eq!(std::mem::size_of::<StashedSctpRecv>(), 24);
             assert_eq!(std::mem::size_of::<SctpRecvState>(), 32);
             assert_eq!(std::mem::align_of::<SctpRecvState>(), 8);
+            assert_eq!(std::mem::size_of::<SctpStream>(), 72);
+            assert_eq!(std::mem::align_of::<SctpStream>(), 8);
             assert_eq!(SCTP_RCVINFO_CONTROL_LEN, 48);
             assert_eq!(SCTP_RECV_CONTROL_LEN, 200);
             assert_eq!(
@@ -11336,6 +11506,7 @@ mod tests {
             _marker: PhantomData,
         };
         drop(dropped);
+        assert_eq!(stream.recv_state.stashed_state, StashedSctpRecvState::Live);
         assert_eq!(stream.recv_state.stashed.state_ptr, state_ptr);
         assert_eq!(stream.recv_state.stashed.iov_count, 0);
         assert!(stream.recv_state.stashed.process_completed.is_some());
@@ -11346,7 +11517,7 @@ mod tests {
         stream: &mut SctpStream,
         cx: &mut Context<'_>,
         expected_state: *mut CompletionState,
-        expected_processor: bool,
+        expected_stash_state: StashedSctpRecvState,
     ) {
         let pointer_calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
@@ -11373,10 +11544,11 @@ mod tests {
             "completed lean rejection did not fuse"
         );
         drop(future);
+        assert_eq!(stream.recv_state.stashed_state, expected_stash_state);
         assert_eq!(stream.recv_state.stashed.state_ptr, expected_state);
         assert_eq!(
             stream.recv_state.stashed.process_completed.is_some(),
-            expected_processor
+            expected_stash_state == StashedSctpRecvState::Live
         );
         drop(returned);
         assert_eq!(drops.get(), 1);
@@ -11549,7 +11721,7 @@ mod tests {
 
             test_hooks::fail_next_raw_sqe_submit();
             test_hooks::fail_next_op_alloc();
-            assert_lean_stash_rejection(&mut stream, cx, state_ptr, true);
+            assert_lean_stash_rejection(&mut stream, cx, state_ptr, StashedSctpRecvState::Live);
             assert!(
                 test_hooks::take_op_alloc_failure(),
                 "pending-stash rejection attempted operation allocation"
@@ -11564,7 +11736,7 @@ mod tests {
 
             unsafe { (*state_ptr).set_completed() };
             test_hooks::fail_next_op_alloc();
-            assert_lean_stash_rejection(&mut stream, cx, state_ptr, true);
+            assert_lean_stash_rejection(&mut stream, cx, state_ptr, StashedSctpRecvState::Live);
             assert!(
                 test_hooks::take_op_alloc_failure(),
                 "completed-stash rejection attempted operation allocation"
@@ -11740,14 +11912,21 @@ mod tests {
             abandoned_state.set_ring_abandoned();
             let abandoned_ptr = std::ptr::addr_of_mut!(abandoned_state);
             let mut abandoned_stream = ringless_sctp_stream();
-            abandoned_stream.recv_state.stashed = StashedSctpRecv {
-                state_ptr: abandoned_ptr,
-                iov_count: 0,
-                process_completed: Some(reject_abandoned_stashed_processing),
-            };
-            assert_lean_stash_rejection(&mut abandoned_stream, cx, abandoned_ptr, true);
+            unsafe {
+                abandoned_stream.recv_state.set_stashed_live_for_test(
+                    abandoned_ptr,
+                    0,
+                    reject_abandoned_stashed_processing,
+                );
+            }
+            assert_lean_stash_rejection(
+                &mut abandoned_stream,
+                cx,
+                abandoned_ptr,
+                StashedSctpRecvState::Live,
+            );
             assert_eq!(abandoned_stream.recv_state.stashed.state_ptr, abandoned_ptr);
-            abandoned_stream.recv_state.stashed = StashedSctpRecv::empty();
+            abandoned_stream.recv_state.clear_stashed_local();
             drop(abandoned_stream);
 
             let mut signaling_stream = ringless_sctp_stream();
@@ -12229,11 +12408,13 @@ mod tests {
 
             let mut recv_state = SctpRecvState::external();
             recv_state.record_sync = SctpRecordSync::DataTail;
-            recv_state.stashed = StashedSctpRecv {
-                state_ptr,
-                iov_count: 0,
-                process_completed: Some(process_stashed_sctp_recv::<RejectedContextRecvBuffer>),
-            };
+            unsafe {
+                recv_state.set_stashed_live_for_test(
+                    state_ptr,
+                    0,
+                    process_stashed_sctp_recv::<RejectedContextRecvBuffer>,
+                );
+            }
 
             let mut rejected_cx = Context::from_waker(std::task::Waker::noop());
             assert!(

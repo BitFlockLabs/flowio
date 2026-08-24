@@ -490,6 +490,7 @@ mod tests {
     struct CountingStats {
         inits: Cell<usize>,
         requests: Cell<usize>,
+        last_request_size: Cell<Option<usize>>,
         frees: Cell<usize>,
     }
 
@@ -532,6 +533,7 @@ mod tests {
                 return None;
             }
             self.stats.requests.set(self.stats.requests.get() + 1);
+            self.stats.last_request_size.set(Some(size));
             Some(ptr)
         }
 
@@ -642,6 +644,45 @@ mod tests {
 
         unsafe { chain.free_all(&mut allocator) };
         assert_eq!(stats.requests.get(), 1);
+        assert_eq!(stats.frees.get(), 1);
+    }
+
+    #[test]
+    fn slab_allocator_uses_effective_stride_for_nonmultiple_object_size() {
+        const OBJECT_ALIGN: usize = 64;
+        const OBJECTS_PER_SLAB: usize = 4;
+        const EXPECTED_STRIDE: usize = 128;
+        const EXPECTED_SLAB_SIZE: usize = 64 + EXPECTED_STRIDE * OBJECTS_PER_SLAB;
+
+        let stats = Rc::new(CountingStats::default());
+        let mut provider = CountingProvider::new(Rc::clone(&stats));
+        let mut allocator =
+            SlabAllocator::new_uninit(&mut provider, 96, OBJECT_ALIGN, OBJECTS_PER_SLAB)
+                .expect("nonmultiple object geometry should round to one checked stride");
+        assert_eq!(allocator.object_stride(), EXPECTED_STRIDE);
+        allocator.init();
+
+        let mut chain = SlabPageChain::new();
+        let slots: [*mut u8; OBJECTS_PER_SLAB] = std::array::from_fn(|index| {
+            let allocation = unsafe {
+                chain
+                    .alloc_or_grow(&mut allocator)
+                    .expect("each configured slot should allocate")
+            };
+            assert_eq!(allocation.new_slab, index == 0);
+            allocation.ptr
+        });
+
+        for ptr in slots {
+            assert_eq!(ptr as usize % OBJECT_ALIGN, 0);
+        }
+        for pair in slots.windows(2) {
+            assert_eq!(pair[1] as usize - pair[0] as usize, EXPECTED_STRIDE);
+        }
+        assert_eq!(stats.requests.get(), 1);
+        assert_eq!(stats.last_request_size.get(), Some(EXPECTED_SLAB_SIZE));
+
+        unsafe { chain.free_all(&mut allocator) };
         assert_eq!(stats.frees.get(), 1);
     }
 

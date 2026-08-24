@@ -23,8 +23,8 @@ use flowio::runtime::executor::{Executor, ExecutorConfig};
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{TimeoutError, sleep, timeout};
 use flowio::test_support::net::sctp::{
-    SctpSocketOptionSnapshot, append_initialized_test_cmsg, capability_unavailable,
-    test_accept_slot_drop_cached_state_preserves_unrelated_fd,
+    SctpSocketOptionSnapshot, SctpStashedRecvStateSnapshot, append_initialized_test_cmsg,
+    capability_unavailable, test_accept_slot_drop_cached_state_preserves_unrelated_fd,
     test_accept_slot_drop_future_preserves_unrelated_fd, test_accept_with_established_config_error,
     test_adaptation_indication_type, test_apply_sctp_socket_options, test_assoc_change_type,
     test_assoc_reset_event_type, test_authentication_event_type,
@@ -35,9 +35,10 @@ use flowio::test_support::net::sctp::{
     test_partial_delivery_event_type, test_peer_addr_change_type,
     test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
     test_sctp_socket_receive_options, test_sctp_stream_receive_policy,
-    test_send_failed_error_offset, test_send_failed_event_type, test_send_failed_info_offset,
-    test_send_failed_type, test_sender_dry_event_type, test_shutdown_event_type,
-    test_stream_change_event_type, test_stream_reset_event_type,
+    test_sctp_stream_stashed_recv_state, test_send_failed_error_offset,
+    test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
+    test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
+    test_stream_reset_event_type,
 };
 use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
@@ -1189,6 +1190,11 @@ fn runtime_sctp_abandoned_stash_remains_terminal_through_stream_drop_with_watchd
         "forced SCTP stash shutdown fallback was not consumed"
     );
     assert_eq!(stashed_drops.get(), 0);
+    assert_eq!(
+        test_sctp_stream_stashed_recv_state(&server),
+        SctpStashedRecvStateSnapshot::Live,
+        "executor teardown must leave the dropped receive live until recovery observes abandonment"
+    );
 
     let returned_pointer_calls = Rc::new(Cell::new(0));
     let returned_drops = Rc::new(Cell::new(0));
@@ -1211,10 +1217,20 @@ fn runtime_sctp_abandoned_stash_remains_terminal_through_stream_drop_with_watchd
         );
         assert_eq!(returned_drops.get(), attempt - 1);
         drop(recv);
+        assert_eq!(
+            test_sctp_stream_stashed_recv_state(&server),
+            SctpStashedRecvStateSnapshot::Abandoned,
+            "terminal rich receive did not publish the explicit abandoned marker"
+        );
         drop(returned);
         assert_eq!(returned_drops.get(), attempt);
     }
 
+    assert_eq!(
+        test_sctp_stream_stashed_recv_state(&server),
+        SctpStashedRecvStateSnapshot::Abandoned,
+        "later terminal behavior did not retain the marker before stream teardown"
+    );
     drop(server);
     assert_eq!(stashed_drops.get(), 0);
     drop(client);

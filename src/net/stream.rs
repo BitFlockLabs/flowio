@@ -29,7 +29,9 @@
 //! completed state is freed immediately from `Drop`.
 
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
-use crate::net::{CompletionTake, complete_read_with_progress, completion_cqe_result};
+use crate::net::{
+    CompletionTake, MsgHdrInit, complete_read_with_progress, completion_cqe_result, write_msghdr,
+};
 use crate::runtime::buffer::iobuffvec::{
     IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut, checked_iovec_count_and_length_sum,
     invalid_read_iovec_shape,
@@ -39,6 +41,10 @@ use crate::runtime::executor::{
     PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker,
     refresh_op_waiter_from_waker, submit_initialized_retained_fd_sqe, submit_resubmitted_fd_sqe,
     submit_retained_fd_sqe, validate_local_io_result,
+};
+#[cfg(debug_assertions)]
+use crate::runtime::executor::{
+    record_retained_iovec_oversize_rejection, validate_local_iovec_oversize_rejection,
 };
 use crate::runtime::fd::RuntimeFdOpState;
 use crate::runtime::op::CompletionState;
@@ -919,6 +925,25 @@ pub(super) fn invalid_readv_aggregate() -> io::Error {
     invalid_input(READV_AGGREGATE_OVERFLOW)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum DeferredReadvError {
+    None = 0,
+    AggregateOverflow = 1,
+    ActiveIovecOverflow = 2,
+}
+
+#[cold]
+#[inline(never)]
+fn materialize_deferred_readv_error(error: &DeferredReadvError) -> io::Error {
+    match error {
+        DeferredReadvError::None | DeferredReadvError::AggregateOverflow => {
+            invalid_readv_aggregate()
+        }
+        DeferredReadvError::ActiveIovecOverflow => retained_iovec_oversize_error(),
+    }
+}
+
 struct RetainedWritePayload<B: IoBuffReadOnly> {
     /// Caller-owned source buffer retained while the write SQE is in flight.
     buffer: B,
@@ -1170,15 +1195,18 @@ fn prepare_sendmsg_header(
     skip: usize,
     count: usize,
 ) -> *const libc::msghdr {
-    msg.write(libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: unsafe { iovec_slice_ptr(iovecs, skip) as *mut libc::iovec },
-        msg_iovlen: count,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    }) as *const libc::msghdr
+    write_msghdr(
+        msg,
+        MsgHdrInit {
+            name: std::ptr::null_mut(),
+            namelen: 0,
+            iov: unsafe { iovec_slice_ptr(iovecs, skip) as *mut libc::iovec },
+            iovlen: count,
+            control: std::ptr::null_mut(),
+            controllen: 0,
+        },
+    );
+    msg.as_ptr()
 }
 
 #[inline(always)]
@@ -2476,9 +2504,8 @@ pub struct ReadvFuture<'a, const N: usize, S> {
     writable: usize,
     /// Stream descriptor read from by this future.
     fd: RawFd,
-    /// Whether the sizing pass found an unrepresentable writable aggregate or
-    /// active count.
-    invalid_aggregate: bool,
+    /// Exact deferred error classified by the single sizing pass, if any.
+    deferred_error: DeferredReadvError,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
@@ -2486,14 +2513,18 @@ pub struct ReadvFuture<'a, const N: usize, S> {
 impl<'a, const N: usize, S> ReadvFuture<'a, N, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: IoBuffVecMut<N>) -> Self {
         let fd = fd_state.raw_fd();
-        let (iov_count, writable, invalid_aggregate) =
+        let (iov_count, writable, deferred_error) =
             match buffer.checked_read_iovec_count_and_writable_len() {
                 Some((iov_count, writable)) => (
                     iov_count,
                     writable,
-                    N > RETAINED_IOVEC_MAX_COUNT && iov_count > RETAINED_IOVEC_MAX_COUNT,
+                    if N > RETAINED_IOVEC_MAX_COUNT && iov_count > RETAINED_IOVEC_MAX_COUNT {
+                        DeferredReadvError::ActiveIovecOverflow
+                    } else {
+                        DeferredReadvError::None
+                    },
                 ),
-                None => (0, 0, true),
+                None => (0, 0, DeferredReadvError::AggregateOverflow),
             };
         Self {
             state_ptr: fd_state,
@@ -2501,7 +2532,7 @@ impl<'a, const N: usize, S> ReadvFuture<'a, N, S> {
             iov_count,
             writable,
             fd,
-            invalid_aggregate,
+            deferred_error,
             _marker: PhantomData,
         }
     }
@@ -2533,14 +2564,24 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
             return Poll::Pending;
         }
 
-        if this.state_ptr.state_ptr().is_null() && this.invalid_aggregate {
-            let error = if N > RETAINED_IOVEC_MAX_COUNT && this.iov_count > RETAINED_IOVEC_MAX_COUNT
-            {
-                retained_iovec_oversize_error()
+        if this.state_ptr.state_ptr().is_null() && this.deferred_error != DeferredReadvError::None {
+            #[cfg(debug_assertions)]
+            let result = if this.deferred_error == DeferredReadvError::ActiveIovecOverflow {
+                validate_local_iovec_oversize_rejection(
+                    cx,
+                    Err(materialize_deferred_readv_error(&this.deferred_error)),
+                )
             } else {
-                invalid_readv_aggregate()
+                validate_local_io_result(
+                    cx,
+                    Err(materialize_deferred_readv_error(&this.deferred_error)),
+                )
             };
-            let result = validate_local_io_result(cx, Err(error));
+            #[cfg(not(debug_assertions))]
+            let result = validate_local_io_result(
+                cx,
+                Err(materialize_deferred_readv_error(&this.deferred_error)),
+            );
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
         }
@@ -2868,6 +2909,8 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                 return Poll::Ready((Ok(0), buffer));
             }
             if N > RETAINED_IOVEC_MAX_COUNT && iov_count > RETAINED_IOVEC_MAX_COUNT {
+                #[cfg(debug_assertions)]
+                record_retained_iovec_oversize_rejection(&pctx);
                 let buffer = unsafe { opt_take(&mut this.buffer) };
                 return Poll::Ready((Err(retained_iovec_oversize_error()), buffer));
             }
@@ -3382,6 +3425,10 @@ pub struct ReadvExactFuture<'a, const N: usize, S> {
     window_iov_count: usize,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
+    /// Whether the deferred error is the intrinsic retained-iovec capacity
+    /// rejection counted after poll-context validation.
+    #[cfg(debug_assertions)]
+    record_iovec_oversize_rejection: bool,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
 }
@@ -3409,11 +3456,11 @@ impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
                 }
             }
         };
-        if N > RETAINED_IOVEC_MAX_COUNT
+        let iovec_oversize = N > RETAINED_IOVEC_MAX_COUNT
             && input_error.is_none()
             && target != 0
-            && iov_count > RETAINED_IOVEC_MAX_COUNT
-        {
+            && iov_count > RETAINED_IOVEC_MAX_COUNT;
+        if iovec_oversize {
             input_error = Some(retained_iovec_oversize_error());
         }
 
@@ -3428,6 +3475,8 @@ impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
             skip: 0,
             window_iov_count: 0,
             input_error,
+            #[cfg(debug_assertions)]
+            record_iovec_oversize_rejection: iovec_oversize,
             _marker: PhantomData,
         }
     }
@@ -3443,6 +3492,13 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
         if this.state_ptr.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
         {
+            #[cfg(debug_assertions)]
+            let result = if this.record_iovec_oversize_rejection {
+                validate_local_iovec_oversize_rejection(cx, Err(err))
+            } else {
+                validate_local_io_result(cx, Err(err))
+            };
+            #[cfg(not(debug_assertions))]
             let result = validate_local_io_result(cx, Err(err));
             let buffer = unsafe { opt_take(&mut this.buffer) };
             return Poll::Ready((result, buffer));
@@ -3892,6 +3948,15 @@ mod tests {
     };
 
     const OVERSIZED_RETAINED_IOVEC_COUNT: usize = RETAINED_IOVEC_MAX_COUNT + 1;
+
+    const fn expected_preflight_oversize_rejections(debug_count: usize) -> usize {
+        if cfg!(debug_assertions) {
+            debug_count
+        } else {
+            0
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct OversizedWriteItem(u8);
 
@@ -3986,6 +4051,12 @@ mod tests {
         let expected = oversized_read_chain_endpoint_ptrs(
             future.buffer.as_mut().expect("readv chain missing"),
         );
+        assert_eq!(
+            future.deferred_error,
+            DeferredReadvError::ActiveIovecOverflow,
+            "readv constructor did not retain its exact deferred diagnostic"
+        );
+        future.iov_count = 0;
         crate::runtime::test_hooks::fail_next_op_alloc();
         let output = match Pin::new(&mut future).poll(cx) {
             Poll::Ready(output) => Some(output),
@@ -4942,7 +5013,8 @@ mod tests {
             ReadvFuture::<4, ()>::new(invalid_fd_capability(), compacted_readv_test_chain());
         assert_eq!(readv.iov_count, 2);
         assert_eq!(readv.writable, 12);
-        assert!(!readv.invalid_aggregate);
+        assert_eq!(readv.deferred_error, DeferredReadvError::None);
+        assert_eq!(size_of::<DeferredReadvError>(), 1);
         assert_eq!(
             readv
                 .buffer
@@ -4975,9 +5047,28 @@ mod tests {
     fn vectored_overlimit_precedes_op_allocation_and_preserves_owners() {
         with_ringless_poll_context_for_test(0, |owner, cx| {
             let reactor = owner.reactor_ptr();
+            assert_eq!(
+                unsafe { (&*reactor).retained_payload_stats() }.writev_scratch_oversize_rejections,
+                0
+            );
             let read = poll_overlimit_readv(cx);
+            assert_eq!(
+                unsafe { (&*reactor).retained_payload_stats() }.writev_scratch_oversize_rejections,
+                expected_preflight_oversize_rejections(1),
+                "readv preflight rejection was not counted exactly once"
+            );
             let exact = poll_overlimit_readv_exact(cx);
+            assert_eq!(
+                unsafe { (&*reactor).retained_payload_stats() }.writev_scratch_oversize_rejections,
+                expected_preflight_oversize_rejections(2),
+                "readv_exact preflight rejection was not counted exactly once"
+            );
             let write = poll_overlimit_writev_all(cx);
+            assert_eq!(
+                unsafe { (&*reactor).retained_payload_stats() }.writev_scratch_oversize_rejections,
+                expected_preflight_oversize_rejections(3),
+                "writev_all preflight rejection was not counted exactly once"
+            );
 
             let expected = Some((io::ErrorKind::InvalidInput, RETAINED_IOVEC_OVERSIZE_MESSAGE));
             assert_eq!(
@@ -5026,7 +5117,10 @@ mod tests {
             assert_eq!(stats.heap_fallbacks, 0);
             assert_eq!(stats.writev_scratch_inline_allocs, 0);
             assert_eq!(stats.writev_scratch_pooled_allocs, 0);
-            assert_eq!(stats.writev_scratch_oversize_rejections, 0);
+            assert_eq!(
+                stats.writev_scratch_oversize_rejections,
+                expected_preflight_oversize_rejections(3)
+            );
         });
     }
 
@@ -5066,7 +5160,8 @@ mod tests {
             "readv_exact context rejection changed its owner"
         );
 
-        with_ringless_poll_context_for_test(0, |_owner, cx| {
+        with_ringless_poll_context_for_test(0, |owner, cx| {
+            let reactor = owner.reactor_ptr();
             let (result, owner_ok, fault_remaining) = poll_overlimit_zero_target(cx);
             assert_eq!(
                 result
@@ -5078,6 +5173,36 @@ mod tests {
             assert!(
                 fault_remaining,
                 "zero-target readv_exact attempted op allocation"
+            );
+
+            let mut empty_read =
+                ReadvFuture::<1, ()>::new(invalid_fd_capability(), IoBuffVecMut::<1>::new());
+            let (empty_read_result, empty_read_chain) = match Pin::new(&mut empty_read).poll(cx) {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("empty readv remained pending"),
+            };
+            assert_eq!(
+                empty_read_result
+                    .expect_err("empty readv unexpectedly succeeded")
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(empty_read_chain.segments(), 0);
+
+            let mut empty_write =
+                WritevAllFuture::<_, 1, ()>::new(invalid_fd_capability(), IoBuffVec::<1>::new());
+            let (empty_write_result, empty_write_chain) = match Pin::new(&mut empty_write).poll(cx)
+            {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("empty writev_all remained pending"),
+            };
+            assert_eq!(empty_write_result.expect("empty writev_all failed"), 0);
+            assert_eq!(empty_write_chain.segments(), 0);
+
+            assert_eq!(
+                unsafe { (&*reactor).retained_payload_stats() }.writev_scratch_oversize_rejections,
+                0,
+                "target-zero or empty-shape paths counted an oversize rejection"
             );
         });
     }
@@ -5123,7 +5248,7 @@ mod tests {
     fn readv_aggregate_overflow_preserves_context_precedence_and_returns_exact_chain() {
         let mut readv =
             ReadvFuture::<1, ()>::new(invalid_fd_capability(), aggregate_rejection_test_chain());
-        readv.invalid_aggregate = true;
+        readv.deferred_error = DeferredReadvError::AggregateOverflow;
         readv.iov_count = 0;
         readv.writable = 0;
         let expected_ptr = aggregate_rejection_chain_ptr(
@@ -5166,7 +5291,7 @@ mod tests {
                 invalid_fd_capability(),
                 aggregate_rejection_test_chain(),
             );
-            readv.invalid_aggregate = true;
+            readv.deferred_error = DeferredReadvError::AggregateOverflow;
             readv.iov_count = 0;
             readv.writable = 0;
             let expected_ptr = aggregate_rejection_chain_ptr(
@@ -5203,6 +5328,7 @@ mod tests {
             assert_eq!(stats.heap_fallbacks, 0);
             assert_eq!(stats.writev_scratch_inline_allocs, 0);
             assert_eq!(stats.writev_scratch_pooled_allocs, 0);
+            assert_eq!(stats.writev_scratch_oversize_rejections, 0);
         });
     }
 

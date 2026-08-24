@@ -214,7 +214,7 @@ macro_rules! define_runtime_stats {
             /// sidecar pool.
             #[cfg(debug_assertions)]
             pub writev_scratch_slab_allocs: usize,
-            /// Vectored I/O requests rejected for exceeding the iovec limit.
+            /// Stream requests rejected for exceeding the active iovec limit.
             #[cfg(debug_assertions)]
             pub writev_scratch_oversize_rejections: usize,
             /// Vectored I/O scratch sidecar allocation failures.
@@ -1268,6 +1268,28 @@ pub(crate) fn validate_local_io_result<T>(
     result: io::Result<T>,
 ) -> io::Result<T> {
     poll_ctx_from_waker(cx)?;
+    result
+}
+
+/// Records one preflighted stream iovec-capacity rejection after its owner
+/// poll context and all higher-precedence validation have succeeded.
+#[cfg(debug_assertions)]
+#[inline(always)]
+pub(crate) fn record_retained_iovec_oversize_rejection(pctx: &PollCtx) {
+    let pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
+    unsafe { (*pool.as_ptr()).record_iovec_oversize_rejection() };
+}
+
+/// Validates a locally rejected stream request before recording its intrinsic
+/// iovec-capacity event.
+#[cfg(debug_assertions)]
+#[inline(always)]
+pub(crate) fn validate_local_iovec_oversize_rejection<T>(
+    cx: &std::task::Context<'_>,
+    result: io::Result<T>,
+) -> io::Result<T> {
+    let pctx = poll_ctx_from_waker(cx)?;
+    record_retained_iovec_oversize_rejection(&pctx);
     result
 }
 

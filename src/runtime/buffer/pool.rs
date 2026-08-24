@@ -34,15 +34,6 @@ use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
-/// Alignment required while one pool slot alternates between a live buffer
-/// header and an intrusive free-list link.
-const IOBUFF_POOL_SLOT_ALIGN: usize =
-    if std::mem::align_of::<IoBuffHeader>() > std::mem::align_of::<SListLink>() {
-        std::mem::align_of::<IoBuffHeader>()
-    } else {
-        std::mem::align_of::<SListLink>()
-    };
-
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
@@ -53,7 +44,6 @@ const _: () = {
     assert!(std::mem::align_of::<IoBuffHeader>() == 8);
     assert!(std::mem::size_of::<SListLink>() == 8);
     assert!(std::mem::align_of::<SListLink>() == 8);
-    assert!(IOBUFF_POOL_SLOT_ALIGN == 8);
 };
 
 /// Configuration for [`IoBuffPool`] buffer layout.
@@ -216,25 +206,17 @@ impl IoBuffPoolInner {
         let slot_raw_size = std::mem::size_of::<IoBuffHeader>()
             .checked_add(total_data)
             .ok_or(IoBuffPoolConfigError::LayoutOverflow)?;
-        // A checked-out slot contains an IoBuffHeader; an inactive slot
-        // contains an overlaid free-list link. Construct the allocation for
-        // both states instead of relying on their current alignments matching.
-        let slot_align = IOBUFF_POOL_SLOT_ALIGN;
-        let link_size = std::mem::size_of::<SListLink>();
-        let slot_min = std::cmp::max(slot_raw_size, link_size);
-        let slot_size = crate::utils::size_up(slot_min, slot_align)
-            .map_err(|_| IoBuffPoolConfigError::LayoutOverflow)?;
-
         let provider = ProviderOwner::new(BasicMemoryProvider::new());
 
         let slab_factory = match unsafe {
             // SAFETY: provider.as_ptr() comes from a heap allocation owned by
             // ProviderOwner and remains stable until after slab_factory is
-            // manually dropped.
+            // manually dropped. SlabAllocator is the sole authority for
+            // inactive-link fit/alignment and effective stride rounding.
             SlabAllocator::new_uninit_from_raw(
                 provider.as_ptr(),
-                slot_size,
-                slot_align,
+                slot_raw_size,
+                std::mem::align_of::<IoBuffHeader>(),
                 config.objs_per_slab,
             )
         } {
@@ -439,6 +421,21 @@ impl Drop for IoBuffPool {
 mod layout_tests {
     use super::*;
 
+    fn legacy_slot_stride(data_size: usize) -> usize {
+        let raw_size = std::mem::size_of::<IoBuffHeader>()
+            .checked_add(data_size)
+            .expect("legacy test geometry must fit");
+        let alignment = std::cmp::max(
+            std::mem::align_of::<IoBuffHeader>(),
+            std::mem::align_of::<SListLink>(),
+        );
+        crate::utils::size_up(
+            std::cmp::max(raw_size, std::mem::size_of::<SListLink>()),
+            alignment,
+        )
+        .expect("legacy test geometry must round")
+    }
+
     fn slot_ptr(buffer: &IoBuffMut) -> *mut u8 {
         buffer.header.as_ptr().cast::<u8>()
     }
@@ -458,14 +455,46 @@ mod layout_tests {
 
     #[test]
     fn iobuff_pool_slot_alignment_covers_both_overlay_states() {
-        assert_eq!(
-            IOBUFF_POOL_SLOT_ALIGN,
-            std::cmp::max(
-                std::mem::align_of::<IoBuffHeader>(),
-                std::mem::align_of::<SListLink>()
-            )
-        );
-        assert!(IOBUFF_POOL_SLOT_ALIGN.is_power_of_two());
+        for (headroom, payload, tailroom, objs_per_slab) in
+            [(0, 0, 0, 1), (0, 1, 0, 2), (3, 5, 7, 3), (16, 1_500, 8, 64)]
+        {
+            let data_size = headroom + payload + tailroom;
+            let pool = IoBuffPool::new(IoBuffPoolConfig {
+                headroom,
+                payload,
+                tailroom,
+                objs_per_slab,
+            })
+            .expect("representative legacy pool geometry should remain valid");
+            let inner = unsafe { &*pool.inner.as_ptr() };
+            let stride = inner.slab_factory.object_stride();
+            let slab_align = inner.slab_factory.get_slab_alignment();
+
+            assert_eq!(stride, legacy_slot_stride(data_size));
+            assert_eq!(stride % std::mem::align_of::<IoBuffHeader>(), 0);
+            assert_eq!(stride % std::mem::align_of::<SListLink>(), 0);
+            assert!(slab_align >= std::mem::align_of::<IoBuffHeader>());
+            assert!(slab_align >= std::mem::align_of::<SListLink>());
+        }
+    }
+
+    #[test]
+    fn iobuff_pool_raw_geometry_preserves_layout_overflow_mapping() {
+        for headroom in [
+            usize::MAX,
+            usize::MAX - std::mem::size_of::<IoBuffHeader>(),
+            usize::MAX - std::mem::size_of::<IoBuffHeader>() - 7,
+        ] {
+            assert!(matches!(
+                IoBuffPool::new(IoBuffPoolConfig {
+                    headroom,
+                    payload: 0,
+                    tailroom: 0,
+                    objs_per_slab: 1,
+                }),
+                Err(IoBuffPoolConfigError::LayoutOverflow)
+            ));
+        }
     }
 
     #[test]
@@ -484,19 +513,10 @@ mod layout_tests {
                 inner.slab_factory.get_slab_alignment(),
             )
         };
-        assert_eq!(
-            slot_size,
-            crate::utils::size_up(
-                std::cmp::max(
-                    std::mem::size_of::<IoBuffHeader>() + 1,
-                    std::mem::size_of::<SListLink>()
-                ),
-                IOBUFF_POOL_SLOT_ALIGN
-            )
-            .expect("supported pool geometry should not overflow")
-        );
+        assert_eq!(slot_size, legacy_slot_stride(1));
         assert!(
-            slab_align >= IOBUFF_POOL_SLOT_ALIGN,
+            slab_align >= std::mem::align_of::<IoBuffHeader>()
+                && slab_align >= std::mem::align_of::<SListLink>(),
             "slab alignment must cover every slot alignment"
         );
         #[cfg(all(

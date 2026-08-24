@@ -126,7 +126,7 @@ macro_rules! retained_payload_stat_fields {
             writev_scratch_slab_allocs => writev_scratch_slab_allocs:
                 "Sidecar scratch slab pages requested from providers.";
             writev_scratch_oversize_rejections => writev_scratch_oversize_rejections:
-                "Scratch requests rejected for exceeding the supported iovec count.";
+                "Stream requests rejected for exceeding the supported active iovec count.";
             writev_scratch_alloc_failures => writev_scratch_alloc_failures:
                 "Scratch requests rejected because no sidecar block was available.";
         }
@@ -626,6 +626,14 @@ impl RetainedPayloadPool {
                 Rc::clone(&self.iovec_pool),
             )
         })
+    }
+
+    /// Records one intrinsic stream iovec-capacity rejection that preflighted
+    /// before allocator defense.
+    #[cfg(debug_assertions)]
+    #[inline(always)]
+    pub(crate) fn record_iovec_oversize_rejection(&self) {
+        self.iovec_pool.record_oversize_rejection();
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]

@@ -3690,6 +3690,29 @@ nameserver 192.0.2.9\n",
     }
 
     #[test]
+    fn compressed_overlength_precedes_excessive_pointer_depth() {
+        let mut packet = Vec::new();
+        let mut target = 0usize;
+        for index in 0..(MAX_NAME_COMPRESSION_DEPTH + 2) {
+            let label_offset = packet.len();
+            packet.push(63);
+            packet.extend(std::iter::repeat_n(b'a' + index as u8, 63));
+            if index == 0 {
+                packet.push(0);
+            } else {
+                assert!(target < 0x4000, "test compression pointer should fit");
+                packet.extend_from_slice(&(0xC000 | target as u16).to_be_bytes());
+            }
+            target = label_offset;
+        }
+
+        let err = decode_name(&packet, target, 0)
+            .expect_err("overlength should win before the ninth pointer hop");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "DNS name exceeded maximum length");
+    }
+
+    #[test]
     fn compressed_name_expansion_enforces_253_byte_boundary() {
         let suffix = [
             "a".repeat(63),
