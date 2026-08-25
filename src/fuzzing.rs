@@ -198,15 +198,24 @@ pub fn dns_parse_resolv_conf_bytes(data: &[u8]) {
     let _ = std::hint::black_box(observe_dns_parse_resolv_conf_bytes(data));
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn observe_sctp_parse_notification(data: &[u8]) -> std::io::Result<crate::net::sctp::SctpRecvMeta> {
     let data = maybe_decode_hex_seed(data);
-    let data = data.as_ref();
+    observe_sctp_parse_notification_bytes(data.as_ref())
+}
+
+fn observe_sctp_parse_notification_bytes(
+    data: &[u8],
+) -> std::io::Result<crate::net::sctp::SctpRecvMeta> {
     crate::net::sctp::parse_notification(data)
 }
 
 /// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
 pub fn sctp_parse_notification(data: &[u8]) {
-    let _ = std::hint::black_box(observe_sctp_parse_notification(data));
+    let decoded = maybe_decode_hex_seed(data);
+    let decoded = decoded.as_ref();
+    let _ = std::hint::black_box(observe_sctp_parse_notification_bytes(decoded));
+    crate::net::sctp::fuzz_sctp_record_recovery(decoded);
 }
 
 fn observe_sctp_parse_recv_meta(data: &[u8]) -> std::io::Result<crate::net::sctp::SctpRecvMeta> {

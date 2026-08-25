@@ -2445,6 +2445,9 @@ enum SctpRecordSync {
     Synced,
     DataTail,
     NotificationTail,
+    /// A distinct notification is being classified while the underlying
+    /// abandoned record remains a data tail.
+    DataNotificationTail,
 }
 
 impl SctpRecordSync {
@@ -2452,93 +2455,24 @@ impl SctpRecordSync {
     const fn is_synced(self) -> bool {
         matches!(self, Self::Synced)
     }
-
-    /// Advances internal recovery without interpreting notification-tail
-    /// bytes as a fresh notification header.
-    #[inline(always)]
-    fn after_recovery_completion(
-        self,
-        header: SctpRecvHeader,
-        partial_delivery_abort: bool,
-    ) -> Self {
-        match self {
-            Self::Synced => Self::Synced,
-            Self::NotificationTail => {
-                if sctp_msg_end_of_record(header.msg_flags) {
-                    Self::Synced
-                } else {
-                    Self::NotificationTail
-                }
-            }
-            Self::DataTail => {
-                if sctp_msg_notification(header.msg_flags) {
-                    if partial_delivery_abort {
-                        Self::Synced
-                    } else {
-                        Self::DataTail
-                    }
-                } else if sctp_msg_end_of_record(header.msg_flags) {
-                    Self::Synced
-                } else {
-                    Self::DataTail
-                }
-            }
-        }
-    }
-
-    /// Accounts for a successful completion whose bytes cannot be published
-    /// to the caller because its future was dropped or its context rejected.
-    #[inline(always)]
-    fn after_unpublished_completion(
-        self,
-        actual: usize,
-        header: SctpRecvHeader,
-        partial_delivery_abort: bool,
-    ) -> Self {
-        if sctp_msg_clean_eof(actual, header) {
-            return Self::Synced;
-        }
-
-        match self {
-            Self::Synced => {
-                if partial_delivery_abort || sctp_msg_end_of_record(header.msg_flags) || actual == 0
-                {
-                    Self::Synced
-                } else if sctp_msg_notification(header.msg_flags) {
-                    Self::NotificationTail
-                } else {
-                    Self::DataTail
-                }
-            }
-            pending => pending.after_recovery_completion(header, partial_delivery_abort),
-        }
-    }
-
-    /// Records a caller-visible metadata failure after the kernel consumed a
-    /// nonterminal completion. A complete PDAPI abort has already restored the
-    /// abandoned data-record boundary and must not be reclassified as a new
-    /// notification tail merely because it arrived without EOR.
-    #[inline(always)]
-    fn after_visible_error(
-        self,
-        actual: usize,
-        header: SctpRecvHeader,
-        partial_delivery_abort: bool,
-    ) -> Self {
-        if partial_delivery_abort || !sctp_msg_partial_nonempty(actual, header.msg_flags) {
-            return self;
-        }
-
-        if sctp_msg_notification(header.msg_flags) {
-            Self::NotificationTail
-        } else {
-            Self::DataTail
-        }
-    }
 }
 
 type StashedSctpRecvProcessor =
-    unsafe fn(*mut Reactor, *mut CompletionState, usize, &mut SctpRecordSync);
+    unsafe fn(*mut Reactor, *mut CompletionState, usize, &mut SctpRecvState);
+
+const SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN: usize = SCTP_PARTIAL_DELIVERY_MIN_LEN;
+const SCTP_NESTED_PREFIX_CLASSIFIED: u8 = 0x80;
+
+enum SctpCompletionPublication {
+    Visible(io::Result<Option<SctpRecvInfo>>),
+    Unpublished,
+}
+
+#[must_use]
+enum SctpMetadataCompletion {
+    Consume,
+    Publish(io::Result<SctpRecvMeta>),
+}
 
 /// Explicit lifecycle of the stream-owned dropped metadata receive.
 ///
@@ -2601,10 +2535,18 @@ struct SctpRecvState {
     /// Explicit lifecycle tag for `stashed`. This stays separate from the
     /// payload so the full-width iovec count and existing layouts are retained.
     stashed_state: StashedSctpRecvState,
+    /// Low seven bits retain the nested notification prefix length. The high
+    /// bit records that the full bounded prefix was classified as non-abort.
+    /// This control byte consumes prior natural padding.
+    nested_prefix_state: u8,
     /// Dropped metadata receive completion that must be adopted before the
     /// next metadata receive can preserve record-boundary state, or terminal
     /// opaque poison retained after origin-ring abandonment.
     stashed: StashedSctpRecv,
+    /// Bounded PDAPI classifier storage used only while a notification record
+    /// interrupts an abandoned data tail. Variable notification tails are
+    /// never retained or copied.
+    nested_notification_prefix: [u8; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN],
 }
 
 impl SctpRecvState {
@@ -2619,7 +2561,9 @@ impl SctpRecvState {
             partial_delivery_visible: Cell::new(true),
             any_notification_visible: Cell::new(true),
             stashed_state: StashedSctpRecvState::Empty,
+            nested_prefix_state: 0,
             stashed: StashedSctpRecv::empty(),
+            nested_notification_prefix: [0; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN],
         }
     }
 
@@ -2631,7 +2575,9 @@ impl SctpRecvState {
             partial_delivery_visible: Cell::new(config.notifications.partial_delivery),
             any_notification_visible: Cell::new(config.notifications.any()),
             stashed_state: StashedSctpRecvState::Empty,
+            nested_prefix_state: 0,
             stashed: StashedSctpRecv::empty(),
+            nested_notification_prefix: [0; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN],
         }
     }
 
@@ -2724,8 +2670,79 @@ impl SctpRecvState {
     }
 
     #[inline(always)]
-    /// Classifies one caller-visible metadata completion under this stream's
-    /// configured receive-info policy.
+    fn set_record_sync(&mut self, record_sync: SctpRecordSync) {
+        self.record_sync = record_sync;
+        if !matches!(record_sync, SctpRecordSync::DataNotificationTail) {
+            self.nested_prefix_state = 0;
+        }
+    }
+
+    #[inline(always)]
+    fn nested_prefix_len(&self) -> usize {
+        usize::from(self.nested_prefix_state & !SCTP_NESTED_PREFIX_CLASSIFIED)
+    }
+
+    #[inline(always)]
+    fn begin_nested_notification(&mut self) {
+        debug_assert_eq!(self.record_sync, SctpRecordSync::DataTail);
+        self.record_sync = SctpRecordSync::DataNotificationTail;
+        self.nested_prefix_state = 0;
+    }
+
+    #[inline(always)]
+    fn needs_bounded_recovery_prefix(&self, msg_flags: libc::c_int) -> bool {
+        sctp_msg_notification(msg_flags)
+            || matches!(self.record_sync, SctpRecordSync::DataNotificationTail)
+    }
+
+    /// Appends only the fixed PDAPI classifier prefix. Once a full prefix is
+    /// known not to be an abort, later notification-tail bytes remain opaque.
+    fn append_nested_notification_prefix(
+        &mut self,
+        bytes: &[u8],
+    ) -> Option<io::Result<SctpRecvMeta>> {
+        debug_assert_eq!(self.record_sync, SctpRecordSync::DataNotificationTail);
+        if (self.nested_prefix_state & SCTP_NESTED_PREFIX_CLASSIFIED) != 0 {
+            return None;
+        }
+
+        let prefix_len = self.nested_prefix_len();
+        debug_assert!(prefix_len <= SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+        let appended = std::cmp::min(
+            bytes.len(),
+            SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN - prefix_len,
+        );
+        self.nested_notification_prefix[prefix_len..prefix_len + appended]
+            .copy_from_slice(&bytes[..appended]);
+        let prefix_len = prefix_len + appended;
+        self.nested_prefix_state = prefix_len as u8;
+        if prefix_len != SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN {
+            return None;
+        }
+        Some(parse_notification(
+            &self.nested_notification_prefix[..prefix_len],
+        ))
+    }
+
+    #[inline(always)]
+    fn transition_unpublished_synced_completion(
+        &mut self,
+        actual: usize,
+        header: SctpRecvHeader,
+        partial_delivery_abort: bool,
+    ) {
+        let next =
+            if partial_delivery_abort || sctp_msg_end_of_record(header.msg_flags) || actual == 0 {
+                SctpRecordSync::Synced
+            } else if sctp_msg_notification(header.msg_flags) {
+                SctpRecordSync::NotificationTail
+            } else {
+                SctpRecordSync::DataTail
+            };
+        self.set_record_sync(next);
+    }
+
+    #[inline(always)]
     fn parse_completion_meta(
         &self,
         rcvinfo: io::Result<Option<SctpRecvInfo>>,
@@ -2742,66 +2759,205 @@ impl SctpRecvState {
         )
     }
 
-    /// Parses a notification head unless this completion is known to be an
-    /// opaque continuation of an earlier notification.
-    #[inline(always)]
-    fn parse_notification_for_completion(
-        &self,
-        data_slice: &[u8],
-        msg_flags: libc::c_int,
-    ) -> Option<io::Result<SctpRecvMeta>> {
-        if matches!(self.record_sync, SctpRecordSync::NotificationTail) {
-            None
-        } else {
-            parse_sctp_notification_once(data_slice, msg_flags)
-        }
-    }
-
-    /// Updates record synchronization and returns true when this completion
-    /// is internal recovery work rather than caller-visible metadata.
-    fn should_consume_metadata_completion(
+    fn publish_metadata_completion(
         &mut self,
         actual: usize,
         header: SctpRecvHeader,
-        parsed_notification: Option<&io::Result<SctpRecvMeta>>,
-    ) -> bool {
-        let partial_delivery_abort = sctp_notification_retires_discard(parsed_notification);
+        data_slice: &[u8],
+        rcvinfo: io::Result<Option<SctpRecvInfo>>,
+        parsed_notification: Option<io::Result<SctpRecvMeta>>,
+        partial_delivery_abort: bool,
+    ) -> SctpMetadataCompletion {
+        let meta =
+            self.parse_completion_meta(rcvinfo, header.msg_flags, data_slice, parsed_notification);
+        if meta.is_err()
+            && !partial_delivery_abort
+            && sctp_msg_partial_nonempty(actual, header.msg_flags)
+        {
+            let tail = if sctp_msg_notification(header.msg_flags) {
+                SctpRecordSync::NotificationTail
+            } else {
+                SctpRecordSync::DataTail
+            };
+            self.set_record_sync(tail);
+        }
+        SctpMetadataCompletion::Publish(meta)
+    }
+
+    fn process_nested_notification_completion(
+        &mut self,
+        actual: usize,
+        header: SctpRecvHeader,
+        data_slice: &[u8],
+        recovery_prefix: &[u8],
+        publication: SctpCompletionPublication,
+    ) -> SctpMetadataCompletion {
+        debug_assert_eq!(self.record_sync, SctpRecordSync::DataNotificationTail);
+        let parsed_notification = self.append_nested_notification_prefix(recovery_prefix);
+        let partial_delivery_abort =
+            sctp_notification_retires_discard(parsed_notification.as_ref());
+        if parsed_notification.is_some() && !partial_delivery_abort {
+            self.nested_prefix_state |= SCTP_NESTED_PREFIX_CLASSIFIED;
+        }
+
+        if partial_delivery_abort {
+            self.set_record_sync(SctpRecordSync::Synced);
+        } else if sctp_msg_end_of_record(header.msg_flags) {
+            self.set_record_sync(SctpRecordSync::DataTail);
+        }
+
+        match publication {
+            SctpCompletionPublication::Visible(rcvinfo)
+                if partial_delivery_abort && self.partial_delivery_visible.get() =>
+            {
+                self.publish_metadata_completion(
+                    actual,
+                    header,
+                    data_slice,
+                    rcvinfo,
+                    parsed_notification,
+                    true,
+                )
+            }
+            SctpCompletionPublication::Visible(_) | SctpCompletionPublication::Unpublished => {
+                SctpMetadataCompletion::Consume
+            }
+        }
+    }
+
+    /// Classifies and transitions one successful metadata completion exactly
+    /// once. `recovery_prefix` is the first at most 24 bytes across all active
+    /// iovecs; `data_slice` preserves the ordinary contiguous parsing surface.
+    fn process_metadata_completion(
+        &mut self,
+        actual: usize,
+        header: SctpRecvHeader,
+        data_slice: &[u8],
+        recovery_prefix: &[u8],
+        publication: SctpCompletionPublication,
+    ) -> SctpMetadataCompletion {
+        if self.needs_bounded_recovery_prefix(header.msg_flags) {
+            debug_assert_eq!(
+                recovery_prefix.len(),
+                std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN),
+                "SCTP recovery prefix does not match the completed byte count"
+            );
+        }
+
+        if sctp_msg_clean_eof(actual, header) {
+            self.set_record_sync(SctpRecordSync::Synced);
+            return match publication {
+                SctpCompletionPublication::Visible(_) => {
+                    SctpMetadataCompletion::Publish(Ok(sctp_eof_recv_meta()))
+                }
+                SctpCompletionPublication::Unpublished => SctpMetadataCompletion::Consume,
+            };
+        }
+
         match self.record_sync {
             SctpRecordSync::NotificationTail => {
-                self.record_sync = self
-                    .record_sync
-                    .after_recovery_completion(header, partial_delivery_abort);
-                true
+                if sctp_msg_end_of_record(header.msg_flags) {
+                    self.set_record_sync(SctpRecordSync::Synced);
+                }
+                SctpMetadataCompletion::Consume
+            }
+            SctpRecordSync::DataTail if sctp_msg_notification(header.msg_flags) => {
+                self.begin_nested_notification();
+                self.process_nested_notification_completion(
+                    actual,
+                    header,
+                    data_slice,
+                    recovery_prefix,
+                    publication,
+                )
             }
             SctpRecordSync::DataTail => {
-                self.record_sync = self
-                    .record_sync
-                    .after_recovery_completion(header, partial_delivery_abort);
-                !(partial_delivery_abort && self.partial_delivery_visible.get())
+                if sctp_msg_end_of_record(header.msg_flags) {
+                    self.set_record_sync(SctpRecordSync::Synced);
+                }
+                SctpMetadataCompletion::Consume
             }
+            SctpRecordSync::DataNotificationTail => self.process_nested_notification_completion(
+                actual,
+                header,
+                data_slice,
+                recovery_prefix,
+                publication,
+            ),
             SctpRecordSync::Synced => {
-                if sctp_msg_notification(header.msg_flags) && !self.any_notification_visible.get() {
-                    self.record_sync = self.record_sync.after_unpublished_completion(
-                        actual,
-                        header,
-                        partial_delivery_abort,
-                    );
-                    true
+                let parse_slice = if actual <= SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN
+                    && recovery_prefix.len() == actual
+                {
+                    recovery_prefix
                 } else {
-                    partial_delivery_abort && !self.partial_delivery_visible.get()
+                    data_slice
+                };
+                let parsed_notification =
+                    parse_sctp_notification_once(parse_slice, header.msg_flags);
+                let partial_delivery_abort =
+                    sctp_notification_retires_discard(parsed_notification.as_ref());
+
+                match publication {
+                    SctpCompletionPublication::Unpublished => {
+                        self.transition_unpublished_synced_completion(
+                            actual,
+                            header,
+                            partial_delivery_abort,
+                        );
+                        SctpMetadataCompletion::Consume
+                    }
+                    SctpCompletionPublication::Visible(_)
+                        if sctp_msg_notification(header.msg_flags)
+                            && !self.any_notification_visible.get() =>
+                    {
+                        self.transition_unpublished_synced_completion(
+                            actual,
+                            header,
+                            partial_delivery_abort,
+                        );
+                        SctpMetadataCompletion::Consume
+                    }
+                    SctpCompletionPublication::Visible(_)
+                        if partial_delivery_abort && !self.partial_delivery_visible.get() =>
+                    {
+                        SctpMetadataCompletion::Consume
+                    }
+                    SctpCompletionPublication::Visible(rcvinfo) => self
+                        .publish_metadata_completion(
+                            actual,
+                            header,
+                            data_slice,
+                            rcvinfo,
+                            parsed_notification,
+                            partial_delivery_abort,
+                        ),
                 }
             }
         }
     }
 
     #[cfg(test)]
-    fn should_consume_for_test(&mut self, data_slice: &[u8], msg: &libc::msghdr) -> bool {
-        let parsed_notification = self.parse_notification_for_completion(data_slice, msg.msg_flags);
-        self.should_consume_metadata_completion(
+    fn process_unpublished_for_test(&mut self, data_slice: &[u8], msg: &libc::msghdr) {
+        let action = self.process_metadata_completion(
             data_slice.len(),
             SctpRecvHeader::from_msghdr(msg),
-            parsed_notification.as_ref(),
-        )
+            data_slice,
+            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)],
+            SctpCompletionPublication::Unpublished,
+        );
+        debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
+    }
+
+    #[cfg(test)]
+    fn should_consume_for_test(&mut self, data_slice: &[u8], msg: &libc::msghdr) -> bool {
+        let action = self.process_metadata_completion(
+            data_slice.len(),
+            SctpRecvHeader::from_msghdr(msg),
+            data_slice,
+            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)],
+            SctpCompletionPublication::Visible(Ok(None)),
+        );
+        matches!(action, SctpMetadataCompletion::Consume)
     }
 
     /// Transfers an in-flight metadata receive from a dropped future into the
@@ -2897,14 +3053,7 @@ impl SctpRecvState {
             "stashed SCTP recv missing completion processor"
         );
         let process_completed = unsafe { process_completed.unwrap_unchecked() };
-        unsafe {
-            process_completed(
-                op_ctx.reactor(),
-                state_ptr,
-                stashed.iov_count,
-                &mut self.record_sync,
-            )
-        };
+        unsafe { process_completed(op_ctx.reactor(), state_ptr, stashed.iov_count, self) };
         if op_ctx.context_rejected() {
             Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)))
         } else {
@@ -2936,6 +3085,48 @@ impl SctpRecvState {
     #[inline(always)]
     fn pending_metadata_recovery(&self) -> bool {
         !self.record_sync.is_synced() || self.stashed_state != StashedSctpRecvState::Empty
+    }
+}
+
+/// Exercises every bounded split of one arbitrary notification prefix through
+/// the production nested-data-tail classifier.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_sctp_record_recovery(data: &[u8]) {
+    let split_limit = std::cmp::min(data.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+    for split in 0..=split_limit {
+        for terminal in [false, true] {
+            let mut state = SctpRecvState::external();
+            state.set_record_sync(SctpRecordSync::DataTail);
+
+            let first = &data[..split];
+            let first_prefix =
+                &first[..std::cmp::min(first.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+            let _ = state.process_metadata_completion(
+                first.len(),
+                SctpRecvHeader {
+                    msg_controllen: 0,
+                    msg_flags: libc::MSG_NOTIFICATION,
+                },
+                first,
+                first_prefix,
+                SctpCompletionPublication::Unpublished,
+            );
+
+            let second = &data[split..];
+            let second_prefix =
+                &second[..std::cmp::min(second.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+            let _ = state.process_metadata_completion(
+                second.len(),
+                SctpRecvHeader {
+                    msg_controllen: 0,
+                    msg_flags: libc::MSG_NOTIFICATION | if terminal { libc::MSG_EOR } else { 0 },
+                },
+                second,
+                second_prefix,
+                SctpCompletionPublication::Unpublished,
+            );
+            std::hint::black_box((state.record_sync, state.nested_prefix_state));
+        }
     }
 }
 
@@ -4416,7 +4607,7 @@ struct StashedSctpRecvVectoredCompletion<const N: usize> {
     header: SctpRecvHeader,
     first_iovec: Option<libc::iovec>,
     /// Keeps every copied iovec target alive through discard-state processing.
-    _buffer: IoBuffVecMut<N>,
+    buffer: IoBuffVecMut<N>,
 }
 
 #[inline(always)]
@@ -4589,7 +4780,7 @@ unsafe fn take_stashed_sctp_recv_vectored_completion<const N: usize>(
     StashedSctpRecvVectoredCompletion {
         header,
         first_iovec,
-        _buffer: buffer,
+        buffer,
     }
 }
 
@@ -4698,22 +4889,6 @@ fn sctp_notification_retires_discard(
     )
 }
 
-fn update_record_sync_after_unpublished_completion(
-    record_sync: &mut SctpRecordSync,
-    actual: usize,
-    header: SctpRecvHeader,
-    data_slice: &[u8],
-) {
-    let parsed_notification = if matches!(*record_sync, SctpRecordSync::NotificationTail) {
-        None
-    } else {
-        parse_sctp_notification_once(data_slice, header.msg_flags)
-    };
-    let partial_delivery_abort = sctp_notification_retires_discard(parsed_notification.as_ref());
-    *record_sync =
-        (*record_sync).after_unpublished_completion(actual, header, partial_delivery_abort);
-}
-
 /// Returns the initialized prefix consumed by a completed scalar receive.
 /// Zero progress returns an empty slice without inspecting the caller buffer.
 ///
@@ -4742,6 +4917,40 @@ unsafe fn sctp_first_iov_slice(first_iovec: Option<&libc::iovec>, actual: usize)
 
     let safe_len = std::cmp::min(actual, first_iov.iov_len);
     unsafe { std::slice::from_raw_parts(first_iov.iov_base as *const u8, safe_len) }
+}
+
+/// Copies the first fixed recovery prefix across active vectored destinations.
+///
+/// # Safety
+///
+/// The first `actual` bytes across the chain's current writable regions must
+/// have been initialized by one completed kernel receive. `storage` may be
+/// uninitialized; this function returns only the prefix it initializes.
+unsafe fn sctp_vectored_received_prefix<'a, const N: usize>(
+    buffer: &mut IoBuffVecMut<N>,
+    actual: usize,
+    storage: &'a mut MaybeUninit<[u8; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN]>,
+) -> &'a [u8] {
+    let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+    let destination = storage.as_mut_ptr().cast::<u8>();
+    let mut copied = 0usize;
+    for index in 0..buffer.segments() {
+        if copied == target {
+            break;
+        }
+        // SAFETY: `index` is bounded by the chain's initialized segment count.
+        let segment = unsafe { buffer.get_mut(index).unwrap_unchecked() };
+        let available = std::cmp::min(segment.writable_len(), target - copied);
+        if available == 0 {
+            continue;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(segment.as_mut_ptr(), destination.add(copied), available);
+        }
+        copied += available;
+    }
+    debug_assert_eq!(copied, target, "completed SCTP iovecs did not cover actual");
+    unsafe { std::slice::from_raw_parts(destination, copied) }
 }
 
 #[inline(always)]
@@ -4803,7 +5012,7 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
     reactor: *mut Reactor,
     state_ptr: *mut CompletionState,
     _iov_count: usize,
-    record_sync: &mut SctpRecordSync,
+    recv_state: &mut SctpRecvState,
 ) {
     let state_return = unsafe { StashedSctpStateReturnGuard::new(reactor, state_ptr) };
     let result = unsafe { completion_cqe_result((*state_ptr).result) };
@@ -4816,12 +5025,16 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
             )
         };
         let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-        update_record_sync_after_unpublished_completion(
-            record_sync,
+        let recovery_prefix =
+            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+        let action = recv_state.process_metadata_completion(
             actual,
             completion.header,
             data_slice,
+            recovery_prefix,
+            SctpCompletionPublication::Unpublished,
         );
+        debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
     }
 
     unsafe { state_return.finish() };
@@ -4838,24 +5051,44 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
     reactor: *mut Reactor,
     state_ptr: *mut CompletionState,
     iov_count: usize,
-    record_sync: &mut SctpRecordSync,
+    recv_state: &mut SctpRecvState,
 ) {
     let result = unsafe { completion_cqe_result((*state_ptr).result) };
     if let Ok(actual) = result {
-        let completion = unsafe {
+        let mut completion = unsafe {
             Reactor::take_retained_payload_with_unchecked::<RetainedSctpRecvVectoredPayload<N>, _>(
                 reactor,
                 state_ptr,
                 |payload| take_stashed_sctp_recv_vectored_completion(payload, iov_count),
             )
         };
+        let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+        let first_len = completion
+            .first_iovec
+            .as_ref()
+            .map_or(0, |iov| std::cmp::min(actual, iov.iov_len));
+        let mut prefix_storage = MaybeUninit::uninit();
+        let gathered_prefix = if recv_state
+            .needs_bounded_recovery_prefix(completion.header.msg_flags)
+            && first_len < target
+        {
+            Some(unsafe {
+                sctp_vectored_received_prefix(&mut completion.buffer, actual, &mut prefix_storage)
+            })
+        } else {
+            None
+        };
         let data_slice = unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-        update_record_sync_after_unpublished_completion(
-            record_sync,
+        let recovery_prefix =
+            gathered_prefix.unwrap_or(&data_slice[..std::cmp::min(data_slice.len(), target)]);
+        let action = recv_state.process_metadata_completion(
             actual,
             completion.header,
             data_slice,
+            recovery_prefix,
+            SctpCompletionPublication::Unpublished,
         );
+        debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
     }
 
     unsafe { Reactor::free_op_unchecked(reactor, state_ptr) };
@@ -5202,12 +5435,18 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                         // callback inside the shared slice helper.
                         let data_slice =
                             unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-                        update_record_sync_after_unpublished_completion(
-                            &mut this.recv_state.record_sync,
+                        let recovery_prefix = &data_slice[..std::cmp::min(
+                            data_slice.len(),
+                            SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN,
+                        )];
+                        let action = this.recv_state.process_metadata_completion(
                             actual,
                             header,
                             data_slice,
+                            recovery_prefix,
+                            SctpCompletionPublication::Unpublished,
                         );
+                        debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
                     }
                     return Poll::Ready((
                         Err(io::Error::from(io::ErrorKind::NotConnected)),
@@ -5221,61 +5460,46 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             };
 
             let header = completion.meta.header;
-            if sctp_msg_clean_eof(actual, header) {
-                this.recv_state.record_sync = SctpRecordSync::Synced;
-                let completed = unsafe {
-                    complete_read_with_progress(
-                        completion.buffer,
-                        this.write_base_len,
-                        0,
-                        Ok((0, sctp_eof_recv_meta())),
-                    )
-                };
-                return Poll::Ready(completed);
-            }
-
             let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-            let parsed_notification = this
-                .recv_state
-                .parse_notification_for_completion(data_slice, header.msg_flags);
-            let partial_delivery_abort =
-                sctp_notification_retires_discard(parsed_notification.as_ref());
-            let consume_internal = this.recv_state.should_consume_metadata_completion(
+            let recovery_prefix = &data_slice
+                [..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+            let action = this.recv_state.process_metadata_completion(
                 actual,
                 header,
-                parsed_notification.as_ref(),
-            );
-            if consume_internal {
-                let (_, buffer) = unsafe {
-                    complete_read_with_progress(completion.buffer, this.write_base_len, 0, Ok(()))
-                };
-                // Non-vectored internal recovery has no reusable iovec scratch
-                // to refill: the next poll builds a fresh single-iovec payload
-                // at the same unchanged caller-visible writable tail.
-                this.buffer = Some(buffer);
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-
-            let meta = this.recv_state.parse_completion_meta(
-                completion.meta.rcvinfo,
-                header.msg_flags,
                 data_slice,
-                parsed_notification,
+                recovery_prefix,
+                SctpCompletionPublication::Visible(completion.meta.rcvinfo),
             );
-
-            if meta.is_err() {
-                this.recv_state.record_sync = this.recv_state.record_sync.after_visible_error(
-                    actual,
-                    header,
-                    partial_delivery_abort,
-                );
-            }
-            let result = meta.map(|meta| (actual, meta));
-            let completed = unsafe {
-                complete_read_with_progress(completion.buffer, this.write_base_len, actual, result)
+            return match action {
+                SctpMetadataCompletion::Consume => {
+                    let (_, buffer) = unsafe {
+                        complete_read_with_progress(
+                            completion.buffer,
+                            this.write_base_len,
+                            0,
+                            Ok(()),
+                        )
+                    };
+                    // Non-vectored internal recovery has no reusable iovec scratch
+                    // to refill: the next poll builds a fresh single-iovec payload
+                    // at the same unchanged caller-visible writable tail.
+                    this.buffer = Some(buffer);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                SctpMetadataCompletion::Publish(meta) => {
+                    let result = meta.map(|meta| (actual, meta));
+                    let completed = unsafe {
+                        complete_read_with_progress(
+                            completion.buffer,
+                            this.write_base_len,
+                            actual,
+                            result,
+                        )
+                    };
+                    Poll::Ready(completed)
+                }
             };
-            return Poll::Ready(completed);
         }
 
         if this.state_ptr.is_null() {
@@ -5513,26 +5737,51 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 },
             )
         } {
-            let (result, completion) = match completion {
+            let (result, mut completion) = match completion {
                 CompletionTake::Accepted { result, value } => (result, value),
                 CompletionTake::ContextRejected {
                     result,
-                    value: completion,
+                    value: mut completion,
                 } => {
                     if let Ok(actual) = result {
                         let header = completion.meta.header;
                         // SAFETY: completion extraction copied the first active
                         // kernel iovec before releasing retained storage, and the
                         // returned chain still owns every referenced allocation.
+                        let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+                        let first_len = completion
+                            .first_iovec
+                            .as_ref()
+                            .map_or(0, |iov| std::cmp::min(actual, iov.iov_len));
+                        let mut prefix_storage = MaybeUninit::uninit();
+                        let gathered_prefix = if this
+                            .recv_state
+                            .needs_bounded_recovery_prefix(header.msg_flags)
+                            && first_len < target
+                        {
+                            Some(unsafe {
+                                sctp_vectored_received_prefix(
+                                    &mut completion.buffer,
+                                    actual,
+                                    &mut prefix_storage,
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         let data_slice = unsafe {
                             sctp_first_iov_slice(completion.first_iovec.as_ref(), actual)
                         };
-                        update_record_sync_after_unpublished_completion(
-                            &mut this.recv_state.record_sync,
+                        let recovery_prefix = gathered_prefix
+                            .unwrap_or(&data_slice[..std::cmp::min(data_slice.len(), target)]);
+                        let action = this.recv_state.process_metadata_completion(
                             actual,
                             header,
                             data_slice,
+                            recovery_prefix,
+                            SctpCompletionPublication::Unpublished,
                         );
+                        debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
                     }
                     return Poll::Ready((
                         Err(io::Error::from(io::ErrorKind::NotConnected)),
@@ -5545,73 +5794,72 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 Err(err) => return Poll::Ready((Err(err), completion.buffer)),
             };
             let header = completion.meta.header;
-            if sctp_msg_clean_eof(actual, header) {
-                this.recv_state.record_sync = SctpRecordSync::Synced;
-                let mut buffer = completion.buffer;
-                unsafe {
-                    buffer.distribute_written(0);
-                }
-                return Poll::Ready((Ok((0, sctp_eof_recv_meta())), buffer));
-            }
-
+            let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+            let first_len = completion
+                .first_iovec
+                .as_ref()
+                .map_or(0, |iov| std::cmp::min(actual, iov.iov_len));
+            let mut prefix_storage = MaybeUninit::uninit();
+            let gathered_prefix = if this
+                .recv_state
+                .needs_bounded_recovery_prefix(header.msg_flags)
+                && first_len < target
+            {
+                Some(unsafe {
+                    sctp_vectored_received_prefix(
+                        &mut completion.buffer,
+                        actual,
+                        &mut prefix_storage,
+                    )
+                })
+            } else {
+                None
+            };
             let data_slice =
                 unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-            let parsed_notification = this
-                .recv_state
-                .parse_notification_for_completion(data_slice, header.msg_flags);
-            let partial_delivery_abort =
-                sctp_notification_retires_discard(parsed_notification.as_ref());
-            let consume_internal = this.recv_state.should_consume_metadata_completion(
+            let recovery_prefix =
+                gathered_prefix.unwrap_or(&data_slice[..std::cmp::min(data_slice.len(), target)]);
+            let action = this.recv_state.process_metadata_completion(
                 actual,
                 header,
-                parsed_notification.as_ref(),
-            );
-            if consume_internal {
-                let mut buffer = completion.buffer;
-                unsafe {
-                    buffer.distribute_written(0);
-                }
-                let Some((iov_count, writable)) =
-                    buffer.checked_read_iovec_count_and_writable_len()
-                else {
-                    return Poll::Ready((Err(invalid_readv_aggregate()), buffer));
-                };
-                if writable == 0 {
-                    return Poll::Ready((Err(invalid_read_iovec_shape()), buffer));
-                }
-                debug_assert_eq!(
-                    (iov_count, writable),
-                    (this.iov_count, this.writable),
-                    "SCTP vectored internal recv changed the receive chain shape"
-                );
-                this.iov_count = iov_count;
-                this.writable = writable;
-                this.buffer = Some(buffer);
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-
-            let meta = this.recv_state.parse_completion_meta(
-                completion.meta.rcvinfo,
-                header.msg_flags,
                 data_slice,
-                parsed_notification,
+                recovery_prefix,
+                SctpCompletionPublication::Visible(completion.meta.rcvinfo),
             );
-
-            let mut buffer = completion.buffer;
-            unsafe {
-                buffer.distribute_written(actual);
-            }
-
-            return match meta {
-                Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
-                Err(err) => {
-                    this.recv_state.record_sync = this.recv_state.record_sync.after_visible_error(
-                        actual,
-                        header,
-                        partial_delivery_abort,
+            return match action {
+                SctpMetadataCompletion::Consume => {
+                    let mut buffer = completion.buffer;
+                    unsafe {
+                        buffer.distribute_written(0);
+                    }
+                    let Some((iov_count, writable)) =
+                        buffer.checked_read_iovec_count_and_writable_len()
+                    else {
+                        return Poll::Ready((Err(invalid_readv_aggregate()), buffer));
+                    };
+                    if writable == 0 {
+                        return Poll::Ready((Err(invalid_read_iovec_shape()), buffer));
+                    }
+                    debug_assert_eq!(
+                        (iov_count, writable),
+                        (this.iov_count, this.writable),
+                        "SCTP vectored internal recv changed the receive chain shape"
                     );
-                    Poll::Ready((Err(err), buffer))
+                    this.iov_count = iov_count;
+                    this.writable = writable;
+                    this.buffer = Some(buffer);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                SctpMetadataCompletion::Publish(meta) => {
+                    let mut buffer = completion.buffer;
+                    unsafe {
+                        buffer.distribute_written(actual);
+                    }
+                    match meta {
+                        Ok(meta) => Poll::Ready((Ok((actual, meta)), buffer)),
+                        Err(err) => Poll::Ready((Err(err), buffer)),
+                    }
                 }
             };
         }
@@ -7352,6 +7600,25 @@ pub(crate) mod test_support {
         Abandoned,
     }
 
+    /// Feature-gated snapshot of metadata receive record synchronization.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SctpRecordRecoverySnapshot {
+        /// The next completion begins at a record boundary.
+        Synced,
+        /// An unpublished data record still has bytes to discard.
+        DataTail,
+        /// An unpublished notification record still has opaque tail bytes.
+        NotificationTail,
+        /// A notification interrupts a data tail and retains only its bounded
+        /// classifier prefix.
+        DataNotificationTail {
+            /// Number of retained prefix bytes, never greater than 24.
+            prefix_len: usize,
+            /// Whether the full prefix was already classified as non-abort.
+            classified: bool,
+        },
+    }
+
     /// Returns whether a general SCTP capability probe may be treated as
     /// unavailable rather than as a test or benchmark failure.
     ///
@@ -7515,6 +7782,51 @@ pub(crate) mod test_support {
             StashedSctpRecvState::Empty => SctpStashedRecvStateSnapshot::Empty,
             StashedSctpRecvState::Live => SctpStashedRecvStateSnapshot::Live,
             StashedSctpRecvState::Abandoned => SctpStashedRecvStateSnapshot::Abandoned,
+        }
+    }
+
+    /// Starts deterministic data-tail recovery for integration tests without
+    /// requiring the kernel to trigger partial delivery.
+    pub fn test_sctp_stream_begin_data_tail(stream: &mut SctpStream) {
+        stream.recv_state.set_record_sync(SctpRecordSync::DataTail);
+    }
+
+    /// Applies one successful unpublished completion through the production
+    /// classifier and returns its bounded record-recovery state.
+    pub fn test_sctp_stream_apply_unpublished_completion(
+        stream: &mut SctpStream,
+        data: &[u8],
+        msg_flags: libc::c_int,
+    ) -> SctpRecordRecoverySnapshot {
+        let header = SctpRecvHeader {
+            msg_controllen: 0,
+            msg_flags,
+        };
+        let recovery_prefix =
+            &data[..std::cmp::min(data.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+        let action = stream.recv_state.process_metadata_completion(
+            data.len(),
+            header,
+            data,
+            recovery_prefix,
+            SctpCompletionPublication::Unpublished,
+        );
+        debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
+        test_sctp_stream_record_recovery(&stream.recv_state)
+    }
+
+    fn test_sctp_stream_record_recovery(recv_state: &SctpRecvState) -> SctpRecordRecoverySnapshot {
+        match recv_state.record_sync {
+            SctpRecordSync::Synced => SctpRecordRecoverySnapshot::Synced,
+            SctpRecordSync::DataTail => SctpRecordRecoverySnapshot::DataTail,
+            SctpRecordSync::NotificationTail => SctpRecordRecoverySnapshot::NotificationTail,
+            SctpRecordSync::DataNotificationTail => {
+                SctpRecordRecoverySnapshot::DataNotificationTail {
+                    prefix_len: recv_state.nested_prefix_len(),
+                    classified: (recv_state.nested_prefix_state & SCTP_NESTED_PREFIX_CLASSIFIED)
+                        != 0,
+                }
+            }
         }
     }
 
@@ -8004,7 +8316,7 @@ mod tests {
         _reactor: *mut Reactor,
         _state_ptr: *mut CompletionState,
         _iov_count: usize,
-        _record_sync: &mut SctpRecordSync,
+        _recv_state: &mut SctpRecvState,
     ) {
         panic!("ring-abandoned stashed receive was processed as completed");
     }
@@ -8013,7 +8325,7 @@ mod tests {
         _reactor: *mut Reactor,
         _state_ptr: *mut CompletionState,
         _iov_count: usize,
-        _record_sync: &mut SctpRecordSync,
+        _recv_state: &mut SctpRecvState,
     ) {
         panic!("invalid metadata receive processed the prior stash");
     }
@@ -10048,9 +10360,9 @@ mod tests {
             assert_eq!(std::mem::size_of::<StashedSctpRecvState>(), 1);
             assert_eq!(std::mem::align_of::<StashedSctpRecvState>(), 1);
             assert_eq!(std::mem::size_of::<StashedSctpRecv>(), 24);
-            assert_eq!(std::mem::size_of::<SctpRecvState>(), 32);
+            assert_eq!(std::mem::size_of::<SctpRecvState>(), 56);
             assert_eq!(std::mem::align_of::<SctpRecvState>(), 8);
-            assert_eq!(std::mem::size_of::<SctpStream>(), 72);
+            assert_eq!(std::mem::size_of::<SctpStream>(), 96);
             assert_eq!(std::mem::align_of::<SctpStream>(), 8);
             assert_eq!(SCTP_RCVINFO_CONTROL_LEN, 48);
             assert_eq!(SCTP_RECV_CONTROL_LEN, 200);
@@ -12541,15 +12853,18 @@ mod tests {
         sctp_notification_retires_discard(parsed_notification.as_ref())
     }
 
-    fn data_tail_after_completion_for_test(
-        msg: &libc::msghdr,
+    fn process_visible_completion_for_test(
+        state: &mut SctpRecvState,
         data_slice: &[u8],
-    ) -> SctpRecordSync {
-        let parsed_notification = parse_sctp_notification_once(data_slice, msg.msg_flags);
-        let partial_delivery_abort =
-            sctp_notification_retires_discard(parsed_notification.as_ref());
-        SctpRecordSync::DataTail
-            .after_recovery_completion(test_recv_header(msg), partial_delivery_abort)
+        msg: &libc::msghdr,
+    ) -> SctpMetadataCompletion {
+        state.process_metadata_completion(
+            data_slice.len(),
+            test_recv_header(msg),
+            data_slice,
+            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)],
+            SctpCompletionPublication::Visible(Ok(None)),
+        )
     }
 
     #[test]
@@ -12563,28 +12878,14 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
 
         assert!(notification_retires_discard_for_test(&data, msg.msg_flags));
-        assert_eq!(
-            data_tail_after_completion_for_test(&msg, &data),
-            SctpRecordSync::Synced
-        );
+        let mut state = SctpRecvState::external();
+        state.record_sync = SctpRecordSync::DataTail;
+        state.process_unpublished_for_test(&data, &msg);
+        assert_eq!(state.record_sync, SctpRecordSync::Synced);
 
-        let mut record_sync = SctpRecordSync::DataTail;
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
-        assert_eq!(record_sync, SctpRecordSync::Synced);
-
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
+        state.process_unpublished_for_test(&data, &msg);
         assert_eq!(
-            record_sync,
+            state.record_sync,
             SctpRecordSync::Synced,
             "a dropped PDAPI abort must not start discard when none was active"
         );
@@ -12594,30 +12895,20 @@ mod tests {
     fn sctp_live_and_dropped_non_eor_abort_retirement_agree() {
         let data = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
-        let parsed_notification = parse_sctp_notification_once(&data, msg.msg_flags);
-
         let mut metadata_only = SctpSocketConfig::data(SctpInitConfig::default());
         metadata_only.recv_rcvinfo = true;
         let mut live = SctpRecvState::configured(metadata_only);
         live.record_sync = SctpRecordSync::DataTail;
         assert!(
-            live.should_consume_metadata_completion(
-                data.len(),
-                test_recv_header(&msg),
-                parsed_notification.as_ref(),
-            ),
+            live.should_consume_for_test(&data, &msg),
             "a FlowIO-forced PDAPI abort remains internal"
         );
 
-        let mut dropped = SctpRecordSync::DataTail;
-        update_record_sync_after_unpublished_completion(
-            &mut dropped,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
+        let mut dropped = SctpRecvState::configured(metadata_only);
+        dropped.record_sync = SctpRecordSync::DataTail;
+        dropped.process_unpublished_for_test(&data, &msg);
         assert_eq!(
-            live.record_sync, dropped,
+            live.record_sync, dropped.record_sync,
             "live and dropped completion retirement must use one oracle"
         );
         assert_eq!(
@@ -12676,6 +12967,13 @@ mod tests {
                 SctpRecordSync::Synced,
             ),
             (
+                "non-abort notification head",
+                SctpRecordSync::DataTail,
+                &non_abort,
+                libc::MSG_NOTIFICATION,
+                SctpRecordSync::DataNotificationTail,
+            ),
+            (
                 "unrelated notification EOR",
                 SctpRecordSync::DataTail,
                 &non_abort,
@@ -12690,24 +12988,18 @@ mod tests {
             let msg = test_msghdr_with_flags(flags);
             let mut live = SctpRecvState::configured(metadata_only);
             live.record_sync = initial;
-            let parsed = live.parse_notification_for_completion(data, flags);
             assert!(
-                live.should_consume_metadata_completion(
-                    data.len(),
-                    test_recv_header(&msg),
-                    parsed.as_ref(),
-                ),
+                live.should_consume_for_test(data, &msg),
                 "{name}: internal completion became caller-visible"
             );
 
-            let mut unpublished = initial;
-            update_record_sync_after_unpublished_completion(
-                &mut unpublished,
-                data.len(),
-                test_recv_header(&msg),
-                data,
+            let mut unpublished = SctpRecvState::configured(metadata_only);
+            unpublished.record_sync = initial;
+            unpublished.process_unpublished_for_test(data, &msg);
+            assert_eq!(
+                live.record_sync, unpublished.record_sync,
+                "{name}: live/drop drift"
             );
-            assert_eq!(live.record_sync, unpublished, "{name}: live/drop drift");
             assert_eq!(live.record_sync, expected, "{name}: wrong transition");
         }
     }
@@ -12721,28 +13013,13 @@ mod tests {
         let mut visible = SctpRecvState::external();
 
         let head = &notification[..8];
-        let parsed_head = visible
-            .parse_notification_for_completion(head, partial.msg_flags)
-            .expect("a synchronized notification head must be parsed");
         assert!(
-            parsed_head.is_err(),
-            "short variable-tail head parsed completely"
-        );
-        assert!(!visible.should_consume_metadata_completion(
-            head.len(),
-            test_recv_header(&partial),
-            Some(&parsed_head),
-        ));
-        let head_error =
-            visible.parse_completion_meta(Ok(None), partial.msg_flags, head, Some(parsed_head));
-        assert!(
-            head_error.is_err(),
+            matches!(
+                process_visible_completion_for_test(&mut visible, head, &partial),
+                SctpMetadataCompletion::Publish(Err(_))
+            ),
             "fragmented visible head did not fail closed"
         );
-        visible.record_sync =
-            visible
-                .record_sync
-                .after_visible_error(head.len(), test_recv_header(&partial), false);
         assert_eq!(visible.record_sync, SctpRecordSync::NotificationTail);
 
         for start in (8..notification.len()).step_by(8) {
@@ -12753,16 +13030,9 @@ mod tests {
                 &partial
             };
             let continuation = &notification[start..end];
-            assert!(
-                visible
-                    .parse_notification_for_completion(continuation, msg.msg_flags)
-                    .is_none(),
-                "notification continuation {start} was reparsed as a fresh header"
-            );
-            assert!(visible.should_consume_metadata_completion(
-                continuation.len(),
-                test_recv_header(msg),
-                None,
+            assert!(matches!(
+                process_visible_completion_for_test(&mut visible, continuation, msg),
+                SctpMetadataCompletion::Consume
             ));
             assert_eq!(
                 visible.record_sync,
@@ -12777,14 +13047,11 @@ mod tests {
         let mut shutdown = test_notification_buffer(LOCAL_SCTP_SHUTDOWN_EVENT, 12);
         write_u32_ne(&mut shutdown, 8, 7);
         let shutdown_msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
-        let parsed_shutdown = visible
-            .parse_notification_for_completion(&shutdown, shutdown_msg.msg_flags)
-            .expect("notification parsing did not resume after terminal EOR");
-        assert!(parsed_shutdown.is_ok());
-        assert!(!visible.should_consume_metadata_completion(
-            shutdown.len(),
-            test_recv_header(&shutdown_msg),
-            Some(&parsed_shutdown),
+        assert!(matches!(
+            process_visible_completion_for_test(&mut visible, &shutdown, &shutdown_msg),
+            SctpMetadataCompletion::Publish(Ok(SctpRecvMeta::Notification(
+                SctpNotification::Shutdown { assoc_id: 7 }
+            )))
         ));
     }
 
@@ -12793,7 +13060,7 @@ mod tests {
         let notification = test_fragmented_stream_reset_notification();
         let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
         let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
-        let mut record_sync = SctpRecordSync::Synced;
+        let mut state = SctpRecvState::external();
 
         for start in (0..notification.len()).step_by(8) {
             let end = std::cmp::min(start + 8, notification.len());
@@ -12803,14 +13070,9 @@ mod tests {
                 &partial
             };
             let completion = &notification[start..end];
-            update_record_sync_after_unpublished_completion(
-                &mut record_sync,
-                completion.len(),
-                test_recv_header(msg),
-                completion,
-            );
+            state.process_unpublished_for_test(completion, msg);
             assert_eq!(
-                record_sync,
+                state.record_sync,
                 if end == notification.len() {
                     SctpRecordSync::Synced
                 } else {
@@ -12827,21 +13089,147 @@ mod tests {
         let mut state = SctpRecvState::external();
         state.record_sync = SctpRecordSync::NotificationTail;
 
-        assert!(
-            state
-                .parse_notification_for_completion(&abort, partial.msg_flags)
-                .is_none(),
-            "opaque notification tail was parsed as a complete PDAPI abort"
-        );
-        assert!(state.should_consume_metadata_completion(
-            abort.len(),
-            test_recv_header(&partial),
-            None,
+        assert!(matches!(
+            process_visible_completion_for_test(&mut state, &abort, &partial),
+            SctpMetadataCompletion::Consume
         ));
         assert_eq!(state.record_sync, SctpRecordSync::NotificationTail);
 
         let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
-        assert!(state.should_consume_metadata_completion(1, test_recv_header(&terminal), None,));
+        assert!(matches!(
+            process_visible_completion_for_test(&mut state, &[0], &terminal),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(state.record_sync, SctpRecordSync::Synced);
+    }
+
+    #[test]
+    fn nested_pdapi_abort_split_at_every_prefix_boundary_retires_data_tail() {
+        let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+
+        for split in 1..abort.len() {
+            let mut state = SctpRecvState::external();
+            state.record_sync = SctpRecordSync::DataTail;
+            assert!(matches!(
+                process_visible_completion_for_test(&mut state, &abort[..split], &partial),
+                SctpMetadataCompletion::Consume
+            ));
+            assert_eq!(state.record_sync, SctpRecordSync::DataNotificationTail);
+            assert_eq!(state.nested_prefix_len(), split);
+
+            let action = process_visible_completion_for_test(&mut state, &abort[split..], &partial);
+            assert!(matches!(action, SctpMetadataCompletion::Publish(Err(_))));
+            assert_eq!(
+                state.record_sync,
+                SctpRecordSync::Synced,
+                "split {split} did not recognize the complete abort prefix"
+            );
+            assert_eq!(state.nested_prefix_len(), 0);
+        }
+    }
+
+    #[test]
+    fn nested_header_shaped_continuation_cannot_forge_pdapi_abort() {
+        let notification = test_fragmented_stream_reset_notification();
+        let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+        let mut state = SctpRecvState::external();
+        state.record_sync = SctpRecordSync::DataTail;
+
+        assert!(matches!(
+            process_visible_completion_for_test(&mut state, &notification[..8], &partial),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(state.record_sync, SctpRecordSync::DataNotificationTail);
+        assert!(matches!(
+            process_visible_completion_for_test(&mut state, &abort, &partial),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(
+            state.record_sync,
+            SctpRecordSync::DataNotificationTail,
+            "continuation bytes were parsed as a fresh abort header"
+        );
+        assert_ne!(state.nested_prefix_state & SCTP_NESTED_PREFIX_CLASSIFIED, 0);
+
+        assert!(matches!(
+            process_visible_completion_for_test(&mut state, &[0], &terminal),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(
+            state.record_sync,
+            SctpRecordSync::DataTail,
+            "unrelated notification EOR retired the underlying data tail"
+        );
+    }
+
+    #[test]
+    fn nested_short_and_malformed_notification_eor_preserve_data_tail() {
+        let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let malformed = [0xa5; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN];
+
+        let mut first_eor = SctpRecvState::external();
+        first_eor.record_sync = SctpRecordSync::DataTail;
+        assert!(matches!(
+            process_visible_completion_for_test(&mut first_eor, &[0], &terminal),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(first_eor.record_sync, SctpRecordSync::DataTail);
+
+        let mut later_eor = SctpRecvState::external();
+        later_eor.record_sync = SctpRecordSync::DataTail;
+        assert!(matches!(
+            process_visible_completion_for_test(&mut later_eor, &malformed[..9], &partial),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(later_eor.record_sync, SctpRecordSync::DataNotificationTail);
+        assert!(matches!(
+            process_visible_completion_for_test(&mut later_eor, &malformed[9..], &terminal),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_eq!(
+            later_eor.record_sync,
+            SctpRecordSync::DataTail,
+            "a malformed completed prefix retired the underlying data tail"
+        );
+    }
+
+    #[test]
+    fn vectored_nested_pdapi_prefix_spans_iovecs_without_variable_tail_copy() {
+        let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let mut first = IoBuffMut::new(0, 5, 0).expect("first segment allocation failed");
+        let mut second = IoBuffMut::new(0, 7, 0).expect("second segment allocation failed");
+        let mut third = IoBuffMut::new(0, 12, 0).expect("third segment allocation failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(abort.as_ptr(), first.as_mut_ptr(), 5);
+            std::ptr::copy_nonoverlapping(abort.as_ptr().add(5), second.as_mut_ptr(), 7);
+            std::ptr::copy_nonoverlapping(abort.as_ptr().add(12), third.as_mut_ptr(), 12);
+        }
+        let first_iovec = libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: 5,
+        };
+        let mut chain = IoBuffVecMut::from_array([first, second, third]);
+        let mut storage = MaybeUninit::uninit();
+        let prefix =
+            unsafe { sctp_vectored_received_prefix(&mut chain, abort.len(), &mut storage) };
+        let data_slice = unsafe { sctp_first_iov_slice(Some(&first_iovec), abort.len()) };
+        assert_eq!(prefix, abort);
+
+        let mut state = SctpRecvState::external();
+        state.record_sync = SctpRecordSync::DataTail;
+        let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let action = state.process_metadata_completion(
+            abort.len(),
+            test_recv_header(&msg),
+            data_slice,
+            prefix,
+            SctpCompletionPublication::Unpublished,
+        );
+        assert!(matches!(action, SctpMetadataCompletion::Consume));
         assert_eq!(state.record_sync, SctpRecordSync::Synced);
     }
 
@@ -13125,10 +13513,11 @@ mod tests {
 
         let parsed_notification = parse_sctp_notification_once(&data, msg.msg_flags)
             .expect("caller-visible notification should be parsed");
-        assert!(!visible.should_consume_metadata_completion(
-            data.len(),
-            test_recv_header(&msg),
-            Some(&parsed_notification)
+        assert!(matches!(
+            process_visible_completion_for_test(&mut visible, &data, &msg),
+            SctpMetadataCompletion::Publish(Ok(SctpRecvMeta::Notification(
+                SctpNotification::Shutdown { assoc_id: 42 }
+            )))
         ));
 
         // A deliberately different, malformed slice proves final metadata
@@ -13151,10 +13540,9 @@ mod tests {
         let parsed_notification = parse_sctp_notification_once(&malformed, msg.msg_flags)
             .expect("caller-visible malformed notification should be parsed once");
         assert!(parsed_notification.is_err());
-        assert!(!visible.should_consume_metadata_completion(
-            malformed.len(),
-            test_recv_header(&msg),
-            Some(&parsed_notification)
+        assert!(matches!(
+            process_visible_completion_for_test(&mut visible, &malformed, &msg),
+            SctpMetadataCompletion::Publish(Err(_))
         ));
         assert_eq!(
             parse_recv_meta_with_notification_for_test(
@@ -13180,10 +13568,9 @@ mod tests {
         let mut visible = SctpRecvState::external();
         let parsed_notification = parse_sctp_notification_once(&shutdown, truncated.msg_flags)
             .expect("visible notification should be parsed");
-        assert!(!visible.should_consume_metadata_completion(
-            shutdown.len(),
-            test_recv_header(&truncated),
-            Some(&parsed_notification),
+        assert!(matches!(
+            process_visible_completion_for_test(&mut visible, &shutdown, &truncated),
+            SctpMetadataCompletion::Publish(Err(_))
         ));
         assert_eq!(
             parse_recv_meta_with_notification_for_test(
@@ -13203,10 +13590,9 @@ mod tests {
         let parsed_notification = parse_sctp_notification_once(&malformed, partial.msg_flags)
             .expect("visible malformed notification should be parsed");
         assert!(parsed_notification.is_err());
-        assert!(!visible.should_consume_metadata_completion(
-            malformed.len(),
-            test_recv_header(&partial),
-            Some(&parsed_notification)
+        assert!(matches!(
+            process_visible_completion_for_test(&mut visible, &malformed, &partial),
+            SctpMetadataCompletion::Publish(Err(_))
         ));
         assert_eq!(
             parse_recv_meta_with_notification_for_test(
@@ -13227,15 +13613,7 @@ mod tests {
 
         let hidden_fragment = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_TRUNC);
         let mut hidden = SctpRecvState::configured(metadata_only);
-        let parsed_notification =
-            parse_sctp_notification_once(&malformed, hidden_fragment.msg_flags)
-                .expect("a hidden PDAPI fragment still drives discard policy");
-        assert!(parsed_notification.is_err());
-        assert!(hidden.should_consume_metadata_completion(
-            malformed.len(),
-            test_recv_header(&hidden_fragment),
-            Some(&parsed_notification),
-        ));
+        assert!(hidden.should_consume_for_test(&malformed, &hidden_fragment));
         assert_eq!(hidden.record_sync, SctpRecordSync::NotificationTail);
         let hidden_eor =
             test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_TRUNC | libc::MSG_EOR);
@@ -13253,26 +13631,21 @@ mod tests {
             ..SctpSocketConfig::data(SctpInitConfig::default())
         });
         other_visible.record_sync = SctpRecordSync::DataTail;
-        let parsed_notification = parse_sctp_notification_once(&abort, abort_truncated.msg_flags)
-            .expect("forced PDAPI should be parsed when another event is visible");
-        assert!(other_visible.should_consume_metadata_completion(
-            abort.len(),
-            test_recv_header(&abort_truncated),
-            Some(&parsed_notification),
-        ));
+        assert!(other_visible.should_consume_for_test(&abort, &abort_truncated));
         assert_eq!(other_visible.record_sync, SctpRecordSync::Synced);
 
         metadata_only.notifications.partial_delivery = true;
         let mut explicit = SctpRecvState::configured(metadata_only);
         explicit.record_sync = SctpRecordSync::DataTail;
-        let parsed_notification = parse_sctp_notification_once(&abort, abort_truncated.msg_flags)
-            .expect("explicit PDAPI should be parsed");
-        assert!(!explicit.should_consume_metadata_completion(
-            abort.len(),
-            test_recv_header(&abort_truncated),
-            Some(&parsed_notification),
+        let explicit_action =
+            process_visible_completion_for_test(&mut explicit, &abort, &abort_truncated);
+        assert!(matches!(
+            explicit_action,
+            SctpMetadataCompletion::Publish(Err(_))
         ));
         assert_eq!(explicit.record_sync, SctpRecordSync::Synced);
+        let parsed_notification = parse_sctp_notification_once(&abort, abort_truncated.msg_flags)
+            .expect("explicit PDAPI should be parsed");
         assert_eq!(
             parse_recv_meta_with_notification_for_test(
                 &[],
@@ -13287,14 +13660,11 @@ mod tests {
         );
 
         visible.record_sync = SctpRecordSync::DataTail;
-        let parsed_notification = parse_sctp_notification_once(&malformed, partial.msg_flags)
-            .expect("visible malformed notification should be parsed");
-        assert!(visible.should_consume_metadata_completion(
-            malformed.len(),
-            test_recv_header(&partial),
-            Some(&parsed_notification)
+        assert!(matches!(
+            process_visible_completion_for_test(&mut visible, &malformed, &partial),
+            SctpMetadataCompletion::Consume
         ));
-        assert_eq!(visible.record_sync, SctpRecordSync::DataTail);
+        assert_eq!(visible.record_sync, SctpRecordSync::DataNotificationTail);
     }
 
     #[test]
@@ -13305,15 +13675,8 @@ mod tests {
         let mut metadata_only = SctpSocketConfig::data(SctpInitConfig::default());
         metadata_only.recv_rcvinfo = true;
         let mut forced = SctpRecvState::configured(metadata_only);
-        let parsed_notification = parse_sctp_notification_once(&data, msg.msg_flags)
-            .expect("a hidden PDAPI event still drives discard policy");
-        assert!(parsed_notification.is_ok());
         assert!(
-            forced.should_consume_metadata_completion(
-                data.len(),
-                test_recv_header(&msg),
-                Some(&parsed_notification),
-            ),
+            forced.should_consume_for_test(&data, &msg),
             "FlowIO-only forced notifications remain internal"
         );
 
@@ -13323,27 +13686,14 @@ mod tests {
 
         metadata_only.notifications.partial_delivery = true;
         let mut explicit = SctpRecvState::configured(metadata_only);
-        let parsed_notification = parse_sctp_notification_once(&data, msg.msg_flags)
-            .expect("caller-visible PDAPI notification should be parsed");
-        assert!(!explicit.should_consume_metadata_completion(
-            data.len(),
-            test_recv_header(&msg),
-            Some(&parsed_notification)
-        ));
         assert!(matches!(
-            parse_recv_meta_with_notification_for_test(
-                &[],
-                0,
-                msg.msg_flags,
-                &data,
-                Some(parsed_notification)
-            ),
-            Ok(SctpRecvMeta::Notification(
+            process_visible_completion_for_test(&mut explicit, &data, &msg),
+            SctpMetadataCompletion::Publish(Ok(SctpRecvMeta::Notification(
                 SctpNotification::PartialDelivery {
                     indication: SCTP_PARTIAL_DELIVERY_ABORTED,
                     ..
                 }
-            ))
+            )))
         ));
 
         explicit.record_sync = SctpRecordSync::DataTail;
@@ -13382,32 +13732,17 @@ mod tests {
         let intact = test_msghdr_with_flags(libc::MSG_EOR);
         assert!(!fragmented_forced.should_consume_for_test(b"next", &intact));
 
-        let mut record_sync = SctpRecordSync::Synced;
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
-        assert_eq!(record_sync, SctpRecordSync::Synced);
+        let mut unpublished = SctpRecvState::external();
+        unpublished.process_unpublished_for_test(&data, &msg);
+        assert_eq!(unpublished.record_sync, SctpRecordSync::Synced);
 
         let eor = test_msghdr_with_flags(libc::MSG_EOR);
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            4,
-            test_recv_header(&eor),
-            b"next",
-        );
-        assert_eq!(record_sync, SctpRecordSync::Synced);
+        unpublished.process_unpublished_for_test(b"next", &eor);
+        assert_eq!(unpublished.record_sync, SctpRecordSync::Synced);
 
         let eof = test_msghdr_with_flags(0);
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            0,
-            test_recv_header(&eof),
-            &[],
-        );
-        assert_eq!(record_sync, SctpRecordSync::Synced);
+        unpublished.process_unpublished_for_test(&[], &eof);
+        assert_eq!(unpublished.record_sync, SctpRecordSync::Synced);
     }
 
     #[test]
@@ -13416,19 +13751,11 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
 
         assert!(!notification_retires_discard_for_test(&data, msg.msg_flags));
-        assert_eq!(
-            data_tail_after_completion_for_test(&msg, &data),
-            SctpRecordSync::DataTail
-        );
-
-        let mut record_sync = SctpRecordSync::DataTail;
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
-        assert_eq!(record_sync, SctpRecordSync::DataTail);
+        let mut state = SctpRecvState::external();
+        state.record_sync = SctpRecordSync::DataTail;
+        state.process_unpublished_for_test(&data, &msg);
+        assert_eq!(state.record_sync, SctpRecordSync::DataNotificationTail);
+        assert_ne!(state.nested_prefix_state & SCTP_NESTED_PREFIX_CLASSIFIED, 0);
     }
 
     #[test]
@@ -13437,14 +13764,9 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
 
         assert!(sctp_msg_partial_nonempty(data.len(), msg.msg_flags));
-        let mut record_sync = SctpRecordSync::Synced;
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
-        assert_eq!(record_sync, SctpRecordSync::NotificationTail);
+        let mut state = SctpRecvState::external();
+        state.process_unpublished_for_test(&data, &msg);
+        assert_eq!(state.record_sync, SctpRecordSync::NotificationTail);
     }
 
     #[test]
@@ -13453,20 +13775,19 @@ mod tests {
         let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
 
         assert!(!notification_retires_discard_for_test(&data, msg.msg_flags));
+        let mut data_tail = SctpRecvState::external();
+        data_tail.record_sync = SctpRecordSync::DataTail;
+        data_tail.process_unpublished_for_test(&data, &msg);
         assert_eq!(
-            data_tail_after_completion_for_test(&msg, &data),
+            data_tail.record_sync,
             SctpRecordSync::DataTail,
             "an unrelated notification EOR cannot retire a data-record tail"
         );
 
-        let mut record_sync = SctpRecordSync::NotificationTail;
-        update_record_sync_after_unpublished_completion(
-            &mut record_sync,
-            data.len(),
-            test_recv_header(&msg),
-            &data,
-        );
-        assert_eq!(record_sync, SctpRecordSync::Synced);
+        let mut notification_tail = SctpRecvState::external();
+        notification_tail.record_sync = SctpRecordSync::NotificationTail;
+        notification_tail.process_unpublished_for_test(&data, &msg);
+        assert_eq!(notification_tail.record_sync, SctpRecordSync::Synced);
     }
 
     fn assoc_ipv4_entry(ip: [u8; 4], port: u16, len: usize) -> Vec<u8> {

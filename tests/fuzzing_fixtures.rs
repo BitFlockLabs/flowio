@@ -613,6 +613,21 @@ fn sctp_recv_meta_wrapper_reaches_exact_data_and_notification_results() {
         rcvinfo_input(sample_rcvinfo(), b"ping"),
     );
     #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+    let data_input_storage = {
+        let control_align = std::mem::align_of::<libc::cmsghdr>();
+        let mut storage = vec![0; data_input.len() + control_align];
+        let start = (0..control_align)
+            .find(|start| storage[*start + 3..].as_ptr().align_offset(control_align) != 0)
+            .expect("one bounded placement must make the control address unaligned");
+        storage[start..start + data_input.len()].copy_from_slice(&data_input);
+        (storage, start)
+    };
+    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+    let data_input =
+        &data_input_storage.0[data_input_storage.1..data_input_storage.1 + data_input.len()];
+    #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+    let data_input = data_input.as_slice();
+    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
     assert_ne!(
         data_input[3..]
             .as_ptr()
@@ -621,7 +636,7 @@ fn sctp_recv_meta_wrapper_reaches_exact_data_and_notification_results() {
         "the checked corpus must exercise an unaligned control address"
     );
     assert_eq!(
-        observe_sctp_parse_recv_meta(&data_input).expect("valid RCVINFO should parse"),
+        observe_sctp_parse_recv_meta(data_input).expect("valid RCVINFO should parse"),
         sample_recv_meta()
     );
 
@@ -655,6 +670,7 @@ fn sctp_notification_fixture_inventory_is_exact() {
         "declared_short_shutdown",
         "legacy_send_failed",
         "partial_delivery",
+        "partial_delivery_abort",
         "peer_addr_change",
         "peer_addr_change_ipv6",
         "peer_addr_change_unsupported_family",
@@ -942,6 +958,18 @@ fn sctp_notification_fixtures_reach_expected_layouts() {
             assoc_id: -34,
             stream: 0x3536_3738,
             sequence: 0x393a_3b3c,
+        })
+    );
+    assert_eq!(
+        observe_sctp_parse_notification(include_bytes!(
+            "../fixtures/fuzzing/sctp_parse_notification/partial_delivery_abort"
+        ))
+        .expect("partial-delivery abort notification should parse"),
+        SctpRecvMeta::Notification(SctpNotification::PartialDelivery {
+            indication: 0,
+            assoc_id: 0,
+            stream: 0,
+            sequence: 0,
         })
     );
     assert_eq!(

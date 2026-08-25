@@ -109,8 +109,9 @@ pub mod net {
 
     pub mod sctp {
         pub use crate::net::sctp::test_support::{
-            SctpSocketOptionSnapshot, SctpStashedRecvStateSnapshot, append_initialized_test_cmsg,
-            capability_unavailable, test_accept_slot_drop_cached_state_preserves_unrelated_fd,
+            SctpRecordRecoverySnapshot, SctpSocketOptionSnapshot, SctpStashedRecvStateSnapshot,
+            append_initialized_test_cmsg, capability_unavailable,
+            test_accept_slot_drop_cached_state_preserves_unrelated_fd,
             test_accept_slot_drop_future_preserves_unrelated_fd,
             test_accept_with_established_config_error, test_adaptation_indication_type,
             test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
@@ -121,7 +122,8 @@ pub mod net {
             test_parse_recv_meta_with_policy, test_parse_stream_recv_meta,
             test_partial_delivery_event_type, test_peer_addr_change_type,
             test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
-            test_sctp_socket_receive_options, test_sctp_stream_receive_policy,
+            test_sctp_socket_receive_options, test_sctp_stream_apply_unpublished_completion,
+            test_sctp_stream_begin_data_tail, test_sctp_stream_receive_policy,
             test_sctp_stream_stashed_recv_state, test_send_failed_error_offset,
             test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
             test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,

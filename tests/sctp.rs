@@ -23,8 +23,9 @@ use flowio::runtime::executor::{Executor, ExecutorConfig};
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{TimeoutError, sleep, timeout};
 use flowio::test_support::net::sctp::{
-    SctpSocketOptionSnapshot, SctpStashedRecvStateSnapshot, append_initialized_test_cmsg,
-    capability_unavailable, test_accept_slot_drop_cached_state_preserves_unrelated_fd,
+    SctpRecordRecoverySnapshot, SctpSocketOptionSnapshot, SctpStashedRecvStateSnapshot,
+    append_initialized_test_cmsg, capability_unavailable,
+    test_accept_slot_drop_cached_state_preserves_unrelated_fd,
     test_accept_slot_drop_future_preserves_unrelated_fd, test_accept_with_established_config_error,
     test_adaptation_indication_type, test_apply_sctp_socket_options, test_assoc_change_type,
     test_assoc_reset_event_type, test_authentication_event_type,
@@ -34,7 +35,8 @@ use flowio::test_support::net::sctp::{
     test_parse_recv_meta_with_policy, test_parse_stream_recv_meta,
     test_partial_delivery_event_type, test_peer_addr_change_type,
     test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
-    test_sctp_socket_receive_options, test_sctp_stream_receive_policy,
+    test_sctp_socket_receive_options, test_sctp_stream_apply_unpublished_completion,
+    test_sctp_stream_begin_data_tail, test_sctp_stream_receive_policy,
     test_sctp_stream_stashed_recv_state, test_send_failed_error_offset,
     test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
     test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
@@ -2222,6 +2224,69 @@ fn parse_partial_delivery_and_reset_notifications() {
             inbound_streams: 23,
             outbound_streams: 24,
         })
+    );
+}
+
+#[test]
+fn sctp_nested_notification_recovery_retains_only_the_bounded_prefix() {
+    let owned: OwnedFd = std::fs::File::open("/dev/null")
+        .expect("test descriptor open failed")
+        .into();
+    let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3868));
+    let mut stream = SctpStream::from_owned_fd(owned, peer);
+    let abort = notification_buffer(test_partial_delivery_event_type(), 0, 24);
+
+    test_sctp_stream_begin_data_tail(&mut stream);
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &abort[..7],
+            libc::MSG_NOTIFICATION,
+        ),
+        SctpRecordRecoverySnapshot::DataNotificationTail {
+            prefix_len: 7,
+            classified: false,
+        }
+    );
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &abort[7..],
+            libc::MSG_NOTIFICATION,
+        ),
+        SctpRecordRecoverySnapshot::Synced,
+        "a split complete PDAPI abort did not retire the underlying data tail"
+    );
+
+    let stream_reset = notification_buffer(test_stream_reset_event_type(), 0, 44);
+    test_sctp_stream_begin_data_tail(&mut stream);
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &stream_reset[..8],
+            libc::MSG_NOTIFICATION,
+        ),
+        SctpRecordRecoverySnapshot::DataNotificationTail {
+            prefix_len: 8,
+            classified: false,
+        }
+    );
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(&mut stream, &abort, libc::MSG_NOTIFICATION,),
+        SctpRecordRecoverySnapshot::DataNotificationTail {
+            prefix_len: 24,
+            classified: true,
+        },
+        "header-shaped continuation bytes were reparsed as a fresh abort"
+    );
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &[0],
+            libc::MSG_NOTIFICATION | libc::MSG_EOR,
+        ),
+        SctpRecordRecoverySnapshot::DataTail,
+        "notification EOR retired the underlying data tail"
     );
 }
 

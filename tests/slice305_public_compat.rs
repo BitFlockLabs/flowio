@@ -195,14 +195,14 @@ fn assert_layout<T>(name: &str, expected_size: usize, expected_align: usize) {
 
 #[test]
 fn descriptor_handle_and_future_layouts_match_slice304_baseline() {
-    // Exact x86-64 Linux baseline from Slice 304 commit 514d41d1. These are
-    // compatibility/admission guards, not portable ABI promises.
+    // Exact x86-64 Linux admission guards. SctpStream includes its approved
+    // fixed nested-notification classifier; these are not portable ABI promises.
     assert_layout::<TcpStream>("TcpStream", 8, 4);
     assert_layout::<TcpListener>("TcpListener", 64, 8);
     assert_layout::<TcpConnector>("TcpConnector", 160, 8);
     assert_layout::<UnixStream>("UnixStream", 8, 4);
     assert_layout::<UdpSocket>("UdpSocket", 40, 4);
-    assert_layout::<SctpStream>("SctpStream", 72, 8);
+    assert_layout::<SctpStream>("SctpStream", 96, 8);
     assert_layout::<SctpListener>("SctpListener", 232, 8);
     assert_layout::<SctpConnector>("SctpConnector", 528, 8);
     assert_layout::<TlsClientStream>("TlsClientStream", 1_256, 8);
