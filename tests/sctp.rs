@@ -2258,6 +2258,28 @@ fn sctp_nested_notification_recovery_retains_only_the_bounded_prefix() {
         "a split complete PDAPI abort did not retire the underlying data tail"
     );
 
+    test_sctp_stream_begin_data_tail(&mut stream);
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &abort[..7],
+            libc::MSG_NOTIFICATION,
+        ),
+        SctpRecordRecoverySnapshot::DataNotificationTail {
+            prefix_len: 7,
+            classified: false,
+        }
+    );
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &abort[7..],
+            libc::MSG_NOTIFICATION | libc::MSG_EOR,
+        ),
+        SctpRecordRecoverySnapshot::Synced,
+        "a reachable terminal split PDAPI abort did not retire the data tail"
+    );
+
     let stream_reset = notification_buffer(test_stream_reset_event_type(), 0, 44);
     test_sctp_stream_begin_data_tail(&mut stream);
     assert_eq!(
@@ -2287,6 +2309,32 @@ fn sctp_nested_notification_recovery_retains_only_the_bounded_prefix() {
         ),
         SctpRecordRecoverySnapshot::DataTail,
         "notification EOR retired the underlying data tail"
+    );
+
+    test_sctp_stream_begin_data_tail(&mut stream);
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(
+            &mut stream,
+            &stream_reset[..8],
+            libc::MSG_NOTIFICATION,
+        ),
+        SctpRecordRecoverySnapshot::DataNotificationTail {
+            prefix_len: 8,
+            classified: false,
+        }
+    );
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(&mut stream, &abort, 0),
+        SctpRecordRecoverySnapshot::DataNotificationTail {
+            prefix_len: 8,
+            classified: false,
+        },
+        "PDAPI-shaped peer data was appended to the notification classifier"
+    );
+    assert_eq!(
+        test_sctp_stream_apply_unpublished_completion(&mut stream, &abort, libc::MSG_EOR),
+        SctpRecordRecoverySnapshot::NotificationTail,
+        "terminal peer data did not leave the unfinished notification fail-closed"
     );
 }
 

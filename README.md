@@ -536,7 +536,9 @@ must contain exactly the ordered `TBSCertificate`, `signatureAlgorithm`, and
 `signatureValue` children with canonical DER lengths. The signature BIT STRING
 must start with a zero unused-bit count and contain at least one payload octet;
 the helper does not recursively validate the certificate or cryptographically
-validate those signature bytes.
+validate those signature bytes. SHA-256/384/512-with-RSA identifiers accept
+either absent parameters or an explicit DER NULL, and reject every other
+parameter shape or trailing identifier child.
 
 SCTP has separate socket and association configuration types. Basic
 one-to-one SCTP works through `SctpListener`, `SctpConnector`, and

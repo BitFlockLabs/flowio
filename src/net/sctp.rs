@@ -2690,9 +2690,29 @@ impl SctpRecvState {
     }
 
     #[inline(always)]
-    fn needs_bounded_recovery_prefix(&self, msg_flags: libc::c_int) -> bool {
-        sctp_msg_notification(msg_flags)
-            || matches!(self.record_sync, SctpRecordSync::DataNotificationTail)
+    fn bounded_recovery_prefix_target(&self, actual: usize, msg_flags: libc::c_int) -> usize {
+        if sctp_msg_notification(msg_flags) {
+            self.notification_recovery_prefix_target(actual)
+        } else {
+            0
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn notification_recovery_prefix_target(&self, actual: usize) -> usize {
+        let missing = match self.record_sync {
+            SctpRecordSync::DataTail => SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN,
+            SctpRecordSync::DataNotificationTail
+                if (self.nested_prefix_state & SCTP_NESTED_PREFIX_CLASSIFIED) == 0 =>
+            {
+                SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN.saturating_sub(self.nested_prefix_len())
+            }
+            SctpRecordSync::Synced
+            | SctpRecordSync::NotificationTail
+            | SctpRecordSync::DataNotificationTail => 0,
+        };
+        std::cmp::min(actual, missing)
     }
 
     /// Appends only the fixed PDAPI classifier prefix. Once a full prefix is
@@ -2827,7 +2847,8 @@ impl SctpRecvState {
 
     /// Classifies and transitions one successful metadata completion exactly
     /// once. `recovery_prefix` is the first at most 24 bytes across all active
-    /// iovecs; `data_slice` preserves the ordinary contiguous parsing surface.
+    /// iovecs only while nested recovery needs missing classifier bytes;
+    /// `data_slice` preserves the ordinary contiguous parsing surface.
     fn process_metadata_completion(
         &mut self,
         actual: usize,
@@ -2836,13 +2857,11 @@ impl SctpRecvState {
         recovery_prefix: &[u8],
         publication: SctpCompletionPublication,
     ) -> SctpMetadataCompletion {
-        if self.needs_bounded_recovery_prefix(header.msg_flags) {
-            debug_assert_eq!(
-                recovery_prefix.len(),
-                std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN),
-                "SCTP recovery prefix does not match the completed byte count"
-            );
-        }
+        debug_assert_eq!(
+            recovery_prefix.len(),
+            self.bounded_recovery_prefix_target(actual, header.msg_flags),
+            "SCTP recovery prefix does not match the missing classifier bytes"
+        );
 
         if sctp_msg_clean_eof(actual, header) {
             self.set_record_sync(SctpRecordSync::Synced);
@@ -2877,23 +2896,23 @@ impl SctpRecvState {
                 }
                 SctpMetadataCompletion::Consume
             }
-            SctpRecordSync::DataNotificationTail => self.process_nested_notification_completion(
-                actual,
-                header,
-                data_slice,
-                recovery_prefix,
-                publication,
-            ),
+            SctpRecordSync::DataNotificationTail if sctp_msg_notification(header.msg_flags) => self
+                .process_nested_notification_completion(
+                    actual,
+                    header,
+                    data_slice,
+                    recovery_prefix,
+                    publication,
+                ),
+            SctpRecordSync::DataNotificationTail => {
+                if sctp_msg_end_of_record(header.msg_flags) {
+                    self.set_record_sync(SctpRecordSync::NotificationTail);
+                }
+                SctpMetadataCompletion::Consume
+            }
             SctpRecordSync::Synced => {
-                let parse_slice = if actual <= SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN
-                    && recovery_prefix.len() == actual
-                {
-                    recovery_prefix
-                } else {
-                    data_slice
-                };
                 let parsed_notification =
-                    parse_sctp_notification_once(parse_slice, header.msg_flags);
+                    parse_sctp_notification_once(data_slice, header.msg_flags);
                 let partial_delivery_abort =
                     sctp_notification_retires_discard(parsed_notification.as_ref());
 
@@ -2938,11 +2957,12 @@ impl SctpRecvState {
 
     #[cfg(test)]
     fn process_unpublished_for_test(&mut self, data_slice: &[u8], msg: &libc::msghdr) {
+        let recovery_target = self.bounded_recovery_prefix_target(data_slice.len(), msg.msg_flags);
         let action = self.process_metadata_completion(
             data_slice.len(),
             SctpRecvHeader::from_msghdr(msg),
             data_slice,
-            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)],
+            &data_slice[..recovery_target],
             SctpCompletionPublication::Unpublished,
         );
         debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
@@ -2950,11 +2970,12 @@ impl SctpRecvState {
 
     #[cfg(test)]
     fn should_consume_for_test(&mut self, data_slice: &[u8], msg: &libc::msghdr) -> bool {
+        let recovery_target = self.bounded_recovery_prefix_target(data_slice.len(), msg.msg_flags);
         let action = self.process_metadata_completion(
             data_slice.len(),
             SctpRecvHeader::from_msghdr(msg),
             data_slice,
-            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)],
+            &data_slice[..recovery_target],
             SctpCompletionPublication::Visible(Ok(None)),
         );
         matches!(action, SctpMetadataCompletion::Consume)
@@ -3095,37 +3116,57 @@ pub(crate) fn fuzz_sctp_record_recovery(data: &[u8]) {
     let split_limit = std::cmp::min(data.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
     for split in 0..=split_limit {
         for terminal in [false, true] {
-            let mut state = SctpRecvState::external();
-            state.set_record_sync(SctpRecordSync::DataTail);
+            for visible in [false, true] {
+                for second_is_notification in [false, true] {
+                    let mut state = SctpRecvState::external();
+                    state.set_record_sync(SctpRecordSync::DataTail);
 
-            let first = &data[..split];
-            let first_prefix =
-                &first[..std::cmp::min(first.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
-            let _ = state.process_metadata_completion(
-                first.len(),
-                SctpRecvHeader {
-                    msg_controllen: 0,
-                    msg_flags: libc::MSG_NOTIFICATION,
-                },
-                first,
-                first_prefix,
-                SctpCompletionPublication::Unpublished,
-            );
+                    let first = &data[..split];
+                    let first_flags = libc::MSG_NOTIFICATION;
+                    let first_target =
+                        state.bounded_recovery_prefix_target(first.len(), first_flags);
+                    let first_publication = if visible {
+                        SctpCompletionPublication::Visible(Ok(None))
+                    } else {
+                        SctpCompletionPublication::Unpublished
+                    };
+                    let _ = state.process_metadata_completion(
+                        first.len(),
+                        SctpRecvHeader {
+                            msg_controllen: 0,
+                            msg_flags: first_flags,
+                        },
+                        first,
+                        &first[..first_target],
+                        first_publication,
+                    );
 
-            let second = &data[split..];
-            let second_prefix =
-                &second[..std::cmp::min(second.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
-            let _ = state.process_metadata_completion(
-                second.len(),
-                SctpRecvHeader {
-                    msg_controllen: 0,
-                    msg_flags: libc::MSG_NOTIFICATION | if terminal { libc::MSG_EOR } else { 0 },
-                },
-                second,
-                second_prefix,
-                SctpCompletionPublication::Unpublished,
-            );
-            std::hint::black_box((state.record_sync, state.nested_prefix_state));
+                    let second = &data[split..];
+                    let second_flags = if second_is_notification {
+                        libc::MSG_NOTIFICATION
+                    } else {
+                        0
+                    } | if terminal { libc::MSG_EOR } else { 0 };
+                    let second_target =
+                        state.bounded_recovery_prefix_target(second.len(), second_flags);
+                    let second_publication = if visible {
+                        SctpCompletionPublication::Visible(Ok(None))
+                    } else {
+                        SctpCompletionPublication::Unpublished
+                    };
+                    let _ = state.process_metadata_completion(
+                        second.len(),
+                        SctpRecvHeader {
+                            msg_controllen: 0,
+                            msg_flags: second_flags,
+                        },
+                        second,
+                        &second[..second_target],
+                        second_publication,
+                    );
+                    std::hint::black_box((state.record_sync, state.nested_prefix_state));
+                }
+            }
         }
     }
 }
@@ -4592,9 +4633,45 @@ struct SctpRecvCompletion<B> {
     buffer: B,
 }
 
+struct SctpFirstIovec {
+    // Retains the frozen completion footprints without imposing a private
+    // field-layout ABI; this reserve is never read.
+    _reserved: MaybeUninit<usize>,
+    descriptor: libc::iovec,
+}
+
+impl SctpFirstIovec {
+    #[inline(always)]
+    const fn empty() -> Self {
+        Self {
+            _reserved: MaybeUninit::uninit(),
+            descriptor: SCTP_EMPTY_FIRST_IOVEC,
+        }
+    }
+
+    #[inline(always)]
+    fn present(descriptor: libc::iovec) -> Self {
+        debug_assert_ne!(descriptor.iov_len, 0);
+        Self {
+            _reserved: MaybeUninit::uninit(),
+            descriptor,
+        }
+    }
+
+    #[inline(always)]
+    fn descriptor(&self) -> &libc::iovec {
+        &self.descriptor
+    }
+
+    #[cfg(test)]
+    fn as_ref(&self) -> Option<&libc::iovec> {
+        (self.descriptor.iov_len != 0).then_some(&self.descriptor)
+    }
+}
+
 struct SctpRecvVectoredCompletion<const N: usize> {
     meta: SctpRecvCompletionMeta,
-    first_iovec: Option<libc::iovec>,
+    first_iovec: SctpFirstIovec,
     buffer: IoBuffVecMut<N>,
 }
 
@@ -4605,7 +4682,7 @@ struct StashedSctpRecvCompletion<B> {
 
 struct StashedSctpRecvVectoredCompletion<const N: usize> {
     header: SctpRecvHeader,
-    first_iovec: Option<libc::iovec>,
+    first_iovec: SctpFirstIovec,
     /// Keeps every copied iovec target alive through discard-state processing.
     buffer: IoBuffVecMut<N>,
 }
@@ -4678,11 +4755,11 @@ unsafe fn take_sctp_retained_buffer<B>(buffer: *const B) -> B {
 unsafe fn copy_sctp_first_iovec<const N: usize>(
     iovecs: *const [MaybeUninit<libc::iovec>; N],
     iov_count: usize,
-) -> Option<libc::iovec> {
+) -> SctpFirstIovec {
     if iov_count == 0 {
-        return None;
+        return SctpFirstIovec::empty();
     }
-    Some(unsafe {
+    SctpFirstIovec::present(unsafe {
         std::ptr::read(
             iovecs
                 .cast::<MaybeUninit<libc::iovec>>()
@@ -4908,30 +4985,38 @@ unsafe fn sctp_scalar_received_slice<B: IoBuffReadWrite>(buffer: &mut B, actual:
 ///
 /// # Safety
 ///
-/// A present `first_iovec` must describe the first writable destination, and
-/// its base pointer must remain readable for `min(actual, iov_len)` bytes.
-unsafe fn sctp_first_iov_slice(first_iovec: Option<&libc::iovec>, actual: usize) -> &[u8] {
-    let Some(first_iov) = first_iovec else {
-        return &[];
-    };
-
-    let safe_len = std::cmp::min(actual, first_iov.iov_len);
-    unsafe { std::slice::from_raw_parts(first_iov.iov_base as *const u8, safe_len) }
+/// `first_iovec` must describe the first writable destination owned by
+/// `buffer`, and its base must remain readable for
+/// `min(actual, iov_len)` bytes. Empty completions use the zero-length
+/// non-null sentinel descriptor.
+#[inline(always)]
+unsafe fn sctp_first_iov_slice<'a, const N: usize>(
+    _buffer: &'a IoBuffVecMut<N>,
+    first_iovec: &libc::iovec,
+    actual: usize,
+) -> &'a [u8] {
+    let safe_len = std::cmp::min(actual, first_iovec.iov_len);
+    unsafe { std::slice::from_raw_parts(first_iovec.iov_base.cast::<u8>(), safe_len) }
 }
+
+const SCTP_EMPTY_FIRST_IOVEC: libc::iovec = libc::iovec {
+    iov_base: NonNull::<u8>::dangling().as_ptr().cast(),
+    iov_len: 0,
+};
 
 /// Copies the first fixed recovery prefix across active vectored destinations.
 ///
 /// # Safety
 ///
-/// The first `actual` bytes across the chain's current writable regions must
+/// The first `target` bytes across the chain's current writable regions must
 /// have been initialized by one completed kernel receive. `storage` may be
 /// uninitialized; this function returns only the prefix it initializes.
 unsafe fn sctp_vectored_received_prefix<'a, const N: usize>(
     buffer: &mut IoBuffVecMut<N>,
-    actual: usize,
+    target: usize,
     storage: &'a mut MaybeUninit<[u8; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN]>,
 ) -> &'a [u8] {
-    let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+    debug_assert!(target <= SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
     let destination = storage.as_mut_ptr().cast::<u8>();
     let mut copied = 0usize;
     for index in 0..buffer.segments() {
@@ -4951,6 +5036,54 @@ unsafe fn sctp_vectored_received_prefix<'a, const N: usize>(
     }
     debug_assert_eq!(copied, target, "completed SCTP iovecs did not cover actual");
     unsafe { std::slice::from_raw_parts(destination, copied) }
+}
+
+/// Defines the ordinary first-iovec view and independently bounded recovery
+/// prefix for one completed vectored receive without changing the expanded
+/// fast-path code shape.
+macro_rules! sctp_vectored_received_slices {
+    (
+        $buffer:expr,
+        $first_iovec:expr,
+        $actual:expr,
+        $recovery_target:expr,
+        $prefix_storage:ident,
+        $data_slice:ident,
+        $recovery_prefix:ident
+    ) => {
+        let __sctp_received_buffer = $buffer;
+        let __sctp_received_first_iovec = $first_iovec;
+        let __sctp_received_actual = $actual;
+        let __sctp_received_recovery_target = $recovery_target;
+        debug_assert!(
+            __sctp_received_recovery_target
+                <= std::cmp::min(__sctp_received_actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)
+        );
+        let __sctp_received_first_len =
+            std::cmp::min(__sctp_received_actual, __sctp_received_first_iovec.iov_len);
+        let mut $prefix_storage = MaybeUninit::uninit();
+        let gathered_prefix = if __sctp_received_first_len < __sctp_received_recovery_target {
+            Some(unsafe {
+                sctp_vectored_received_prefix(
+                    &mut *__sctp_received_buffer,
+                    __sctp_received_recovery_target,
+                    &mut $prefix_storage,
+                )
+            })
+        } else {
+            None
+        };
+        let $data_slice = unsafe {
+            sctp_first_iov_slice(
+                &*__sctp_received_buffer,
+                __sctp_received_first_iovec,
+                __sctp_received_actual,
+            )
+        };
+        let $recovery_prefix = gathered_prefix.unwrap_or(
+            &$data_slice[..std::cmp::min($data_slice.len(), __sctp_received_recovery_target)],
+        );
+    };
 }
 
 #[inline(always)]
@@ -5025,8 +5158,9 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
             )
         };
         let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-        let recovery_prefix =
-            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+        let recovery_target =
+            recv_state.bounded_recovery_prefix_target(actual, completion.header.msg_flags);
+        let recovery_prefix = &data_slice[..recovery_target];
         let action = recv_state.process_metadata_completion(
             actual,
             completion.header,
@@ -5062,25 +5196,16 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
                 |payload| take_stashed_sctp_recv_vectored_completion(payload, iov_count),
             )
         };
-        let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
-        let first_len = completion
-            .first_iovec
-            .as_ref()
-            .map_or(0, |iov| std::cmp::min(actual, iov.iov_len));
-        let mut prefix_storage = MaybeUninit::uninit();
-        let gathered_prefix = if recv_state
-            .needs_bounded_recovery_prefix(completion.header.msg_flags)
-            && first_len < target
-        {
-            Some(unsafe {
-                sctp_vectored_received_prefix(&mut completion.buffer, actual, &mut prefix_storage)
-            })
-        } else {
-            None
-        };
-        let data_slice = unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-        let recovery_prefix =
-            gathered_prefix.unwrap_or(&data_slice[..std::cmp::min(data_slice.len(), target)]);
+        let target = recv_state.bounded_recovery_prefix_target(actual, completion.header.msg_flags);
+        sctp_vectored_received_slices!(
+            &mut completion.buffer,
+            completion.first_iovec.descriptor(),
+            actual,
+            target,
+            prefix_storage,
+            data_slice,
+            recovery_prefix
+        );
         let action = recv_state.process_metadata_completion(
             actual,
             completion.header,
@@ -5435,10 +5560,10 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                         // callback inside the shared slice helper.
                         let data_slice =
                             unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-                        let recovery_prefix = &data_slice[..std::cmp::min(
-                            data_slice.len(),
-                            SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN,
-                        )];
+                        let recovery_target = this
+                            .recv_state
+                            .bounded_recovery_prefix_target(actual, header.msg_flags);
+                        let recovery_prefix = &data_slice[..recovery_target];
                         let action = this.recv_state.process_metadata_completion(
                             actual,
                             header,
@@ -5461,8 +5586,10 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
 
             let header = completion.meta.header;
             let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-            let recovery_prefix = &data_slice
-                [..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+            let recovery_target = this
+                .recv_state
+                .bounded_recovery_prefix_target(actual, header.msg_flags);
+            let recovery_prefix = &data_slice[..recovery_target];
             let action = this.recv_state.process_metadata_completion(
                 actual,
                 header,
@@ -5748,32 +5875,18 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                         // SAFETY: completion extraction copied the first active
                         // kernel iovec before releasing retained storage, and the
                         // returned chain still owns every referenced allocation.
-                        let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
-                        let first_len = completion
-                            .first_iovec
-                            .as_ref()
-                            .map_or(0, |iov| std::cmp::min(actual, iov.iov_len));
-                        let mut prefix_storage = MaybeUninit::uninit();
-                        let gathered_prefix = if this
+                        let target = this
                             .recv_state
-                            .needs_bounded_recovery_prefix(header.msg_flags)
-                            && first_len < target
-                        {
-                            Some(unsafe {
-                                sctp_vectored_received_prefix(
-                                    &mut completion.buffer,
-                                    actual,
-                                    &mut prefix_storage,
-                                )
-                            })
-                        } else {
-                            None
-                        };
-                        let data_slice = unsafe {
-                            sctp_first_iov_slice(completion.first_iovec.as_ref(), actual)
-                        };
-                        let recovery_prefix = gathered_prefix
-                            .unwrap_or(&data_slice[..std::cmp::min(data_slice.len(), target)]);
+                            .bounded_recovery_prefix_target(actual, header.msg_flags);
+                        sctp_vectored_received_slices!(
+                            &mut completion.buffer,
+                            completion.first_iovec.descriptor(),
+                            actual,
+                            target,
+                            prefix_storage,
+                            data_slice,
+                            recovery_prefix
+                        );
                         let action = this.recv_state.process_metadata_completion(
                             actual,
                             header,
@@ -5794,31 +5907,18 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                 Err(err) => return Poll::Ready((Err(err), completion.buffer)),
             };
             let header = completion.meta.header;
-            let target = std::cmp::min(actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
-            let first_len = completion
-                .first_iovec
-                .as_ref()
-                .map_or(0, |iov| std::cmp::min(actual, iov.iov_len));
-            let mut prefix_storage = MaybeUninit::uninit();
-            let gathered_prefix = if this
+            let target = this
                 .recv_state
-                .needs_bounded_recovery_prefix(header.msg_flags)
-                && first_len < target
-            {
-                Some(unsafe {
-                    sctp_vectored_received_prefix(
-                        &mut completion.buffer,
-                        actual,
-                        &mut prefix_storage,
-                    )
-                })
-            } else {
-                None
-            };
-            let data_slice =
-                unsafe { sctp_first_iov_slice(completion.first_iovec.as_ref(), actual) };
-            let recovery_prefix =
-                gathered_prefix.unwrap_or(&data_slice[..std::cmp::min(data_slice.len(), target)]);
+                .bounded_recovery_prefix_target(actual, header.msg_flags);
+            sctp_vectored_received_slices!(
+                &mut completion.buffer,
+                completion.first_iovec.descriptor(),
+                actual,
+                target,
+                prefix_storage,
+                data_slice,
+                recovery_prefix
+            );
             let action = this.recv_state.process_metadata_completion(
                 actual,
                 header,
@@ -6748,6 +6848,19 @@ macro_rules! bare_receive_invalid_data {
     };
 }
 
+#[cold]
+#[inline(never)]
+fn missing_notification_preparse() -> io::Error {
+    production_receive_invalid_data!("SCTP notification completion was not preparsed")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[cold]
+#[inline(never)]
+fn missing_notification_preparse_bare() -> io::Error {
+    bare_receive_invalid_data!("SCTP notification completion was not preparsed")
+}
+
 macro_rules! define_parse_rcvinfo {
     ($(#[$attribute:meta])* $name:ident, $invalid_data:ident) => {
         $(#[$attribute])*
@@ -6927,6 +7040,7 @@ macro_rules! define_parse_recv_meta {
             data_slice: &[u8],
             recv_rcvinfo_requested: bool,
         ) -> io::Result<SctpRecvMeta> {
+            let parsed_notification = parse_sctp_notification_once(data_slice, msg_flags);
             // SAFETY: initialized bytes may always be viewed as MaybeUninit bytes.
             let control = unsafe {
                 std::slice::from_raw_parts(
@@ -6942,7 +7056,7 @@ macro_rules! define_parse_recv_meta {
                     msg_flags,
                     data_slice,
                     recv_rcvinfo_requested,
-                    None,
+                    parsed_notification,
                 )
             }
         }
@@ -7015,7 +7129,7 @@ define_parse_recv_meta_with_notification!(
 );
 
 macro_rules! define_classify_recv_meta {
-    ($(#[$attribute:meta])* $name:ident, $invalid_data:ident) => {
+    ($(#[$attribute:meta])* $name:ident, $invalid_data:ident, $missing_preparse:ident) => {
         $(#[$attribute])*
         fn $name(
             rcvinfo: io::Result<Option<SctpRecvInfo>>,
@@ -7038,7 +7152,7 @@ macro_rules! define_classify_recv_meta {
             if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
                 return match parsed_notification {
                     Some(notification) => notification,
-                    None => parse_notification(data_slice),
+                    None => Err($missing_preparse()),
                 };
             }
 
@@ -7074,14 +7188,16 @@ macro_rules! define_classify_recv_meta {
 define_classify_recv_meta!(
     #[inline(always)]
     classify_recv_meta,
-    production_receive_invalid_data
+    production_receive_invalid_data,
+    missing_notification_preparse
 );
 
 define_classify_recv_meta!(
     #[cfg(any(test, feature = "test-support"))]
     #[inline(always)]
     classify_recv_meta_bare,
-    bare_receive_invalid_data
+    bare_receive_invalid_data,
+    missing_notification_preparse_bare
 );
 
 fn send_failed_notification(
@@ -7802,8 +7918,10 @@ pub(crate) mod test_support {
             msg_controllen: 0,
             msg_flags,
         };
-        let recovery_prefix =
-            &data[..std::cmp::min(data.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)];
+        let recovery_target = stream
+            .recv_state
+            .bounded_recovery_prefix_target(data.len(), msg_flags);
+        let recovery_prefix = &data[..recovery_target];
         let action = stream.recv_state.process_metadata_completion(
             data.len(),
             header,
@@ -9029,7 +9147,11 @@ mod tests {
         }
 
         let first_iovec = unsafe { copy_sctp_first_iovec(&iovecs, iov_count) };
-        let received = unsafe { sctp_first_iov_slice(first_iovec.as_ref(), 4) };
+        let received = first_iov_view_from_copied_descriptor(
+            &chain,
+            *first_iovec.as_ref().expect("active first iovec missing"),
+            4,
+        );
         assert_eq!(received, b"note");
         assert_eq!(
             chain.get(0).expect("full segment missing").payload_bytes(),
@@ -9042,6 +9164,39 @@ mod tests {
                 .payload_len(),
             0
         );
+    }
+
+    type FirstIovSliceFn<const N: usize> = for<'owner, 'descriptor> unsafe fn(
+        &'owner IoBuffVecMut<N>,
+        &'descriptor libc::iovec,
+        usize,
+    ) -> &'owner [u8];
+
+    fn first_iov_view_from_copied_descriptor<const N: usize>(
+        owner: &IoBuffVecMut<N>,
+        descriptor: libc::iovec,
+        actual: usize,
+    ) -> &[u8] {
+        unsafe { sctp_first_iov_slice(owner, &descriptor, actual) }
+    }
+
+    #[test]
+    fn sctp_first_iov_slice_lifetime_is_bound_to_buffer_owner() {
+        let signature: FirstIovSliceFn<1> = sctp_first_iov_slice::<1>;
+        let _ = signature;
+
+        let mut segment = IoBuffMut::new(0, 8, 0).expect("segment allocation failed");
+        let first_iovec = libc::iovec {
+            iov_base: segment.as_mut_ptr().cast(),
+            iov_len: 8,
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"owner".as_ptr(), segment.as_mut_ptr(), 5);
+        }
+        let chain = IoBuffVecMut::from_array([segment]);
+
+        let view = first_iov_view_from_copied_descriptor(&chain, first_iovec, 5);
+        assert_eq!(view, b"owner");
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -10095,6 +10250,8 @@ mod tests {
 
         let mut notification = test_notification_buffer(LOCAL_SCTP_SHUTDOWN_EVENT, 12);
         write_u32_ne(&mut notification, 8, 42);
+        let parsed_notification =
+            parse_sctp_notification_once(&notification, libc::MSG_NOTIFICATION | libc::MSG_EOR);
         assert!(matches!(
             parse_recv_state_meta_for_test(
                 &requested,
@@ -10102,7 +10259,7 @@ mod tests {
                 0,
                 libc::MSG_NOTIFICATION | libc::MSG_EOR,
                 &notification,
-                None,
+                parsed_notification,
             ),
             Ok(SctpRecvMeta::Notification(SctpNotification::Shutdown {
                 assoc_id: 42
@@ -10380,6 +10537,7 @@ mod tests {
             );
             assert_eq!(std::mem::size_of::<SctpRecvCompletionMeta>(), 48);
             assert_eq!(std::mem::size_of::<SctpRecvCompletion<IoBuffMut>>(), 88);
+            assert_eq!(std::mem::size_of::<SctpFirstIovec>(), 24);
             assert_eq!(std::mem::size_of::<SctpRecvVectoredCompletion<2>>(), 160);
             assert_eq!(std::mem::size_of::<SctpRecvVectoredCompletion<16>>(), 720);
             assert!(
@@ -10820,7 +10978,7 @@ mod tests {
         assert_eq!(first_iovec.iov_base, segment_ptrs[0].cast());
         assert_eq!(first_iovec.iov_len, 8);
         assert_eq!(
-            unsafe { sctp_first_iov_slice(Some(first_iovec), 4) },
+            first_iov_view_from_copied_descriptor(&completion.buffer, *first_iovec, 4),
             b"note"
         );
         assert_eq!(
@@ -10887,7 +11045,11 @@ mod tests {
 
         let uninitialized: [MaybeUninit<libc::iovec>; N] =
             std::array::from_fn(|_| MaybeUninit::uninit());
-        assert!(unsafe { copy_sctp_first_iovec(&uninitialized, 0) }.is_none());
+        assert!(
+            unsafe { copy_sctp_first_iovec(&uninitialized, 0) }
+                .as_ref()
+                .is_none()
+        );
         drop(completion);
         let stats = pool.stats();
         assert_eq!(stats.pooled_allocs, 2);
@@ -10962,7 +11124,7 @@ mod tests {
             .expect("active first iovec was not extracted");
         assert_eq!(first_iovec.iov_base, segment_ptrs[0].cast());
         assert_eq!(
-            unsafe { sctp_first_iov_slice(Some(first_iovec), 4) },
+            first_iov_view_from_copied_descriptor(&completion.buffer, *first_iovec, 4),
             b"tail"
         );
         for (index, expected_ptr) in segment_ptrs.into_iter().enumerate() {
@@ -12858,13 +13020,318 @@ mod tests {
         data_slice: &[u8],
         msg: &libc::msghdr,
     ) -> SctpMetadataCompletion {
+        let recovery_target = state.bounded_recovery_prefix_target(data_slice.len(), msg.msg_flags);
         state.process_metadata_completion(
             data_slice.len(),
             test_recv_header(msg),
             data_slice,
-            &data_slice[..std::cmp::min(data_slice.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN)],
+            &data_slice[..recovery_target],
             SctpCompletionPublication::Visible(Ok(None)),
         )
+    }
+
+    fn process_two_segment_completion_for_test(
+        state: &mut SctpRecvState,
+        data: &[u8],
+        first_len: usize,
+        msg_flags: libc::c_int,
+        visible: bool,
+    ) -> (SctpMetadataCompletion, usize, usize) {
+        assert!(first_len <= data.len());
+        let second_len = data.len() - first_len;
+        let mut first = IoBuffMut::new(0, first_len, 0).expect("first segment allocation failed");
+        let mut second =
+            IoBuffMut::new(0, second_len, 0).expect("second segment allocation failed");
+        if first_len != 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), first.as_mut_ptr(), first_len);
+            }
+        }
+        if second_len != 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(first_len),
+                    second.as_mut_ptr(),
+                    second_len,
+                );
+            }
+        }
+        let first_iovec = libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: first_len,
+        };
+        let mut chain = IoBuffVecMut::from_array([first, second]);
+        let recovery_target = state.bounded_recovery_prefix_target(data.len(), msg_flags);
+        sctp_vectored_received_slices!(
+            &mut chain,
+            &first_iovec,
+            data.len(),
+            recovery_target,
+            prefix_storage,
+            data_slice,
+            recovery_prefix
+        );
+        let view_lengths = (data_slice.len(), recovery_prefix.len());
+        let publication = if visible {
+            SctpCompletionPublication::Visible(Ok(None))
+        } else {
+            SctpCompletionPublication::Unpublished
+        };
+        let action = state.process_metadata_completion(
+            data.len(),
+            SctpRecvHeader {
+                msg_controllen: 0,
+                msg_flags,
+            },
+            data_slice,
+            recovery_prefix,
+            publication,
+        );
+        (action, view_lengths.0, view_lengths.1)
+    }
+
+    fn assert_published_meta(
+        action: SctpMetadataCompletion,
+        expected: SctpRecvMeta,
+        context: &str,
+    ) {
+        match action {
+            SctpMetadataCompletion::Publish(Ok(actual)) => {
+                assert_eq!(actual, expected, "{context}")
+            }
+            SctpMetadataCompletion::Publish(Err(err)) => {
+                panic!("{context}: unexpected error: {err}")
+            }
+            SctpMetadataCompletion::Consume => panic!("{context}: completion was consumed"),
+        }
+    }
+
+    #[test]
+    fn vectored_public_notifications_remain_first_iovec_only_at_every_prefix_size() {
+        let cases = [
+            (
+                "shutdown",
+                test_notification_buffer(LOCAL_SCTP_SHUTDOWN_EVENT, 12),
+                12,
+            ),
+            (
+                "remote error",
+                test_notification_buffer(LOCAL_SCTP_REMOTE_ERROR, 16),
+                16,
+            ),
+            (
+                "association change",
+                test_notification_buffer(LOCAL_SCTP_ASSOC_CHANGE, 20),
+                20,
+            ),
+            (
+                "partial delivery",
+                test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED),
+                24,
+            ),
+            (
+                "stream reset",
+                test_fragmented_stream_reset_notification(),
+                44,
+            ),
+        ];
+
+        for (name, notification, expected_len) in cases {
+            assert_eq!(notification.len(), expected_len, "{name}: fixture size");
+            let expected = parse_notification(&notification)
+                .unwrap_or_else(|err| panic!("{name}: fixture did not parse: {err}"));
+            let msg = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+
+            let mut scalar = SctpRecvState::external();
+            assert_published_meta(
+                process_visible_completion_for_test(&mut scalar, &notification, &msg),
+                expected,
+                &format!("{name}: scalar control"),
+            );
+
+            let mut first_complete = SctpRecvState::external();
+            let (action, data_len, recovery_len) = process_two_segment_completion_for_test(
+                &mut first_complete,
+                &notification,
+                notification.len(),
+                msg.msg_flags,
+                true,
+            );
+            assert_eq!(data_len, notification.len(), "{name}: first-iovec view");
+            assert_eq!(recovery_len, 0, "{name}: synced gather target");
+            assert_published_meta(action, expected, &format!("{name}: vectored control"));
+
+            let mut split = SctpRecvState::external();
+            let (action, data_len, recovery_len) = process_two_segment_completion_for_test(
+                &mut split,
+                &notification,
+                5,
+                msg.msg_flags,
+                true,
+            );
+            assert_eq!(data_len, 5, "{name}: split first-iovec view");
+            assert_eq!(recovery_len, 0, "{name}: split synced gather target");
+            match action {
+                SctpMetadataCompletion::Publish(Err(err)) => assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{name}: split parser error"
+                ),
+                SctpMetadataCompletion::Publish(Ok(meta)) => {
+                    panic!("{name}: split notification unexpectedly parsed as {meta:?}")
+                }
+                SctpMetadataCompletion::Consume => {
+                    panic!("{name}: split visible notification was consumed")
+                }
+            }
+            assert_eq!(split.record_sync, SctpRecordSync::Synced);
+        }
+    }
+
+    #[test]
+    fn data_notification_tail_gates_every_source_eor_and_publication_combination() {
+        let hostile_data = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let malformed_notification = [0xa5; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN];
+
+        for visible in [false, true] {
+            for notification in [false, true] {
+                for end_of_record in [false, true] {
+                    let mut state = SctpRecvState::external();
+                    state.record_sync = SctpRecordSync::DataNotificationTail;
+                    state.nested_notification_prefix[..5].fill(0xa5);
+                    state.nested_prefix_state = 5;
+                    let original_prefix = state.nested_notification_prefix;
+                    let data = if notification {
+                        &malformed_notification[5..]
+                    } else {
+                        hostile_data.as_slice()
+                    };
+                    let msg_flags = if notification {
+                        libc::MSG_NOTIFICATION
+                    } else {
+                        0
+                    } | if end_of_record { libc::MSG_EOR } else { 0 };
+                    let recovery_target =
+                        state.bounded_recovery_prefix_target(data.len(), msg_flags);
+                    let publication = if visible {
+                        SctpCompletionPublication::Visible(Ok(None))
+                    } else {
+                        SctpCompletionPublication::Unpublished
+                    };
+                    let action = state.process_metadata_completion(
+                        data.len(),
+                        SctpRecvHeader {
+                            msg_controllen: 0,
+                            msg_flags,
+                        },
+                        data,
+                        &data[..recovery_target],
+                        publication,
+                    );
+                    assert!(
+                        matches!(action, SctpMetadataCompletion::Consume),
+                        "visible={visible} notification={notification} eor={end_of_record}"
+                    );
+
+                    if notification {
+                        assert_eq!(recovery_target, 19);
+                        assert_eq!(
+                            state.record_sync,
+                            if end_of_record {
+                                SctpRecordSync::DataTail
+                            } else {
+                                SctpRecordSync::DataNotificationTail
+                            }
+                        );
+                        if !end_of_record {
+                            assert_eq!(state.nested_prefix_len(), 24);
+                            assert_ne!(
+                                state.nested_prefix_state & SCTP_NESTED_PREFIX_CLASSIFIED,
+                                0
+                            );
+                            assert_eq!(
+                                state.bounded_recovery_prefix_target(
+                                    data.len(),
+                                    libc::MSG_NOTIFICATION
+                                ),
+                                0,
+                                "classified prefix requested another gather"
+                            );
+                        }
+                    } else {
+                        assert_eq!(recovery_target, 0);
+                        assert_eq!(
+                            state.record_sync,
+                            if end_of_record {
+                                SctpRecordSync::NotificationTail
+                            } else {
+                                SctpRecordSync::DataNotificationTail
+                            }
+                        );
+                        if !end_of_record {
+                            assert_eq!(state.nested_prefix_len(), 5);
+                            assert_eq!(state.nested_notification_prefix, original_prefix);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_split_pdapi_abort_preserves_visibility_filtering_and_vectored_recovery() {
+        let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+        let partial = test_msghdr_with_flags(libc::MSG_NOTIFICATION);
+        let terminal = test_msghdr_with_flags(libc::MSG_NOTIFICATION | libc::MSG_EOR);
+
+        let mut explicit = SctpRecvState::external();
+        explicit.record_sync = SctpRecordSync::DataTail;
+        assert!(matches!(
+            process_visible_completion_for_test(&mut explicit, &abort[..7], &partial),
+            SctpMetadataCompletion::Consume
+        ));
+        assert_published_meta(
+            process_visible_completion_for_test(&mut explicit, &abort[7..], &terminal),
+            parse_notification(&abort).expect("PDAPI fixture did not parse"),
+            "explicit terminal split PDAPI",
+        );
+        assert_eq!(explicit.record_sync, SctpRecordSync::Synced);
+
+        let mut metadata_only = SctpSocketConfig::data(SctpInitConfig::default());
+        metadata_only.recv_rcvinfo = true;
+        let mut forced = SctpRecvState::configured(metadata_only);
+        forced.record_sync = SctpRecordSync::DataTail;
+        assert!(forced.should_consume_for_test(&abort[..7], &partial));
+        assert!(forced.should_consume_for_test(&abort[7..], &terminal));
+        assert_eq!(forced.record_sync, SctpRecordSync::Synced);
+
+        let mut unpublished = SctpRecvState::external();
+        unpublished.record_sync = SctpRecordSync::DataTail;
+        unpublished.process_unpublished_for_test(&abort[..7], &partial);
+        unpublished.process_unpublished_for_test(&abort[7..], &terminal);
+        assert_eq!(unpublished.record_sync, SctpRecordSync::Synced);
+
+        let mut vectored = SctpRecvState::external();
+        vectored.record_sync = SctpRecordSync::DataTail;
+        assert!(matches!(
+            process_visible_completion_for_test(&mut vectored, &abort[..7], &partial),
+            SctpMetadataCompletion::Consume
+        ));
+        let (action, data_len, recovery_len) = process_two_segment_completion_for_test(
+            &mut vectored,
+            &abort[7..],
+            5,
+            terminal.msg_flags,
+            true,
+        );
+        assert_eq!(data_len, 5);
+        assert_eq!(recovery_len, 17, "only the missing prefix was gathered");
+        assert_published_meta(
+            action,
+            parse_notification(&abort).expect("PDAPI fixture did not parse"),
+            "vectored terminal split PDAPI",
+        );
+        assert_eq!(vectored.record_sync, SctpRecordSync::Synced);
     }
 
     #[test]
@@ -13198,6 +13665,158 @@ mod tests {
     }
 
     #[test]
+    fn vectored_received_slices_preserve_first_iovec_and_recovery_views() {
+        let mut empty = IoBuffVecMut::<1>::new();
+        let empty_actual = 0usize;
+        let empty_target = std::cmp::min(empty_actual, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+        let empty_first_iovec = SCTP_EMPTY_FIRST_IOVEC;
+        sctp_vectored_received_slices!(
+            &mut empty,
+            &empty_first_iovec,
+            empty_actual,
+            empty_target,
+            empty_storage,
+            empty_data,
+            empty_recovery
+        );
+        assert!(empty_data.is_empty());
+        assert!(empty_recovery.is_empty());
+
+        let bytes = b"abcdefghijkl";
+        let mut first = IoBuffMut::new(0, 8, 0).expect("first segment allocation failed");
+        let mut second = IoBuffMut::new(0, 4, 0).expect("second segment allocation failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), first.as_mut_ptr(), 8);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(8), second.as_mut_ptr(), 4);
+        }
+        let first_iovec = libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: 8,
+        };
+        let mut first_complete = IoBuffVecMut::from_array([first, second]);
+        sctp_vectored_received_slices!(
+            &mut first_complete,
+            &first_iovec,
+            8,
+            8,
+            first_complete_storage,
+            first_complete_data,
+            first_complete_recovery
+        );
+        assert_eq!(first_complete_data, &bytes[..8]);
+        assert_eq!(first_complete_recovery, &bytes[..8]);
+
+        let mut first = IoBuffMut::new(0, 5, 0).expect("first segment allocation failed");
+        let mut second = IoBuffMut::new(0, 7, 0).expect("second segment allocation failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), first.as_mut_ptr(), 5);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(5), second.as_mut_ptr(), 7);
+        }
+        let first_iovec = libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: 5,
+        };
+        let mut cross_segment = IoBuffVecMut::from_array([first, second]);
+        sctp_vectored_received_slices!(
+            &mut cross_segment,
+            &first_iovec,
+            bytes.len(),
+            bytes.len(),
+            cross_segment_storage,
+            cross_segment_data,
+            cross_segment_recovery
+        );
+        assert_eq!(cross_segment_data, &bytes[..5]);
+        assert_eq!(cross_segment_recovery, bytes);
+
+        sctp_vectored_received_slices!(
+            &mut cross_segment,
+            &first_iovec,
+            bytes.len(),
+            5,
+            ungathered_storage,
+            ungathered_data,
+            ungathered_recovery
+        );
+        assert_eq!(ungathered_data, &bytes[..5]);
+        assert_eq!(ungathered_recovery, &bytes[..5]);
+    }
+
+    #[test]
+    fn vectored_received_slices_evaluate_each_operand_once() {
+        let buffer_evaluations = Cell::new(0usize);
+        let first_iovec_evaluations = Cell::new(0usize);
+        let actual_evaluations = Cell::new(0usize);
+        let target_evaluations = Cell::new(0usize);
+        let mut empty = IoBuffVecMut::<1>::new();
+        let no_first_iovec = SCTP_EMPTY_FIRST_IOVEC;
+
+        sctp_vectored_received_slices!(
+            {
+                buffer_evaluations.set(buffer_evaluations.get() + 1);
+                &mut empty
+            },
+            {
+                first_iovec_evaluations.set(first_iovec_evaluations.get() + 1);
+                &no_first_iovec
+            },
+            {
+                actual_evaluations.set(actual_evaluations.get() + 1);
+                0usize
+            },
+            {
+                target_evaluations.set(target_evaluations.get() + 1);
+                0usize
+            },
+            prefix_storage,
+            data_slice,
+            recovery_prefix
+        );
+
+        assert!(data_slice.is_empty());
+        assert!(recovery_prefix.is_empty());
+        assert_eq!(buffer_evaluations.get(), 1);
+        assert_eq!(first_iovec_evaluations.get(), 1);
+        assert_eq!(actual_evaluations.get(), 1);
+        assert_eq!(target_evaluations.get(), 1);
+    }
+
+    #[test]
+    fn vectored_received_slices_gather_only_target_from_larger_completion() {
+        let bytes = b"0123456789abcdefghijklmnopqrst";
+        assert_eq!(bytes.len(), 30);
+        let mut first = IoBuffMut::new(0, 5, 0).expect("first segment allocation failed");
+        let mut second = IoBuffMut::new(0, 19, 0).expect("second segment allocation failed");
+        let mut third = IoBuffMut::new(0, 6, 0).expect("third segment allocation failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), first.as_mut_ptr(), 5);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(5), second.as_mut_ptr(), 19);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(24), third.as_mut_ptr(), 6);
+        }
+        let first_iovec = libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: 5,
+        };
+        let mut chain = IoBuffVecMut::from_array([first, second, third]);
+
+        sctp_vectored_received_slices!(
+            &mut chain,
+            &first_iovec,
+            30,
+            SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN,
+            prefix_storage,
+            data_slice,
+            recovery_prefix
+        );
+
+        assert_eq!(data_slice, &bytes[..5]);
+        assert_eq!(
+            recovery_prefix,
+            &bytes[..SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN]
+        );
+    }
+
+    #[test]
     fn vectored_nested_pdapi_prefix_spans_iovecs_without_variable_tail_copy() {
         let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
         let mut first = IoBuffMut::new(0, 5, 0).expect("first segment allocation failed");
@@ -13216,7 +13835,7 @@ mod tests {
         let mut storage = MaybeUninit::uninit();
         let prefix =
             unsafe { sctp_vectored_received_prefix(&mut chain, abort.len(), &mut storage) };
-        let data_slice = unsafe { sctp_first_iov_slice(Some(&first_iovec), abort.len()) };
+        let data_slice = first_iov_view_from_copied_descriptor(&chain, first_iovec, abort.len());
         assert_eq!(prefix, abort);
 
         let mut state = SctpRecvState::external();
@@ -13555,6 +14174,34 @@ mod tests {
             .expect_err("the pre-parsed malformed result must be preserved")
             .kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn notification_classification_requires_explicit_preparse() {
+        let mut notification = test_notification_buffer(LOCAL_SCTP_SHUTDOWN_EVENT, 12);
+        write_u32_ne(&mut notification, 8, 42);
+        let msg_flags = libc::MSG_NOTIFICATION | libc::MSG_EOR;
+        let expected = SctpRecvMeta::Notification(SctpNotification::Shutdown { assoc_id: 42 });
+
+        let missing =
+            parse_recv_meta_with_notification_for_test(&[], 0, msg_flags, &notification, None)
+                .expect_err("valid-looking bytes must not replace completion-boundary preparsing");
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            missing.to_string(),
+            "SCTP notification completion was not preparsed"
+        );
+
+        assert_eq!(
+            parse_recv_meta(&[], 0, msg_flags, &notification, false)
+                .expect("production facade should explicitly preparse the notification"),
+            expected
+        );
+        assert_eq!(
+            parse_recv_meta_bare(&[], 0, msg_flags, &notification, false)
+                .expect("bare facade should explicitly preparse the notification"),
+            expected
         );
     }
 

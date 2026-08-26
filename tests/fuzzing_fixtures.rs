@@ -1440,6 +1440,7 @@ fn tls_server_end_point_fixture_inventory_is_exact() {
         "malformed_zero_padded_child_length",
         "unsupported_ed25519_minimal",
         "valid_ecdsa_sha256_minimal",
+        "valid_rsa_sha256_absent_parameters_minimal",
         "valid_rsa_sha256_minimal",
     ];
 
@@ -1449,6 +1450,9 @@ fn tls_server_end_point_fixture_inventory_is_exact() {
 #[test]
 fn tls_server_end_point_wrapper_reaches_valid_and_malformed_der() {
     let rsa = include_bytes!("../fixtures/fuzzing/tls_server_end_point/valid_rsa_sha256_minimal");
+    let rsa_absent = include_bytes!(
+        "../fixtures/fuzzing/tls_server_end_point/valid_rsa_sha256_absent_parameters_minimal"
+    );
     let ecdsa =
         include_bytes!("../fixtures/fuzzing/tls_server_end_point/valid_ecdsa_sha256_minimal");
     assert_eq!(
@@ -1465,6 +1469,21 @@ fn tls_server_end_point_wrapper_reaches_valid_and_malformed_der() {
             0x01, 0x01, 0x0b, 0x05, 0x00, 0x03, 0x02, 0x00, 0xa5,
         ],
         "minimal RSA seed bytes must stay exact"
+    );
+    assert_eq!(
+        observe_tls_server_end_point(rsa_absent)
+            .expect("RSA SHA-256 absent-parameter seed should derive a binding")
+            .len(),
+        32
+    );
+    let rsa_absent_der = decode_hex_seed(rsa_absent);
+    assert_eq!(
+        rsa_absent_der,
+        [
+            0x30, 0x13, 0x30, 0x00, 0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d,
+            0x01, 0x01, 0x0b, 0x03, 0x02, 0x00, 0xa5,
+        ],
+        "minimal absent-parameter RSA seed bytes must stay exact"
     );
     assert_eq!(
         observe_tls_server_end_point(ecdsa)

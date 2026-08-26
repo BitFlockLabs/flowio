@@ -136,6 +136,7 @@ type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMark
 
 const DER_SEQUENCE_TAG: u8 = 0x30;
 const DER_BIT_STRING_TAG: u8 = 0x03;
+const DER_NULL: &[u8] = &[0x05, 0x00];
 
 /// rustls 0.23.42 deframer `MAX_WIRE_SIZE`; bounds the reusable read scratch
 /// and its retained-suffix offset. A feed may be partial when rustls applies
@@ -529,6 +530,14 @@ fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]])
     candidates.contains(&signature_algorithm)
 }
 
+fn matches_rsa_pkcs1_sha2_algorithm(
+    signature_algorithm: &[u8],
+    algorithm_with_null: &[u8],
+) -> bool {
+    signature_algorithm == algorithm_with_null
+        || algorithm_with_null.strip_suffix(DER_NULL) == Some(signature_algorithm)
+}
+
 /// Derives RFC 5929 `tls-server-end-point` channel-binding bytes from an
 /// end-entity certificate DER blob.
 ///
@@ -544,6 +553,9 @@ fn matches_signature_algorithm(signature_algorithm: &[u8], candidates: &[&[u8]])
 /// Returns `None` when the parsed structure is malformed or the signature
 /// algorithm is unsupported for this derivation. Unsupported cases include
 /// algorithms without a defined binding digest, such as Ed25519 and Ed448.
+/// SHA-256/384/512-with-RSA identifiers accept exactly the two RFC 4055
+/// parameter forms: an absent parameter or an explicit DER NULL. Other
+/// parameters and trailing identifier children are rejected.
 ///
 /// This allocates the returned channel-binding bytes. Call it after the TLS
 /// handshake when a protocol needs the binding value; it is not steady-state
@@ -562,33 +574,32 @@ pub fn tls_server_end_point(certificate_der: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    if matches_signature_algorithm(
-        signature_algorithm,
-        &[
-            RSA_PKCS1_MD5,
-            RSA_PKCS1_SHA1,
-            DSA_SHA1,
-            ECDSA_SHA1,
-            RSA_PKCS1_SHA256.as_ref(),
-            ECDSA_SHA256.as_ref(),
-            RSA_PSS_SHA256.as_ref(),
-        ],
-    ) {
+    if matches_rsa_pkcs1_sha2_algorithm(signature_algorithm, RSA_PKCS1_SHA256.as_ref())
+        || matches_signature_algorithm(
+            signature_algorithm,
+            &[
+                RSA_PKCS1_MD5,
+                RSA_PKCS1_SHA1,
+                DSA_SHA1,
+                ECDSA_SHA1,
+                ECDSA_SHA256.as_ref(),
+                RSA_PSS_SHA256.as_ref(),
+            ],
+        )
+    {
         return Some(Sha256::digest(certificate_der).to_vec());
     }
 
-    if matches_signature_algorithm(
-        signature_algorithm,
-        &[
-            RSA_PKCS1_SHA384.as_ref(),
-            ECDSA_SHA384.as_ref(),
-            RSA_PSS_SHA384.as_ref(),
-        ],
-    ) {
+    if matches_rsa_pkcs1_sha2_algorithm(signature_algorithm, RSA_PKCS1_SHA384.as_ref())
+        || matches_signature_algorithm(
+            signature_algorithm,
+            &[ECDSA_SHA384.as_ref(), RSA_PSS_SHA384.as_ref()],
+        )
+    {
         return Some(Sha384::digest(certificate_der).to_vec());
     }
 
-    if signature_algorithm == RSA_PKCS1_SHA512.as_ref()
+    if matches_rsa_pkcs1_sha2_algorithm(signature_algorithm, RSA_PKCS1_SHA512.as_ref())
         || signature_algorithm == ECDSA_SHA512.as_ref()
         || signature_algorithm == RSA_PSS_SHA512.as_ref()
     {

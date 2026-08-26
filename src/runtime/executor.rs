@@ -722,8 +722,10 @@ impl Drop for TimerShutdownPhase {
     fn drop(&mut self) {
         let state = self.state;
         run_cleanup_preserving_panic(|| {
-            // SAFETY: shutdown_owner creates this phase from its heap-stable
-            // ExecutorState and keeps that state alive until after phase drop.
+            // SAFETY: direct shutdown owns this phase inside shutdown_owner
+            // while its ExecutorOwner keeps the heap-stable state alive;
+            // deferred iterative drain pins that state in
+            // deferred_shutdown_owner through phase drop.
             unsafe {
                 TimerRuntime::cancel_all_for_shutdown_unchecked(std::ptr::addr_of_mut!(
                     (*state).timers
@@ -742,8 +744,10 @@ impl Drop for ReactorShutdownPhase {
     fn drop(&mut self) {
         let state = self.state;
         run_cleanup_preserving_panic(|| {
-            // SAFETY: shutdown_owner creates this phase from its heap-stable
-            // ExecutorState and keeps that state alive until after phase drop.
+            // SAFETY: direct shutdown owns this phase inside shutdown_owner
+            // while its ExecutorOwner keeps the heap-stable state alive;
+            // deferred iterative drain pins that state in
+            // deferred_shutdown_owner through phase drop.
             unsafe {
                 let runtime_state = std::ptr::addr_of_mut!((*state).runtime_state);
                 let ready_queue = std::ptr::addr_of_mut!((*state).ready_queue);

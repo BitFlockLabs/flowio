@@ -1,17 +1,24 @@
 use flowio::net::tls::tls_server_end_point;
-use rustls::pki_types::alg_id::{ED25519, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512};
+use rustls::pki_types::alg_id::{
+    ED25519, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512, RSA_PSS_SHA256, RSA_PSS_SHA384,
+    RSA_PSS_SHA512,
+};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 const RSA_PKCS1_SHA1: &[u8] = &[
     0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05, 0x05, 0x00,
 ];
 const ECDSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01];
+const RSA_PSS_OID: &[u8] = &[
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a,
+];
 const UNKNOWN_SIGNATURE_ALGORITHM: &[u8] = &[0x06, 0x03, 0x2a, 0x03, 0x04];
 const MINIMAL_SIGNATURE_TLV: [u8; 4] = [0x03, 0x02, 0x00, 0xa5];
 
 const RSA_SHA256_CERT_HEX: &str = include_str!("fixtures/tls_channel_binding/rsa_sha256.der.hex");
 const ECDSA_SHA256_CERT_HEX: &str =
     include_str!("fixtures/tls_channel_binding/ecdsa_sha256.der.hex");
+type DigestCase = (&'static str, &'static [u8], fn(&[u8]) -> Vec<u8>);
 
 fn encode_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 4);
@@ -83,6 +90,103 @@ fn tls_server_end_point_uses_signature_hash_mapping() {
     assert_eq!(
         tls_server_end_point(&sha512_cert),
         Some(Sha512::digest(&sha512_cert).to_vec())
+    );
+}
+
+#[test]
+fn tls_server_end_point_accepts_both_legal_rsa_sha2_parameter_forms() {
+    let cases: [DigestCase; 3] = [
+        ("SHA-256", RSA_PKCS1_SHA256.as_ref(), |certificate| {
+            Sha256::digest(certificate).to_vec()
+        }),
+        ("SHA-384", RSA_PKCS1_SHA384.as_ref(), |certificate| {
+            Sha384::digest(certificate).to_vec()
+        }),
+        ("SHA-512", RSA_PKCS1_SHA512.as_ref(), |certificate| {
+            Sha512::digest(certificate).to_vec()
+        }),
+    ];
+
+    for (name, algorithm_with_null, digest) in cases {
+        let algorithm_without_parameters = algorithm_with_null
+            .strip_suffix(&[0x05, 0x00])
+            .expect("rustls RSA PKCS#1 SHA-2 identifiers should end in DER NULL");
+        for (parameter_form, algorithm) in [
+            ("absent", algorithm_without_parameters),
+            ("explicit NULL", algorithm_with_null),
+        ] {
+            let certificate = certificate_with_algorithm(algorithm);
+            assert_eq!(
+                tls_server_end_point(&certificate),
+                Some(digest(&certificate)),
+                "{name} with {parameter_form} parameters was rejected"
+            );
+        }
+    }
+}
+
+#[test]
+fn tls_server_end_point_rejects_other_rsa_sha2_parameters_and_children() {
+    let invalid_parameters: [(&str, &[u8]); 3] = [
+        ("wrong parameter tag", &[0x04, 0x00]),
+        ("malformed NULL", &[0x05, 0x01, 0x00]),
+        ("trailing child after NULL", &[0x05, 0x00, 0x05, 0x00]),
+    ];
+
+    for (name, algorithm_with_null) in [
+        ("SHA-256", RSA_PKCS1_SHA256.as_ref()),
+        ("SHA-384", RSA_PKCS1_SHA384.as_ref()),
+        ("SHA-512", RSA_PKCS1_SHA512.as_ref()),
+    ] {
+        let oid = algorithm_with_null
+            .strip_suffix(&[0x05, 0x00])
+            .expect("rustls RSA PKCS#1 SHA-2 identifiers should end in DER NULL");
+        for (invalid_shape, suffix) in invalid_parameters {
+            let mut algorithm = Vec::with_capacity(oid.len() + suffix.len());
+            algorithm.extend_from_slice(oid);
+            algorithm.extend_from_slice(suffix);
+            assert_eq!(
+                tls_server_end_point(&certificate_with_algorithm(&algorithm)),
+                None,
+                "{name} accepted {invalid_shape}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tls_server_end_point_preserves_rsa_pss_parameter_requirements() {
+    let cases: [DigestCase; 3] = [
+        ("SHA-256", RSA_PSS_SHA256.as_ref(), |certificate| {
+            Sha256::digest(certificate).to_vec()
+        }),
+        ("SHA-384", RSA_PSS_SHA384.as_ref(), |certificate| {
+            Sha384::digest(certificate).to_vec()
+        }),
+        ("SHA-512", RSA_PSS_SHA512.as_ref(), |certificate| {
+            Sha512::digest(certificate).to_vec()
+        }),
+    ];
+    for (name, algorithm, digest) in cases {
+        let certificate = certificate_with_algorithm(algorithm);
+        assert_eq!(
+            tls_server_end_point(&certificate),
+            Some(digest(&certificate)),
+            "canonical RSA-PSS {name} parameters were rejected"
+        );
+    }
+
+    assert_eq!(
+        tls_server_end_point(&certificate_with_algorithm(RSA_PSS_OID)),
+        None,
+        "bare RSA-PSS OID was accepted"
+    );
+    let mut pss_with_null = RSA_PSS_OID.to_vec();
+    pss_with_null.extend_from_slice(&[0x05, 0x00]);
+    assert_eq!(
+        tls_server_end_point(&certificate_with_algorithm(&pss_with_null)),
+        None,
+        "RSA-PSS with NULL instead of its required parameters was accepted"
     );
 }
 

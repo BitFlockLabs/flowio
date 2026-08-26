@@ -378,6 +378,8 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
                 utils::SizeUpError::InvalidAlign => SlabAllocatorConfigError::InvalidObjectAlign,
                 utils::SizeUpError::SizeOverflow => SlabAllocatorConfigError::SizeOverflow,
             })?;
+        std::alloc::Layout::from_size_align(total_slab_size, slab_align)
+            .map_err(|_| SlabAllocatorConfigError::SizeOverflow)?;
 
         Ok(Self {
             provider,
@@ -685,6 +687,54 @@ mod tests {
 
         unsafe { chain.free_all(&mut allocator) };
         assert_eq!(stats.frees.get(), 1);
+    }
+
+    fn slab_layout_boundary() -> (usize, usize, usize) {
+        let slab_align = std::cmp::max(SLAB_ALIGN, SLAB_LINK_ALIGN);
+        let header_padded_size = crate::utils::size_up(SLAB_HDR_SIZE, slab_align)
+            .expect("slab header alignment should be valid");
+        let largest_valid_size = (isize::MAX as usize) & !(slab_align - 1);
+        (slab_align, header_padded_size, largest_valid_size)
+    }
+
+    #[test]
+    fn slab_allocator_accepts_largest_valid_allocation_layout_without_allocation() {
+        let (slab_align, header_padded_size, largest_valid_size) = slab_layout_boundary();
+        let largest_valid_object_size = largest_valid_size - header_padded_size;
+        let stats = Rc::new(CountingStats::default());
+        let mut provider = CountingProvider::new(Rc::clone(&stats));
+
+        let allocator =
+            SlabAllocator::new_uninit(&mut provider, largest_valid_object_size, slab_align, 1)
+                .expect("largest valid allocation layout should be accepted");
+
+        assert_eq!(allocator.total_slab_size, largest_valid_size);
+        assert_eq!(allocator.slab_align, slab_align);
+        assert!(Layout::from_size_align(largest_valid_size, slab_align).is_ok());
+        assert_eq!(stats.inits.get(), 0);
+        assert_eq!(stats.requests.get(), 0);
+        assert_eq!(stats.last_request_size.get(), None);
+    }
+
+    #[test]
+    fn slab_allocator_rejects_first_invalid_allocation_layout_before_provider_use() {
+        let (slab_align, header_padded_size, largest_valid_size) = slab_layout_boundary();
+        let first_invalid_size = largest_valid_size + slab_align;
+        let first_invalid_object_size = first_invalid_size - header_padded_size;
+        assert!(Layout::from_size_align(first_invalid_size, slab_align).is_err());
+        let stats = Rc::new(CountingStats::default());
+        let mut provider = CountingProvider::new(Rc::clone(&stats));
+
+        assert_eq!(
+            SlabAllocator::new_uninit(&mut provider, first_invalid_object_size, slab_align, 1,)
+                .err()
+                .expect("first invalid allocation layout must fail"),
+            SlabAllocatorConfigError::SizeOverflow
+        );
+        assert_eq!(stats.inits.get(), 0);
+        assert_eq!(stats.requests.get(), 0);
+        assert_eq!(stats.last_request_size.get(), None);
+        assert_eq!(stats.frees.get(), 0);
     }
 
     #[test]

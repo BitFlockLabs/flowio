@@ -3444,7 +3444,12 @@ fn runtime_sleep_can_be_cancelled_by_drop() {
 
     executor
         .run(async move {
-            let sleeper = sleep(Duration::from_millis(25));
+            let mut sleeper = sleep(Duration::from_secs(60));
+            let first_poll = poll_fn(|cx| Poll::Ready(Pin::new(&mut sleeper).poll(cx))).await;
+            assert!(
+                matches!(first_poll, Poll::Pending),
+                "cancelled sleep should arm before drop"
+            );
             drop(sleeper);
             sleep(Duration::from_millis(5))
                 .await
@@ -3454,6 +3459,19 @@ fn runtime_sleep_can_be_cancelled_by_drop() {
         .expect("executor run failed");
 
     assert!(completed.get(), "follow-up sleep did not complete");
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(
+            stats.timer_expired, 1,
+            "cancelled sleep reached timer-expiry accounting"
+        );
+        assert_eq!(
+            stats.waiter_wakes, 1,
+            "cancelled sleep produced a timer wake"
+        );
+    }
 }
 
 #[test]
