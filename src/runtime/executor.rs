@@ -8454,46 +8454,25 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let current_exe = std::env::current_exe().expect("current unit-test executable");
-        let mut child = Command::new(current_exe)
+        let child = Command::new(current_exe)
             .args(["--exact", test_name, "--nocapture"])
             .env(child_env, "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|err| panic!("spawn {label} child: {err}"));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-
-        loop {
-            if child
-                .try_wait()
-                .unwrap_or_else(|err| panic!("poll {label} child: {err}"))
-                .is_some()
-            {
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|err| panic!("collect {label} child output: {err}"));
-                assert!(
-                    output.status.success(),
-                    "{label} child failed: status={:?}, stdout={}, stderr={}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|err| panic!("reap timed-out {label} child: {err}"));
-                panic!(
-                    "{label} child exceeded watchdog; stdout={}, stderr={}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let output = crate::test_child::capture_child_with_watchdog(
+            child,
+            std::time::Duration::from_secs(8),
+        )
+        .unwrap_or_else(|err| panic!("{label} child capture failed: {err}"));
+        assert!(
+            output.status.success(),
+            "{label} child failed: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(not(miri))]

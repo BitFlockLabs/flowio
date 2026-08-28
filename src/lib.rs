@@ -2,6 +2,8 @@
 
 pub mod net;
 pub mod runtime;
+#[cfg(any(test, feature = "test-support"))]
+mod test_child;
 pub(crate) mod utils;
 
 /// Fuzzing-only re-exports of internal parsers. Enabled by the dev-only

@@ -338,6 +338,42 @@ fn ipv6_loopback_capability_policy_is_narrow() {
 }
 
 #[test]
+fn bounded_tcp_peer_finish_latch_requires_explicit_completion() {
+    let mut completed = common::BoundedTcpPeerFinishLatch::new("completed peer");
+    completed.mark_finished();
+    drop(completed);
+
+    let panic = std::panic::catch_unwind(|| {
+        drop(common::BoundedTcpPeerFinishLatch::new("forgotten peer"));
+    })
+    .expect_err("an unfinished bounded peer should panic on normal drop");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .expect("finish-latch panic should carry text");
+    assert_eq!(
+        message,
+        "bounded TCP peer 'forgotten peer' was dropped without finish()"
+    );
+}
+
+#[test]
+fn bounded_tcp_peer_finish_latch_preserves_active_unwind() {
+    let panic = std::panic::catch_unwind(|| {
+        let _unfinished = common::BoundedTcpPeerFinishLatch::new("unwinding peer");
+        panic!("original peer-test panic");
+    })
+    .expect_err("the original test panic should escape");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .expect("original panic should carry text");
+    assert_eq!(message, "original peer-test panic");
+}
+
+#[test]
 fn bounded_tcp_peer_forced_stalls_fail_with_context() {
     if std::env::var_os(TCP_BOUNDED_PEER_STALL_CHILD_ENV).is_none() {
         common::run_exact_test_child_with_watchdog(

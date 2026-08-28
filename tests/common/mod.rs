@@ -4,6 +4,7 @@ use flowio::runtime::buffer::pool::IoBuffPool;
 use flowio::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
+use flowio::test_support::child::capture_child_with_watchdog;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -427,10 +428,47 @@ pub fn connect_bounded_tcp_peer(
     TcpPeerDeadline::new(label).connect(addr)
 }
 
+/// Requires every normally dropped bounded peer to finish its bounded join.
+#[allow(dead_code)]
+pub(crate) struct BoundedTcpPeerFinishLatch {
+    unfinished_label: Option<&'static str>,
+}
+
+#[allow(dead_code)]
+impl BoundedTcpPeerFinishLatch {
+    pub(crate) const fn new(label: &'static str) -> Self {
+        Self {
+            unfinished_label: Some(label),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.unfinished_label {
+            Some(label) => label,
+            None => "completed bounded TCP peer",
+        }
+    }
+
+    pub(crate) fn mark_finished(&mut self) {
+        self.unfinished_label = None;
+    }
+}
+
+impl Drop for BoundedTcpPeerFinishLatch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(label) = self.unfinished_label {
+            panic!("bounded TCP peer '{label}' was dropped without finish()")
+        }
+    }
+}
+
 /// Join handle for a bounded standard TCP peer thread.
 #[allow(dead_code)]
 pub struct BoundedTcpPeer<T> {
-    label: &'static str,
+    finish_latch: BoundedTcpPeerFinishLatch,
     deadline: TcpPeerDeadline,
     outcome: std::sync::mpsc::Receiver<std::thread::Result<T>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -441,22 +479,17 @@ impl<T> BoundedTcpPeer<T> {
     /// Waits only until the peer's absolute deadline, then propagates its
     /// original result or panic.
     pub fn finish(mut self) -> T {
+        let label = self.finish_latch.label();
         let outcome = match self.outcome.try_recv() {
             Ok(outcome) => outcome,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                panic!(
-                    "bounded TCP peer '{}' disconnected without an outcome",
-                    self.label
-                )
+                panic!("bounded TCP peer '{label}' disconnected without an outcome")
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self
                 .outcome
                 .recv_timeout(self.deadline.remaining_for_wait())
                 .unwrap_or_else(|err| {
-                    panic!(
-                        "bounded TCP peer '{}' did not finish before its deadline: {err}",
-                        self.label
-                    )
+                    panic!("bounded TCP peer '{label}' did not finish before its deadline: {err}")
                 }),
         };
 
@@ -468,14 +501,14 @@ impl<T> BoundedTcpPeer<T> {
             let remaining = self.deadline.remaining_for_wait();
             assert!(
                 !remaining.is_zero(),
-                "bounded TCP peer '{}' returned an outcome but did not exit before its deadline",
-                self.label
+                "bounded TCP peer '{label}' returned an outcome but did not exit before its deadline"
             );
             std::thread::sleep(remaining.min(Duration::from_millis(1)));
         }
         if let Err(panic) = handle.join() {
             std::panic::resume_unwind(panic);
         }
+        self.finish_latch.mark_finished();
 
         match outcome {
             Ok(output) => output,
@@ -512,7 +545,7 @@ where
         let _ = sender.send(result);
     });
     BoundedTcpPeer {
-        label,
+        finish_latch: BoundedTcpPeerFinishLatch::new(label),
         deadline,
         outcome,
         handle: Some(handle),
@@ -536,7 +569,7 @@ pub fn run_exact_test_child_with_watchdog_env(
     extra_env: &[(&str, &str)],
 ) {
     let current_exe = std::env::current_exe().expect("current integration-test executable");
-    let mut child = Command::new(current_exe)
+    let child = Command::new(current_exe)
         .args(["--exact", test_name, "--nocapture"])
         .env(child_env, "1")
         .envs(extra_env.iter().copied())
@@ -544,47 +577,21 @@ pub fn run_exact_test_child_with_watchdog_env(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn integration-test watchdog child");
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if child
-            .try_wait()
-            .expect("poll integration-test watchdog child")
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .expect("collect integration-test watchdog child");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success(),
-                "watchdog child {test_name} failed: status={:?}, stdout={}, stderr={}",
-                output.status,
-                stdout,
-                stderr
-            );
-            assert!(
-                stdout.contains("1 passed;"),
-                "watchdog child {test_name} did not execute exactly one test: stdout={stdout}, stderr={stderr}"
-            );
-            return;
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("reap timed-out integration-test watchdog child");
-            panic!(
-                "watchdog child {test_name} exceeded {timeout:?}; stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let output = capture_child_with_watchdog(child, timeout)
+        .unwrap_or_else(|err| panic!("watchdog child {test_name} capture failed: {err}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "watchdog child {test_name} failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("1 passed;"),
+        "watchdog child {test_name} did not execute exactly one test: stdout={stdout}, stderr={stderr}"
+    );
 }
 
 /// Enables a positive `SO_LINGER` interval on a socket for terminal-close

@@ -4,6 +4,14 @@
 //! out-of-source integration tests and benchmarks. These paths are not part of
 //! the default production surface.
 
+/// Bounded subprocess capture for exact test-child watchdogs.
+pub mod child {
+    pub use crate::test_child::{
+        CapturedChildOutput, ChildCaptureError, ChildCaptureErrorKind, ChildOutputStream,
+        capture_child_with_watchdog,
+    };
+}
+
 pub mod utils {
     pub mod list {
         pub mod intrusive {

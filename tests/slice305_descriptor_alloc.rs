@@ -20,6 +20,7 @@ use flowio::net::tls::{TlsClientOptions, TlsClientStream};
 use flowio::net::udp::UdpSocket;
 use flowio::net::unix::UnixStream;
 use flowio::runtime::executor::Executor;
+use flowio::test_support::child::capture_child_with_watchdog;
 use flowio::test_support::net::sctp::{
     test_construct_sctp_accept_result, test_construct_sctp_connect_result,
 };
@@ -31,7 +32,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -244,47 +245,21 @@ fn descriptor_core_oom_uses_global_allocation_handler() {
     }
 
     let current_exe = std::env::current_exe().expect("current allocation-test executable");
-    let mut child = Command::new(current_exe)
+    let child = Command::new(current_exe)
         .args(["--exact", CORE_OOM_TEST, "--nocapture"])
         .env(CORE_OOM_CHILD_ENV, "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn descriptor-core OOM child");
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    loop {
-        if child
-            .try_wait()
-            .expect("poll descriptor-core OOM child")
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .expect("collect descriptor-core OOM child");
-            assert_eq!(
-                output.status.signal(),
-                Some(libc::SIGABRT),
-                "descriptor-core OOM did not terminate through the global allocation handler: status={:?}, stdout={}, stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            return;
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("reap timed-out descriptor-core OOM child");
-            panic!(
-                "descriptor-core OOM child exceeded its deadline: stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let output = capture_child_with_watchdog(child, Duration::from_secs(5))
+        .unwrap_or_else(|err| panic!("descriptor-core OOM child capture failed: {err}"));
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGABRT),
+        "descriptor-core OOM did not terminate through the global allocation handler: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }

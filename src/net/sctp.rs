@@ -2444,6 +2444,8 @@ impl Drop for SctpConnector {
 enum SctpRecordSync {
     Synced,
     DataTail,
+    /// A fragmented notification is consumed through EOR before the
+    /// supported Linux receive API can make any later data visible.
     NotificationTail,
     /// A distinct notification is being classified while the underlying
     /// abandoned record remains a data tail.
@@ -2715,8 +2717,11 @@ impl SctpRecvState {
         std::cmp::min(actual, missing)
     }
 
-    /// Appends only the fixed PDAPI classifier prefix. Once a full prefix is
-    /// known not to be an abort, later notification-tail bytes remain opaque.
+    /// Appends only the fixed PDAPI classifier prefix. The currently supported
+    /// Linux UAPI record is exactly 24 bytes; a declaration for any extension
+    /// fails closed against this fixed slice before it can retire record
+    /// synchronization. Once a full prefix is known not to be an abort, later
+    /// notification-tail bytes remain opaque.
     fn append_nested_notification_prefix(
         &mut self,
         bytes: &[u8],
@@ -5034,7 +5039,10 @@ unsafe fn sctp_vectored_received_prefix<'a, const N: usize>(
         }
         copied += available;
     }
-    debug_assert_eq!(copied, target, "completed SCTP iovecs did not cover actual");
+    debug_assert_eq!(
+        copied, target,
+        "completed SCTP iovecs did not cover recovery target"
+    );
     unsafe { std::slice::from_raw_parts(destination, copied) }
 }
 

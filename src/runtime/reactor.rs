@@ -5972,54 +5972,32 @@ mod tests {
             use std::process::{Command, Stdio};
 
             let current_exe = std::env::current_exe().expect("current unit-test executable");
-            let mut child = Command::new(current_exe)
+            let child = Command::new(current_exe)
                 .args(["--exact", KERNEL_TIMESPEC_CHILD_TEST, "--nocapture"])
                 .env(KERNEL_TIMESPEC_CHILD_ENV, "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn bounded-timespec child");
-            let deadline = Instant::now() + Duration::from_secs(8);
-
-            loop {
-                if child
-                    .try_wait()
-                    .expect("poll bounded-timespec child")
-                    .is_some()
-                {
-                    let output = child
-                        .wait_with_output()
-                        .expect("collect bounded-timespec child output");
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    assert!(
-                        output.status.success(),
-                        "bounded-timespec child failed: status={:?}, stdout={}, stderr={}",
-                        output.status,
-                        stdout,
-                        stderr
-                    );
-                    assert!(
-                        stdout.contains("1 passed;"),
-                        "bounded-timespec child did not run exactly one test: stdout={}, stderr={}",
-                        stdout,
-                        stderr
-                    );
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let output = child
-                        .wait_with_output()
-                        .expect("reap timed-out bounded-timespec child");
-                    panic!(
-                        "bounded-timespec child exceeded watchdog; stdout={}, stderr={}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            let output =
+                crate::test_child::capture_child_with_watchdog(child, Duration::from_secs(8))
+                    .unwrap_or_else(|err| panic!("bounded-timespec child capture failed: {err}"));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "bounded-timespec child failed: status={:?}, stdout={}, stderr={}",
+                output.status,
+                stdout,
+                stderr
+            );
+            assert!(
+                stdout.contains("1 passed;"),
+                "bounded-timespec child did not run exactly one test: stdout={}, stderr={}",
+                stdout,
+                stderr
+            );
+            return;
         }
 
         const TIMEOUT_USER_DATA: u64 = u64::MAX - 200;

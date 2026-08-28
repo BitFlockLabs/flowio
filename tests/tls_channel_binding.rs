@@ -437,13 +437,16 @@ fn decode_hex_fixture(input: &str) -> Vec<u8> {
 
 /// Minimal stub certificate DER where only signatureAlgorithm is meaningful
 /// for tls_server_end_point.
-fn certificate_with_algorithm(algorithm_oid: &[u8]) -> Vec<u8> {
-    certificate_with_signature_body(algorithm_oid, &[0, 0xa5])
+fn certificate_with_algorithm(algorithm_identifier_body: &[u8]) -> Vec<u8> {
+    certificate_with_signature_body(algorithm_identifier_body, &[0, 0xa5])
 }
 
-fn certificate_with_signature_body(algorithm_oid: &[u8], signature_body: &[u8]) -> Vec<u8> {
+fn certificate_with_signature_body(
+    algorithm_identifier_body: &[u8],
+    signature_body: &[u8],
+) -> Vec<u8> {
     let first = [0x30, 0x00];
-    let algorithm = encode_sequence(&[algorithm_oid]);
+    let algorithm = encode_sequence(&[algorithm_identifier_body]);
     let signature = encode_tlv(0x03, signature_body);
     encode_sequence(&[&first, &algorithm, &signature])
 }

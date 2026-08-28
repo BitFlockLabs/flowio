@@ -1439,6 +1439,7 @@ fn tls_server_end_point_fixture_inventory_is_exact() {
         "malformed_truncated_long_length",
         "malformed_zero_padded_child_length",
         "unsupported_ed25519_minimal",
+        "unsupported_rsa_sha256_wrong_parameters_minimal",
         "valid_ecdsa_sha256_minimal",
         "valid_rsa_sha256_absent_parameters_minimal",
         "valid_rsa_sha256_minimal",
@@ -1485,6 +1486,19 @@ fn tls_server_end_point_wrapper_reaches_valid_and_malformed_der() {
         ],
         "minimal absent-parameter RSA seed bytes must stay exact"
     );
+    let rsa_wrong_parameters = include_bytes!(
+        "../fixtures/fuzzing/tls_server_end_point/unsupported_rsa_sha256_wrong_parameters_minimal"
+    );
+    let rsa_wrong_parameters_der = decode_hex_seed(rsa_wrong_parameters);
+    assert_eq!(
+        rsa_wrong_parameters_der,
+        [
+            0x30, 0x15, 0x30, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d,
+            0x01, 0x01, 0x0b, 0x04, 0x00, 0x03, 0x02, 0x00, 0xa5,
+        ],
+        "minimal wrong-parameter RSA seed bytes must stay exact"
+    );
+    assert!(!tls_server_end_point(rsa_wrong_parameters));
     assert_eq!(
         observe_tls_server_end_point(ecdsa)
             .expect("ECDSA SHA-256 seed should derive a binding")
