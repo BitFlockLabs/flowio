@@ -886,7 +886,13 @@ fn tls_partial_read_publishes_relative_iobuff_and_fresh_vec() {
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
 fn tls_staged_transport_future_drops_after_executor_teardown() {
-    let (client_config, server_config, server_name, _) = make_client_server_configs();
+    let (client_config, mut server_config, server_name, _) = make_client_server_configs();
+    // Keep the staged transport read quiescent. Default TLS 1.3 session tickets
+    // are valid post-handshake traffic and could complete it before the reactor
+    // reaches the deliberately injected wait failure.
+    Arc::get_mut(&mut server_config)
+        .expect("fresh TLS teardown server config should be uniquely owned")
+        .send_tls13_tickets = 0;
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("std bind failed");
     let addr = listener.local_addr().expect("local_addr failed");
@@ -939,6 +945,11 @@ fn tls_staged_transport_future_drops_after_executor_teardown() {
         })
         .expect_err("injected wait error should end the staged TLS run");
     assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    assert_eq!(
+        test_hooks::ring_wait_failures_remaining(),
+        0,
+        "staged TLS run did not consume the injected ring wait failure"
+    );
 
     drop(executor);
     drop(
