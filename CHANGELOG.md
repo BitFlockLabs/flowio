@@ -122,6 +122,13 @@ Alpha prereleases carry no compatibility guarantee.
   records shorter than 20 bytes return `InvalidData`; raw indication values are
   preserved. Stream-reset stream-ID tails remain bounded by the declared
   record but are intentionally not materialized.
+- **Breaking:** `SctpNotification::SendFailed` now exposes the raw notification
+  `flags: u16` disposition from both legacy `SCTP_SEND_FAILED` and modern
+  `SCTP_SEND_FAILED_EVENT` layouts. Unknown values are preserved. Downstream
+  field-exhaustive patterns must bind `flags` or add `..`; variant-exhaustive
+  matches are unchanged. A known notification whose declared record is shorter
+  than its Linux layout minimum remains `InvalidData`, but its diagnostic now
+  identifies the raw kind plus declared and required lengths.
 - Runtime dependencies have been refreshed while retaining the existing
   feature set and minimum supported Rust version.
 - Compatibility documentation now consistently states that x86-64 Linux is

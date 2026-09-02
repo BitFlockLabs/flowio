@@ -3370,6 +3370,26 @@ impl Drop for UnsubmittedOpGuard {
     }
 }
 
+/// Allocates an operation state, gives it an owning pre-submission guard, and
+/// registers the active task as its waiter.
+///
+/// # Safety
+///
+/// `pctx` must identify a live FlowIO executor poll context with a non-null
+/// owner task. The returned guard must remain the state's unique owner until
+/// submission succeeds or preparation is abandoned.
+#[inline(always)]
+pub(crate) unsafe fn prepare_unsubmitted_op(pctx: &PollCtx) -> Option<UnsubmittedOpGuard> {
+    let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
+    if state_ptr.is_null() {
+        return None;
+    }
+
+    let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
+    unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+    Some(guard)
+}
+
 /// Owns an attached retained payload while user-controlled SQE construction
 /// runs.
 ///

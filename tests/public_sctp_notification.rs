@@ -1,4 +1,4 @@
-use flowio::net::sctp::{SctpNotification, SctpNotificationKind};
+use flowio::net::sctp::{SctpNotification, SctpNotificationKind, SctpSendInfo};
 
 fn exhaustive_notification_kind(notification: SctpNotification) -> SctpNotificationKind {
     match notification {
@@ -56,4 +56,38 @@ fn authentication_notification_is_fixed_copyable_and_exhaustively_nameable() {
         exhaustive_kind_name(SctpNotificationKind::Authentication),
         "authentication"
     );
+}
+
+#[test]
+fn send_failed_notification_exposes_raw_flags_and_remains_copyable() {
+    let info = SctpSendInfo {
+        stream_id: 3,
+        flags: 4,
+        ppid: 5,
+        context: 6,
+        assoc_id: 7,
+    };
+    let notification = SctpNotification::SendFailed {
+        flags: 0x7a5c,
+        error: 8,
+        info,
+        assoc_id: 9,
+    };
+    let copied = notification;
+
+    assert_eq!(copied, notification);
+    match copied {
+        SctpNotification::SendFailed {
+            flags,
+            error,
+            info: copied_info,
+            assoc_id,
+        } => {
+            assert_eq!(flags, 0x7a5c);
+            assert_eq!(error, 8);
+            assert_eq!(copied_info, info);
+            assert_eq!(assoc_id, 9);
+        }
+        _ => panic!("constructed SendFailed notification changed variant"),
+    }
 }

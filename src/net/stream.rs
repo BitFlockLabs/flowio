@@ -38,9 +38,9 @@ use crate::runtime::buffer::iobuffvec::{
 };
 use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker,
-    refresh_op_waiter_from_waker, submit_initialized_retained_fd_sqe, submit_resubmitted_fd_sqe,
-    submit_retained_fd_sqe, validate_local_io_result,
+    PollCtx, completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker,
+    prepare_unsubmitted_op, refresh_op_waiter_from_waker, submit_initialized_retained_fd_sqe,
+    submit_resubmitted_fd_sqe, submit_retained_fd_sqe, validate_local_io_result,
 };
 #[cfg(debug_assertions)]
 use crate::runtime::executor::{
@@ -1700,14 +1700,14 @@ fn submit_initial_projected_writev<T: WritevProjection>(
             }
         };
 
-    let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-    if state_ptr.is_null() {
-        let source = unsafe { opt_take(source) };
-        return Err((io::Error::from(io::ErrorKind::WouldBlock), source));
-    }
-
-    let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-    unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+    let guard = match unsafe { prepare_unsubmitted_op(pctx) } {
+        Some(guard) => guard,
+        None => {
+            let source = unsafe { opt_take(source) };
+            return Err((io::Error::from(io::ErrorKind::WouldBlock), source));
+        }
+    };
+    let state_ptr = guard.state_ptr();
 
     let payload =
         unsafe { emplace_retained_projected_writev_payload(retained_pool, source, scratch_init) };
@@ -1827,13 +1827,14 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedReadPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -1951,13 +1952,14 @@ impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedWritePayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -2140,13 +2142,14 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
             }
         }
         if this.buffer.is_some() {
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
             let payload = RetainedWritePayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
             };
@@ -2380,20 +2383,21 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
             }
         }
         if this.buffer.is_some() {
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready(unsafe {
-                    complete_read_with_progress(
-                        buffer,
-                        this.write_base_len,
-                        this.filled as usize,
-                        Err(io::Error::from(io::ErrorKind::WouldBlock)),
-                    )
-                });
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready(unsafe {
+                        complete_read_with_progress(
+                            buffer,
+                            this.write_base_len,
+                            this.filled as usize,
+                            Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                        )
+                    });
+                }
+            };
+            let state_ptr = guard.state_ptr();
             let payload = RetainedReadPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
             };
@@ -2603,13 +2607,14 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
             let scratch_init =
@@ -2763,13 +2768,8 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
                     scratch_init,
                     this.total,
                     || {
-                        let state_ptr = (*pctx.reactor()).alloc_op();
-                        if state_ptr.is_null() {
-                            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                        }
-                        let guard = UnsubmittedOpGuard::new(pctx.reactor(), state_ptr);
-                        (*state_ptr).register_waiter(pctx.owner_task());
-                        Ok(guard)
+                        prepare_unsubmitted_op(&pctx)
+                            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))
                     },
                 )
             } {
@@ -2989,13 +2989,14 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                 this.state_ptr.state_ptr().is_null(),
                 "initial writev_all state was published"
             );
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
             let scratch_init =
@@ -3605,14 +3606,15 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
                 this.state_ptr.state_ptr().is_null(),
                 "initial readv_exact state was published"
             );
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let mut buffer = unsafe { opt_take(&mut this.buffer) };
-                unsafe { buffer.distribute_written(this.filled) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let mut buffer = unsafe { opt_take(&mut this.buffer) };
+                    unsafe { buffer.distribute_written(this.filled) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let retained_pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
             let scratch_init =

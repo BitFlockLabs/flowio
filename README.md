@@ -384,6 +384,11 @@ When the requested notification mask is empty, PDAPI is the sole kernel event,
 so even its short-buffer fragments remain internal through EOR. If other
 notification types are requested, a caller buffer that truncates an event
 before it can be parsed completely retains the normal `InvalidData` behavior.
+That error identifies the raw notification kind plus its declared and required
+lengths. Legacy and modern send-failure notifications both expose their raw
+disposition through `SctpNotification::SendFailed::flags`; unknown values are
+preserved. Code that destructures every `SendFailed` field must bind `flags` or
+add `..`.
 Linux authentication events are returned as the fixed,
 allocation-free `SctpNotification::Authentication` value with flags, key and
 alternate-key numbers, the raw indication, and association ID. A declared

@@ -223,8 +223,9 @@ use crate::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut, invalid_read_io
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
     PollCtx, UnsubmittedOpGuard, completed_op_ctx, drop_fd_op_state_unchecked,
-    drop_op_ptr_unchecked, poll_ctx_from_waker, refresh_op_waiter_from_waker,
-    submit_initialized_retained_fd_sqe, submit_retained_fd_sqe, validate_local_io_result,
+    drop_op_ptr_unchecked, poll_ctx_from_waker, prepare_unsubmitted_op,
+    refresh_op_waiter_from_waker, submit_initialized_retained_fd_sqe, submit_retained_fd_sqe,
+    validate_local_io_result,
 };
 use crate::runtime::fd::{LingerProvenance, RuntimeFd, RuntimeFdOpState};
 use crate::runtime::op::CompletionState;
@@ -937,6 +938,9 @@ pub enum SctpNotification {
     },
     /// A send failed and the kernel returned the original send metadata.
     SendFailed {
+        /// Raw kernel disposition flags, including `SCTP_DATA_UNSENT` and
+        /// `SCTP_DATA_SENT`; unfamiliar values are preserved.
+        flags: u16,
         /// Kernel error code for the failed send.
         error: u32,
         /// Original send metadata supplied with the failed message.
@@ -5299,13 +5303,9 @@ unsafe fn prepare_unsubmitted_sctp_state(
     cx: &mut Context<'_>,
 ) -> io::Result<(PollCtx, UnsubmittedOpGuard)> {
     let pctx = poll_ctx_from_waker(cx)?;
-    let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-    if state_ptr.is_null() {
+    let Some(guard) = (unsafe { prepare_unsubmitted_op(&pctx) }) else {
         return Err(io::Error::from(io::ErrorKind::WouldBlock));
-    }
-
-    let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-    unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+    };
     Ok((pctx, guard))
 }
 
@@ -7208,12 +7208,45 @@ define_classify_recv_meta!(
     missing_notification_preparse_bare
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShortSctpNotification {
+    kind: u16,
+    declared_length: u32,
+    required_length: usize,
+}
+
+impl std::fmt::Display for ShortSctpNotification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "SCTP notification kind {:#06x} declared length {} is shorter than required length {}",
+            self.kind, self.declared_length, self.required_length
+        )
+    }
+}
+
+impl std::error::Error for ShortSctpNotification {}
+
+#[inline]
+fn short_sctp_notification(kind: u16, declared_length: u32, required_length: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        ShortSctpNotification {
+            kind,
+            declared_length,
+            required_length,
+        },
+    )
+}
+
 fn send_failed_notification(
+    flags: u16,
     error: u32,
     info: SctpSendInfo,
     assoc_id: libc::sctp_assoc_t,
 ) -> SctpNotification {
     SctpNotification::SendFailed {
+        flags,
         error,
         info,
         assoc_id,
@@ -7344,74 +7377,6 @@ const SCTP_STREAM_CHANGE_MIN_LEN: usize =
 
 const _: () = {
     assert!(size_of::<libc::sctp_assoc_t>() == size_of::<i32>());
-    assert!(SCTP_NOTIFICATION_FLAGS_OFFSET == SCTP_NOTIFICATION_TYPE_OFFSET + size_of::<u16>());
-    assert!(SCTP_NOTIFICATION_LENGTH_OFFSET == SCTP_NOTIFICATION_FLAGS_OFFSET + size_of::<u16>());
-    assert!(SCTP_NOTIFICATION_HEADER_LEN == SCTP_NOTIFICATION_LENGTH_OFFSET + size_of::<u32>());
-    assert!(SCTP_SEND_FAILED_INFO_OFFSET == SCTP_SEND_FAILED_ERROR_OFFSET + size_of::<u32>());
-    assert!(
-        SCTP_ASSOC_CHANGE_MIN_LEN
-            == SCTP_ASSOC_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_PEER_ADDR_CHANGE_MIN_LEN
-            == SCTP_PEER_ADDR_CHANGE_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_LEGACY_SEND_FAILED_MIN_LEN
-            == SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_SEND_FAILED_EVENT_MIN_LEN
-            == SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET
-            == SCTP_REMOTE_ERROR_ERROR_OFFSET
-                + size_of::<u16>()
-                + SCTP_REMOTE_ERROR_ASSOC_ID_PADDING_LEN
-    );
-    assert!(
-        SCTP_REMOTE_ERROR_MIN_LEN
-            == SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_SHUTDOWN_MIN_LEN == SCTP_SHUTDOWN_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_ADAPTATION_MIN_LEN
-            == SCTP_ADAPTATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET
-            == SCTP_AUTHENTICATION_KEY_NUMBER_OFFSET + size_of::<u16>()
-    );
-    assert!(
-        SCTP_AUTHENTICATION_INDICATION_OFFSET
-            == SCTP_AUTHENTICATION_ALTERNATE_KEY_NUMBER_OFFSET + size_of::<u16>()
-    );
-    assert!(
-        SCTP_AUTHENTICATION_ASSOC_ID_OFFSET
-            == SCTP_AUTHENTICATION_INDICATION_OFFSET + size_of::<u32>()
-    );
-    assert!(
-        SCTP_AUTHENTICATION_MIN_LEN
-            == SCTP_AUTHENTICATION_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_PARTIAL_DELIVERY_MIN_LEN == SCTP_PARTIAL_DELIVERY_SEQUENCE_OFFSET + size_of::<u32>()
-    );
-    assert!(
-        SCTP_SENDER_DRY_MIN_LEN
-            == SCTP_SENDER_DRY_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(
-        SCTP_STREAM_RESET_MIN_LEN
-            == SCTP_STREAM_RESET_ASSOC_ID_OFFSET + size_of::<libc::sctp_assoc_t>()
-    );
-    assert!(SCTP_ASSOC_RESET_MIN_LEN == SCTP_ASSOC_RESET_REMOTE_TSN_OFFSET + size_of::<u32>());
-    assert!(
-        SCTP_STREAM_CHANGE_MIN_LEN == SCTP_STREAM_CHANGE_OUTBOUND_STREAMS_OFFSET + size_of::<u16>()
-    );
 };
 
 #[cfg(all(
@@ -7424,7 +7389,11 @@ const _: () = {
     assert!(size_of::<libc::sctp_assoc_t>() == 4);
     assert!(size_of::<libc::sctp_sndrcvinfo>() == 32);
     assert!(size_of::<libc::sctp_sndinfo>() == 16);
+    assert!(SCTP_NOTIFICATION_FLAGS_OFFSET == 2);
+    assert!(SCTP_NOTIFICATION_LENGTH_OFFSET == 4);
     assert!(SCTP_NOTIFICATION_HEADER_LEN == 8);
+    assert!(SCTP_SEND_FAILED_INFO_OFFSET == 12);
+    assert!(SCTP_REMOTE_ERROR_ASSOC_ID_OFFSET == 12);
     assert!(SCTP_ASSOC_CHANGE_MIN_LEN == 20);
     assert!(SCTP_PEER_ADDR_CHANGE_MIN_LEN == 148);
     assert!(SCTP_LEGACY_SEND_FAILED_MIN_LEN == 48);
@@ -7445,9 +7414,17 @@ const _: () = {
     assert!(SCTP_STREAM_CHANGE_MIN_LEN == 16);
 };
 
-fn parse_legacy_send_failed_notification(buffer: &[u8]) -> io::Result<SctpNotification> {
+fn parse_legacy_send_failed_notification(
+    buffer: &[u8],
+    flags: u16,
+    declared_length: u32,
+) -> io::Result<SctpNotification> {
     if buffer.len() < SCTP_LEGACY_SEND_FAILED_MIN_LEN {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
+        return Err(short_sctp_notification(
+            LOCAL_SCTP_SEND_FAILED as u16,
+            declared_length,
+            SCTP_LEGACY_SEND_FAILED_MIN_LEN,
+        ));
     }
 
     let error =
@@ -7459,15 +7436,24 @@ fn parse_legacy_send_failed_notification(buffer: &[u8]) -> io::Result<SctpNotifi
     let assoc_id = read_i32_at(buffer, SCTP_LEGACY_SEND_FAILED_ASSOC_ID_OFFSET)
         .map_err(byte_range_invalid_data)?;
     Ok(send_failed_notification(
+        flags,
         error,
         send_info_from_sndrcvinfo(sndrcvinfo),
         assoc_id,
     ))
 }
 
-fn parse_send_failed_event_notification(buffer: &[u8]) -> io::Result<SctpNotification> {
+fn parse_send_failed_event_notification(
+    buffer: &[u8],
+    flags: u16,
+    declared_length: u32,
+) -> io::Result<SctpNotification> {
     if buffer.len() < SCTP_SEND_FAILED_EVENT_MIN_LEN {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
+        return Err(short_sctp_notification(
+            LOCAL_SCTP_SEND_FAILED_EVENT as u16,
+            declared_length,
+            SCTP_SEND_FAILED_EVENT_MIN_LEN,
+        ));
     }
 
     let error =
@@ -7478,6 +7464,7 @@ fn parse_send_failed_event_notification(buffer: &[u8]) -> io::Result<SctpNotific
     let assoc_id = read_i32_at(buffer, SCTP_SEND_FAILED_EVENT_ASSOC_ID_OFFSET)
         .map_err(byte_range_invalid_data)?;
     Ok(send_failed_notification(
+        flags,
         error,
         send_info_from_sndinfo(sndinfo),
         assoc_id,
@@ -7503,7 +7490,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
     let notification = match sn_type as libc::c_int {
         x if x == LOCAL_SCTP_ASSOC_CHANGE => {
             if buffer.len() < SCTP_ASSOC_CHANGE_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_ASSOC_CHANGE_MIN_LEN,
+                ));
             }
             SctpNotification::AssocChange {
                 state: read_u16_at(buffer, SCTP_ASSOC_CHANGE_STATE_OFFSET)
@@ -7520,7 +7511,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_PEER_ADDR_CHANGE => {
             if buffer.len() < SCTP_PEER_ADDR_CHANGE_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_PEER_ADDR_CHANGE_MIN_LEN,
+                ));
             }
 
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -7547,10 +7542,16 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         // Defensive only: FlowIO configures sctp_send_failure_event=0, but
         // untrusted/test notification bytes can still exercise this legacy layout.
-        x if x == LOCAL_SCTP_SEND_FAILED => parse_legacy_send_failed_notification(buffer)?,
+        x if x == LOCAL_SCTP_SEND_FAILED => {
+            parse_legacy_send_failed_notification(buffer, sn_flags, sn_length)?
+        }
         x if x == LOCAL_SCTP_REMOTE_ERROR => {
             if buffer.len() < SCTP_REMOTE_ERROR_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_REMOTE_ERROR_MIN_LEN,
+                ));
             }
             SctpNotification::RemoteError {
                 error: read_u16_be_at(buffer, SCTP_REMOTE_ERROR_ERROR_OFFSET)
@@ -7561,7 +7562,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_SHUTDOWN_EVENT => {
             if buffer.len() < SCTP_SHUTDOWN_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_SHUTDOWN_MIN_LEN,
+                ));
             }
             SctpNotification::Shutdown {
                 assoc_id: read_i32_at(buffer, SCTP_SHUTDOWN_ASSOC_ID_OFFSET)
@@ -7570,7 +7575,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_ADAPTATION_INDICATION => {
             if buffer.len() < SCTP_ADAPTATION_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_ADAPTATION_MIN_LEN,
+                ));
             }
             SctpNotification::Adaptation {
                 indication: read_u32_at(buffer, SCTP_ADAPTATION_INDICATION_OFFSET)
@@ -7581,7 +7590,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_AUTHENTICATION_EVENT => {
             if buffer.len() < SCTP_AUTHENTICATION_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_AUTHENTICATION_MIN_LEN,
+                ));
             }
             SctpNotification::Authentication {
                 flags: sn_flags,
@@ -7600,7 +7613,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_PARTIAL_DELIVERY_EVENT => {
             if buffer.len() < SCTP_PARTIAL_DELIVERY_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_PARTIAL_DELIVERY_MIN_LEN,
+                ));
             }
             SctpNotification::PartialDelivery {
                 indication: read_u32_at(buffer, SCTP_PARTIAL_DELIVERY_INDICATION_OFFSET)
@@ -7615,7 +7632,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_SENDER_DRY_EVENT => {
             if buffer.len() < SCTP_SENDER_DRY_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_SENDER_DRY_MIN_LEN,
+                ));
             }
             SctpNotification::SenderDry {
                 assoc_id: read_i32_at(buffer, SCTP_SENDER_DRY_ASSOC_ID_OFFSET)
@@ -7624,7 +7645,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_STREAM_RESET_EVENT => {
             if buffer.len() < SCTP_STREAM_RESET_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_STREAM_RESET_MIN_LEN,
+                ));
             }
             SctpNotification::StreamReset {
                 flags: sn_flags,
@@ -7634,7 +7659,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_ASSOC_RESET_EVENT => {
             if buffer.len() < SCTP_ASSOC_RESET_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_ASSOC_RESET_MIN_LEN,
+                ));
             }
             SctpNotification::AssocReset {
                 flags: sn_flags,
@@ -7648,7 +7677,11 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
         }
         x if x == LOCAL_SCTP_STREAM_CHANGE_EVENT => {
             if buffer.len() < SCTP_STREAM_CHANGE_MIN_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData));
+                return Err(short_sctp_notification(
+                    sn_type,
+                    sn_length,
+                    SCTP_STREAM_CHANGE_MIN_LEN,
+                ));
             }
             SctpNotification::StreamChange {
                 flags: sn_flags,
@@ -7660,7 +7693,9 @@ pub(crate) fn parse_notification(buffer: &[u8]) -> io::Result<SctpRecvMeta> {
                     .map_err(byte_range_invalid_data)?,
             }
         }
-        x if x == LOCAL_SCTP_SEND_FAILED_EVENT => parse_send_failed_event_notification(buffer)?,
+        x if x == LOCAL_SCTP_SEND_FAILED_EVENT => {
+            parse_send_failed_event_notification(buffer, sn_flags, sn_length)?
+        }
         _ => SctpNotification::Other {
             kind: sn_type,
             flags: sn_flags,
@@ -11503,6 +11538,34 @@ mod tests {
         bytes
     }
 
+    fn assert_short_sctp_notification(
+        error: &io::Error,
+        kind: u16,
+        declared_length: u32,
+        required_length: usize,
+        context: &str,
+    ) {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{context}");
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ShortSctpNotification>()),
+            Some(&ShortSctpNotification {
+                kind,
+                declared_length,
+                required_length,
+            }),
+            "{context} must retain structured length diagnostics"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "SCTP notification kind {kind:#06x} declared length {declared_length} is shorter than required length {required_length}"
+            ),
+            "{context} lazy display"
+        );
+    }
+
     fn notification_layout_cases() -> Vec<(&'static str, Vec<u8>, SctpRecvMeta)> {
         let mut cases = Vec::new();
 
@@ -11564,6 +11627,7 @@ mod tests {
 
         let mut legacy =
             test_notification_buffer(LOCAL_SCTP_SEND_FAILED, SCTP_LEGACY_SEND_FAILED_MIN_LEN);
+        write_u16_ne(&mut legacy, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x1112);
         write_u32_ne(&mut legacy, SCTP_SEND_FAILED_ERROR_OFFSET, 0x1314_1516);
         let legacy_info = SCTP_SEND_FAILED_INFO_OFFSET;
         write_u16_ne(
@@ -11596,6 +11660,7 @@ mod tests {
             "legacy send failed",
             legacy,
             SctpRecvMeta::Notification(SctpNotification::SendFailed {
+                flags: 0x1112,
                 error: 0x1314_1516,
                 info: SctpSendInfo {
                     stream_id: 0x1718,
@@ -11787,6 +11852,7 @@ mod tests {
 
         let mut modern =
             test_notification_buffer(LOCAL_SCTP_SEND_FAILED_EVENT, SCTP_SEND_FAILED_EVENT_MIN_LEN);
+        write_u16_ne(&mut modern, SCTP_NOTIFICATION_FLAGS_OFFSET, 0x5152);
         write_u32_ne(&mut modern, SCTP_SEND_FAILED_ERROR_OFFSET, 0x5354_5556);
         let modern_info = SCTP_SEND_FAILED_INFO_OFFSET;
         write_u16_ne(
@@ -11819,6 +11885,7 @@ mod tests {
             "modern send failed",
             modern,
             SctpRecvMeta::Notification(SctpNotification::SendFailed {
+                flags: 0x5152,
                 error: 0x5354_5556,
                 info: SctpSendInfo {
                     stream_id: 0x5758,
@@ -13982,7 +14049,13 @@ mod tests {
             let actual_short = test_notification_buffer(notification_type, min_len - 1);
             let err = parse_notification(&actual_short)
                 .expect_err("a one-byte-short backing buffer must be rejected");
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name} backing");
+            assert_short_sctp_notification(
+                &err,
+                notification_type as u16,
+                (min_len - 1) as u32,
+                min_len,
+                &format!("{name} backing"),
+            );
 
             let mut declared_short = test_notification_buffer(notification_type, min_len);
             write_u32_ne(
@@ -13992,7 +14065,13 @@ mod tests {
             );
             let err = parse_notification(&declared_short)
                 .expect_err("trailing backing bytes cannot extend the declared record");
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name} declared");
+            assert_short_sctp_notification(
+                &err,
+                notification_type as u16,
+                (min_len - 1) as u32,
+                min_len,
+                &format!("{name} declared"),
+            );
         }
     }
 

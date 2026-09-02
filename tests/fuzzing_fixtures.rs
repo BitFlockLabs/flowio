@@ -930,6 +930,10 @@ fn sctp_notification_fixtures_reach_expected_layouts() {
     let declared_short = observe_sctp_parse_notification(declared_short_fixture)
         .expect_err("a declared-short shutdown notification must be rejected");
     assert_eq!(declared_short.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        declared_short.to_string(),
+        "SCTP notification kind 0x8005 declared length 8 is shorter than required length 12"
+    );
 
     assert_eq!(
         observe_sctp_parse_notification(include_bytes!(
@@ -937,6 +941,7 @@ fn sctp_notification_fixtures_reach_expected_layouts() {
         ))
         .expect("legacy send-failed notification should parse"),
         SctpRecvMeta::Notification(SctpNotification::SendFailed {
+            flags: 0,
             error: 0x1314_1516,
             info: SctpSendInfo {
                 stream_id: 0x1718,
@@ -1000,6 +1005,7 @@ fn sctp_notification_fixtures_reach_expected_layouts() {
         ))
         .expect("send-failed event notification should parse"),
         SctpRecvMeta::Notification(SctpNotification::SendFailed {
+            flags: 0,
             error: 0x5354_5556,
             info: SctpSendInfo {
                 stream_id: 0x5758,

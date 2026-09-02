@@ -1729,7 +1729,7 @@ fn parse_legacy_send_failed_notification() {
     let mut buf = vec![0u8; info_offset + sndrcvinfo_len + 4];
     buf.write_u16_at(0, test_send_failed_type() as u16)
         .expect("legacy send failed type write should fit");
-    buf.write_u16_at(2, 0)
+    buf.write_u16_at(2, 1)
         .expect("legacy send failed flags write should fit");
     buf.write_u32_at(4, (info_offset + sndrcvinfo_len + 4) as u32)
         .expect("legacy send failed length write should fit");
@@ -1761,6 +1761,7 @@ fn parse_legacy_send_failed_notification() {
     assert_eq!(
         parsed,
         SctpRecvMeta::Notification(SctpNotification::SendFailed {
+            flags: 1,
             error: 9,
             info: SctpSendInfo {
                 stream_id: 3,
@@ -2022,7 +2023,7 @@ fn parse_send_failed_event_notification() {
     let mut buf = vec![0u8; info_offset + sndinfo_len + 4];
     buf.write_u16_at(0, test_send_failed_event_type() as u16)
         .expect("send failed type write should fit");
-    buf.write_u16_at(2, 0)
+    buf.write_u16_at(2, 0x7a5c)
         .expect("send failed flags write should fit");
     buf.write_u32_at(4, (info_offset + sndinfo_len + 4) as u32)
         .expect("send failed length write should fit");
@@ -2050,6 +2051,7 @@ fn parse_send_failed_event_notification() {
     assert_eq!(
         parsed,
         SctpRecvMeta::Notification(SctpNotification::SendFailed {
+            flags: 0x7a5c,
             error: 9,
             info: SctpSendInfo {
                 stream_id: 3,
