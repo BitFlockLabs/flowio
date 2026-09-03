@@ -2,7 +2,7 @@ use flowio::test_support::utils::list::intrusive::slist::Link;
 use flowio::test_support::utils::memory::pool::*;
 use flowio::test_support::utils::memory::provider::{BasicMemoryProvider, MemoryProvider};
 use flowio::test_support::utils::memory::slab::{Slab, SlabAllocator};
-use std::mem::{MaybeUninit, size_of};
+use std::mem::{MaybeUninit, align_of, size_of};
 
 // verbose memory provider
 struct VerboseProvider {
@@ -212,11 +212,41 @@ fn pool_free_null_is_noop() {
 #[test]
 fn pool_rejects_slot_count_overflow() {
     let mut provider = BasicMemoryProvider::new();
+    assert!(size_of::<Task>() <= size_of::<Link>());
+    assert!(align_of::<Task>() <= align_of::<Link>());
+    let slot_stride = size_of::<Link>();
+    let first_overflowing_slot_count = usize::MAX / slot_stride + 1;
+    assert!(
+        slot_stride
+            .checked_mul(first_overflowing_slot_count)
+            .is_none(),
+        "the selected count must overflow slot-count multiplication"
+    );
+    assert_eq!(
+        slot_stride.wrapping_mul(first_overflowing_slot_count),
+        0,
+        "unchecked multiplication would leave valid downstream slab geometry"
+    );
 
     assert_eq!(
-        Pool::<Task, _>::new_uninit(&mut provider, usize::MAX)
+        Pool::<Task, _>::new_uninit(&mut provider, first_overflowing_slot_count)
             .err()
             .expect("pool slot geometry must reject multiplication overflow"),
+        PoolConfigError::SizeOverflow
+    );
+
+    let last_multiplication_safe_count = first_overflowing_slot_count - 1;
+    let last_payload_size = slot_stride
+        .checked_mul(last_multiplication_safe_count)
+        .expect("the adjacent lower count must fit slot-count multiplication");
+    assert!(
+        size_of::<Slab>().checked_add(last_payload_size).is_none(),
+        "the adjacent lower count must fail only in later slab geometry"
+    );
+    assert_eq!(
+        Pool::<Task, _>::new_uninit(&mut provider, last_multiplication_safe_count)
+            .err()
+            .expect("later slab geometry must reject its own overflow"),
         PoolConfigError::SizeOverflow
     );
 }
