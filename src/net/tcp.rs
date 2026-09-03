@@ -280,8 +280,8 @@ fn poll_tcp_connect(slot: &mut ConnectSlot, cx: &mut Context<'_>) -> Poll<io::Re
 /// On the steady-state fast path, keep the stream alive and reuse it for many
 /// reads and writes rather than reconnecting repeatedly.
 ///
-/// The stream is an owner-OS-thread value and is neither [`Send`](std::marker::Send)
-/// nor [`Sync`](std::marker::Sync).
+/// The stream is an owner-OS-thread value and is neither [`Send`]
+/// nor [`Sync`].
 /// An idle stream may be used by another FlowIO executor on that same thread;
 /// once I/O is submitted, its future and completion state remain with the
 /// originating executor through the target completion.

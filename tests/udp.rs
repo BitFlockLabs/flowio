@@ -1442,6 +1442,47 @@ fn runtime_udp_context_errors_preserve_prefilled_iobuff_for_all_apis() {
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
+fn runtime_udp_operation_allocation_errors_preserve_prefilled_iobuff_for_all_apis() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, _peer, peer_addr) = connected_udp_pair();
+
+    executor
+        .run(async move {
+            test_hooks::fail_next_op_alloc();
+            let (result, buffer) = socket.recv(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("forced recv operation allocation should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_op_alloc();
+            let (result, buffer) = socket.recv_msg(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("forced recv_msg operation allocation should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_op_alloc();
+            let (result, buffer) = socket.send(prefilled_udp_buffer(4)).await;
+            let error = result.expect_err("forced send operation allocation should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_op_alloc();
+            let (result, buffer) = socket.recv_from(prefilled_udp_buffer(4), 4).await;
+            let error = result.expect_err("forced recv_from operation allocation should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+
+            test_hooks::fail_next_op_alloc();
+            let (result, buffer) = socket.send_to(prefilled_udp_buffer(4), peer_addr).await;
+            let error = result.expect_err("forced send_to operation allocation should fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
+        })
+        .expect("executor run failed");
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
 fn runtime_udp_submission_errors_preserve_prefilled_iobuff_for_all_apis() {
     let mut executor = Executor::new().expect("failed to construct executor");
     let (mut socket, _peer, peer_addr) = connected_udp_pair();

@@ -93,7 +93,7 @@ use super::{
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    UnsubmittedOpGuard, completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker,
+    completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker, prepare_unsubmitted_op,
     refresh_op_waiter_from_waker, submit_retained_fd_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::{RuntimeFd, RuntimeFdOpState};
@@ -115,8 +115,8 @@ use std::task::{Context, Poll};
 /// fixed-peer fast path. Use `recv_msg` on connected sockets when the caller
 /// must reject truncated datagrams.
 ///
-/// The socket is an owner-OS-thread value and is neither [`Send`](std::marker::Send)
-/// nor [`Sync`](std::marker::Sync).
+/// The socket is an owner-OS-thread value and is neither [`Send`]
+/// nor [`Sync`].
 /// An idle socket may be used by another FlowIO executor on that same thread;
 /// once I/O is submitted, its future and completion state remain with the
 /// originating executor through the target completion.
@@ -760,14 +760,14 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedRecvPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -870,14 +870,14 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedRecvMsgPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -973,14 +973,14 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedSendPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -1090,14 +1090,14 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let payload = RetainedRecvFromPayload {
                 buffer: unsafe { opt_take(&mut this.buffer) },
@@ -1198,14 +1198,14 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                     return Poll::Ready((Err(err), buffer));
                 }
             };
-            let state_ptr = unsafe { (*pctx.reactor()).alloc_op() };
-            if state_ptr.is_null() {
-                let buffer = unsafe { opt_take(&mut this.buffer) };
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
-            }
-            let guard = unsafe { UnsubmittedOpGuard::new(pctx.reactor(), state_ptr) };
-
-            unsafe { (*state_ptr).register_waiter(pctx.owner_task()) };
+            let guard = match unsafe { prepare_unsubmitted_op(&pctx) } {
+                Some(guard) => guard,
+                None => {
+                    let buffer = unsafe { opt_take(&mut this.buffer) };
+                    return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buffer));
+                }
+            };
+            let state_ptr = guard.state_ptr();
 
             let destination = this.addr;
             let len = this.len;
