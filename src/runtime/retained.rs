@@ -39,11 +39,11 @@ use std::slice;
 
 const RETAINED_BLOCK_ALIGN: usize = 64;
 const RETAINED_SLAB_TARGET_BYTES: usize = 64 * 1024;
-const RETAINED_SIZE_CLASSES: [usize; 11] = [
+pub(crate) const RETAINED_SIZE_CLASSES: [usize; 11] = [
     64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
 pub(crate) const RETAINED_IOVEC_INLINE_COUNT: usize = 16;
-const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
+pub(crate) const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
 pub(crate) const RETAINED_IOVEC_MAX_COUNT: usize =
     RETAINED_IOVEC_SIZE_CLASSES[RETAINED_IOVEC_SIZE_CLASSES.len() - 1];
 pub(crate) const RETAINED_IOVEC_OVERSIZE_MESSAGE: &str =
@@ -178,6 +178,45 @@ macro_rules! impl_retained_payload_pool_stats_delta {
 #[cfg(any(debug_assertions, feature = "test-support"))]
 retained_payload_stat_fields!(impl_retained_payload_pool_stats_delta);
 
+/// Feature-gated counters retained by one executor's payload pools.
+#[cfg(feature = "diagnostic-counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetainedPayloadDiagnosticCounters {
+    pub(crate) payload_class_allocs: [usize; RETAINED_SIZE_CLASSES.len()],
+    pub(crate) payload_reuses: usize,
+    pub(crate) payload_slab_allocs: usize,
+    pub(crate) heap_fallbacks: usize,
+    pub(crate) scratch_inline_allocs: usize,
+    pub(crate) scratch_class_allocs: [usize; RETAINED_IOVEC_SIZE_CLASSES.len()],
+    pub(crate) scratch_reuses: usize,
+    pub(crate) scratch_slab_allocs: usize,
+}
+
+#[cfg(feature = "diagnostic-counters")]
+impl RetainedPayloadDiagnosticCounters {
+    #[inline(always)]
+    fn record_payload_class(&mut self, class_index: usize, result: &ClassAllocResult) {
+        self.payload_class_allocs[class_index] =
+            self.payload_class_allocs[class_index].saturating_add(1);
+        self.payload_reuses = self
+            .payload_reuses
+            .saturating_add(usize::from(result.reused));
+        self.payload_slab_allocs = self
+            .payload_slab_allocs
+            .saturating_add(usize::from(result.new_slab));
+    }
+}
+
+/// Repository-only retained-storage state sampled at executor quiescence.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetainedPayloadPoolQuiescence {
+    pub(crate) stats: RetainedPayloadPoolStats,
+    pub(crate) payload_slab_pages: usize,
+    pub(crate) scratch_slab_pages: usize,
+    pub(crate) scratch_owner_refs: usize,
+}
+
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[inline(always)]
 fn record_class_allocation(
@@ -210,6 +249,28 @@ struct RetainedIovecScratchStats {
     writev_scratch_alloc_failures: usize,
 }
 
+/// Feature-gated counters stored with the heap-stable scratch owner.
+#[cfg(feature = "diagnostic-counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RetainedIovecDiagnosticCounters {
+    inline_allocs: usize,
+    class_allocs: [usize; RETAINED_IOVEC_SIZE_CLASSES.len()],
+    reuses: usize,
+    slab_allocs: usize,
+}
+
+#[cfg(feature = "diagnostic-counters")]
+impl RetainedIovecDiagnosticCounters {
+    #[inline(always)]
+    fn record_class(&mut self, class_index: usize, result: &ClassAllocResult) {
+        self.class_allocs[class_index] = self.class_allocs[class_index].saturating_add(1);
+        self.reuses = self.reuses.saturating_add(usize::from(result.reused));
+        self.slab_allocs = self
+            .slab_allocs
+            .saturating_add(usize::from(result.new_slab));
+    }
+}
+
 #[cfg(any(debug_assertions, feature = "test-support"))]
 impl RetainedIovecScratchStats {
     fn apply_to(self, stats: &mut RetainedPayloadPoolStats) {
@@ -239,6 +300,8 @@ struct RetainedIovecScratchPoolState {
     _provider: ProviderOwner<BasicMemoryProvider>,
     #[cfg(any(debug_assertions, feature = "test-support"))]
     stats: RetainedIovecScratchStats,
+    #[cfg(feature = "diagnostic-counters")]
+    diagnostics: RetainedIovecDiagnosticCounters,
 }
 
 impl RetainedIovecScratchPool {
@@ -256,6 +319,8 @@ impl RetainedIovecScratchPool {
                 _provider: provider,
                 #[cfg(any(debug_assertions, feature = "test-support"))]
                 stats: RetainedIovecScratchStats::default(),
+                #[cfg(feature = "diagnostic-counters")]
+                diagnostics: RetainedIovecDiagnosticCounters::default(),
             }),
         }))
     }
@@ -270,6 +335,11 @@ impl RetainedIovecScratchPool {
             let stats = &mut (*self.state.get()).stats;
             stats.writev_scratch_inline_allocs =
                 stats.writev_scratch_inline_allocs.saturating_add(1);
+            #[cfg(feature = "diagnostic-counters")]
+            {
+                let diagnostics = &mut (*self.state.get()).diagnostics;
+                diagnostics.inline_allocs = diagnostics.inline_allocs.saturating_add(1);
+            }
         }
     }
 
@@ -309,6 +379,9 @@ impl RetainedIovecScratchPool {
             );
         }
 
+        #[cfg(feature = "diagnostic-counters")]
+        state.diagnostics.record_class(class_index, &result);
+
         Some(result)
     }
 
@@ -338,6 +411,13 @@ impl RetainedIovecScratchPool {
         // not overlap allocation or release.
         unsafe { (*self.state.get()).stats }
     }
+
+    #[cfg(feature = "diagnostic-counters")]
+    fn take_diagnostic_counters(&self) -> RetainedIovecDiagnosticCounters {
+        // SAFETY: snapshots are taken between executor runs on the sole owner
+        // thread and therefore cannot overlap scratch allocation or release.
+        unsafe { std::mem::take(&mut (*self.state.get()).diagnostics) }
+    }
 }
 
 /// Raw, size-classed pool for retained operation payloads.
@@ -352,6 +432,9 @@ pub(crate) struct RetainedPayloadPool {
     #[cfg(any(debug_assertions, feature = "test-support"))]
     /// Debug/test-support counters exported through runtime stats and tests.
     stats: RetainedPayloadPoolStats,
+    #[cfg(feature = "diagnostic-counters")]
+    /// Opt-in counters sampled and reset between benchmark rows.
+    diagnostics: RetainedPayloadDiagnosticCounters,
     /// Fixed, nonallocating cleanup records used only so deliberate
     /// partial-initialization poison tests remain Miri leak-clean.
     #[cfg(test)]
@@ -363,6 +446,24 @@ pub(crate) struct RetainedPayloadPool {
     #[cfg(test)]
     test_poisoned_writes: usize,
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(debug_assertions),
+    not(feature = "test-support"),
+    not(feature = "diagnostic-counters")
+))]
+const _: [(); 328] = [(); std::mem::size_of::<RetainedIovecScratchPool>()];
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(debug_assertions),
+    not(feature = "test-support"),
+    not(feature = "diagnostic-counters")
+))]
+const _: [(); 896] = [(); std::mem::size_of::<RetainedPayloadPool>()];
 
 impl RetainedPayloadPool {
     pub(crate) fn new() -> io::Result<Self> {
@@ -387,6 +488,8 @@ impl RetainedPayloadPool {
             iovec_pool,
             #[cfg(any(debug_assertions, feature = "test-support"))]
             stats: RetainedPayloadPoolStats::default(),
+            #[cfg(feature = "diagnostic-counters")]
+            diagnostics: RetainedPayloadDiagnosticCounters::default(),
             #[cfg(test)]
             test_poisoned_heaps: [MaybeUninit::uninit(); TEST_POISONED_HEAP_CAPACITY],
             #[cfg(test)]
@@ -417,6 +520,9 @@ impl RetainedPayloadPool {
                         &mut self.stats.slab_allocs,
                     );
 
+                    #[cfg(feature = "diagnostic-counters")]
+                    self.diagnostics.record_payload_class(class_index, &result);
+
                     let ptr = result.ptr as *mut T;
                     unsafe { ptr.write(value) };
                     return unsafe {
@@ -435,6 +541,10 @@ impl RetainedPayloadPool {
         #[cfg(any(debug_assertions, feature = "test-support"))]
         {
             self.stats.heap_fallbacks = self.stats.heap_fallbacks.saturating_add(1);
+        }
+        #[cfg(feature = "diagnostic-counters")]
+        {
+            self.diagnostics.heap_fallbacks = self.diagnostics.heap_fallbacks.saturating_add(1);
         }
 
         let ptr = Box::into_raw(Box::new(value));
@@ -469,6 +579,11 @@ impl RetainedPayloadPool {
                     &mut pool_ref.stats.slab_allocs,
                 );
 
+                #[cfg(feature = "diagnostic-counters")]
+                pool_ref
+                    .diagnostics
+                    .record_payload_class(class_index, &result);
+
                 return unsafe {
                     RawRetainedSlot::new(
                         result.ptr.cast::<MaybeUninit<T>>(),
@@ -495,6 +610,14 @@ impl RetainedPayloadPool {
             // raw slot below becomes observable.
             let pool_ref = unsafe { &mut *pool.as_ptr() };
             pool_ref.stats.heap_fallbacks = pool_ref.stats.heap_fallbacks.saturating_add(1);
+        }
+        #[cfg(feature = "diagnostic-counters")]
+        {
+            // SAFETY: guaranteed by the caller. The borrow ends before the
+            // raw slot below becomes observable.
+            let pool_ref = unsafe { &mut *pool.as_ptr() };
+            pool_ref.diagnostics.heap_fallbacks =
+                pool_ref.diagnostics.heap_fallbacks.saturating_add(1);
         }
 
         // SAFETY: `Box::into_raw` returns a non-null, correctly aligned live
@@ -641,6 +764,38 @@ impl RetainedPayloadPool {
         let mut stats = self.stats;
         self.iovec_pool.stats().apply_to(&mut stats);
         stats
+    }
+
+    /// Samples retained payload/scratch ownership outside operation paths.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn quiescence(&self) -> RetainedPayloadPoolQuiescence {
+        let payload_slab_pages = self.classes.iter().fold(0usize, |total, class| {
+            total.saturating_add(class.slab_pages.page_count())
+        });
+        // SAFETY: the retained pool and sidecar leases are owner-thread-only,
+        // and an Executor snapshot cannot overlap allocation or release.
+        let scratch_state = unsafe { &*self.iovec_pool.state.get() };
+        let scratch_slab_pages = scratch_state.classes.iter().fold(0usize, |total, class| {
+            total.saturating_add(class.slab_pages.page_count())
+        });
+        RetainedPayloadPoolQuiescence {
+            stats: self.stats(),
+            payload_slab_pages,
+            scratch_slab_pages,
+            scratch_owner_refs: Rc::strong_count(&self.iovec_pool),
+        }
+    }
+
+    /// Takes and resets diagnostic-only allocation counters between runs.
+    #[cfg(feature = "diagnostic-counters")]
+    pub(crate) fn take_diagnostic_counters(&mut self) -> RetainedPayloadDiagnosticCounters {
+        let mut counters = std::mem::take(&mut self.diagnostics);
+        let scratch = self.iovec_pool.take_diagnostic_counters();
+        counters.scratch_inline_allocs = scratch.inline_allocs;
+        counters.scratch_class_allocs = scratch.class_allocs;
+        counters.scratch_reuses = scratch.reuses;
+        counters.scratch_slab_allocs = scratch.slab_allocs;
+        counters
     }
 }
 
@@ -1560,6 +1715,81 @@ mod tests {
         assert_eq!(current.saturating_delta_since(baseline), expected);
         assert_eq!(baseline.saturating_delta_since(current), Default::default());
         assert_eq!(current.saturating_delta_since(current), Default::default());
+    }
+
+    #[cfg(feature = "diagnostic-counters")]
+    #[test]
+    fn diagnostic_counters_record_classes_fallback_reuse_and_reset() {
+        #[repr(align(128))]
+        struct HeapValue(u8);
+
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+
+        let first = pool.alloc(1_u8);
+        unsafe { first.drop_and_free(&mut pool) };
+        let reused = pool.alloc(2_u8);
+        unsafe { reused.drop_and_free(&mut pool) };
+
+        let heap = pool.alloc(HeapValue(7));
+        let heap = unsafe { heap.take(&mut pool) };
+        assert_eq!(heap.0, 7);
+
+        let inline = pool
+            .alloc_iovec_scratch(RETAINED_IOVEC_INLINE_COUNT)
+            .expect("inline scratch allocation failed");
+        drop(inline);
+        let pooled = pool
+            .alloc_iovec_scratch(RETAINED_IOVEC_INLINE_COUNT + 1)
+            .expect("pooled scratch allocation failed");
+        drop(pooled);
+        let reused = pool
+            .alloc_iovec_scratch(RETAINED_IOVEC_INLINE_COUNT + 1)
+            .expect("reused scratch allocation failed");
+        drop(reused);
+
+        let counters = pool.take_diagnostic_counters();
+        assert_eq!(
+            counters.payload_class_allocs,
+            [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(counters.payload_reuses, 1);
+        assert_eq!(counters.payload_slab_allocs, 1);
+        assert_eq!(counters.heap_fallbacks, 1);
+        assert_eq!(counters.scratch_inline_allocs, 1);
+        assert_eq!(counters.scratch_class_allocs, [2, 0, 0, 0]);
+        assert_eq!(counters.scratch_reuses, 1);
+        assert_eq!(counters.scratch_slab_allocs, 1);
+        assert_eq!(
+            pool.take_diagnostic_counters(),
+            RetainedPayloadDiagnosticCounters::default()
+        );
+
+        let allocation = ClassAllocResult {
+            ptr: std::ptr::null_mut(),
+            reused: true,
+            new_slab: true,
+        };
+        let mut payload = RetainedPayloadDiagnosticCounters {
+            payload_class_allocs: [usize::MAX; RETAINED_SIZE_CLASSES.len()],
+            payload_reuses: usize::MAX,
+            payload_slab_allocs: usize::MAX,
+            ..Default::default()
+        };
+        payload.record_payload_class(0, &allocation);
+        assert_eq!(payload.payload_class_allocs[0], usize::MAX);
+        assert_eq!(payload.payload_reuses, usize::MAX);
+        assert_eq!(payload.payload_slab_allocs, usize::MAX);
+
+        let mut scratch = RetainedIovecDiagnosticCounters {
+            class_allocs: [usize::MAX; RETAINED_IOVEC_SIZE_CLASSES.len()],
+            reuses: usize::MAX,
+            slab_allocs: usize::MAX,
+            ..Default::default()
+        };
+        scratch.record_class(0, &allocation);
+        assert_eq!(scratch.class_allocs[0], usize::MAX);
+        assert_eq!(scratch.reuses, usize::MAX);
+        assert_eq!(scratch.slab_allocs, usize::MAX);
     }
 
     #[test]

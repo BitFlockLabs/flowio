@@ -31,17 +31,6 @@ pub trait InPlaceInit: Sized {
     fn init_at(slot: &mut MaybeUninit<Self>, args: Self::Args);
 }
 
-impl<const N: usize> InPlaceInit for [u8; N] {
-    type Args = ();
-
-    fn init_at(slot: &mut MaybeUninit<Self>, _args: Self::Args) {
-        // Zero-fill byte arrays so newly allocated buffers start in a defined state.
-        unsafe {
-            std::ptr::write_bytes(slot.as_mut_ptr() as *mut u8, 0, N);
-        }
-    }
-}
-
 /// A memory pool that manages objects of type `T`.
 ///
 /// It allocates large chunks of memory (slabs) from the `MemoryProvider`
@@ -172,6 +161,13 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     pub fn init(&mut self) {
         self.slab_factory.init();
         self.free_list.init();
+    }
+
+    /// Returns the number of slab pages retained by this pool for
+    /// repository-only quiescence checks.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn slab_page_count(&self) -> usize {
+        self.slab_pages.page_count()
     }
 
     /// Allocates and initializes one object slot.

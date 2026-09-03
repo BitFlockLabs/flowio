@@ -1045,6 +1045,14 @@ impl TimerRuntime {
         self.wheel.has_pending_entries()
     }
 
+    /// Returns the retained timer slab count for repository-only quiescence
+    /// checks. Sampling walks existing slab metadata and does not add timer
+    /// fast-path bookkeeping.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn slab_page_count(&self) -> usize {
+        self.timer_pool.slab_page_count()
+    }
+
     /// Returns the duration until the next timer deadline, if any.
     pub fn next_wait_duration(&mut self, now_tick: u64) -> Option<Duration> {
         if self.wheel.next_deadline_dirty {

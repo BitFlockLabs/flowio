@@ -277,6 +277,130 @@ define_runtime_stats!(pub(crate));
 #[cfg(all(not(debug_assertions), any(test, feature = "test-support")))]
 const _: [(); 0] = [(); size_of::<RuntimeStats>()];
 
+/// Opt-in executor-local counters for bounded diagnostic campaigns.
+///
+/// These counters are available only with the dev-only
+/// `diagnostic-counters` feature and are not a supported production metrics
+/// API. They use plain owner-thread-local integers: no atomics, locks, queues,
+/// allocation, or background work is introduced. Use the test-support facade
+/// to snapshot and reset them only after [`Executor::run`] returns, so the
+/// observation work stays outside benchmark row timing.
+#[cfg(feature = "diagnostic-counters")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeDiagnosticCounters {
+    /// Calls that reached an `io_uring_enter`-issuing ring method.
+    pub ring_enter_attempts: usize,
+    /// Ring-enter calls that returned an `Ok` result.
+    pub ring_enter_successes: usize,
+    /// SQEs reported submitted by successful ring-enter calls.
+    pub ring_enter_submitted_sqes: usize,
+    /// Ring-enter calls that returned `EINTR`.
+    pub ring_enter_eintr: usize,
+    /// Ring-enter calls that returned `EBUSY`.
+    pub ring_enter_ebusy: usize,
+    /// Timed ring-enter calls that returned `ETIME`.
+    pub ring_enter_etime: usize,
+    /// Ring-enter calls that returned any other error.
+    pub ring_enter_other_errors: usize,
+    /// SQEs successfully appended to this executor's userspace submission
+    /// queue, including target, cancel, and close entries.
+    pub sqes_queued: usize,
+    /// Retained payload allocations by the size-class index described by
+    /// [`Self::RETAINED_PAYLOAD_CLASS_BYTES`].
+    pub retained_payload_class_allocs: [usize; 11],
+    /// Retained payload class allocations served from returned blocks.
+    pub retained_payload_reuses: usize,
+    /// Retained payload class allocations that requested a new slab page.
+    pub retained_payload_slab_allocs: usize,
+    /// Retained payload allocations that used the heap fallback.
+    pub retained_heap_fallbacks: usize,
+    /// Retained vectored-I/O scratch requests served from inline storage.
+    pub writev_scratch_inline_allocs: usize,
+    /// Retained vectored-I/O scratch allocations by the class index described
+    /// by [`Self::WRITEV_SCRATCH_CLASS_IOVECS`].
+    pub writev_scratch_class_allocs: [usize; 4],
+    /// Retained vectored-I/O scratch class allocations served from returned
+    /// blocks.
+    pub writev_scratch_reuses: usize,
+    /// Retained vectored-I/O scratch class allocations that requested a new
+    /// slab page.
+    pub writev_scratch_slab_allocs: usize,
+    /// Partial vectored writes that advanced retained iovec metadata before
+    /// submitting the remaining write window.
+    pub writev_partial_continuations: usize,
+}
+
+#[cfg(feature = "diagnostic-counters")]
+impl RuntimeDiagnosticCounters {
+    /// Byte capacity represented by each retained-payload counter index.
+    pub const RETAINED_PAYLOAD_CLASS_BYTES: [usize; 11] =
+        crate::runtime::retained::RETAINED_SIZE_CLASSES;
+
+    /// Iovec capacity represented by each retained-scratch counter index.
+    pub const WRITEV_SCRATCH_CLASS_IOVECS: [usize; 4] =
+        crate::runtime::retained::RETAINED_IOVEC_SIZE_CLASSES;
+}
+
+/// Repository-only ownership snapshot taken between executor runs.
+///
+/// This type exists only for crate tests and the dev-only `test-support`
+/// feature. It is absent from ordinary production builds and is not a
+/// supported observability API.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeQuiescence {
+    /// Unfinished executor-owned tasks.
+    pub live_tasks: usize,
+    /// Submitted operations whose target CQE has not retired.
+    pub inflight_ops: usize,
+    /// Whether the runnable-task queue is empty.
+    pub ready_queue_empty: bool,
+    /// Whether every allocated task slot has released its references.
+    pub task_registry_empty: bool,
+    /// Whether any timer entry remains armed.
+    pub timers_pending: bool,
+    /// Completion states still checked out from the operation pool.
+    pub live_ops: usize,
+    /// Orphaned operations waiting for another cancel submission attempt.
+    pub pending_cancels: usize,
+    /// Userspace SQEs not yet consumed by the kernel.
+    pub queued_sqes: u64,
+    /// Descriptor owners retained for queued reactor close SQEs.
+    pub pending_reactor_closes: usize,
+    /// Descriptor owners deferred until a completion view is released.
+    pub deferred_reactor_closes: usize,
+    /// Strong references to the executor's heap-stable owner.
+    pub executor_owner_refs: usize,
+    /// Strong references to the retained-iovec sidecar owner.
+    pub scratch_owner_refs: usize,
+    /// Slab pages retained by the task pool.
+    pub task_slab_pages: usize,
+    /// Slab pages retained by the completion-state pool.
+    pub operation_slab_pages: usize,
+    /// Slab pages retained by the timer pool.
+    pub timer_slab_pages: usize,
+    /// Slab pages retained by payload size classes.
+    pub retained_slab_pages: usize,
+    /// Slab pages retained by vectored-I/O scratch size classes.
+    pub scratch_slab_pages: usize,
+    /// Retained payload allocations served by slab classes.
+    pub retained_pooled_allocs: usize,
+    /// Retained payload blocks returned to slab classes.
+    pub retained_pooled_frees: usize,
+    /// Retained payload allocations served by the heap fallback.
+    pub retained_heap_allocs: usize,
+    /// Retained heap-fallback blocks released.
+    pub retained_heap_frees: usize,
+    /// Vectored-I/O scratch allocations served by sidecar slabs.
+    pub scratch_pooled_allocs: usize,
+    /// Vectored-I/O scratch blocks returned to sidecar slabs.
+    pub scratch_pooled_frees: usize,
+    /// Whether reactor shutdown abandoned kernel-visible storage.
+    pub storage_abandoned: bool,
+}
+
 #[cfg(debug_assertions)]
 macro_rules! define_apply_retained_payload_stats {
     ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
@@ -476,6 +600,15 @@ pub(crate) struct RuntimeState {
     /// Debug-only scheduler and allocation counters.
     pub(crate) stats: RuntimeStats,
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(debug_assertions),
+    not(feature = "test-support"),
+    not(feature = "diagnostic-counters")
+))]
+const _: [(); 16] = [(); size_of::<RuntimeState>()];
 
 impl RuntimeState {
     fn new() -> Self {
@@ -712,6 +845,15 @@ struct ExecutorState {
     /// shut down the runtime and joined the existing close worker.
     deferred_shutdown_owner: Option<Rc<ExecutorOwner>>,
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(debug_assertions),
+    not(feature = "test-support"),
+    not(feature = "diagnostic-counters")
+))]
+const _: [(); 9040] = [(); size_of::<ExecutorState>()];
 
 /// Cancels timers after task shutdown.
 struct TimerShutdownPhase {
@@ -2360,6 +2502,15 @@ pub struct Executor {
     last_stats: RuntimeStats,
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(debug_assertions),
+    not(feature = "test-support"),
+    not(feature = "diagnostic-counters")
+))]
+const _: [(); 32] = [(); size_of::<Executor>()];
+
 #[inline(always)]
 fn timers_pending_after_processing(timers_pending: bool, recheck: impl FnOnce() -> bool) -> bool {
     timers_pending && recheck()
@@ -2378,6 +2529,56 @@ impl Executor {
     #[doc(hidden)]
     pub fn test_cpu_affinity(&self) -> Option<usize> {
         self.cpu_affinity
+    }
+
+    /// Takes and resets opt-in diagnostic counters between executor runs.
+    ///
+    /// The test-support facade is the external entry point. Keeping this
+    /// operation between `run` calls prevents snapshot/reset work from
+    /// entering a timed benchmark row.
+    #[cfg(feature = "diagnostic-counters")]
+    pub(crate) fn take_diagnostic_counters(&mut self) -> RuntimeDiagnosticCounters {
+        let state = unsafe { &mut *self.owner.state_ptr() };
+        state.reactor.take_diagnostic_counters()
+    }
+
+    /// Samples repository-only ownership state between executor runs.
+    ///
+    /// Callers must use this only after `run` has returned. The snapshot walks
+    /// already-owned slab metadata and reads existing registries/counters; it
+    /// allocates nothing and adds no bookkeeping to ordinary builds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_quiescence(&self) -> RuntimeQuiescence {
+        let state = unsafe { &*self.owner.state_ptr() };
+        let reactor = state.reactor.quiescence();
+        let retained = reactor.retained;
+        RuntimeQuiescence {
+            live_tasks: state.runtime_state.live_tasks,
+            inflight_ops: state.runtime_state.inflight_ops,
+            ready_queue_empty: state.ready_queue.is_empty(),
+            task_registry_empty: state.all_tasks.is_empty(),
+            timers_pending: state.timers.has_pending(),
+            live_ops: reactor.live_ops,
+            pending_cancels: reactor.pending_cancels,
+            queued_sqes: reactor.queued_sqes,
+            pending_reactor_closes: reactor.pending_closes,
+            deferred_reactor_closes: reactor.deferred_closes,
+            executor_owner_refs: Rc::strong_count(&self.owner),
+            scratch_owner_refs: retained.scratch_owner_refs,
+            task_slab_pages: state.task_pool.slab_page_count(),
+            operation_slab_pages: reactor.operation_slab_pages,
+            timer_slab_pages: state.timers.slab_page_count(),
+            retained_slab_pages: retained.payload_slab_pages,
+            scratch_slab_pages: retained.scratch_slab_pages,
+            retained_pooled_allocs: retained.stats.pooled_allocs,
+            retained_pooled_frees: retained.stats.pooled_frees,
+            retained_heap_allocs: retained.stats.heap_fallbacks,
+            retained_heap_frees: retained.stats.heap_frees,
+            scratch_pooled_allocs: retained.stats.writev_scratch_pooled_allocs,
+            scratch_pooled_frees: retained.stats.writev_scratch_pooled_frees,
+            storage_abandoned: reactor.storage_abandoned,
+        }
     }
 
     /// Constructs an executor with default configuration.

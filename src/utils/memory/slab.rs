@@ -135,6 +135,22 @@ impl SlabPageChain {
         }
     }
 
+    /// Counts currently retained slab pages for repository-only quiescence
+    /// checks. The walk is outside allocation and scheduling paths and adds no
+    /// bookkeeping to ordinary builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn page_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut current = self.head;
+        while !current.is_null() {
+            count = count.saturating_add(1);
+            // SAFETY: every live node in this private chain is a slab page
+            // owned by the chain, and snapshots cannot overlap mutation.
+            current = unsafe { (*current).link.next.cast::<Slab>() };
+        }
+        count
+    }
+
     /// Attempts to bump-allocate from the current slab page.
     ///
     /// # Safety
@@ -586,6 +602,7 @@ mod tests {
         assert_eq!(stats.inits.get(), 1);
 
         let mut chain = SlabPageChain::new();
+        assert_eq!(chain.page_count(), 0);
 
         let first = unsafe {
             chain
@@ -593,18 +610,21 @@ mod tests {
                 .expect("first slot should allocate")
         };
         assert!(first.new_slab);
+        assert_eq!(chain.page_count(), 1);
         let second = unsafe {
             chain
                 .alloc_or_grow(&mut allocator)
                 .expect("second slot should allocate")
         };
         assert!(!second.new_slab);
+        assert_eq!(chain.page_count(), 1);
         let third = unsafe {
             chain
                 .alloc_or_grow(&mut allocator)
                 .expect("third slot should allocate from a new slab")
         };
         assert!(third.new_slab);
+        assert_eq!(chain.page_count(), 2);
 
         assert_ne!(first.ptr, second.ptr);
         assert_ne!(first.ptr, third.ptr);
@@ -613,6 +633,7 @@ mod tests {
 
         unsafe { chain.free_all(&mut allocator) };
         assert_eq!(stats.frees.get(), 2);
+        assert_eq!(chain.page_count(), 0);
 
         unsafe { chain.free_all(&mut allocator) };
         assert_eq!(stats.frees.get(), 2, "free_all must leave the chain empty");

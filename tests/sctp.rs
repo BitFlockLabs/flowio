@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/runtime_longevity.rs"]
+mod runtime_longevity_support;
 
 use common::{
     DropTrackedReadOnly, DropTrackedReadWrite, TestIoBuffMut as IoBuffMut,
@@ -71,6 +73,8 @@ const SCTP_ACTIVE_IOVEC_BOUNDARY_TEST: &str =
 const SCTP_CONNECT_REUSE_CHILD_ENV: &str = "FLOWIO_SCTP_CONNECT_REUSE_CHILD";
 const SCTP_CONNECT_REUSE_TEST: &str =
     "runtime_sctp_reusable_dropped_connect_retains_socket_until_connect_cqe";
+const SCTP_LONGEVITY_CHILD_ENV: &str = "FLOWIO_SCTP_LONGEVITY_CHILD";
+const SCTP_LONGEVITY_TEST: &str = "runtime_sctp_longevity_reclaims_each_batch";
 const SCTP_ACTIVE_IOVEC_TEST_STACK_BYTES: &str = "33554432";
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
@@ -883,6 +887,160 @@ fn established_sctp_pair(
         &mut executor,
         accepted_sctp_pair(listener, SctpConnector::with_config(config), addr),
     )
+}
+
+async fn establish_longevity_sctp_pair(
+    listener: SctpListener,
+    connector: &mut SctpConnector,
+    address: SocketAddr,
+) -> (SctpListener, SctpStream, SctpStream) {
+    let accept = Executor::spawn(async move {
+        let mut listener = listener;
+        let (stream, _peer) = listener.accept().await.expect("longevity SCTP accept");
+        (listener, stream)
+    })
+    .expect("spawn longevity SCTP accept");
+    let client = connector
+        .connect(address)
+        .expect("prepare longevity SCTP connect")
+        .await
+        .expect("complete longevity SCTP connect");
+    let (listener, server) = accept.await.expect("longevity SCTP accept was cancelled");
+    (listener, client, server)
+}
+
+async fn cancel_longevity_sctp_read(
+    mut reader: SctpStream,
+    peer: SctpStream,
+) -> (SctpStream, SctpStream) {
+    let result = timeout(Duration::from_millis(1), reader.recv(vec![0u8; 1], 1)).await;
+    assert!(
+        matches!(result, Err(TimeoutError::Elapsed)),
+        "SCTP read completed before its cancellation deadline"
+    );
+    (reader, peer)
+}
+
+async fn exercise_sctp_longevity_cycles(
+    listener: SctpListener,
+    config: SctpSocketConfig,
+    cycles: usize,
+) {
+    const WINDOW: usize = 8;
+    assert!(cycles.is_multiple_of(WINDOW));
+    let address = listener.local_addr();
+    let mut listener = listener;
+    let mut connector = SctpConnector::with_config(config);
+    let mut pairs = Vec::with_capacity(WINDOW);
+    for _ in 0..WINDOW {
+        let (returned_listener, client, server) =
+            establish_longevity_sctp_pair(listener, &mut connector, address).await;
+        listener = returned_listener;
+        pairs.push((client, server));
+    }
+
+    let mut completed = 0usize;
+    while completed < cycles {
+        let mut handles = Vec::with_capacity(WINDOW);
+        for (reader, peer) in pairs.drain(..) {
+            handles.push(
+                Executor::spawn(cancel_longevity_sctp_read(reader, peer))
+                    .expect("spawn longevity SCTP task cycle"),
+            );
+        }
+        for handle in handles {
+            pairs.push(handle.await.expect("longevity SCTP task was cancelled"));
+        }
+        completed += WINDOW;
+    }
+    drop(pairs);
+    drop(listener);
+}
+
+fn run_sctp_longevity_child() {
+    use runtime_longevity_support::{
+        SlabPlateau, assert_fd_count_instrument_discriminates, assert_quiescent, process_fd_count,
+    };
+
+    const WARMUP_CYCLES: usize = 1_000;
+    const BATCHES: usize = 10;
+    const CYCLES_PER_BATCH: usize = 1_000;
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    assert_fd_count_instrument_discriminates();
+    let pre_construction_fds = process_fd_count();
+    let Some(probe) = bind_sctp_listener_or_skip(SCTP_LONGEVITY_TEST, config) else {
+        return;
+    };
+    drop(probe);
+    assert_eq!(
+        process_fd_count(),
+        pre_construction_fds,
+        "SCTP capability probe descriptor drift"
+    );
+
+    let mut executor = Executor::new().expect("construct SCTP longevity executor");
+    let runtime_fd_baseline = process_fd_count();
+    let listener = bind_sctp_listener_or_skip(SCTP_LONGEVITY_TEST, config)
+        .expect("SCTP capability disappeared after its successful probe");
+    executor
+        .run(async move {
+            exercise_sctp_longevity_cycles(listener, config, WARMUP_CYCLES).await;
+        })
+        .expect("run SCTP longevity warmup");
+    let warm = executor.test_quiescence();
+    assert_quiescent(warm, "SCTP warmup");
+    assert_eq!(
+        process_fd_count(),
+        runtime_fd_baseline,
+        "SCTP warmup descriptor drift"
+    );
+    assert!(
+        warm.retained_pooled_allocs > 0,
+        "SCTP warmup missed retained pool"
+    );
+    let plateau = SlabPlateau::from(warm);
+
+    for batch in 1..=BATCHES {
+        let listener = bind_sctp_listener_or_skip(SCTP_LONGEVITY_TEST, config)
+            .expect("SCTP capability disappeared during longevity run");
+        executor
+            .run(async move {
+                exercise_sctp_longevity_cycles(listener, config, CYCLES_PER_BATCH).await;
+            })
+            .unwrap_or_else(|err| panic!("run SCTP longevity batch {batch}: {err}"));
+        let snapshot = executor.test_quiescence();
+        assert_quiescent(snapshot, &format!("SCTP batch {batch}"));
+        assert_eq!(
+            process_fd_count(),
+            runtime_fd_baseline,
+            "SCTP batch {batch}: descriptor drift"
+        );
+        assert_eq!(
+            SlabPlateau::from(snapshot),
+            plateau,
+            "SCTP batch {batch}: slab count grew after warmup"
+        );
+    }
+
+    drop(executor);
+    assert_eq!(
+        process_fd_count(),
+        pre_construction_fds,
+        "SCTP executor teardown descriptor drift"
+    );
+}
+
+#[test]
+fn runtime_sctp_longevity_reclaims_each_batch() {
+    if std::env::var_os(SCTP_LONGEVITY_CHILD_ENV).is_some() {
+        run_sctp_longevity_child();
+        return;
+    }
+    common::run_exact_test_child_with_watchdog(
+        SCTP_LONGEVITY_TEST,
+        SCTP_LONGEVITY_CHILD_ENV,
+        Duration::from_secs(60),
+    );
 }
 
 #[test]

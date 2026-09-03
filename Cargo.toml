@@ -18,6 +18,9 @@ fuzzing = []
 # Dev-only: re-exports internal hooks used by out-of-source tests/benches.
 # Off by default; not part of the supported public API.
 test-support = []
+# Dev-only: adds executor-local counters for bounded diagnostic campaigns.
+# Implies the unsupported test-support facade used to snapshot and reset them.
+diagnostic-counters = ["test-support"]
 
 [dependencies]
 io-uring = "0.7.13"

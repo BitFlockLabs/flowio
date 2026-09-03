@@ -1,5 +1,7 @@
 //! `io_uring` reactor: SQE submission, CQE completion, and operation lifecycle.
 
+#[cfg(feature = "diagnostic-counters")]
+use crate::runtime::executor::RuntimeDiagnosticCounters;
 use crate::runtime::executor::{
     CompletionDrainGuard, ExecutorOwner, PanicPayload, RuntimeState, completion_drain_active,
     retain_first_panic, run_cleanup_preserving_panic,
@@ -8,6 +10,8 @@ use crate::runtime::fd::RuntimeFdLease;
 use crate::runtime::op::CompletionState;
 #[cfg(all(test, not(miri)))]
 use crate::runtime::retained::RetainedIovecScratch;
+#[cfg(any(test, feature = "test-support"))]
+use crate::runtime::retained::RetainedPayloadPoolQuiescence;
 #[cfg(any(debug_assertions, test))]
 use crate::runtime::retained::RetainedPayloadPoolStats;
 use crate::runtime::retained::{RetainedPayload, RetainedPayloadPool};
@@ -40,9 +44,46 @@ pub(crate) enum ReactorSubmitStatus {
     Busy,
 }
 
+/// Repository-only reactor state sampled after an executor run drains.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReactorQuiescence {
+    pub(crate) live_ops: usize,
+    pub(crate) pending_cancels: usize,
+    pub(crate) queued_sqes: u64,
+    pub(crate) pending_closes: usize,
+    pub(crate) deferred_closes: usize,
+    pub(crate) operation_slab_pages: usize,
+    pub(crate) retained: RetainedPayloadPoolQuiescence,
+    pub(crate) storage_abandoned: bool,
+}
+
 #[inline(always)]
 fn is_raw_os_error(err: &io::Error, code: libc::c_int) -> bool {
     err.raw_os_error() == Some(code)
+}
+
+#[cfg(feature = "diagnostic-counters")]
+#[inline(always)]
+fn record_ring_enter_result(counters: &mut RuntimeDiagnosticCounters, result: &io::Result<usize>) {
+    counters.ring_enter_attempts = counters.ring_enter_attempts.saturating_add(1);
+    match result {
+        Ok(submitted) => {
+            counters.ring_enter_successes = counters.ring_enter_successes.saturating_add(1);
+            counters.ring_enter_submitted_sqes = counters
+                .ring_enter_submitted_sqes
+                .saturating_add(*submitted);
+        }
+        Err(err) => {
+            let counter = match err.raw_os_error() {
+                Some(libc::EINTR) => &mut counters.ring_enter_eintr,
+                Some(libc::EBUSY) => &mut counters.ring_enter_ebusy,
+                Some(libc::ETIME) => &mut counters.ring_enter_etime,
+                _ => &mut counters.ring_enter_other_errors,
+            };
+            *counter = counter.saturating_add(1);
+        }
+    }
 }
 
 /// Clamps a Rust duration before `io-uring` casts its seconds to signed
@@ -609,7 +650,19 @@ pub(crate) struct Reactor {
     /// The operation and retained-payload pools must then be leaked because the
     /// kernel may still hold pointers into their checked-out storage.
     storage_abandoned: bool,
+    /// Opt-in owner-thread-local counters for diagnostic campaigns.
+    #[cfg(feature = "diagnostic-counters")]
+    diagnostics: RuntimeDiagnosticCounters,
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(debug_assertions),
+    not(feature = "test-support"),
+    not(feature = "diagnostic-counters")
+))]
+const _: [(); 1424] = [(); std::mem::size_of::<Reactor>()];
 
 /// Drains descriptor owners only after this reactor's completion view and
 /// thread-local exclusion guard have both been released.
@@ -681,6 +734,8 @@ impl Reactor {
             live_registry,
             retained_pool: ManuallyDrop::new(retained_pool),
             storage_abandoned: false,
+            #[cfg(feature = "diagnostic-counters")]
+            diagnostics: RuntimeDiagnosticCounters::default(),
         })
     }
 
@@ -717,6 +772,8 @@ impl Reactor {
             live_registry,
             retained_pool: ManuallyDrop::new(retained_pool),
             storage_abandoned: false,
+            #[cfg(feature = "diagnostic-counters")]
+            diagnostics: RuntimeDiagnosticCounters::default(),
         };
         reactor.init();
         Ok(reactor)
@@ -850,6 +907,50 @@ impl Reactor {
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn retained_payload_stats(&self) -> RetainedPayloadPoolStats {
         self.retained_pool.stats()
+    }
+
+    /// Samples ownership queues and retained storage outside reactor work.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn quiescence(&self) -> ReactorQuiescence {
+        ReactorQuiescence {
+            live_ops: self.live_registry.len(),
+            pending_cancels: self.pending_cancels.len(),
+            queued_sqes: self.queued_sqe_count(),
+            pending_closes: self.pending_closes.len(),
+            deferred_closes: self.deferred_closes.len(),
+            operation_slab_pages: self.op_pool.slab_page_count(),
+            retained: self.retained_pool.quiescence(),
+            storage_abandoned: self.storage_abandoned,
+        }
+    }
+
+    /// Takes and resets diagnostic counters between executor runs.
+    #[cfg(feature = "diagnostic-counters")]
+    pub(crate) fn take_diagnostic_counters(&mut self) -> RuntimeDiagnosticCounters {
+        let mut counters = std::mem::take(&mut self.diagnostics);
+        let retained = self.retained_pool.take_diagnostic_counters();
+        counters.retained_payload_class_allocs = retained.payload_class_allocs;
+        counters.retained_payload_reuses = retained.payload_reuses;
+        counters.retained_payload_slab_allocs = retained.payload_slab_allocs;
+        counters.retained_heap_fallbacks = retained.heap_fallbacks;
+        counters.writev_scratch_inline_allocs = retained.scratch_inline_allocs;
+        counters.writev_scratch_class_allocs = retained.scratch_class_allocs;
+        counters.writev_scratch_reuses = retained.scratch_reuses;
+        counters.writev_scratch_slab_allocs = retained.scratch_slab_allocs;
+        counters
+    }
+
+    /// Records one partial vectored-write continuation on this owner reactor.
+    ///
+    /// # Safety
+    ///
+    /// `reactor` must identify the currently polling task's live owner reactor.
+    #[cfg(feature = "diagnostic-counters")]
+    #[inline(always)]
+    pub(crate) unsafe fn note_writev_partial_continuation(reactor: *mut Self) {
+        let counters = unsafe { &mut (*reactor).diagnostics };
+        counters.writev_partial_continuations =
+            counters.writev_partial_continuations.saturating_add(1);
     }
 
     #[cfg(test)]
@@ -1056,7 +1157,14 @@ impl Reactor {
             return Err(err);
         }
 
+        #[cfg(not(feature = "diagnostic-counters"))]
         let submitted = self.ring_mut()?.submit()?;
+        #[cfg(feature = "diagnostic-counters")]
+        let submitted = {
+            let result = self.ring_mut()?.submit();
+            record_ring_enter_result(&mut self.diagnostics, &result);
+            result?
+        };
         self.retire_submitted(submitted)?;
         Ok(submitted)
     }
@@ -1130,10 +1238,20 @@ impl Reactor {
             return Err(err);
         }
 
+        #[cfg(not(feature = "diagnostic-counters"))]
         let submitted = self
             .ring_mut()?
             .submitter()
             .submit_with_args(min_complete, args)?;
+        #[cfg(feature = "diagnostic-counters")]
+        let submitted = {
+            let result = self
+                .ring_mut()?
+                .submitter()
+                .submit_with_args(min_complete, args);
+            record_ring_enter_result(&mut self.diagnostics, &result);
+            result?
+        };
         self.retire_submitted(submitted)?;
         Ok(submitted)
     }
@@ -1145,7 +1263,14 @@ impl Reactor {
             return Err(err);
         }
 
+        #[cfg(not(feature = "diagnostic-counters"))]
         let submitted = self.ring_mut()?.submit_and_wait(min_complete)?;
+        #[cfg(feature = "diagnostic-counters")]
+        let submitted = {
+            let result = self.ring_mut()?.submit_and_wait(min_complete);
+            record_ring_enter_result(&mut self.diagnostics, &result);
+            result?
+        };
         self.retire_submitted(submitted)?;
         Ok(submitted)
     }
@@ -1305,6 +1430,10 @@ impl Reactor {
         }
         *next_sequence = next_sequence.wrapping_add(1);
         drop(sq);
+        #[cfg(feature = "diagnostic-counters")]
+        {
+            self.diagnostics.sqes_queued = self.diagnostics.sqes_queued.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -1359,6 +1488,10 @@ impl Reactor {
         }
         *next_sequence = next_sequence.wrapping_add(1);
         drop(sq);
+        #[cfg(feature = "diagnostic-counters")]
+        {
+            self.diagnostics.sqes_queued = self.diagnostics.sqes_queued.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -5235,6 +5368,72 @@ mod tests {
         // SAFETY: the helper returns one open descriptor whose sole ownership
         // is transferred into this OwnedFd.
         (raw, unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    #[cfg(feature = "diagnostic-counters")]
+    #[test]
+    fn diagnostic_counters_classify_results_saturate_and_reset() {
+        let mut reactor =
+            Reactor::new_ringless_for_test(8).expect("ringless reactor construction failed");
+
+        record_ring_enter_result(&mut reactor.diagnostics, &Ok(3));
+        record_ring_enter_result(
+            &mut reactor.diagnostics,
+            &Err(io::Error::from_raw_os_error(libc::EINTR)),
+        );
+        record_ring_enter_result(
+            &mut reactor.diagnostics,
+            &Err(io::Error::from_raw_os_error(libc::EBUSY)),
+        );
+        record_ring_enter_result(
+            &mut reactor.diagnostics,
+            &Err(io::Error::from_raw_os_error(libc::ETIME)),
+        );
+        record_ring_enter_result(
+            &mut reactor.diagnostics,
+            &Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        );
+        record_ring_enter_result(
+            &mut reactor.diagnostics,
+            &Err(io::Error::other("non-errno ring failure")),
+        );
+        reactor.diagnostics.sqes_queued = 7;
+        unsafe {
+            Reactor::note_writev_partial_continuation(&mut reactor);
+            Reactor::note_writev_partial_continuation(&mut reactor);
+        }
+
+        let counters = reactor.take_diagnostic_counters();
+        assert_eq!(counters.ring_enter_attempts, 6);
+        assert_eq!(counters.ring_enter_successes, 1);
+        assert_eq!(counters.ring_enter_submitted_sqes, 3);
+        assert_eq!(counters.ring_enter_eintr, 1);
+        assert_eq!(counters.ring_enter_ebusy, 1);
+        assert_eq!(counters.ring_enter_etime, 1);
+        assert_eq!(counters.ring_enter_other_errors, 2);
+        assert_eq!(counters.sqes_queued, 7);
+        assert_eq!(counters.writev_partial_continuations, 2);
+        assert_eq!(
+            counters.ring_enter_attempts,
+            counters.ring_enter_successes
+                + counters.ring_enter_eintr
+                + counters.ring_enter_ebusy
+                + counters.ring_enter_etime
+                + counters.ring_enter_other_errors
+        );
+        assert_eq!(
+            reactor.take_diagnostic_counters(),
+            RuntimeDiagnosticCounters::default()
+        );
+
+        reactor.diagnostics.ring_enter_attempts = usize::MAX;
+        reactor.diagnostics.ring_enter_successes = usize::MAX;
+        reactor.diagnostics.ring_enter_submitted_sqes = usize::MAX;
+        record_ring_enter_result(&mut reactor.diagnostics, &Ok(1));
+        let saturated = reactor.take_diagnostic_counters();
+        assert_eq!(saturated.ring_enter_attempts, usize::MAX);
+        assert_eq!(saturated.ring_enter_successes, usize::MAX);
+        assert_eq!(saturated.ring_enter_submitted_sqes, usize::MAX);
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]

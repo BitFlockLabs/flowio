@@ -1382,6 +1382,50 @@ fn runtime_executor_runs_nop_future() {
     }
 }
 
+#[cfg(all(feature = "diagnostic-counters", not(miri)))]
+#[test]
+fn runtime_diagnostic_snapshot_observes_nop_and_resets() {
+    use flowio::test_support::runtime::diagnostics::{self, RuntimeDiagnosticCounters};
+
+    let mut executor = new_executor();
+    executor
+        .run(async move {
+            assert_eq!(Nop::new().await.expect("nop failed"), 0);
+        })
+        .expect("executor run failed");
+
+    let counters = diagnostics::take(&mut executor);
+    assert_eq!(counters.sqes_queued, 1);
+    assert_eq!(counters.ring_enter_submitted_sqes, 1);
+    assert!(counters.ring_enter_attempts >= 1);
+    assert_eq!(
+        counters.ring_enter_attempts,
+        counters.ring_enter_successes
+            + counters.ring_enter_eintr
+            + counters.ring_enter_ebusy
+            + counters.ring_enter_etime
+            + counters.ring_enter_other_errors
+    );
+    assert_eq!(counters.retained_payload_class_allocs, [0; 11]);
+    assert_eq!(counters.retained_heap_fallbacks, 0);
+    assert_eq!(counters.writev_scratch_class_allocs, [0; 4]);
+    assert_eq!(counters.writev_partial_continuations, 0);
+    assert_eq!(
+        RuntimeDiagnosticCounters::RETAINED_PAYLOAD_CLASS_BYTES,
+        [
+            64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+        ]
+    );
+    assert_eq!(
+        RuntimeDiagnosticCounters::WRITEV_SCRATCH_CLASS_IOVECS,
+        [64, 128, 512, 1024]
+    );
+    assert_eq!(
+        diagnostics::take(&mut executor),
+        RuntimeDiagnosticCounters::default()
+    );
+}
+
 #[test]
 fn runtime_io_wake_can_arm_timer_on_following_executor_pass() {
     let completed = Rc::new(Cell::new(false));

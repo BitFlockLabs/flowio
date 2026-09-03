@@ -43,6 +43,21 @@ pub mod utils {
 }
 
 pub mod runtime {
+    /// Opt-in executor-local counters for bounded diagnostic campaigns.
+    #[cfg(feature = "diagnostic-counters")]
+    pub mod diagnostics {
+        use crate::runtime::executor::Executor;
+        pub use crate::runtime::executor::RuntimeDiagnosticCounters;
+
+        /// Takes one executor's counters and resets them to zero.
+        ///
+        /// Call this only after [`Executor::run`] returns. Snapshot and reset
+        /// are deliberately separate from the benchmark's timed row.
+        pub fn take(executor: &mut Executor) -> RuntimeDiagnosticCounters {
+            executor.take_diagnostic_counters()
+        }
+    }
+
     pub mod fd_codegen {
         pub use crate::runtime::executor::flowio_slice305_probe_resubmit_same_state;
         pub use crate::runtime::fd::{

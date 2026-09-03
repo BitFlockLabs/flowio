@@ -8,9 +8,9 @@ macro_rules! debug_assert_slist_sanity {
     ($list:expr) => {{
         let mut slow = ($list).head;
         let mut fast = ($list).head;
-        let mut count = 0;
-        // Bounded Floyd cycle check; cap debug work on unexpectedly long lists.
-        while !fast.is_null() && count < 1000 {
+        // This debug-only whole-list oracle is deliberately exhaustive: stop
+        // only at the null terminator or when Floyd's walk finds a cycle.
+        while !fast.is_null() {
             unsafe {
                 fast = (*fast).next;
                 if fast.is_null() {
@@ -24,7 +24,6 @@ macro_rules! debug_assert_slist_sanity {
                     "singly linked list cycle detected"
                 );
             }
-            count += 1;
         }
     }};
 }

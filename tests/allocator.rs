@@ -152,6 +152,76 @@ fn basic_provider_frees_with_alloc_time_alignment_after_reinit() {
 }
 
 #[test]
+fn basic_provider_rejects_request_size_overflow() {
+    let mut provider = BasicMemoryProvider::new();
+    provider.init(64);
+
+    assert!(
+        provider.request_memory(usize::MAX).is_none(),
+        "header plus payload overflow must fail before allocation"
+    );
+}
+
+#[test]
+fn basic_provider_returns_aligned_nonoverlapping_live_ranges() {
+    const ALIGNMENT: usize = 256;
+    const FIRST_SIZE: usize = 33;
+    const SECOND_SIZE: usize = 257;
+
+    let mut provider = BasicMemoryProvider::new();
+    provider.init(ALIGNMENT);
+    let first = provider
+        .request_memory(FIRST_SIZE)
+        .expect("first provider allocation failed");
+    let second = provider
+        .request_memory(SECOND_SIZE)
+        .expect("second provider allocation failed");
+
+    assert_eq!((first as usize) % ALIGNMENT, 0);
+    assert_eq!((second as usize) % ALIGNMENT, 0);
+    let first_range = first as usize..(first as usize + FIRST_SIZE);
+    let second_range = second as usize..(second as usize + SECOND_SIZE);
+    assert!(
+        first_range.end <= second_range.start || second_range.end <= first_range.start,
+        "simultaneously live provider allocations must not overlap"
+    );
+
+    unsafe {
+        std::ptr::write_bytes(first, 0x11, FIRST_SIZE);
+        std::ptr::write_bytes(second, 0x22, SECOND_SIZE);
+        assert!((0..FIRST_SIZE).all(|index| *first.add(index) == 0x11));
+        assert!((0..SECOND_SIZE).all(|index| *second.add(index) == 0x22));
+        provider.free_memory(second, SECOND_SIZE);
+        provider.free_memory(first, FIRST_SIZE);
+    }
+}
+
+#[test]
+fn pool_free_null_is_noop() {
+    let mut provider = BasicMemoryProvider::new();
+    let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 1).unwrap();
+    pool.init();
+
+    unsafe { pool.free(std::ptr::null_mut()) };
+
+    let task = unsafe { pool.alloc(902).expect("pool must remain usable") };
+    assert_eq!(unsafe { (*task).id }, 902);
+    unsafe { pool.free(task) };
+}
+
+#[test]
+fn pool_rejects_slot_count_overflow() {
+    let mut provider = BasicMemoryProvider::new();
+
+    assert_eq!(
+        Pool::<Task, _>::new_uninit(&mut provider, usize::MAX)
+            .err()
+            .expect("pool slot geometry must reject multiplication overflow"),
+        PoolConfigError::SizeOverflow
+    );
+}
+
+#[test]
 fn pool_drop_allows_balanced_raw_slots() {
     let mut provider = VerboseProvider::new(4096, 64);
     let mut pool = Pool::<Task, _>::new_uninit(&mut provider, 1).unwrap();

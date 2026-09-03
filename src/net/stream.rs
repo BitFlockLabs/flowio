@@ -2981,6 +2981,10 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                         stats.writev_partial_continuations =
                             stats.writev_partial_continuations.saturating_add(1);
                     }
+                    #[cfg(feature = "diagnostic-counters")]
+                    unsafe {
+                        Reactor::note_writev_partial_continuation(pctx.reactor());
+                    }
                 }
             }
         }
@@ -3339,6 +3343,10 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
                         let stats = &mut (*pctx.runtime_state()).stats;
                         stats.writev_partial_continuations =
                             stats.writev_partial_continuations.saturating_add(1);
+                    }
+                    #[cfg(feature = "diagnostic-counters")]
+                    unsafe {
+                        Reactor::note_writev_partial_continuation(pctx.reactor());
                     }
                 }
             }

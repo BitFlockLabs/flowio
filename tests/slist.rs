@@ -215,4 +215,35 @@ mod debug_only {
             list.pop_front();
         }
     }
+
+    #[test]
+    #[should_panic(expected = "singly linked list cycle detected")]
+    fn test_1001_node_head_cycle_panics() {
+        const NODE_COUNT: usize = 1_001;
+
+        let mut nodes: Box<[Node]> = (0..NODE_COUNT)
+            .map(|value| Node {
+                link: utils::list::intrusive::slist::Link::new_unlinked(),
+                value: value as u64,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let nodes_ptr = nodes.as_mut_ptr();
+        let mut list: utils::list::intrusive::slist::SList<Node> =
+            utils::list::intrusive::slist::SList::new();
+
+        unsafe {
+            for index in 0..NODE_COUNT {
+                list.push_front_unchecked(nodes_ptr.add(index).cast());
+            }
+
+            // Push order makes the final element the head and element zero the
+            // tail. Closing tail -> head creates one 1,001-node cycle. The old
+            // 1,000-iteration Floyd cap returned before detecting this shape.
+            (*nodes_ptr).link.next = nodes_ptr.add(NODE_COUNT - 1).cast();
+            std::hint::black_box((*nodes_ptr).link.next);
+
+            let _ = list.pop_front();
+        }
+    }
 }
