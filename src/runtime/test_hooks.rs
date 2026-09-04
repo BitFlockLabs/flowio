@@ -1,4 +1,4 @@
-//! Development-only fault injection hooks for repository tests.
+//! Development-only fault injection hooks for crate tests.
 //!
 //! The module is compiled in debug builds or when `test-support` is enabled;
 //! normal release builds exclude it. The thread-local counters make otherwise

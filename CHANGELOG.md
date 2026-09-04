@@ -58,9 +58,6 @@ Alpha prereleases carry no compatibility guarantee.
   permit a null pointer only for an empty window. Every positive-length range
   must be non-null, suitably aligned, contained in one stable allocation, and
   satisfy the documented initialization and access requirements.
-- Projected write-all retries now rely consistently on the retained
-  carrier/completion-state invariant instead of preserving an unreachable
-  wake-less pending fallback.
 - Empty timer wheels now keep `current_tick` monotonic when refreshing a stale
   arm-time baseline.
 - TCP and Unix one-shot stream reads and writes now complete zero-length
@@ -129,14 +126,11 @@ Alpha prereleases carry no compatibility guarantee.
   matches are unchanged. A known notification whose declared record is shorter
   than its Linux layout minimum remains `InvalidData`, but its diagnostic now
   identifies the raw kind plus declared and required lengths.
-- Runtime dependencies have been refreshed while retaining the existing
-  feature set and minimum supported Rust version.
-- Compatibility documentation now consistently states that x86-64 Linux is
-  the currently supported runtime platform and that Linux 5.11 is its binding
-  kernel floor, imposed by `IORING_ENTER_EXT_ARG`. Other CPU architectures are
-  outside the current compatibility and validation contract. The older
-  `IORING_OP_CLOSE` and 14-byte `SCTP_EVENTS` requirements do not lower the
-  kernel floor or require a legacy SCTP subscription fallback.
+- Documented x86-64 Linux as the only supported runtime platform, with Linux
+  5.11 as the binding kernel floor imposed by `IORING_ENTER_EXT_ARG`. Other CPU
+  architectures are outside the current compatibility and validation contract.
+  The older `IORING_OP_CLOSE` and 14-byte `SCTP_EVENTS` requirements do not
+  lower the kernel floor or require a legacy SCTP subscription fallback.
 - Rich SCTP message operations now construct kernel-visible iovecs,
   control storage, and self-referential message headers directly in their
   retained completion payloads. Vectored receive and send futures no longer
@@ -305,9 +299,6 @@ Alpha prereleases carry no compatibility guarantee.
   its self-referential provider/pool relation. Narrow inlined operations retain
   the existing allocation behavior while keeping pool teardown before provider
   teardown.
-- Dev-only intrusive-list cursors now advance past a pending node before
-  unlinking it, so removing the next forward or backward node cannot leave the
-  cursor pointing at cleared links.
 - `SlabAllocator` now rejects slab acquisition before initialization and
   initializes its backing provider at most once, preventing safe code from
   formatting a slab before the provider accepts the required alignment.

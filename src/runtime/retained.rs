@@ -207,7 +207,7 @@ impl RetainedPayloadDiagnosticCounters {
     }
 }
 
-/// Repository-only retained-storage state sampled at executor quiescence.
+/// Test-support-only retained-storage state sampled at executor quiescence.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetainedPayloadPoolQuiescence {
@@ -433,7 +433,7 @@ pub(crate) struct RetainedPayloadPool {
     /// Debug/test-support counters exported through runtime stats and tests.
     stats: RetainedPayloadPoolStats,
     #[cfg(feature = "diagnostic-counters")]
-    /// Opt-in counters sampled and reset between benchmark rows.
+    /// Opt-in counters sampled and reset between timed benchmark intervals.
     diagnostics: RetainedPayloadDiagnosticCounters,
     /// Fixed, nonallocating cleanup records used only so deliberate
     /// partial-initialization poison tests remain Miri leak-clean.
@@ -505,10 +505,9 @@ impl RetainedPayloadPool {
     /// [`RetainedPayload::take`] or [`RetainedPayload::drop_and_free`].
     #[inline(always)]
     pub(crate) fn alloc<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
-        // Keep this established by-value path independent of the raw-slot RAII
-        // guard below. The Slice 68 optimized-code oracle proved that routing
-        // safe callers through that guard enlarged unaffected whole-payload
-        // stream transfers; this direct shape preserves their existing codegen.
+        // Keep this by-value path independent of the raw-slot RAII guard below:
+        // routing safe callers through that guard enlarges codegen for
+        // whole-payload stream transfers, which this direct shape preserves.
         match class_index_for::<T>() {
             Some(class_index) => {
                 if let Some(result) = self.classes[class_index].alloc_block() {
@@ -1133,8 +1132,8 @@ impl RetainedIovecScratchInit {
         }
     }
 
-    /// Builds the established movable scratch value for unaffected safe
-    /// callers while sharing the token's allocation and release policy.
+    /// Builds a movable [`RetainedIovecScratch`] that shares this token's
+    /// allocation and release policy.
     #[inline(always)]
     #[cfg(any(test, feature = "test-support"))]
     fn into_scratch(self) -> RetainedIovecScratch {

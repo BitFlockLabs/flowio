@@ -1,4 +1,4 @@
-//! Development-only bounded capture for exact test subprocesses.
+//! Development-only bounded capture of test subprocess output.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -118,7 +118,7 @@ impl std::error::Error for ChildCaptureError {
     }
 }
 
-/// Exit status and bounded output collected from one exact child.
+/// Exit status and bounded output collected from one captured child process.
 #[derive(Debug)]
 pub struct CapturedChildOutput {
     /// Reaped child exit status.

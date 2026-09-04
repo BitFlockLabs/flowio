@@ -2,7 +2,7 @@
 
 // These process/fd/io_uring allocation oracles exercise facilities that Miri
 // intentionally does not emulate. The public trait and layout guards remain in
-// `slice305_public_compat` and do run under Miri.
+// `descriptor_core_public_compat` and do run under Miri.
 #![cfg(not(miri))]
 
 mod common;
@@ -37,7 +37,7 @@ use std::time::Duration;
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-const CORE_OOM_CHILD_ENV: &str = "FLOWIO_SLICE305_CORE_OOM_CHILD";
+const CORE_OOM_CHILD_ENV: &str = "FLOWIO_DESCRIPTOR_CORE_OOM_CHILD";
 const CORE_OOM_TEST: &str = "descriptor_core_oom_uses_global_allocation_handler";
 
 fn null_owned_fd() -> OwnedFd {
@@ -80,8 +80,8 @@ fn descriptor_construction_paths_have_exact_core_allocation_counts() {
         UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("UDP bind failed")
     });
 
-    // The listener used one `Rc` allocation before Slice 305. Its descriptor
-    // core replaces that owner; it must not add a second allocation.
+    // The descriptor core is the listener's only heap owner: binding allocates
+    // it exactly once and adds nothing beside it.
     assert_one_core_allocation(|| {
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 8)
             .expect("TCP listener bind failed")
@@ -195,10 +195,10 @@ fn tls_wrapper_reuses_the_existing_tcp_descriptor_core() {
         transport_write_buffer_size: 1_024,
     };
 
-    // The exact constructor delta is frozen against Slice 304. Moving the TCP
-    // stream into TLS must reuse its existing core rather than allocating a
-    // second descriptor owner; TLS protocol and scratch allocations are the
-    // unchanged baseline work represented by this count.
+    // Moving the TCP stream into TLS must reuse its existing core rather than
+    // allocating a second descriptor owner. The remaining allocations are
+    // rustls protocol state and transport scratch buffers, so this count
+    // changes only when TLS construction itself changes.
     let before = ThreadLocalAllocationSnapshot::current();
     let tls = TlsClientStream::new(stream, config, server_name, options)
         .expect("TLS allocation wrapper construction failed");

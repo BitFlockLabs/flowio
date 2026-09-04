@@ -59,11 +59,9 @@ pub mod runtime {
     }
 
     pub mod fd_codegen {
-        pub use crate::runtime::executor::flowio_slice305_probe_resubmit_same_state;
-        pub use crate::runtime::fd::{
-            flowio_slice305_probe_clone_lease, flowio_slice305_probe_drop_nonfinal_lease,
-        };
-        pub use crate::runtime::reactor::flowio_slice305_probe_reclaim_target;
+        pub use crate::runtime::executor::flowio_probe_resubmit_same_state;
+        pub use crate::runtime::fd::{flowio_probe_clone_lease, flowio_probe_drop_nonfinal_lease};
+        pub use crate::runtime::reactor::flowio_probe_reclaim_target;
     }
 
     pub mod reactor {

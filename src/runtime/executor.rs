@@ -82,7 +82,7 @@ const TASK_DATA_ALIGN: usize = align_of::<TaskHeader>();
 /// Number of task slots allocated per task-pool slab page.
 const TASKS_PER_SLAB: usize = 1024;
 /// The owner pointer and all-task link consume prior padding at the fixed
-/// payload boundary, so 64-bit task slots retain their pre-slice geometry.
+/// payload boundary, so adding them does not change the 64-bit task slot size.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(TASK_DATA_ALIGN == 64);
@@ -277,14 +277,14 @@ define_runtime_stats!(pub(crate));
 #[cfg(all(not(debug_assertions), any(test, feature = "test-support")))]
 const _: [(); 0] = [(); size_of::<RuntimeStats>()];
 
-/// Opt-in executor-local counters for bounded diagnostic campaigns.
+/// Opt-in executor-local counters for bounded diagnostic runs.
 ///
 /// These counters are available only with the dev-only
 /// `diagnostic-counters` feature and are not a supported production metrics
 /// API. They use plain owner-thread-local integers: no atomics, locks, queues,
 /// allocation, or background work is introduced. Use the test-support facade
 /// to snapshot and reset them only after [`Executor::run`] returns, so the
-/// observation work stays outside benchmark row timing.
+/// observation work stays outside the timed benchmark interval.
 #[cfg(feature = "diagnostic-counters")]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -342,7 +342,7 @@ impl RuntimeDiagnosticCounters {
         crate::runtime::retained::RETAINED_IOVEC_SIZE_CLASSES;
 }
 
-/// Repository-only ownership snapshot taken between executor runs.
+/// Test-support-only ownership snapshot taken between executor runs.
 ///
 /// This type exists only for crate tests and the dev-only `test-support`
 /// feature. It is absent from ordinary production builds and is not a
@@ -1113,7 +1113,7 @@ pub(crate) fn with_ringless_poll_context_for_test<R>(
     result
 }
 
-/// Runs one repository benchmark with an initialized executor context and raw
+/// Runs one benchmark closure with an initialized executor context and raw
 /// access to its heap-stable owner-thread fields.
 #[cfg(feature = "test-support")]
 pub(crate) fn with_executor_context_for_benchmark<R>(
@@ -2517,14 +2517,14 @@ fn timers_pending_after_processing(timers_pending: bool, recheck: impl FnOnce() 
 }
 
 impl Executor {
-    /// Returns the configured process quota for repository tests.
+    /// Returns the configured process quota for tests.
     #[cfg(all(not(miri), any(test, feature = "test-support")))]
     #[doc(hidden)]
     pub fn test_process_quota(&self) -> usize {
         self.process_quota
     }
 
-    /// Returns the configured CPU affinity for repository tests.
+    /// Returns the configured CPU affinity for tests.
     #[cfg(all(not(miri), any(test, feature = "test-support")))]
     #[doc(hidden)]
     pub fn test_cpu_affinity(&self) -> Option<usize> {
@@ -2535,14 +2535,14 @@ impl Executor {
     ///
     /// The test-support facade is the external entry point. Keeping this
     /// operation between `run` calls prevents snapshot/reset work from
-    /// entering a timed benchmark row.
+    /// entering the timed benchmark interval.
     #[cfg(feature = "diagnostic-counters")]
     pub(crate) fn take_diagnostic_counters(&mut self) -> RuntimeDiagnosticCounters {
         let state = unsafe { &mut *self.owner.state_ptr() };
         state.reactor.take_diagnostic_counters()
     }
 
-    /// Samples repository-only ownership state between executor runs.
+    /// Samples test-support-only ownership state between executor runs.
     ///
     /// Callers must use this only after `run` has returned. The snapshot walks
     /// already-owned slab metadata and reads existing registries/counters; it
@@ -3732,7 +3732,7 @@ where
     unsafe { submit_tracked_sqe(pctx, sqe) }
 }
 
-/// Candidate-only codegen probe for same-state typed fd resubmission.
+/// Test-support codegen probe for same-state typed fd resubmission.
 ///
 /// # Safety
 ///
@@ -3741,9 +3741,10 @@ where
 /// reserved opaque argument and may be null; the probe isolates only the
 /// ownership fragment used before the separately inspected ring submission.
 #[cfg(feature = "test-support")]
+#[doc(hidden)]
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub unsafe extern "C" fn flowio_slice305_probe_resubmit_same_state(
+pub unsafe extern "C" fn flowio_probe_resubmit_same_state(
     _poll_ctx: *const (),
     fd_state: *const (),
 ) -> i32 {

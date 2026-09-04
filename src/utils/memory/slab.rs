@@ -135,7 +135,7 @@ impl SlabPageChain {
         }
     }
 
-    /// Counts currently retained slab pages for repository-only quiescence
+    /// Counts currently retained slab pages for test-support quiescence
     /// checks. The walk is outside allocation and scheduling paths and adds no
     /// bookkeeping to ordinary builds.
     #[cfg(any(test, feature = "test-support"))]
@@ -472,7 +472,7 @@ impl<'a, P: super::provider::MemoryProvider> SlabAllocator<'a, P> {
         self.slab_align
     }
 
-    /// Returns the authoritative checked slot spacing for crate-unit tests.
+    /// Returns the checked byte stride between consecutive object slots.
     #[cfg(test)]
     pub(crate) fn object_stride(&self) -> usize {
         self.object_stride

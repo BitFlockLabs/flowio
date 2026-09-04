@@ -1086,8 +1086,8 @@ unsafe fn emplace_retained_writev_payload<C: WriteBufferChain<N>, const N: usize
 
 /// Constructs a projected-writev payload directly in retained storage.
 ///
-/// Projection remains post-attachment so its fallible callback observes the
-/// same stable source and scratch addresses as before.
+/// Projection runs after payload attachment so its fallible callback observes
+/// the final stable source and scratch addresses.
 ///
 /// # Safety
 ///

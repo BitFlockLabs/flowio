@@ -20,7 +20,6 @@ fn test_empty_list() {
         utils::list::intrusive::slist::SList::new();
     assert!(list.is_empty(), "Newly created list should be empty");
 
-    // Popping from an empty list should return None
     assert_eq!(node_offset(), 0);
     let popped = unsafe { list.pop_front() };
     assert!(
@@ -183,7 +182,6 @@ mod debug_only {
 
         unsafe {
             list.push_front(node_link_ptr(&mut n1));
-            // This should panic because n1 is already the head, and push_front_unchecked forbids pushing the head onto itself.
             list.push_front_unchecked(node_link_ptr(&mut n1));
         }
     }
@@ -238,8 +236,8 @@ mod debug_only {
             }
 
             // Push order makes the final element the head and element zero the
-            // tail. Closing tail -> head creates one 1,001-node cycle. The old
-            // 1,000-iteration Floyd cap returned before detecting this shape.
+            // tail. Closing tail -> head creates one 1,001-node cycle, so
+            // detection must not depend on a fixed traversal cap.
             (*nodes_ptr).link.next = nodes_ptr.add(NODE_COUNT - 1).cast();
             std::hint::black_box((*nodes_ptr).link.next);
 

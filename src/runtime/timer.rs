@@ -1045,7 +1045,7 @@ impl TimerRuntime {
         self.wheel.has_pending_entries()
     }
 
-    /// Returns the retained timer slab count for repository-only quiescence
+    /// Returns the retained timer slab count for test-support quiescence
     /// checks. Sampling walks existing slab metadata and does not add timer
     /// fast-path bookkeeping.
     #[cfg(any(test, feature = "test-support"))]

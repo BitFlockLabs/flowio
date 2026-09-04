@@ -1,7 +1,6 @@
-//! Frozen public compatibility guards for the owner-thread descriptor core.
+//! Public compatibility guards for the owner-thread descriptor core.
 
 #![allow(clippy::type_complexity)]
-#![allow(unexpected_cfgs)]
 
 use flowio::net::sctp::{
     AcceptFuture as SctpAcceptFuture, ConnectFuture as SctpConnectFuture,
@@ -80,38 +79,19 @@ type SendChain = IoBuffReadOnlyVec<Vec<u8>, SEGMENTS>;
 type TcpWritevSend = WritevFuture<'static, SendChain, SEGMENTS, TcpStream>;
 type TcpWritevAllSend = WritevAllFuture<'static, SendChain, SEGMENTS, TcpStream>;
 
-// Slice 305 deliberately narrows exactly these three descriptor handles from
-// the baseline's `Send + !Sync` to owner-thread `!Send + !Sync`. Their
-// `UnwindSafe + !RefUnwindSafe` baseline remains unchanged.
-#[cfg(flowio_slice305_baseline)]
-assert_impl_all!(TcpStream: Send, UnwindSafe);
-#[cfg(not(flowio_slice305_baseline))]
+// These descriptor handles are bound to their owner thread: `!Send + !Sync`,
+// while remaining `UnwindSafe + !RefUnwindSafe`.
 assert_impl_all!(TcpStream: UnwindSafe);
-#[cfg(flowio_slice305_baseline)]
-assert_not_impl_any!(TcpStream: Sync, RefUnwindSafe);
-#[cfg(not(flowio_slice305_baseline))]
 assert_not_impl_any!(TcpStream: Send, Sync, RefUnwindSafe);
 
-#[cfg(flowio_slice305_baseline)]
-assert_impl_all!(UnixStream: Send, UnwindSafe);
-#[cfg(not(flowio_slice305_baseline))]
 assert_impl_all!(UnixStream: UnwindSafe);
-#[cfg(flowio_slice305_baseline)]
-assert_not_impl_any!(UnixStream: Sync, RefUnwindSafe);
-#[cfg(not(flowio_slice305_baseline))]
 assert_not_impl_any!(UnixStream: Send, Sync, RefUnwindSafe);
 
-#[cfg(flowio_slice305_baseline)]
-assert_impl_all!(UdpSocket: Send, UnwindSafe);
-#[cfg(not(flowio_slice305_baseline))]
 assert_impl_all!(UdpSocket: UnwindSafe);
-#[cfg(flowio_slice305_baseline)]
-assert_not_impl_any!(UdpSocket: Sync, RefUnwindSafe);
-#[cfg(not(flowio_slice305_baseline))]
 assert_not_impl_any!(UdpSocket: Send, Sync, RefUnwindSafe);
 
-// Descriptor-bearing handles that were already local retain their baseline
-// matrix. Listeners deliberately retain the older unwind boundary as well.
+// These owner-thread-bound handles also exclude both unwind traits, so a panic
+// cannot carry one across a catch boundary.
 assert_not_impl_any!(TcpConnector: Send, Sync, UnwindSafe, RefUnwindSafe);
 assert_not_impl_any!(TcpListener: Send, Sync, UnwindSafe, RefUnwindSafe);
 assert_not_impl_any!(SctpConnector: Send, Sync, UnwindSafe, RefUnwindSafe);
@@ -163,8 +143,8 @@ assert_local_unwind_boundary!(
     TlsShutdownFuture<'static>,
 );
 
-// Values suitable for a future bounded inter-executor request/result protocol
-// stay runtime-independent. This does not authorize or implement that queue.
+// These configuration and error values are runtime-independent and can cross
+// threads even though the handles above cannot.
 assert_impl_all!(ExecutorConfig: Send, Sync, UnwindSafe, RefUnwindSafe);
 assert_impl_all!(ReactorConfig: Send, Sync, UnwindSafe, RefUnwindSafe);
 assert_impl_all!(Waker: Send, Sync);
@@ -194,9 +174,9 @@ fn assert_layout<T>(name: &str, expected_size: usize, expected_align: usize) {
 }
 
 #[test]
-fn descriptor_handle_and_future_layouts_match_slice304_baseline() {
-    // Exact x86-64 Linux admission guards. SctpStream includes its approved
-    // fixed nested-notification classifier; these are not portable ABI promises.
+fn descriptor_handle_and_future_layouts_match_x86_64_contract() {
+    // Exact x86-64 Linux admission guards. SctpStream's size includes its fixed
+    // nested-notification classifier; these are not portable ABI promises.
     assert_layout::<TcpStream>("TcpStream", 8, 4);
     assert_layout::<TcpListener>("TcpListener", 64, 8);
     assert_layout::<TcpConnector>("TcpConnector", 160, 8);

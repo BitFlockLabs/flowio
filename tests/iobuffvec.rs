@@ -264,7 +264,6 @@ fn initialize_materialized_iovec_prefix<const N: usize>(
 
 #[test]
 fn vec_mut_new_empty() {
-    println!("--- IoBuffVecMut::new empty ---");
     let chain = IoBuffVecMut::<4>::new();
     println!(
         "  segments: {}, capacity: {}, len: {}",
@@ -280,7 +279,6 @@ fn vec_mut_new_empty() {
 
 #[test]
 fn vec_mut_default() {
-    println!("--- IoBuffVecMut::default ---");
     let chain = IoBuffVecMut::<2>::default();
     assert_eq!(chain.segments(), 0);
     assert_eq!(chain.capacity(), 2);
@@ -288,7 +286,6 @@ fn vec_mut_default() {
 
 #[test]
 fn vec_mut_from_array() {
-    println!("--- IoBuffVecMut::from_array ---");
     let mut b1 = IoBuffMut::new(0, 16, 0);
     b1.payload_append(b"one").unwrap();
     let mut b2 = IoBuffMut::new(0, 16, 0);
@@ -302,7 +299,6 @@ fn vec_mut_from_array() {
 
 #[test]
 fn vec_mut_push_single() {
-    println!("--- Push single buffer ---");
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"hello").unwrap();
     println!(
@@ -326,7 +322,6 @@ fn vec_mut_push_single() {
 
 #[test]
 fn vec_mut_push_multiple() {
-    println!("--- Push multiple buffers ---");
     let mut header = IoBuffMut::new(0, 16, 0);
     header.payload_append(b"HDR:").unwrap();
 
@@ -356,7 +351,6 @@ fn vec_mut_push_multiple() {
 
 #[test]
 fn vec_mut_push_at_capacity_returns_error() {
-    println!("--- Push at capacity ---");
     let mut chain = IoBuffVecMut::<2>::new();
     chain.push(IoBuffMut::new(0, 8, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 8, 0)).unwrap();
@@ -374,7 +368,6 @@ fn vec_mut_push_at_capacity_returns_error() {
 
 #[test]
 fn vec_mut_push_empty_buffers() {
-    println!("--- Push empty buffers ---");
     let mut chain = IoBuffVecMut::<3>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
@@ -426,7 +419,6 @@ fn vec_mut_checked_lengths_cover_public_normal_and_empty_cases() {
 
 #[test]
 fn vec_frozen_new_empty() {
-    println!("--- IoBuffVec::new empty ---");
     let chain = flowio::runtime::buffer::iobuffvec::IoBuffVec::<4>::new();
     assert_eq!(chain.segments(), 0);
     assert_eq!(chain.capacity(), 4);
@@ -436,7 +428,6 @@ fn vec_frozen_new_empty() {
 
 #[test]
 fn vec_frozen_push_multiple() {
-    println!("--- IoBuffVec::push multiple frozen segments ---");
     let mut b1 = IoBuffMut::new(0, 16, 0);
     b1.payload_append(b"hello").unwrap();
     let mut b2 = IoBuffMut::new(0, 16, 0);
@@ -453,7 +444,6 @@ fn vec_frozen_push_multiple() {
 
 #[test]
 fn vec_frozen_from_array() {
-    println!("--- IoBuffVec::from_array ---");
     let mut b1 = IoBuffMut::new(0, 16, 0);
     b1.payload_append(b"seg0").unwrap();
     let mut b2 = IoBuffMut::new(0, 16, 0);
@@ -469,7 +459,6 @@ fn vec_frozen_from_array() {
 
 #[test]
 fn vec_frozen_push_at_capacity_returns_error() {
-    println!("--- IoBuffVec::push at capacity ---");
     let mut b1 = IoBuffMut::new(0, 8, 0);
     b1.payload_append(b"a").unwrap();
     let mut b2 = IoBuffMut::new(0, 8, 0);
@@ -674,7 +663,6 @@ fn vec_read_only_into_iter_middle_remaining_panic_releases_tail_once() {
 
 #[test]
 fn vec_mut_get() {
-    println!("--- get ---");
     let mut chain = IoBuffVecMut::<2>::new();
     let mut buf = IoBuffMut::new(0, 32, 0);
     buf.payload_append(b"segment0").unwrap();
@@ -687,7 +675,6 @@ fn vec_mut_get() {
 
 #[test]
 fn vec_mut_get_mut_modify() {
-    println!("--- get_mut modify ---");
     let mut chain = IoBuffVecMut::<2>::new();
     chain.push(IoBuffMut::new(0, 32, 0)).unwrap();
 
@@ -720,7 +707,6 @@ fn vec_mut_get_mut_out_of_bounds_returns_error() {
 
 #[test]
 fn vec_mut_writable_len() {
-    println!("--- writable_len ---");
     let mut chain = IoBuffVecMut::<2>::new();
 
     let mut buf1 = IoBuffMut::new(0, 100, 0);
@@ -730,7 +716,6 @@ fn vec_mut_writable_len() {
     chain.push(IoBuffMut::new(0, 200, 0)).unwrap();
 
     let writable = chain.writable_len();
-    println!("  writable_len: {} (100-7 + 200 = 293)", writable);
     assert_eq!(writable, (100 - 7) + 200);
 }
 
@@ -740,7 +725,6 @@ fn vec_mut_writable_len() {
 
 #[test]
 fn vec_mut_distribute_written_single_segment() {
-    println!("--- distribute_written: single segment ---");
     let mut chain = IoBuffVecMut::<1>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
 
@@ -759,7 +743,6 @@ fn vec_mut_distribute_written_single_segment() {
 
 #[test]
 fn vec_mut_distribute_written_across_multiple() {
-    println!("--- distribute_written: across 3 segments ---");
     let mut chain = IoBuffVecMut::<3>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 4096, 0)).unwrap();
@@ -785,7 +768,6 @@ fn vec_mut_distribute_written_across_multiple() {
 
 #[test]
 fn vec_mut_distribute_written_fills_all() {
-    println!("--- distribute_written: fills all segments exactly ---");
     let mut chain = IoBuffVecMut::<3>::new();
     chain.push(IoBuffMut::new(0, 10, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 20, 0)).unwrap();
@@ -803,12 +785,10 @@ fn vec_mut_distribute_written_fills_all() {
     assert_eq!(seg!(chain, 1).payload_bytes(), &expected[10..30]);
     assert_eq!(seg!(chain, 2).payload_bytes(), &expected[30..]);
     assert_eq!(chain.len(), 60);
-    println!("  All segments filled exactly: OK");
 }
 
 #[test]
 fn vec_mut_distribute_written_zero() {
-    println!("--- distribute_written: zero bytes ---");
     let mut chain = IoBuffVecMut::<2>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
@@ -817,7 +797,6 @@ fn vec_mut_distribute_written_zero() {
     assert_eq!(seg!(chain, 0).payload_len(), 0);
     assert_eq!(seg!(chain, 1).payload_len(), 0);
     assert_eq!(chain.len(), 0);
-    println!("  Zero bytes distributed: OK");
 }
 
 // ============================================================================
@@ -826,7 +805,6 @@ fn vec_mut_distribute_written_zero() {
 
 #[test]
 fn vec_mut_freeze() {
-    println!("--- freeze ---");
     let mut chain = IoBuffVecMut::<3>::new();
 
     let mut h = IoBuffMut::new(0, 16, 0);
@@ -851,18 +829,15 @@ fn vec_mut_freeze() {
 
 #[test]
 fn vec_mut_freeze_empty() {
-    println!("--- freeze empty chain ---");
     let chain = IoBuffVecMut::<4>::new();
     let frozen = chain.freeze();
     assert_eq!(frozen.segments(), 0);
     assert_eq!(frozen.len(), 0);
     assert!(frozen.is_empty());
-    println!("  Empty freeze: OK");
 }
 
 #[test]
 fn vec_mut_freeze_with_headroom() {
-    println!("--- freeze buffers with headroom ---");
     let mut chain = IoBuffVecMut::<2>::new();
 
     let mut buf = IoBuffMut::new(8, 64, 0);
@@ -882,7 +857,6 @@ fn vec_mut_freeze_with_headroom() {
 
 #[test]
 fn vec_frozen_clone() {
-    println!("--- IoBuffVec clone ---");
     let mut chain = IoBuffVecMut::<2>::new();
     let mut buf = IoBuffMut::new(0, 32, 0);
     buf.payload_append(b"shared").unwrap();
@@ -913,7 +887,6 @@ fn vec_frozen_clone() {
 
 #[test]
 fn vec_frozen_clone_independent_drop() {
-    println!("--- IoBuffVec clone + independent drop ---");
     let mut chain = IoBuffVecMut::<2>::new();
     let mut b1 = IoBuffMut::new(0, 32, 0);
     b1.payload_append(b"seg1").unwrap();
@@ -935,7 +908,6 @@ fn vec_frozen_clone_independent_drop() {
     assert_eq!(seg!(c2, 1).bytes(), b"seg2");
 
     drop(c2);
-    println!("  All dropped independently: OK");
 }
 
 // ============================================================================
@@ -944,7 +916,6 @@ fn vec_frozen_clone_independent_drop() {
 
 #[test]
 fn vec_frozen_iter() {
-    println!("--- IoBuffVec iter ---");
     let mut chain = IoBuffVecMut::<3>::new();
     for i in 0..3 {
         let mut buf = IoBuffMut::new(0, 16, 0);
@@ -964,7 +935,6 @@ fn vec_frozen_iter() {
 
 #[test]
 fn vec_frozen_chain_reports_segments_and_len() {
-    println!("--- Frozen chain reports segments and len ---");
     let mut chain = IoBuffVecMut::<2>::new();
     let mut buf = IoBuffMut::new(0, 32, 0);
     buf.payload_append(b"test data").unwrap();
@@ -984,7 +954,6 @@ fn vec_frozen_chain_reports_segments_and_len() {
 
 #[test]
 fn vec_mut_writable_len_and_distribute_written() {
-    println!("--- writable_len + distribute_written ---");
     let mut chain = IoBuffVecMut::<2>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 128, 0)).unwrap();
@@ -1015,7 +984,6 @@ fn vec_mut_writable_len_and_distribute_written() {
 
 #[test]
 fn vec_mut_single_capacity() {
-    println!("--- Single capacity chain ---");
     let mut chain = IoBuffVecMut::<1>::new();
     let mut buf = IoBuffMut::new(0, 64, 0);
     buf.payload_append(b"only one").unwrap();
@@ -1027,12 +995,10 @@ fn vec_mut_single_capacity() {
 
     assert_eq!(chain.len(), 8);
     assert_eq!(seg!(chain, 0).payload_bytes(), b"only one");
-    println!("  Single segment chain: OK");
 }
 
 #[test]
 fn vec_mut_large_segment_count() {
-    println!("--- Large segment count (16) ---");
     let mut chain = IoBuffVecMut::<16>::new();
     for i in 0..16 {
         let mut buf = IoBuffMut::new(0, 32, 0);
@@ -1045,12 +1011,10 @@ fn vec_mut_large_segment_count() {
     for i in 0..16 {
         assert_eq!(seg!(chain, i).payload_bytes(), &[i as u8; 4]);
     }
-    println!("  16 segments: OK");
 }
 
 #[test]
 fn vec_mut_freeze_reflects_modified_buffers_without_rebuild() {
-    println!("--- freeze reflects modified buffers without rebuild ---");
     let mut chain = IoBuffVecMut::<2>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
@@ -1070,7 +1034,6 @@ fn vec_mut_freeze_reflects_modified_buffers_without_rebuild() {
 
 #[test]
 fn vec_mut_drop_cleans_up() {
-    println!("--- Drop cleans up all segments ---");
     let mut chain = IoBuffVecMut::<4>::new();
     for _ in 0..4 {
         let mut buf = IoBuffMut::new(0, 1024, 0);
@@ -1078,12 +1041,10 @@ fn vec_mut_drop_cleans_up() {
         chain.push(buf).unwrap();
     }
     drop(chain);
-    println!("  Dropped 4-segment chain: no leak, no double-free");
 }
 
 #[test]
 fn vec_frozen_drop_cleans_up() {
-    println!("--- Frozen drop cleans up all segments ---");
     let mut chain = IoBuffVecMut::<3>::new();
     for _ in 0..3 {
         let mut buf = IoBuffMut::new(0, 512, 0);
@@ -1096,12 +1057,10 @@ fn vec_frozen_drop_cleans_up() {
     drop(c1);
     drop(frozen);
     drop(c2);
-    println!("  Dropped frozen chain + 2 clones: no leak, no double-free");
 }
 
 #[test]
 fn vec_mut_mixed_buffer_sizes() {
-    println!("--- Mixed buffer sizes ---");
     let mut chain = IoBuffVecMut::<4>::new();
 
     let sizes = [8, 4096, 64, 65536];
@@ -1118,12 +1077,10 @@ fn vec_mut_mixed_buffer_sizes() {
     for (i, &sz) in sizes.iter().enumerate() {
         assert_eq!(seg!(chain, i).payload_len(), sz / 2);
     }
-    println!("  Mixed sizes: OK");
 }
 
 #[test]
 fn vec_distribute_written_partial_first_segment() {
-    println!("--- distribute_written: partial first segment only ---");
     let mut chain = IoBuffVecMut::<3>::new();
     chain.push(IoBuffMut::new(0, 100, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 200, 0)).unwrap();
@@ -1138,7 +1095,6 @@ fn vec_distribute_written_partial_first_segment() {
     assert_eq!(seg!(chain, 1).payload_len(), 0);
     assert_eq!(seg!(chain, 2).payload_len(), 0);
     assert_eq!(seg!(chain, 0).payload_bytes(), expected);
-    println!("  Partial first segment: OK");
 }
 
 // ============================================================================

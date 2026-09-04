@@ -44,7 +44,7 @@ pub(crate) enum ReactorSubmitStatus {
     Busy,
 }
 
-/// Repository-only reactor state sampled after an executor run drains.
+/// Test-support-only reactor state sampled after an executor run drains.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReactorQuiescence {
@@ -650,7 +650,7 @@ pub(crate) struct Reactor {
     /// The operation and retained-payload pools must then be leaked because the
     /// kernel may still hold pointers into their checked-out storage.
     storage_abandoned: bool,
-    /// Opt-in owner-thread-local counters for diagnostic campaigns.
+    /// Opt-in owner-thread-local counters for diagnostic runs.
     #[cfg(feature = "diagnostic-counters")]
     diagnostics: RuntimeDiagnosticCounters,
 }
@@ -1954,7 +1954,7 @@ impl Drop for Reactor {
     }
 }
 
-/// Candidate-only codegen probe for target-completion state reclamation.
+/// Test-support codegen probe for target-completion state reclamation.
 ///
 /// # Safety
 ///
@@ -1962,9 +1962,10 @@ impl Drop for Reactor {
 /// live completed `state`. The state must be ready for exactly one ordinary
 /// target-CQE reclamation and may hold the final descriptor lease.
 #[cfg(feature = "test-support")]
+#[doc(hidden)]
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub unsafe extern "C" fn flowio_slice305_probe_reclaim_target(reactor: *mut (), state: *mut ()) {
+pub unsafe extern "C" fn flowio_probe_reclaim_target(reactor: *mut (), state: *mut ()) {
     unsafe {
         Reactor::free_op_unchecked(reactor.cast::<Reactor>(), state.cast::<CompletionState>())
     };
@@ -2878,7 +2879,7 @@ impl Drop for CompletionDrainCloseBenchmarkOutput {
 
 /// Measures final listener-owner destruction during completion retirement.
 ///
-/// Repository benchmark setup creates and completes one NOP per listener
+/// Benchmark setup creates and completes one NOP per listener
 /// outside timing. The timed interval contains only production completion
 /// retirement, final task-owned listener destruction, and the post-view close
 /// submission pass. Close-CQE retirement and validation remain outside timing.
@@ -3060,7 +3061,7 @@ pub fn benchmark_completion_drain_close(
 
 /// Measures retirement of targets queued after cancel-submit pressure.
 ///
-/// This repository-only benchmark seam excludes queue construction from the
+/// This benchmark seam excludes queue construction from the
 /// timed interval. Each measured operation retires one completion state in
 /// reverse queue order, exercising the pending-cancel unlink path directly.
 #[cfg(feature = "test-support")]
@@ -3102,8 +3103,8 @@ pub fn benchmark_cancel_submit_pressure(
 
                 // Model the state immediately after an ASYNC_CANCEL submit
                 // failure. Release builds intentionally compile fault hooks
-                // out of the submission fast path, so this repository-only
-                // seam constructs the equivalent queued state directly.
+                // out of the submission fast path, so this test-support seam
+                // constructs the equivalent queued state directly.
                 unsafe {
                     (*state).set_orphaned();
                     CompletionState::clear_waiter_unchecked(state);

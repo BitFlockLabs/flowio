@@ -32,7 +32,7 @@ macro_rules! debug_assert_list_inited {
     ($list:expr) => {};
 }
 
-/// The intrusive hook that must be embedded within your struct.
+/// Intrusive hook embedded in containers stored inside a [`DList`].
 #[repr(C)]
 pub struct Link {
     /// Next link in the circular list.

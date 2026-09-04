@@ -615,7 +615,7 @@ impl Drop for RuntimeFdOpState<'_> {
 
 impl std::panic::UnwindSafe for RuntimeFdOpState<'_> {}
 
-/// Candidate-only codegen probe for one descriptor-lease clone.
+/// Test-support codegen probe for one descriptor-lease clone.
 ///
 /// # Safety
 ///
@@ -624,24 +624,26 @@ impl std::panic::UnwindSafe for RuntimeFdOpState<'_> {}
 /// consumed once by the matching non-final-drop probe while another owner is
 /// still live.
 #[cfg(feature = "test-support")]
+#[doc(hidden)]
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub unsafe extern "C" fn flowio_slice305_probe_clone_lease(runtime_fd: *const ()) -> *const () {
+pub unsafe extern "C" fn flowio_probe_clone_lease(runtime_fd: *const ()) -> *const () {
     let runtime_fd = unsafe { &*runtime_fd.cast::<RuntimeFd>() };
     Rc::into_raw(runtime_fd.lease().into_core()).cast()
 }
 
-/// Candidate-only codegen probe for one known-non-final lease release.
+/// Test-support codegen probe for one known-non-final lease release.
 ///
 /// # Safety
 ///
 /// `lease_core` must be the exact raw owner returned by
-/// [`flowio_slice305_probe_clone_lease`], and another strong owner for that
+/// [`flowio_probe_clone_lease`], and another strong owner for that
 /// same core must remain live until this function returns.
 #[cfg(feature = "test-support")]
+#[doc(hidden)]
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub unsafe extern "C" fn flowio_slice305_probe_drop_nonfinal_lease(lease_core: *const ()) {
+pub unsafe extern "C" fn flowio_probe_drop_nonfinal_lease(lease_core: *const ()) {
     let core = lease_core.cast::<RuntimeFdCore>();
     // SAFETY: the probe contract transfers exactly one `Rc::into_raw` owner
     // into this matching release, while a separate base owner keeps it

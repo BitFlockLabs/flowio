@@ -164,7 +164,7 @@ impl<'a, T: InPlaceInit, P: super::provider::MemoryProvider> Pool<'a, T, P> {
     }
 
     /// Returns the number of slab pages retained by this pool for
-    /// repository-only quiescence checks.
+    /// test-support quiescence checks.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn slab_page_count(&self) -> usize {
         self.slab_pages.page_count()

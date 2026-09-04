@@ -1888,7 +1888,8 @@ fn buffer_mut_simulated_kernel_read() {
     assert_eq!(buf.payload_bytes()[99], 0xAB);
 
     // Step 3: user prepends a protocol header
-    buf.headroom_prepend(b"").unwrap(); // no-op, just verify it works with 0 headroom
+    // An empty prepend succeeds even with zero headroom capacity.
+    buf.headroom_prepend(b"").unwrap();
     println!("  Protocol frame simulation: OK");
 }
 

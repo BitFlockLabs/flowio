@@ -1,0 +1,2 @@
+# Replay inputs are arbitrary byte strings guarded by the exact checksum manifest.
+inputs/** binary

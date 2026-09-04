@@ -87,7 +87,7 @@
 use super::{
     CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, close_fd,
     completion_cqe_result, current_local_addr, get_sock_opt, invalid_data, new_nonblocking_socket,
-    set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    opt_take, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
     write_msghdr,
 };
 use crate::net::complete_read_with_progress;
@@ -437,10 +437,6 @@ impl AsRawFd for UdpSocket {
         self.fd.expose_raw_fd()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Option helpers — avoid expect()/unwrap() in fast-path code.
-use super::opt_take;
 
 struct RetainedRecvPayload<B: IoBuffReadWrite> {
     /// Caller-owned destination buffer retained while connected recv is live.

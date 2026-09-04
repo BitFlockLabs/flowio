@@ -24,10 +24,6 @@
 //! framing simple in documentation. On the hot path, prefer the partial-I/O
 //! APIs when the caller can handle progress explicitly.
 //!
-//! The `try_*` methods are deadline-edge helpers that perform one immediate
-//! nonblocking syscall without reactor registration or retry. Use the async
-//! `read` / `write` APIs for normal FlowIO-managed Unix stream I/O.
-//!
 //! Setup uses the immediate [`UnixStream::pair`] API; once connected, the
 //! asynchronous stream I/O surface has TCP parity.
 //!

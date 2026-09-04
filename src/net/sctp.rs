@@ -2069,7 +2069,6 @@ impl SctpListener {
     /// data fast path. The accepted [`SctpStream`] carries the steady-state
     /// data path.
     ///
-    /// This returns a future directly for compatibility with existing callers.
     /// A concurrent accept on the same listener is reported as an error when
     /// the returned future is first polled; safe borrowing makes that path
     /// unreachable except through intentionally leaked/forgotten futures.
@@ -2559,7 +2558,7 @@ impl SctpRecvState {
     /// Creates receive state for an externally configured descriptor.
     ///
     /// FlowIO cannot infer why an external socket subscribed to PDAPI, so it
-    /// preserves the historical behavior of surfacing valid notifications.
+    /// surfaces every valid notification to the caller.
     const fn external() -> Self {
         Self {
             record_sync: SctpRecordSync::Synced,
@@ -3118,66 +3117,96 @@ impl SctpRecvState {
     }
 }
 
-/// Exercises every bounded split of one arbitrary notification prefix through
-/// the production nested-data-tail classifier.
-#[cfg(feature = "fuzzing")]
-pub(crate) fn fuzz_sctp_record_recovery(data: &[u8]) {
+#[cfg(any(test, feature = "fuzzing"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SctpRecoveryFuzzScenario {
+    split: usize,
+    terminal: bool,
+    visible: bool,
+    second_is_notification: bool,
+}
+
+/// Visits the exact bounded scenario inventory used by record-recovery fuzzing.
+#[cfg(any(test, feature = "fuzzing"))]
+#[inline(always)]
+fn for_each_sctp_recovery_fuzz_scenario(
+    data: &[u8],
+    mut visit: impl FnMut(SctpRecoveryFuzzScenario),
+) {
     let split_limit = std::cmp::min(data.len(), SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
     for split in 0..=split_limit {
         for terminal in [false, true] {
             for visible in [false, true] {
                 for second_is_notification in [false, true] {
-                    let mut state = SctpRecvState::external();
-                    state.set_record_sync(SctpRecordSync::DataTail);
-
-                    let first = &data[..split];
-                    let first_flags = libc::MSG_NOTIFICATION;
-                    let first_target =
-                        state.bounded_recovery_prefix_target(first.len(), first_flags);
-                    let first_publication = if visible {
-                        SctpCompletionPublication::Visible(Ok(None))
-                    } else {
-                        SctpCompletionPublication::Unpublished
-                    };
-                    let _ = state.process_metadata_completion(
-                        first.len(),
-                        SctpRecvHeader {
-                            msg_controllen: 0,
-                            msg_flags: first_flags,
-                        },
-                        first,
-                        &first[..first_target],
-                        first_publication,
-                    );
-
-                    let second = &data[split..];
-                    let second_flags = if second_is_notification {
-                        libc::MSG_NOTIFICATION
-                    } else {
-                        0
-                    } | if terminal { libc::MSG_EOR } else { 0 };
-                    let second_target =
-                        state.bounded_recovery_prefix_target(second.len(), second_flags);
-                    let second_publication = if visible {
-                        SctpCompletionPublication::Visible(Ok(None))
-                    } else {
-                        SctpCompletionPublication::Unpublished
-                    };
-                    let _ = state.process_metadata_completion(
-                        second.len(),
-                        SctpRecvHeader {
-                            msg_controllen: 0,
-                            msg_flags: second_flags,
-                        },
-                        second,
-                        &second[..second_target],
-                        second_publication,
-                    );
-                    std::hint::black_box((state.record_sync, state.nested_prefix_state));
+                    visit(SctpRecoveryFuzzScenario {
+                        split,
+                        terminal,
+                        visible,
+                        second_is_notification,
+                    });
                 }
             }
         }
     }
+}
+
+/// Exercises every bounded split of one arbitrary notification prefix through
+/// the production nested-data-tail classifier.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_sctp_record_recovery(data: &[u8]) {
+    for_each_sctp_recovery_fuzz_scenario(data, |scenario| {
+        let SctpRecoveryFuzzScenario {
+            split,
+            terminal,
+            visible,
+            second_is_notification,
+        } = scenario;
+        let mut state = SctpRecvState::external();
+        state.set_record_sync(SctpRecordSync::DataTail);
+
+        let first = &data[..split];
+        let first_flags = libc::MSG_NOTIFICATION;
+        let first_target = state.bounded_recovery_prefix_target(first.len(), first_flags);
+        let first_publication = if visible {
+            SctpCompletionPublication::Visible(Ok(None))
+        } else {
+            SctpCompletionPublication::Unpublished
+        };
+        let _ = state.process_metadata_completion(
+            first.len(),
+            SctpRecvHeader {
+                msg_controllen: 0,
+                msg_flags: first_flags,
+            },
+            first,
+            &first[..first_target],
+            first_publication,
+        );
+
+        let second = &data[split..];
+        let second_flags = if second_is_notification {
+            libc::MSG_NOTIFICATION
+        } else {
+            0
+        } | if terminal { libc::MSG_EOR } else { 0 };
+        let second_target = state.bounded_recovery_prefix_target(second.len(), second_flags);
+        let second_publication = if visible {
+            SctpCompletionPublication::Visible(Ok(None))
+        } else {
+            SctpCompletionPublication::Unpublished
+        };
+        let _ = state.process_metadata_completion(
+            second.len(),
+            SctpRecvHeader {
+                msg_controllen: 0,
+                msg_flags: second_flags,
+            },
+            second,
+            &second[..second_target],
+            second_publication,
+        );
+        std::hint::black_box((state.record_sync, state.nested_prefix_state));
+    });
 }
 
 /// Applies one effective kernel notification mask before publishing the
@@ -4318,7 +4347,7 @@ unsafe fn emplace_retained_sctp_recv_payload<B: IoBuffReadWrite>(
         with_raw_retained_slot::<RetainedSctpRecvPayload<B>, _>(pool, |mut slot| {
             let dst = slot.as_mut_ptr();
 
-            // Preserve the existing alloc-op-before-callback ordering. The
+            // The operation state is allocated before this callback runs. The
             // callback receives only the still-future-owned buffer and may
             // synchronously re-enter this same retained pool.
             let buffer_ptr = buffer.as_mut().unwrap_unchecked().as_mut_ptr();
@@ -4643,8 +4672,9 @@ struct SctpRecvCompletion<B> {
 }
 
 struct SctpFirstIovec {
-    // Retains the frozen completion footprints without imposing a private
-    // field-layout ABI; this reserve is never read.
+    // Holds this struct at the size and alignment an `Option<libc::iovec>`
+    // would occupy, so enclosing completion types keep their footprint
+    // without a `repr(C)` field-layout commitment. Never read.
     _reserved: MaybeUninit<usize>,
     descriptor: libc::iovec,
 }
@@ -8264,6 +8294,41 @@ mod tests {
     use crate::runtime::executor::with_ringless_poll_context_for_test;
     use crate::runtime::task::{TaskHeader, TaskVTable};
     use crate::runtime::test_hooks;
+
+    #[test]
+    fn recovery_fuzz_scenario_seam_exhausts_its_bounded_cross_product() {
+        let input = [0_u8; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN + 7];
+
+        for input_len in [0, 1, SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN, input.len()] {
+            let split_limit = input_len.min(SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN);
+            let mut seen = [[[[false; 2]; 2]; 2]; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN + 1];
+            let mut count = 0;
+            for_each_sctp_recovery_fuzz_scenario(&input[..input_len], |scenario| {
+                let slot = &mut seen[scenario.split][scenario.terminal as usize]
+                    [scenario.visible as usize][scenario.second_is_notification as usize];
+                assert!(!*slot, "duplicate fuzz scenario: {scenario:?}");
+                *slot = true;
+                count += 1;
+            });
+
+            assert_eq!(count, (split_limit + 1) * 8);
+            for (split, terminals) in seen.iter().enumerate().take(split_limit + 1) {
+                for (terminal, publications) in terminals.iter().enumerate() {
+                    for (visible, notification_sources) in publications.iter().enumerate() {
+                        for (second_is_notification, present) in
+                            notification_sources.iter().enumerate()
+                        {
+                            assert!(
+                                *present,
+                                "missing fuzz scenario at split={split}, terminal={terminal}, \
+                                 visible={visible}, second_notification={second_is_notification}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn invalid_fd_op_state() -> RuntimeFdOpState<'static> {
         RuntimeFd::from_fresh_raw_fd(RuntimeFd::INVALID)

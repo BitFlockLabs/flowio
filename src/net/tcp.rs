@@ -786,7 +786,6 @@ impl TcpListener {
 
     /// Starts accepting one incoming connection.
     ///
-    /// This returns a future directly for compatibility with existing callers.
     /// A concurrent accept on the same listener is reported as an error when
     /// the returned future is first polled; safe borrowing makes that path
     /// unreachable except through intentionally leaked/forgotten futures.

@@ -14,13 +14,11 @@ use flowio::runtime::executor::{Executor, ExecutorConfig, JoinError, JoinHandle,
 use flowio::runtime::reactor::ReactorConfig;
 use flowio::runtime::timer::{Sleep, TimeoutError, sleep, sleep_until, timeout, timeout_at};
 use flowio::test_support::runtime::io::{Nop, NopSlot};
-use flowio::test_support::runtime::op::CompletionState;
 #[cfg(not(miri))]
 use flowio::test_support::runtime::reactor::{
     CompletionDrainDescriptorReport, CompletionDrainReentrancyReport,
     test_completion_drain_descriptor_close, test_completion_drain_reentrancy,
 };
-use flowio::test_support::runtime::task::TaskHeader;
 use flowio::test_support::runtime::test_hooks;
 use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
@@ -1064,24 +1062,6 @@ fn runtime_executor_keeps_cpu_affinity_across_spawned_work() {
 
     assert_eq!(root_cpu.get(), current_cpu);
     assert_eq!(spawned_cpu.get(), current_cpu);
-}
-
-#[test]
-fn runtime_layout_probe() {
-    println!(
-        "layout CompletionState size={} align={}",
-        std::mem::size_of::<CompletionState>(),
-        std::mem::align_of::<CompletionState>()
-    );
-    println!(
-        "layout TaskHeader size={} align={}",
-        std::mem::size_of::<TaskHeader>(),
-        std::mem::align_of::<TaskHeader>()
-    );
-    println!(
-        "layout UnixStream size={}",
-        std::mem::size_of::<flowio::net::unix::UnixStream>()
-    );
 }
 
 #[cfg(not(miri))]
@@ -3982,7 +3962,8 @@ fn runtime_cancel_in_flight_write_on_drop() {
             let (mut left, _right) = UnixStream::pair().expect("socketpair failed");
 
             // Fill the socket buffer so the next single write blocks.
-            // Write in a loop until we get backpressure, then timeout on the blocking write.
+            // Write until the socket applies backpressure, then time out on
+            // the blocked write.
             loop {
                 let buf = vec![0xAAu8; 65536];
                 let result = timeout(Duration::from_millis(5), async {

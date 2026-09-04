@@ -1,7 +1,7 @@
 //! Process-isolated runtime longevity and resource-reclamation oracle.
 
 // Live io_uring, sockets, `/proc`, and child processes are not available to
-// Miri. Pure allocator/list coverage remains in its ordinary inventory.
+// Miri. Allocator and list coverage that needs none of them still runs there.
 #![cfg(not(miri))]
 
 mod common;

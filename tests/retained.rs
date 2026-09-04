@@ -43,7 +43,6 @@ fn retained_payload_pool_allocates_from_size_class() {
     unsafe { payload.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("size-class alloc stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 1);
     assert_eq!(stats.slab_allocs, 1);
     assert_eq!(stats.pooled_frees, 1);
@@ -62,7 +61,6 @@ fn retained_payload_pool_reuses_returned_block() {
     unsafe { second.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("reuse stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 2);
     assert_eq!(stats.pooled_reuses, 1);
     assert_eq!(stats.slab_allocs, 1);
@@ -85,7 +83,6 @@ fn retained_payload_take_moves_value_without_dropping_it() {
     assert_eq!(drops.get(), 1);
 
     let stats = pool.stats();
-    println!("take pooled stats: {stats:?}");
     assert_eq!(stats.pooled_frees, 1);
 }
 
@@ -130,7 +127,6 @@ fn retained_payload_take_with_extracts_field_and_reuses_block() {
     unsafe { second.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("take_with pooled stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 2);
     assert_eq!(stats.pooled_reuses, 1);
     assert_eq!(stats.pooled_frees, 2);
@@ -149,7 +145,6 @@ fn retained_payload_drop_and_free_drops_value_once() {
     unsafe { payload.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("drop pooled stats: {stats:?}");
     assert_eq!(drops.get(), 1);
     assert_eq!(stats.pooled_frees, 1);
 }
@@ -162,7 +157,6 @@ fn retained_payload_pool_allocates_larger_payload_classes_on_demand() {
     unsafe { payload.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("large pooled payload stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 1);
     assert_eq!(stats.slab_allocs, 1);
     assert_eq!(stats.pooled_frees, 1);
@@ -178,7 +172,6 @@ fn retained_payload_pool_uses_heap_for_oversized_payloads() {
     unsafe { payload.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("oversized heap fallback stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 0);
     assert_eq!(stats.heap_fallbacks, 1);
     assert_eq!(stats.heap_frees, 1);
@@ -193,7 +186,6 @@ fn retained_payload_take_frees_heap_storage_for_oversized_payloads() {
     assert_eq!(value[0], 3);
 
     let stats = pool.stats();
-    println!("large take heap fallback stats: {stats:?}");
     assert_eq!(stats.heap_fallbacks, 1);
     assert_eq!(stats.heap_frees, 1);
 }
@@ -206,7 +198,6 @@ fn retained_payload_pool_uses_heap_for_overaligned_payloads() {
     unsafe { payload.drop_and_free(&mut pool) };
 
     let stats = pool.stats();
-    println!("overaligned heap fallback stats: {stats:?}");
     assert_eq!(stats.pooled_allocs, 0);
     assert_eq!(stats.heap_fallbacks, 1);
 }
@@ -229,7 +220,6 @@ fn retained_payload_pool_requests_new_slab_after_class_exhaustion() {
     }
 
     let stats = pool.stats();
-    println!("class exhaustion stats: {stats:?}");
     assert_eq!(stats.pooled_frees, count);
 }
 
@@ -248,7 +238,6 @@ fn retained_iovec_scratch_uses_inline_for_small_counts() {
     drop(scratch);
 
     let stats = pool.stats();
-    println!("inline iovec scratch stats: {stats:?}");
     assert_eq!(stats.writev_scratch_inline_allocs, 1);
     assert_eq!(stats.writev_scratch_pooled_allocs, 0);
     assert_eq!(stats.writev_scratch_pooled_frees, 0);
@@ -272,7 +261,6 @@ fn retained_iovec_scratch_uses_pool_for_512_iovecs() {
     drop(scratch);
 
     let stats = pool.stats();
-    println!("512 iovec scratch stats: {stats:?}");
     assert_eq!(stats.writev_scratch_inline_allocs, 0);
     assert_eq!(stats.writev_scratch_pooled_allocs, 1);
     assert_eq!(stats.writev_scratch_slab_allocs, 1);
@@ -296,7 +284,6 @@ fn retained_iovec_scratch_reuses_returned_sidecar_block() {
     drop(second);
 
     let stats = pool.stats();
-    println!("512 iovec scratch reuse stats: {stats:?}");
     assert_eq!(stats.writev_scratch_pooled_allocs, 2);
     assert_eq!(stats.writev_scratch_pooled_reuses, 1);
     assert_eq!(stats.writev_scratch_slab_allocs, 1);
@@ -314,7 +301,6 @@ fn retained_iovec_scratch_rejects_oversized_count() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     let stats = pool.stats();
-    println!("oversized iovec scratch stats: {stats:?}");
     assert_eq!(stats.writev_scratch_oversize_rejections, 1);
     assert_eq!(stats.writev_scratch_pooled_allocs, 0);
 }

@@ -326,7 +326,7 @@ pub fn tls_server_end_point(data: &[u8]) -> bool {
     observe_tls_server_end_point(data).is_some()
 }
 
-/// Repository-only observation helpers for fixture-backed integration tests.
+/// Test-support observation helpers for fixture-backed integration tests.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support {

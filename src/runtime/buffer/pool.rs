@@ -421,10 +421,10 @@ impl Drop for IoBuffPool {
 mod layout_tests {
     use super::*;
 
-    fn legacy_slot_stride(data_size: usize) -> usize {
+    fn expected_slot_stride(data_size: usize) -> usize {
         let raw_size = std::mem::size_of::<IoBuffHeader>()
             .checked_add(data_size)
-            .expect("legacy test geometry must fit");
+            .expect("test geometry must fit");
         let alignment = std::cmp::max(
             std::mem::align_of::<IoBuffHeader>(),
             std::mem::align_of::<SListLink>(),
@@ -433,7 +433,7 @@ mod layout_tests {
             std::cmp::max(raw_size, std::mem::size_of::<SListLink>()),
             alignment,
         )
-        .expect("legacy test geometry must round")
+        .expect("test geometry must round")
     }
 
     fn slot_ptr(buffer: &IoBuffMut) -> *mut u8 {
@@ -465,12 +465,12 @@ mod layout_tests {
                 tailroom,
                 objs_per_slab,
             })
-            .expect("representative legacy pool geometry should remain valid");
+            .expect("representative pool geometry should remain valid");
             let inner = unsafe { &*pool.inner.as_ptr() };
             let stride = inner.slab_factory.object_stride();
             let slab_align = inner.slab_factory.get_slab_alignment();
 
-            assert_eq!(stride, legacy_slot_stride(data_size));
+            assert_eq!(stride, expected_slot_stride(data_size));
             assert_eq!(stride % std::mem::align_of::<IoBuffHeader>(), 0);
             assert_eq!(stride % std::mem::align_of::<SListLink>(), 0);
             assert!(slab_align >= std::mem::align_of::<IoBuffHeader>());
@@ -513,7 +513,7 @@ mod layout_tests {
                 inner.slab_factory.get_slab_alignment(),
             )
         };
-        assert_eq!(slot_size, legacy_slot_stride(1));
+        assert_eq!(slot_size, expected_slot_stride(1));
         assert!(
             slab_align >= std::mem::align_of::<IoBuffHeader>()
                 && slab_align >= std::mem::align_of::<SListLink>(),

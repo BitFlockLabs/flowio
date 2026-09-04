@@ -95,9 +95,6 @@ const DEFAULT_TOTAL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const HOSTS_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
 /// FlowIO's bound on DNS retry fanout and retained resolver configuration.
-///
-/// This is a library resource policy, not an assertion about another
-/// resolver implementation's nameserver limit.
 const MAX_NAMESERVERS: usize = 8;
 const MAX_RESOLVED_ADDRESSES: usize = 64;
 const MAX_CNAME_HOPS_PER_RESPONSE: usize = 16;
@@ -1961,7 +1958,7 @@ fn materialize_walked_dns_name_at_depth(
 /// Allocation-free failure status used by the shared DNS name walker.
 ///
 /// The UDP candidate prefilter discards this status directly. Full decoding
-/// converts it to the historical `io::Error` kind and message at its boundary.
+/// converts it into the corresponding `io::Error` kind and message at its boundary.
 #[derive(Clone, Copy)]
 enum DnsNameWalkError {
     CompressionDepthExceeded,
@@ -2228,12 +2225,12 @@ fn read_u16_be_candidate(packet: &[u8], offset: usize) -> Option<u16> {
 pub(crate) mod test_support {
     use std::net::{IpAddr, SocketAddr};
 
-    /// Repository-only seam for the DNS name allocation fixture.
+    /// Test-support-only seam for the DNS name allocation fixture.
     pub fn decode_name(packet: &[u8], offset: usize) -> std::io::Result<(String, usize)> {
         super::decode_name(packet, offset, 0)
     }
 
-    /// Repository-only seam for one A-family lookup and its retry behavior.
+    /// Test-support-only seam for one A-family lookup and its retry behavior.
     pub async fn lookup_ipv4(
         resolver: &super::DnsResolver,
         host: &str,
@@ -2256,7 +2253,7 @@ pub(crate) mod test_support {
             .map_err(super::DnsLookupError::into_io_error)
     }
 
-    /// Repository-only seam for the resolver deduplication allocation fixture.
+    /// Test-support-only seam for the resolver deduplication allocation fixture.
     pub fn extend_unique_socket_addrs(
         addrs: &mut Vec<SocketAddr>,
         ips: &[IpAddr],
@@ -2265,7 +2262,7 @@ pub(crate) mod test_support {
         super::extend_unique_socket_addrs(addrs, ips, port)
     }
 
-    /// Repository-only seam for bounded `/etc/hosts` fixtures.
+    /// Test-support-only seam for bounded `/etc/hosts` fixtures.
     pub fn resolve_local_host_with_hosts_path(
         path: &str,
         host: &str,
@@ -2274,7 +2271,7 @@ pub(crate) mod test_support {
         super::resolve_local_host_with_hosts_path(path, host, port)
     }
 
-    /// Repository-only seam for hosts byte-parser fixtures.
+    /// Test-support-only seam for hosts byte-parser fixtures.
     pub fn parse_hosts_bytes(
         contents: &[u8],
         host: &str,
@@ -2285,7 +2282,7 @@ pub(crate) mod test_support {
         Ok(addrs)
     }
 
-    /// Repository-only seam for full resolver lookup with a hosts fixture.
+    /// Test-support-only seam for full resolver lookup with a hosts fixture.
     pub async fn resolve_host_with_hosts_path(
         resolver: &super::DnsResolver,
         path: &str,
@@ -2297,17 +2294,17 @@ pub(crate) mod test_support {
             .await
     }
 
-    /// Repository-only seam for bounded `/etc/resolv.conf` fixtures.
+    /// Test-support-only seam for bounded `/etc/resolv.conf` fixtures.
     pub fn read_resolv_conf(path: &str) -> std::io::Result<Vec<SocketAddr>> {
         super::read_resolv_conf(path).map(|configuration| configuration.nameservers)
     }
 
-    /// Repository-only seam for raw-byte `/etc/resolv.conf` fixtures.
+    /// Test-support-only seam for raw-byte `/etc/resolv.conf` fixtures.
     pub fn parse_resolv_conf_bytes(contents: &[u8]) -> std::io::Result<Vec<SocketAddr>> {
         super::parse_resolv_conf_bytes(contents)
     }
 
-    /// Repository-only seam for effective `/etc/resolv.conf` metadata.
+    /// Test-support-only seam for effective `/etc/resolv.conf` metadata.
     pub fn parse_resolv_conf_configuration_bytes(
         contents: &[u8],
     ) -> std::io::Result<(Vec<SocketAddr>, bool)> {
@@ -2319,12 +2316,12 @@ pub(crate) mod test_support {
         })
     }
 
-    /// Repository-only seam for the DNS candidate allocation fixture.
+    /// Test-support-only seam for the DNS candidate allocation fixture.
     pub fn response_is_decodable_candidate(packet: &[u8], query_id: u16) -> bool {
         super::response_is_decodable_candidate(packet, query_id)
     }
 
-    /// Repository-only seam for response-record allocation fixtures.
+    /// Test-support-only seam for response-record allocation fixtures.
     pub fn parse_ipv4_response(
         packet: &[u8],
         query_id: u16,
@@ -3537,7 +3534,7 @@ nameserver 192.0.2.9\n",
             .expect("test clock should follow the Unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "flowio-slice314-hosts-{}-{unique}",
+            "flowio-hosts-fixture-{}-{unique}",
             std::process::id()
         ));
         std::fs::write(&path, b"192.0.2.55 local-id.flowio.invalid\n")

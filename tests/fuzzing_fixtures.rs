@@ -135,8 +135,8 @@ fn rcvinfo_input(info: libc::sctp_rcvinfo, payload: &[u8]) -> Vec<u8> {
         libc::SCTP_RCVINFO,
         std::mem::size_of::<libc::sctp_rcvinfo>(),
     );
-    // Preserve the historical exact CMSG_LEN-sized fixture rather than
-    // adding optional final alignment padding.
+    // Keep this fixture at exactly CMSG_LEN rather than adding optional final
+    // alignment padding.
     control.truncate(data_offset + std::mem::size_of::<libc::sctp_rcvinfo>());
     write_rcvinfo_fields(&mut control, data_offset, info);
     recv_meta_input(0x08, control, payload)

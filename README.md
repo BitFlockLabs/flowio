@@ -234,23 +234,22 @@ ciphertext can still be transmitted when valid TLS work resumes.
 Standard task `Waker` values must be cloned, woken, and dropped on the thread
 that owns their executor. Debug builds assert this contract; release builds
 keep the direct, allocation-free owner-thread wake path. FlowIO intentionally
-has no cross-thread task-waker relay or inter-executor queue. A separately
-approved later bounded facility may carry only unpolled, runtime-independent
-`Send` requests/results; the destination owner thread must create and poll the
-corresponding FlowIO task. Never put a live socket, FlowIO buffer, polled
-future, SQE/completion state, task/reactor state, or task waker in that
-facility.
+has no cross-thread task-waker relay or inter-executor queue. An
+application-provided bounded cross-thread handoff may carry only unpolled,
+runtime-independent `Send` requests and results; the destination owner thread
+must create and poll the corresponding FlowIO task. Never put a live socket,
+FlowIO buffer, polled future, SQE/completion state, task/reactor state, or task
+waker in that handoff.
 
-Each distinct runtime descriptor owns one owner-thread `Rc` core. Formerly
-inline TCP/Unix/UDP/SCTP construction and adoption therefore gain one setup
-allocation; TCP/SCTP listeners replace their prior allocation, TLS shares its
-TCP core, a Unix pair creates two cores, and a split clone creates one for its
-duplicate fd. Allocation failure invokes Rust's global allocation-error handler
-(normally process abort), not a typed FlowIO error. Core allocation and final
-deallocation may synchronize or block inside the selected global allocator.
-Each actual initial local fd-backed data submission retains one non-atomic core
-lease until its target completion; retries reuse it, and clone/non-final release
-does not allocate.
+Each distinct runtime descriptor owns one owner-thread `Rc` core.
+TCP/Unix/UDP/SCTP construction and adoption each perform one setup allocation
+for that core; TCP/SCTP listeners allocate one, TLS shares its TCP core, a Unix
+pair creates two, and a split clone creates one for its duplicate fd. Allocation
+failure invokes Rust's global allocation-error handler (normally process abort),
+not a typed FlowIO error. Core allocation and final deallocation may synchronize
+or block inside the selected global allocator. Each actual initial local
+fd-backed data submission retains one non-atomic core lease until its target
+completion; retries reuse it, and clone/non-final release does not allocate.
 
 Each executor has one bounded worker for terminal socket closes. Dropping a
 fresh, never publicly exposed TCP, Unix, UDP, or SCTP socket skips terminal
@@ -424,8 +423,8 @@ request.assoc_id = 7;
 assert!(request.streams.is_empty());
 ```
 
-`SctpResetStreams` now carries private intent state, so downstream struct
-literals no longer compile. Start with the matching constructor and then set
+`SctpResetStreams` carries private intent state, so it cannot be built from a
+struct literal. Start with the matching constructor and then set
 the still-public `assoc_id` or `flags` field when custom values are needed. A
 listed request's `streams` may be replaced only with another nonempty list; an
 `all_*` request must keep its list empty. An intent/list mismatch is
