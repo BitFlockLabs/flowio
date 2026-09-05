@@ -10,6 +10,9 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- DNS responses with conflicting CNAME targets for the active owner now return
+  `InvalidData`, independent of record order. Equivalent duplicate targets and
+  matching-family direct-address precedence remain supported.
 - UDP `recv`, `recv_msg`, and `recv_from` reject a zero requested length with
   `InvalidInput` before consuming a datagram and return the unchanged buffer.
   Positive receive requests continue to accept empty datagrams.

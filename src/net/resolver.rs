@@ -12,6 +12,9 @@
 //! - only A and AAAA lookups are issued
 //! - one linear CNAME chain is followed with independent per-response,
 //!   cross-response, and name-compression bounds
+//! - matching-family addresses take precedence at each active CNAME owner;
+//!   otherwise DNS-equivalent CNAME targets are accepted and conflicting
+//!   targets return `InvalidData`
 //! - upstream asynchronous work has one five-second aggregate deadline by
 //!   default, while each matching-response wait retains its independent cap
 //! - search domains and TCP fallback for truncated replies are not yet
@@ -1659,10 +1662,24 @@ pub(crate) fn parse_response_packet(
             break;
         }
 
-        let Some(target) = records.iter().find_map(|record| match record {
-            DnsRecord::Cname { owner, target } if dns_name_eq(owner, active_owner) => Some(target),
-            _ => None,
-        }) else {
+        let mut selected_target = None;
+        for record in &records {
+            if let DnsRecord::Cname { owner, target } = record
+                && dns_name_eq(owner, active_owner)
+            {
+                if let Some(selected) = selected_target {
+                    if !dns_name_eq(selected, target) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS response CNAME owner had conflicting targets",
+                        ));
+                    }
+                } else {
+                    selected_target = Some(target.as_str());
+                }
+            }
+        }
+        let Some(target) = selected_target else {
             break;
         };
 
@@ -2354,6 +2371,7 @@ mod tests {
     enum ScriptedQueryOutcome {
         Address(IpAddr),
         Cname(&'static str),
+        AnswerRecords(Vec<TestResponseRecord<'static>>),
         Empty,
         AttemptTimeout,
         TerminalRuntime(i32),
@@ -2477,6 +2495,9 @@ mod tests {
                         .to_be_bytes(),
                 );
                 response.extend_from_slice(&encoded_target);
+            }
+            ScriptedQueryOutcome::AnswerRecords(records) => {
+                response = response_with_test_records(query_id, &host, qtype, [&records, &[], &[]]);
             }
             ScriptedQueryOutcome::Empty => {}
             ScriptedQueryOutcome::AttemptTimeout | ScriptedQueryOutcome::TerminalRuntime(_) => {
@@ -4818,6 +4839,289 @@ nameserver 192.0.2.9\n",
         packet
     }
 
+    const CNAME_TEST_HOST: &str = "db.example.test";
+    const CNAME_TEST_TARGET: &str = "target.example.test";
+
+    fn cname_test_address(qtype: u16) -> IpAddr {
+        match qtype {
+            DNS_TYPE_A => IpAddr::V4(Ipv4Addr::new(192, 0, 2, 45)),
+            DNS_TYPE_AAAA => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            _ => panic!("test query should request A or AAAA"),
+        }
+    }
+
+    fn conflicting_cname_test_records(owner: &str) -> Vec<TestResponseRecord<'_>> {
+        vec![
+            TestResponseRecord::cname(owner, CNAME_TEST_TARGET),
+            TestResponseRecord::cname(owner, "TARGET.EXAMPLE.TEST"),
+            TestResponseRecord::cname(owner, "other.example.test"),
+        ]
+    }
+
+    #[test]
+    fn dns_cname_conflicting_active_targets_reject_in_both_orders() {
+        for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            for later_owner in [false, true] {
+                for reverse in [false, true] {
+                    let owner = if later_owner {
+                        "middle.example.test"
+                    } else {
+                        CNAME_TEST_HOST
+                    };
+                    let mut records = conflicting_cname_test_records(owner);
+                    if later_owner {
+                        records.push(TestResponseRecord::cname(CNAME_TEST_HOST, owner));
+                    }
+                    let other_family = if qtype == DNS_TYPE_A {
+                        DNS_TYPE_AAAA
+                    } else {
+                        DNS_TYPE_A
+                    };
+                    records.push(TestResponseRecord::address(
+                        owner,
+                        cname_test_address(other_family),
+                    ));
+                    if reverse {
+                        records.reverse();
+                    }
+                    let packet = response_with_test_records(
+                        0x1234,
+                        CNAME_TEST_HOST,
+                        qtype,
+                        [&records, &[], &[]],
+                    );
+                    let err = match parse_response_packet(&packet, 0x1234, CNAME_TEST_HOST, qtype) {
+                        Ok(_) => panic!(
+                            "conflicting CNAME targets passed: qtype={qtype}, later={later_owner}, reverse={reverse}"
+                        ),
+                        Err(err) => err,
+                    };
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                    assert_eq!(
+                        err.to_string(),
+                        "DNS response CNAME owner had conflicting targets"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dns_cname_equivalent_duplicate_targets_preserve_one_edge() {
+        for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            for reverse in [false, true] {
+                let mut records = [
+                    TestResponseRecord::cname(CNAME_TEST_HOST, CNAME_TEST_TARGET),
+                    TestResponseRecord::cname(CNAME_TEST_HOST, CNAME_TEST_TARGET),
+                    TestResponseRecord::cname("DB.EXAMPLE.TEST", "TARGET.EXAMPLE.TEST"),
+                ];
+                if reverse {
+                    records.reverse();
+                }
+                let packet = response_with_test_records(
+                    0x1234,
+                    CNAME_TEST_HOST,
+                    qtype,
+                    [&records, &[], &[]],
+                );
+                let parsed = parse_response_packet(&packet, 0x1234, "DB.EXAMPLE.TEST.", qtype)
+                    .expect("DNS-equivalent duplicate edges should be accepted");
+                assert!(parsed.addresses.is_empty());
+                assert!(dns_name_eq(
+                    parsed.cname.as_deref().expect("CNAME should be selected"),
+                    CNAME_TEST_TARGET
+                ));
+                assert_eq!(parsed.cname_hops, 1);
+                assert!(!parsed.nx_domain);
+            }
+        }
+    }
+
+    #[test]
+    fn dns_cname_conflicts_preserve_direct_address_precedence() {
+        for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            for later_owner in [false, true] {
+                for reverse in [false, true] {
+                    let owner = if later_owner {
+                        "middle.example.test"
+                    } else {
+                        CNAME_TEST_HOST
+                    };
+                    let mut records = conflicting_cname_test_records(owner);
+                    if later_owner {
+                        records.push(TestResponseRecord::cname(CNAME_TEST_HOST, owner));
+                    }
+                    let address = cname_test_address(qtype);
+                    records.push(TestResponseRecord::address(owner, address));
+                    if reverse {
+                        records.reverse();
+                    }
+                    let packet = response_with_test_records(
+                        0x1234,
+                        CNAME_TEST_HOST,
+                        qtype,
+                        [&records, &[], &[]],
+                    );
+                    let parsed = parse_response_packet(&packet, 0x1234, CNAME_TEST_HOST, qtype)
+                        .expect("matching-family address should precede CNAME selection");
+                    assert_eq!(parsed.addresses, [address]);
+                    assert_eq!(parsed.cname.as_deref(), later_owner.then_some(owner));
+                    assert_eq!(parsed.cname_hops, usize::from(later_owner));
+                    assert!(!parsed.nx_domain);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dns_cname_conflicts_ignore_off_chain_class_and_sections() {
+        for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            for ignored_site in ["off-chain", "non-IN", "Authority", "Additional"] {
+                let address = cname_test_address(qtype);
+                let mut answers = vec![
+                    TestResponseRecord::cname(CNAME_TEST_HOST, CNAME_TEST_TARGET),
+                    TestResponseRecord::address(CNAME_TEST_TARGET, address),
+                ];
+                let owner = if ignored_site == "off-chain" {
+                    "unrelated.example.test"
+                } else {
+                    CNAME_TEST_HOST
+                };
+                let mut ignored = conflicting_cname_test_records(owner);
+                if ignored_site == "non-IN" {
+                    for record in &mut ignored {
+                        record.class = 3;
+                    }
+                }
+                let sections: [&[TestResponseRecord<'_>]; 3] = match ignored_site {
+                    "Authority" => [&answers, &ignored, &[]],
+                    "Additional" => [&answers, &[], &ignored],
+                    _ => {
+                        answers.extend_from_slice(&ignored);
+                        [&answers, &[], &[]]
+                    }
+                };
+                let packet = response_with_test_records(0x1234, CNAME_TEST_HOST, qtype, sections);
+                let parsed = parse_response_packet(&packet, 0x1234, CNAME_TEST_HOST, qtype)
+                    .unwrap_or_else(|err| {
+                        panic!("{ignored_site} conflict affected resolution: {err}")
+                    });
+                assert_eq!(parsed.addresses, [address]);
+                assert_eq!(parsed.cname.as_deref(), Some(CNAME_TEST_TARGET));
+                assert_eq!(parsed.cname_hops, 1);
+                assert!(!parsed.nx_domain);
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn run_cname_query_script(
+        nameservers: Vec<SocketAddr>,
+        steps: Vec<ScriptedQueryStep>,
+    ) -> io::Result<Vec<SocketAddr>> {
+        let mut samples = vec![(DnsDeadlineCheckpoint::Start, Duration::ZERO)];
+        samples.extend(std::iter::repeat_n(
+            (DnsDeadlineCheckpoint::BeforeSocketSetup, Duration::ZERO),
+            steps.len(),
+        ));
+        let clock = DeadlineClockGuard::install(samples);
+        let queries = QueryScriptGuard::install(steps);
+        let result =
+            run_scripted_resolution(resolver_with_scripted_queries(nameservers), CNAME_TEST_HOST);
+        queries.assert_exhausted();
+        clock.assert_exhausted();
+        result
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_rejects_conflicting_cname_without_followup() {
+        let nameserver = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        for conflict_type in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            for sibling_address in [false, true] {
+                let steps = [DNS_TYPE_A, DNS_TYPE_AAAA]
+                    .into_iter()
+                    .map(|qtype| {
+                        let outcome = if qtype == conflict_type {
+                            ScriptedQueryOutcome::AnswerRecords(conflicting_cname_test_records(
+                                CNAME_TEST_HOST,
+                            ))
+                        } else if sibling_address {
+                            ScriptedQueryOutcome::Address(cname_test_address(qtype))
+                        } else {
+                            ScriptedQueryOutcome::Empty
+                        };
+                        ScriptedQueryStep {
+                            nameserver,
+                            host: CNAME_TEST_HOST,
+                            qtype,
+                            outcome,
+                        }
+                    })
+                    .collect();
+                let result = run_cname_query_script(vec![nameserver], steps);
+                if sibling_address {
+                    let sibling_type = if conflict_type == DNS_TYPE_A {
+                        DNS_TYPE_AAAA
+                    } else {
+                        DNS_TYPE_A
+                    };
+                    assert_eq!(
+                        result.expect("valid sibling address should survive CNAME rejection"),
+                        [SocketAddr::new(cname_test_address(sibling_type), 5432)]
+                    );
+                } else {
+                    let err = result
+                        .expect_err("conflicting CNAME response should fail without follow-up");
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                    assert_eq!(
+                        err.to_string(),
+                        "DNS response CNAME owner had conflicting targets"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn resolver_conflicting_cname_preserves_nameserver_failover() {
+        let first = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        let second = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 54), DNS_PORT));
+        for conflict_type in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            let mut steps = Vec::new();
+            for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+                let outcome = if qtype == conflict_type {
+                    ScriptedQueryOutcome::AnswerRecords(conflicting_cname_test_records(
+                        CNAME_TEST_HOST,
+                    ))
+                } else {
+                    ScriptedQueryOutcome::Empty
+                };
+                steps.push(ScriptedQueryStep {
+                    nameserver: first,
+                    host: CNAME_TEST_HOST,
+                    qtype,
+                    outcome,
+                });
+                if qtype == conflict_type {
+                    steps.push(ScriptedQueryStep {
+                        nameserver: second,
+                        host: CNAME_TEST_HOST,
+                        qtype,
+                        outcome: ScriptedQueryOutcome::Address(cname_test_address(qtype)),
+                    });
+                }
+            }
+            let result = run_cname_query_script(vec![first, second], steps)
+                .expect("conflicting CNAME should permit the next nameserver response");
+            assert_eq!(
+                result,
+                [SocketAddr::new(cname_test_address(conflict_type), 5432)]
+            );
+        }
+    }
+
     fn response_with_question_name(query_id: u16, name: &[u8]) -> Vec<u8> {
         let mut packet = response_header(query_id, DNS_FLAG_QR, 1);
         packet.extend_from_slice(name);
@@ -4884,6 +5188,85 @@ nameserver 192.0.2.9\n",
         packet.extend_from_slice(&0u32.to_be_bytes());
         packet.extend_from_slice(&4u16.to_be_bytes());
         packet.extend_from_slice(&[192, 0, 2, 1]);
+        packet
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestResponseData<'a> {
+        Cname(&'a str),
+        Address(IpAddr),
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestResponseRecord<'a> {
+        owner: &'a str,
+        class: u16,
+        data: TestResponseData<'a>,
+    }
+
+    impl<'a> TestResponseRecord<'a> {
+        fn cname(owner: &'a str, target: &'a str) -> Self {
+            Self {
+                owner,
+                class: DNS_CLASS_IN,
+                data: TestResponseData::Cname(target),
+            }
+        }
+
+        fn address(owner: &'a str, address: IpAddr) -> Self {
+            Self {
+                owner,
+                class: DNS_CLASS_IN,
+                data: TestResponseData::Address(address),
+            }
+        }
+    }
+
+    fn response_with_test_records(
+        query_id: u16,
+        host: &str,
+        qtype: u16,
+        sections: [&[TestResponseRecord<'_>]; 3],
+    ) -> Vec<u8> {
+        let mut packet = response_header(query_id, DNS_FLAG_QR, 1);
+        push_test_wire_name(&mut packet, host);
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        for (index, records) in sections.into_iter().enumerate() {
+            write_u16_be_at(
+                &mut packet,
+                6 + index * 2,
+                u16::try_from(records.len()).expect("test record count should fit"),
+            )
+            .expect("test section count should fit");
+            for record in records {
+                let mut data = Vec::new();
+                let rr_type = match record.data {
+                    TestResponseData::Cname(target) => {
+                        push_test_wire_name(&mut data, target);
+                        DNS_TYPE_CNAME
+                    }
+                    TestResponseData::Address(IpAddr::V4(address)) => {
+                        data.extend_from_slice(&address.octets());
+                        DNS_TYPE_A
+                    }
+                    TestResponseData::Address(IpAddr::V6(address)) => {
+                        data.extend_from_slice(&address.octets());
+                        DNS_TYPE_AAAA
+                    }
+                };
+                push_test_wire_name(&mut packet, record.owner);
+                packet.extend_from_slice(&rr_type.to_be_bytes());
+                packet.extend_from_slice(&record.class.to_be_bytes());
+                packet.extend_from_slice(&0u32.to_be_bytes());
+                packet.extend_from_slice(
+                    &u16::try_from(data.len())
+                        .expect("test RDATA length should fit")
+                        .to_be_bytes(),
+                );
+                packet.extend_from_slice(&data);
+            }
+        }
         packet
     }
 

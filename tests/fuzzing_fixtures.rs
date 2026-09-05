@@ -247,12 +247,13 @@ fn assoc_change_input() -> Vec<u8> {
     input
 }
 
-fn dns_parser_fixtures() -> [&'static [u8]; 11] {
+fn dns_parser_fixtures() -> [&'static [u8]; 12] {
     [
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/valid_a"),
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/valid_aaaa"),
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/malformed_a_short"),
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_compressed_exact"),
+        include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_conflicting_targets"),
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_trailing_byte"),
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_cycle"),
         include_bytes!("../fixtures/fuzzing/dns_parse_response_packet/cname_hops_16"),
@@ -322,7 +323,7 @@ fn dns_parser_corpus_reaches_record_parsing_for_at_least_two_thirds() {
         fixtures.len()
     );
     assert_eq!(
-        reached, 10,
+        reached, 11,
         "the named semantic corpus changed record-parser reachability"
     );
 }
@@ -355,6 +356,14 @@ fn dns_parser_corpus_pins_deep_record_and_chain_outcomes() {
         ))
         .is_ok(),
         "an exactly consumed compressed CNAME must remain valid"
+    );
+    let conflicting_targets = dns_parse_error(include_bytes!(
+        "../fixtures/fuzzing/dns_parse_response_packet/cname_conflicting_targets"
+    ));
+    assert_eq!(conflicting_targets.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        conflicting_targets.to_string(),
+        "DNS response CNAME owner had conflicting targets"
     );
     assert_eq!(
         dns_parse_error(include_bytes!(
