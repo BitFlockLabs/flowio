@@ -10,6 +10,8 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- Fixed-size socket-option getters reject an unexpected kernel output length
+  with `InvalidData` while preserving syscall errors.
 - `IoBuffMut::payload_extend_from_tailroom(0)` now leaves the buffer unchanged,
   preserving active trailer bytes and the payload seal. Positive extensions
   continue to discard active tailroom data when moving the region boundary.

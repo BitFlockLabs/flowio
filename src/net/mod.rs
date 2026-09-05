@@ -1811,7 +1811,8 @@ fn set_sock_opt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) 
 
 fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<T> {
     let mut value = T::default();
-    let mut len = std::mem::size_of::<T>() as libc::socklen_t;
+    let expected_len = std::mem::size_of::<T>();
+    let mut len = expected_len as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
             fd,
@@ -1823,6 +1824,9 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
     };
     if rc < 0 {
         return Err(io::Error::last_os_error());
+    }
+    if len as usize != expected_len {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
     Ok(value)
 }
@@ -1984,6 +1988,48 @@ mod tests {
         let err = socket_buffer_size_to_c_int(libc::c_int::MAX as usize + 1)
             .expect_err("oversize socket buffer should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn get_sock_opt_rejects_oversized_output() {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("UDP socket creation failed");
+        let err =
+            get_sock_opt::<[libc::c_int; 2]>(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_TYPE)
+                .expect_err("SO_TYPE must not accept output wider than its scalar result");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.raw_os_error(), None);
+        assert!(
+            err.get_ref().is_none(),
+            "length error owns a custom payload"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn get_sock_opt_accepts_exact_scalar_output() {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("UDP socket creation failed");
+        let socket_type =
+            get_sock_opt::<libc::c_int>(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_TYPE)
+                .expect("scalar SO_TYPE getter failed");
+
+        assert_eq!(socket_type, libc::SOCK_DGRAM);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn get_sock_opt_preserves_bad_descriptor_error() {
+        for err in [
+            get_sock_opt::<libc::c_int>(-1, libc::SOL_SOCKET, libc::SO_TYPE)
+                .expect_err("invalid descriptor unexpectedly returned a scalar"),
+            get_sock_opt::<[libc::c_int; 2]>(-1, libc::SOL_SOCKET, libc::SO_TYPE)
+                .expect_err("invalid descriptor unexpectedly returned an oversized output"),
+        ] {
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        }
     }
 
     #[test]
