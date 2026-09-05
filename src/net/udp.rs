@@ -290,10 +290,15 @@ impl UdpSocket {
     /// the provided zero write base publish from their beginning. A zero-byte
     /// datagram preserves the existing logical contents. The returned byte
     /// count is relative to this receive.
+    ///
+    /// `len` must be nonzero. A zero request returns
+    /// [`io::ErrorKind::InvalidInput`] and the unchanged buffer after runtime
+    /// context validation, before operation allocation or submission. It does
+    /// not consume a datagram. A positive request can receive an empty datagram.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let write_base_len = buffer.write_base_len();
         let mut input_error = None;
-        let len = match checked_read_len(len, buffer.writable_len()) {
+        let len = match checked_udp_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -324,10 +329,12 @@ impl UdpSocket {
     /// Positive progress follows the same relative-publication contract as
     /// [`UdpSocket::recv`]. If truncation is reported, the copied prefix is
     /// still published before `InvalidData` is returned.
+    /// The nonzero-request requirement and local rejection behavior are the
+    /// same as [`UdpSocket::recv`].
     pub fn recv_msg<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvMsgFuture<'_, B> {
         let write_base_len = buffer.write_base_len();
         let mut input_error = None;
-        let len = match checked_read_len(len, buffer.writable_len()) {
+        let len = match checked_udp_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -376,6 +383,8 @@ impl UdpSocket {
     /// publish the bytes the kernel copied before the error is returned. This
     /// metadata-free API requests no ancillary control data, so discarded
     /// ancillary metadata does not make a complete payload fail.
+    /// The nonzero-request requirement and local rejection behavior are the
+    /// same as [`UdpSocket::recv`].
     pub fn recv_from<B: IoBuffReadWrite>(
         &mut self,
         buffer: B,
@@ -383,7 +392,7 @@ impl UdpSocket {
     ) -> RecvFromFuture<'_, B> {
         let write_base_len = buffer.write_base_len();
         let mut input_error = None;
-        let len = match checked_read_len(len, buffer.writable_len()) {
+        let len = match checked_udp_read_len(len, buffer.writable_len()) {
             Ok(len) => len,
             Err(err) => {
                 input_error = Some(err);
@@ -436,6 +445,14 @@ impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.expose_raw_fd()
     }
+}
+
+#[inline]
+fn checked_udp_read_len(requested: usize, writable: usize) -> io::Result<u32> {
+    if requested == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    checked_read_len(requested, writable)
 }
 
 struct RetainedRecvPayload<B: IoBuffReadWrite> {

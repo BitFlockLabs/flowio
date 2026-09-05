@@ -10,6 +10,9 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- UDP `recv`, `recv_msg`, and `recv_from` reject a zero requested length with
+  `InvalidInput` before consuming a datagram and return the unchanged buffer.
+  Positive receive requests continue to accept empty datagrams.
 - Fixed-size socket-option getters reject an unexpected kernel output length
   with `InvalidData` while preserving syscall errors.
 - `IoBuffMut::payload_extend_from_tailroom(0)` now leaves the buffer unchanged,

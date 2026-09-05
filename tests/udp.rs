@@ -8,6 +8,9 @@ use common::{
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
 use flowio::net::udp::UdpSocket;
+use flowio::runtime::buffer::{
+    IoBuffError, IoBuffMut as RealIoBuffMut, IoBuffReadOnly, IoBuffReadWrite,
+};
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::{TimeoutError, timeout};
 use flowio::test_support::net::udp::{
@@ -18,7 +21,7 @@ use flowio::test_support::net::udp::{
 use flowio::test_support::runtime::test_hooks;
 use std::cell::Cell;
 use std::fs::File;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -39,6 +42,124 @@ fn prefilled_udp_buffer(writable: usize) -> flowio::runtime::buffer::IoBuffMut {
     let mut buffer = IoBuffMut::new(0, 4 + writable, 0);
     buffer.payload_append(b"HEAD").unwrap();
     buffer
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UdpReceiveApi {
+    Recv,
+    RecvMsg,
+    RecvFrom,
+}
+
+impl UdpReceiveApi {
+    const ALL: [Self; 3] = [Self::Recv, Self::RecvMsg, Self::RecvFrom];
+
+    async fn receive(
+        self,
+        socket: &mut UdpSocket,
+        buffer: RealIoBuffMut,
+        len: usize,
+    ) -> (io::Result<(usize, Option<SocketAddr>)>, RealIoBuffMut) {
+        match self {
+            Self::Recv => {
+                let (result, buffer) = socket.recv(buffer, len).await;
+                (result.map(|len| (len, None)), buffer)
+            }
+            Self::RecvMsg => {
+                let (result, buffer) = socket.recv_msg(buffer, len).await;
+                (result.map(|len| (len, None)), buffer)
+            }
+            Self::RecvFrom => {
+                let (result, buffer) = socket.recv_from(buffer, len).await;
+                (result.map(|(len, from)| (len, Some(from))), buffer)
+            }
+        }
+    }
+}
+
+async fn ready_udp_receive(
+    api: UdpReceiveApi,
+    socket: &mut UdpSocket,
+    buffer: RealIoBuffMut,
+    len: usize,
+) -> (io::Result<(usize, Option<SocketAddr>)>, RealIoBuffMut) {
+    let mut future = std::pin::pin!(api.receive(socket, buffer, len));
+    poll_fn(|cx| match future.as_mut().poll(cx) {
+        Poll::Ready(output) => Poll::Ready(output),
+        Poll::Pending => panic!("{api:?} receive of {len} bytes did not complete immediately"),
+    })
+    .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroReceiveBufferShape {
+    Open,
+    Full,
+    Sealed,
+    Empty,
+}
+
+impl ZeroReceiveBufferShape {
+    const ALL: [Self; 4] = [Self::Open, Self::Full, Self::Sealed, Self::Empty];
+
+    fn buffer(self) -> RealIoBuffMut {
+        if self == Self::Empty {
+            return IoBuffMut::new(0, 0, 0);
+        }
+        let mut buffer = IoBuffMut::new(4, 8, 4);
+        buffer.headroom_prepend(b"H:").unwrap();
+        buffer.payload_append(b"HEAD").unwrap();
+        if self == Self::Full {
+            buffer.payload_append(b"FULL").unwrap();
+        }
+        if self == Self::Sealed {
+            buffer.tailroom_append(b"TAIL").unwrap();
+        }
+        buffer.advance(1).unwrap();
+        buffer
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UdpBufferSnapshot {
+    bytes: Vec<u8>,
+    payload: Vec<u8>,
+    active_ptr: *const u8,
+    payload_ptr: *const u8,
+    capacities: [usize; 3],
+    remaining: [usize; 3],
+    lengths: [usize; 3],
+}
+
+impl UdpBufferSnapshot {
+    fn capture(buffer: &RealIoBuffMut) -> Self {
+        Self {
+            bytes: buffer.bytes().to_vec(),
+            payload: buffer.payload_bytes().to_vec(),
+            active_ptr: IoBuffReadOnly::as_ptr(buffer),
+            payload_ptr: buffer.payload_bytes().as_ptr(),
+            capacities: [
+                buffer.headroom_capacity(),
+                buffer.payload_capacity(),
+                buffer.tailroom_capacity(),
+            ],
+            remaining: [
+                buffer.headroom_remaining(),
+                buffer.payload_remaining(),
+                buffer.tailroom_remaining(),
+            ],
+            lengths: [buffer.len(), buffer.payload_len(), buffer.writable_len()],
+        }
+    }
+}
+
+fn assert_zero_udp_receive_error(error: io::Error) {
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(error.raw_os_error(), None);
+    assert!(
+        error.get_ref().is_none(),
+        "zero receive error owns a payload"
+    );
 }
 
 fn connected_udp_pair() -> (UdpSocket, StdUdpSocket, SocketAddr) {
@@ -1305,6 +1426,124 @@ fn runtime_udp_prefilled_iobuff_receives_append_for_all_apis() {
 }
 
 #[test]
+fn runtime_udp_zero_receive_rejects_immediately_with_exact_owners() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, _peer, _peer_addr) = connected_udp_pair();
+
+    let _socket = run_test_output(&mut executor, async move {
+        for api in UdpReceiveApi::ALL {
+            for shape in ZeroReceiveBufferShape::ALL {
+                let buffer = shape.buffer();
+                let before = UdpBufferSnapshot::capture(&buffer);
+                let (result, mut buffer) = ready_udp_receive(api, &mut socket, buffer, 0).await;
+                assert_zero_udp_receive_error(result.expect_err("zero receive succeeded"));
+                assert_eq!(
+                    UdpBufferSnapshot::capture(&buffer),
+                    before,
+                    "{api:?} {shape:?}"
+                );
+                if shape == ZeroReceiveBufferShape::Sealed {
+                    assert_eq!(buffer.payload_append(b"!"), Err(IoBuffError::PayloadSealed));
+                    assert_eq!(buffer.payload_set_len(5), Err(IoBuffError::PayloadSealed));
+                    assert!(buffer.payload_unwritten_mut().is_empty());
+                }
+            }
+        }
+        socket
+    });
+
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        assert_eq!(stats.sqe_submits, 0);
+        assert_eq!(stats.retained_pooled_allocs, 0);
+        assert_eq!(stats.retained_heap_fallbacks, 0);
+    }
+}
+
+#[test]
+fn runtime_udp_zero_receive_preserves_context_precedence_and_owners() {
+    let (mut socket, _peer, _peer_addr) = connected_udp_pair();
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+    for api in UdpReceiveApi::ALL {
+        for shape in ZeroReceiveBufferShape::ALL {
+            let buffer = shape.buffer();
+            let before = UdpBufferSnapshot::capture(&buffer);
+            let mut future = std::pin::pin!(api.receive(&mut socket, buffer, 0));
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready((Err(error), buffer)) => {
+                    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+                    assert_eq!(UdpBufferSnapshot::capture(&buffer), before);
+                }
+                Poll::Ready((Ok(_), _)) => panic!("{api:?} zero receive succeeded outside run"),
+                Poll::Pending => panic!("{api:?} zero receive remained pending outside run"),
+            }
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_udp_zero_receive_preserves_faults_and_queued_datagrams() {
+    let mut executor = Executor::new().expect("failed to construct executor");
+    let (mut socket, peer, peer_addr) = connected_udp_pair();
+    let payloads = [*b"one", *b"two", *b"tri"];
+    for payload in payloads {
+        assert_eq!(peer.send(&payload).expect("std send failed"), payload.len());
+    }
+
+    executor
+        .run(async move {
+            for (api, payload) in UdpReceiveApi::ALL.into_iter().zip(payloads) {
+                let buffer = ZeroReceiveBufferShape::Open.buffer();
+                let before = UdpBufferSnapshot::capture(&buffer);
+                test_hooks::fail_next_op_alloc();
+                test_hooks::fail_next_sqe_submit();
+
+                let (result, buffer) = ready_udp_receive(api, &mut socket, buffer, 0).await;
+                assert_zero_udp_receive_error(result.expect_err("zero receive succeeded"));
+                assert_eq!(UdpBufferSnapshot::capture(&buffer), before);
+
+                let (result, buffer) = ready_udp_receive(api, &mut socket, buffer, 3).await;
+                assert_eq!(
+                    result
+                        .expect_err("zero receive consumed the allocation fault")
+                        .kind(),
+                    io::ErrorKind::WouldBlock,
+                );
+                assert_eq!(UdpBufferSnapshot::capture(&buffer), before);
+
+                let (result, buffer) = ready_udp_receive(api, &mut socket, buffer, 3).await;
+                assert_eq!(
+                    result
+                        .expect_err("zero receive consumed the submission fault")
+                        .kind(),
+                    io::ErrorKind::WouldBlock,
+                );
+                assert_eq!(UdpBufferSnapshot::capture(&buffer), before);
+
+                let (result, buffer) =
+                    timeout(UDP_TEST_TIMEOUT, api.receive(&mut socket, buffer, 3))
+                        .await
+                        .expect("preserved datagram receive timed out");
+                let (received, from) = result.expect("preserved datagram receive failed");
+                assert_eq!(received, payload.len());
+                let expected_from = (api == UdpReceiveApi::RecvFrom).then_some(peer_addr);
+                assert_eq!(from, expected_from);
+                assert_eq!(IoBuffReadOnly::as_ptr(&buffer), before.active_ptr);
+                assert_eq!(buffer.payload_bytes().as_ptr(), before.payload_ptr);
+                assert_eq!(
+                    buffer.payload_bytes(),
+                    [b"HEAD".as_slice(), &payload].concat()
+                );
+                assert_eq!(buffer.bytes(), [b":HEAD".as_slice(), &payload].concat());
+            }
+        })
+        .expect("executor run failed");
+}
+
+#[test]
 fn runtime_udp_zero_datagrams_preserve_prefilled_iobuff_for_all_apis() {
     let mut executor = Executor::new().expect("failed to construct executor");
     let (mut socket, peer, peer_addr) = connected_udp_pair();
@@ -1391,9 +1630,16 @@ fn runtime_udp_no_progress_boundaries_preserve_prefilled_iobuff() {
             sealed.payload_append(b"HEAD").unwrap();
             sealed.tailroom_append(b"TAIL").unwrap();
             let (result, buffer) = socket.recv(sealed, 0).await;
-            assert_eq!(result.expect("zero-length sealed recv failed"), 0);
+            assert_zero_udp_receive_error(result.expect_err("zero-length sealed recv succeeded"));
             assert_eq!(buffer.payload_bytes(), b"HEAD");
             assert_eq!(buffer.bytes(), b"HEADTAIL");
+
+            let (result, buffer) =
+                timeout(UDP_TEST_TIMEOUT, socket.recv(prefilled_udp_buffer(1), 1))
+                    .await
+                    .expect("queued empty datagram receive timed out");
+            assert_eq!(result.expect("queued empty datagram receive failed"), 0);
+            assert_eq!(buffer.payload_bytes(), b"HEAD");
         })
         .expect("executor run failed");
 }
