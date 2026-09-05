@@ -18,6 +18,8 @@
 //! drained, reads repeat the detailed `InvalidData` failure. Reads do not
 //! implicitly send the queued fatal alert, so callers can explicitly
 //! [`TlsClientStream::flush`] it before closing the connection.
+//! A direct rustls input-buffer failure also stops raw reads. Its first error
+//! is preserved; later calls return `InvalidData` without an owned payload.
 //!
 //! `rustls` still has its own internal protocol buffers. This wrapper exposes
 //! the public `rustls` write-direction limit via [`TlsClientOptions`] so that
@@ -138,6 +140,14 @@ const ECDSA_SHA1: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01
 
 type PendingTlsRead = stream::ReadFuture<'static, Vec<u8>, TlsTransportMarker>;
 type PendingTlsWrite = stream::WriteAllFuture<'static, Vec<u8>, TlsTransportMarker>;
+
+/// Terminal inbound failures either retain their detail in rustls or arise
+/// directly from its raw-input buffer, which has no stored protocol error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TlsInboundFailure {
+    Protocol,
+    RawInput,
+}
 
 const DER_SEQUENCE_TAG: u8 = 0x30;
 const DER_BIT_STRING_TAG: u8 = 0x03;
@@ -422,7 +432,9 @@ unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TlsClientOptions {
     /// rustls limit for unsent plaintext-before-handshake and pending TLS
-    /// records.  `None` means rustls may buffer without bound.
+    /// records. `None` means rustls may buffer without bound. `Some(0)` admits
+    /// no outgoing application plaintext; handshake traffic and reads remain
+    /// available.
     pub rustls_buffer_limit: Option<usize>,
     /// Nonzero requested bound for the reusable ciphertext receive scratch
     /// buffer used for `read_tls`. The stored effective raw-read bound and
@@ -494,6 +506,9 @@ pub struct TlsClientOptions {
 /// later reads repeat the detailed `InvalidData` failure without implicitly
 /// flushing rustls's queued alert. An explicit [`TlsClientStream::flush`] may
 /// still send that alert before the caller closes the connection.
+/// A direct rustls input-buffer failure also disables further raw reads. The
+/// first call returns that error; later calls return `InvalidData` without a
+/// detailed payload.
 ///
 /// Ordinary TLS operations reuse the two reserved ciphertext buffers. If an
 /// earlier exceptional path leaves one unavailable, the operation that needs
@@ -531,10 +546,10 @@ pub struct TlsClientStream {
     write_shutdown: bool,
     /// True after the underlying TCP stream has been shutdown for writes.
     transport_write_shutdown: bool,
-    /// True after rustls reported a fatal inbound protocol error. rustls keeps
-    /// the detailed error and permits replay through `process_new_packets`,
-    /// but forbids any later `read_tls` call.
-    inbound_protocol_failed: bool,
+    /// Terminal inbound failure, after which no more raw input is permitted.
+    /// Protocol error detail stays in rustls; direct input failures replay a
+    /// compact `InvalidData` error without retaining an owned error payload.
+    inbound_failure: Option<TlsInboundFailure>,
     /// Bytes at the front of the available read scratch already accepted by
     /// rustls. A nonzero value retains the unfed suffix across plaintext or
     /// handshake-output backpressure.
@@ -805,7 +820,7 @@ impl TlsClientStream {
             transport_write_failed: false,
             write_shutdown: false,
             transport_write_shutdown: false,
-            inbound_protocol_failed: false,
+            inbound_failure: None,
             read_tls_fed_offset: 0,
         })
     }
@@ -826,6 +841,9 @@ impl TlsClientStream {
     /// # Errors
     /// Returns `NotConnected` when polled without its active FlowIO executor
     /// task context.
+    /// A terminal inbound failure prevents further transport reads. Repeated
+    /// calls return `InvalidData`, retaining rustls's detailed payload only
+    /// for protocol errors.
     ///
     /// This is a connection-setup API, not a steady-state data-path API.
     pub fn handshake(&mut self) -> TlsHandshakeFuture<'_> {
@@ -851,6 +869,8 @@ impl TlsClientStream {
     /// that error is returned first. Once drained, this and later reads return
     /// the same detailed `InvalidData` failure without reading more ciphertext
     /// or implicitly flushing the queued fatal alert.
+    /// A direct rustls input-buffer failure returns its original error, then
+    /// repeats `InvalidData` without a detailed payload or further raw reads.
     ///
     /// Preferred when the caller tracks plaintext framing. This returns after
     /// one plaintext read instead of looping to fill `len`; obtaining that
@@ -1060,13 +1080,15 @@ impl TlsClientStream {
         }
     }
 
-    // rustls retains the first fatal protocol error and documents that later
-    // process_new_packets calls do no new work and return that same error. Use
-    // that storage instead of expanding this latency-sensitive wrapper with a
-    // second owned error representation.
+    // rustls retains fatal protocol errors for process_new_packets replay.
+    // Direct read_tls failures have no such stored error; replay only their
+    // terminal class so the wrapper needs no owned error representation.
     #[cold]
     #[inline(never)]
-    fn replay_inbound_protocol_error(&mut self) -> io::Error {
+    fn replay_inbound_error(&mut self, failure: TlsInboundFailure) -> io::Error {
+        if failure == TlsInboundFailure::RawInput {
+            return io::Error::from(io::ErrorKind::InvalidData);
+        }
         match self.connection.process_new_packets() {
             Err(err) => tls_protocol_error(err),
             Ok(_) => io::Error::new(
@@ -1076,6 +1098,12 @@ impl TlsClientStream {
         }
     }
 
+    fn read_tls(&mut self, reader: &mut dyn Read) -> io::Result<usize> {
+        self.connection.read_tls(reader).inspect_err(|_| {
+            self.inbound_failure = Some(TlsInboundFailure::RawInput);
+        })
+    }
+
     fn feed_transport_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         let unfed = tls_unfed_read_slice(bytes, self.read_tls_fed_offset)?;
         let mut cursor = Cursor::new(unfed);
@@ -1083,7 +1111,7 @@ impl TlsClientStream {
             if !self.connection.wants_read() {
                 return Ok(());
             }
-            let read = self.connection.read_tls(&mut cursor)?;
+            let read = self.read_tls(&mut cursor)?;
             if read == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1095,7 +1123,7 @@ impl TlsClientStream {
             let state = match self.connection.process_new_packets() {
                 Ok(state) => state,
                 Err(err) => {
-                    self.inbound_protocol_failed = true;
+                    self.inbound_failure = Some(TlsInboundFailure::Protocol);
                     return Err(tls_protocol_error(err));
                 }
             };
@@ -1110,9 +1138,9 @@ impl TlsClientStream {
     fn feed_read_tls_buffer(&mut self, mut buffer: Vec<u8>) -> io::Result<()> {
         let result = self.feed_transport_bytes(&buffer);
         if result.is_err() {
-            // A rustls packet-processing error is terminal. Preserve the
-            // existing error while retiring the wrapper-owned suffix: rustls
-            // explicitly forbids feeding more TLS bytes after that error.
+            // Retire the wrapper-owned suffix on failure. A direct read_tls
+            // failure or fatal packet error also latches the input state, so
+            // later calls cannot replace this chunk with new transport input.
             match tls_complete_read_offset(buffer.len()) {
                 Ok(offset) => self.read_tls_fed_offset = offset,
                 Err(offset_err) => {
@@ -1130,9 +1158,9 @@ impl TlsClientStream {
     fn feed_transport_eof(&mut self) -> io::Result<()> {
         self.transport_read_eof = true;
         let mut eof = io::empty();
-        let _ = self.connection.read_tls(&mut eof)?;
+        let _ = self.read_tls(&mut eof)?;
         if let Err(err) = self.connection.process_new_packets() {
-            self.inbound_protocol_failed = true;
+            self.inbound_failure = Some(TlsInboundFailure::Protocol);
             return Err(tls_protocol_error(err));
         }
         tls_transport_eof_result(self.connection.wants_read())
@@ -1212,6 +1240,9 @@ impl TlsClientStream {
     // The pending raw read future is kept on the stream so later TLS calls can
     // resume it if the original higher-level future is dropped.
     fn poll_fill_tls_from_transport(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(failure) = self.inbound_failure {
+            return Poll::Ready(Err(self.replay_inbound_error(failure)));
+        }
         loop {
             if let Some(future) = self.pending_read_tls.as_mut() {
                 match Pin::new(future).poll(cx) {
@@ -1286,15 +1317,15 @@ impl TlsClientStream {
                 Ok(read) => return Poll::Ready(Ok(read)),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(err) => {
-                    if self.inbound_protocol_failed {
-                        return Poll::Ready(Err(self.replay_inbound_protocol_error()));
+                    if let Some(failure) = self.inbound_failure {
+                        return Poll::Ready(Err(self.replay_inbound_error(failure)));
                     }
                     return Poll::Ready(Err(err));
                 }
             }
 
-            if self.inbound_protocol_failed {
-                return Poll::Ready(Err(self.replay_inbound_protocol_error()));
+            if let Some(failure) = self.inbound_failure {
+                return Poll::Ready(Err(self.replay_inbound_error(failure)));
             }
 
             if self.pending_write_tls.is_some() {
@@ -1308,7 +1339,11 @@ impl TlsClientStream {
             if self.pending_read_tls.is_some() || self.connection.wants_read() {
                 match self.poll_fill_tls_from_transport(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(_)) if self.inbound_protocol_failed => continue,
+                    Poll::Ready(Err(_))
+                        if self.inbound_failure == Some(TlsInboundFailure::Protocol) =>
+                    {
+                        continue;
+                    }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Ready(Ok(())) => continue,
                 }
@@ -1363,8 +1398,8 @@ impl Future for TlsHandshakeFuture<'_> {
             return Poll::Ready(Err(err));
         }
 
-        if this.stream.inbound_protocol_failed {
-            return Poll::Ready(Err(this.stream.replay_inbound_protocol_error()));
+        if let Some(failure) = this.stream.inbound_failure {
+            return Poll::Ready(Err(this.stream.replay_inbound_error(failure)));
         }
 
         loop {
@@ -2295,7 +2330,7 @@ mod tests {
             .expect_err("corrupt coalesced record unexpectedly authenticated");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "cannot decrypt peer's message");
-        assert!(tls.inbound_protocol_failed);
+        assert_eq!(tls.inbound_failure, Some(TlsInboundFailure::Protocol));
         assert!(tls.connection.wants_write(), "fatal alert was not queued");
         assert!(tls.pending_read_tls.is_none());
         assert_eq!(tls.read_tls_fed_offset, 0);
@@ -2392,7 +2427,7 @@ mod tests {
                     .expect("explicit fatal-alert flush failed");
                 assert!(!tls.connection.wants_write());
                 assert!(tls.pending_write_tls.is_none());
-                assert!(tls.inbound_protocol_failed);
+                assert_eq!(tls.inbound_failure, Some(TlsInboundFailure::Protocol));
             })
             .expect("executor run failed");
 
@@ -2421,7 +2456,7 @@ mod tests {
             .read_tls(&mut cursor)
             .expect("rustls did not accept the staged corrupt record");
         assert_eq!(accepted, corrupt_record.len());
-        assert!(!tls.inbound_protocol_failed);
+        assert_eq!(tls.inbound_failure, None);
 
         let err = tls
             .feed_transport_eof()
@@ -2429,7 +2464,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "cannot decrypt peer's message");
         assert!(tls.transport_read_eof);
-        assert!(tls.inbound_protocol_failed);
+        assert_eq!(tls.inbound_failure, Some(TlsInboundFailure::Protocol));
         assert!(tls.pending_read_tls.is_none());
 
         let mut cx = Context::from_waker(Waker::noop());
@@ -2446,6 +2481,159 @@ mod tests {
             assert_eq!(err.to_string(), "cannot decrypt peer's message");
             assert!(tls.pending_read_tls.is_none());
         }
+    }
+
+    #[cfg(not(miri))]
+    fn assert_fragmented_handshake_deframer_failure_is_terminal(transport_eof: bool) {
+        const HANDSHAKE_BYTES: usize = 65_535;
+        const RECORD_BYTES: usize = 16_384;
+        const TRANSPORT_BYTES: usize = 1_021;
+
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("test listener bind failed");
+        let client = std::net::TcpStream::connect(
+            listener.local_addr().expect("test listener address failed"),
+        )
+        .expect("test client connect failed");
+        let (_peer, _) = listener.accept().expect("test peer accept failed");
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut tls = TlsClientStream::new(
+            TcpStream::from_owned_fd(client.into()),
+            config,
+            ServerName::try_from("localhost").expect("invalid test server name"),
+            TlsClientOptions {
+                transport_read_buffer_size: TRANSPORT_BYTES,
+                rustls_buffer_limit: Some(1024),
+                transport_write_buffer_size: 128,
+            },
+        )
+        .expect("TLS stream construction failed");
+        while tls.connection.wants_write() {
+            assert!(
+                tls.connection
+                    .write_tls(&mut io::sink())
+                    .expect("ClientHello drain failed")
+                    > 0
+            );
+        }
+
+        // The handshake length itself is valid, but its retained record
+        // framing fills the deframer before the final fragment is complete.
+        let mut handshake = vec![0; HANDSHAKE_BYTES];
+        handshake[..4].copy_from_slice(&[2, 0, 0xff, 0xfb]);
+        let mut wire = Vec::new();
+        for fragment in handshake.chunks(RECORD_BYTES) {
+            wire.extend_from_slice(&[22, 3, 3]);
+            wire.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
+            wire.extend_from_slice(fragment);
+        }
+
+        let scratch = tls.read_tls_buffer.as_ref().expect("missing read scratch");
+        let scratch_allocation = scratch.as_ptr();
+        let scratch_capacity = scratch.capacity();
+        for fragment in wire[..HANDSHAKE_BYTES].chunks(TRANSPORT_BYTES) {
+            let mut scratch = tls.take_read_tls_buffer().expect("missing read scratch");
+            assert!(scratch.is_empty());
+            scratch.extend_from_slice(fragment);
+            tls.feed_read_tls_buffer(scratch)
+                .expect("deframer failed before reaching its capacity");
+        }
+        assert_eq!(tls.inbound_failure, None);
+        let result = if transport_eof {
+            tls.feed_transport_eof()
+        } else {
+            let mut scratch = tls
+                .take_read_tls_buffer()
+                .expect("missing final read scratch");
+            scratch.extend_from_slice(&wire[HANDSHAKE_BYTES..]);
+            tls.feed_read_tls_buffer(scratch)
+        };
+        let err = result.expect_err("fragmented handshake did not reach the deframer bound");
+        assert_eq!(tls.inbound_failure, Some(TlsInboundFailure::RawInput));
+        assert_eq!(tls.transport_read_eof, transport_eof);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "message buffer full");
+        assert!(tls.connection.is_handshaking());
+        tls.connection
+            .process_new_packets()
+            .expect("direct deframer failure became a stored protocol failure");
+
+        let restored = tls
+            .read_tls_buffer
+            .as_ref()
+            .expect("missing restored scratch");
+        assert!(restored.is_empty(), "terminal input retained a raw suffix");
+        assert_eq!(restored.as_ptr(), scratch_allocation);
+        assert_eq!(restored.capacity(), scratch_capacity);
+        assert_eq!(tls.read_tls_fed_offset, 0);
+        assert!(tls.pending_read_tls.is_none());
+        assert!(!tls.connection.wants_write());
+
+        let mut cx = Context::from_waker(Waker::noop());
+        for attempt in 0..2 {
+            let err = match tls.poll_fill_tls_from_transport(&mut cx) {
+                Poll::Ready(Err(err)) => err,
+                Poll::Ready(Ok(())) => panic!("terminal fill {attempt} unexpectedly succeeded"),
+                Poll::Pending => panic!("terminal fill {attempt} submitted raw input"),
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.get_ref().is_none(),
+                "repeated input failure owns a heap error"
+            );
+            assert!(tls.pending_read_tls.is_none());
+            let mut destination = [0; 1];
+            match tls.poll_read_plaintext(&mut cx, &mut destination) {
+                Poll::Ready(Err(err)) => {
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                    assert!(err.get_ref().is_none());
+                }
+                Poll::Ready(Ok(_)) => panic!("terminal plaintext read unexpectedly succeeded"),
+                Poll::Pending => panic!("terminal plaintext read submitted raw input"),
+            }
+        }
+
+        let mut executor = Executor::new().expect("test executor construction failed");
+        executor
+            .run(async move {
+                for attempt in 0..2 {
+                    let mut handshake = tls.handshake();
+                    std::future::poll_fn(|cx| {
+                        match Pin::new(&mut handshake).poll(cx) {
+                            Poll::Ready(Err(err)) => {
+                                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                                assert!(err.get_ref().is_none());
+                            }
+                            Poll::Ready(Ok(())) => panic!("terminal handshake {attempt} succeeded"),
+                            Poll::Pending => panic!("terminal handshake {attempt} submitted input"),
+                        }
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(tls.pending_read_tls.is_none());
+                assert!(tls.pending_write_tls.is_none());
+                let restored = tls
+                    .read_tls_buffer
+                    .as_ref()
+                    .expect("missing repeated-read scratch");
+                assert!(restored.is_empty());
+                assert_eq!(restored.as_ptr(), scratch_allocation);
+                assert_eq!(restored.capacity(), scratch_capacity);
+                assert_eq!(tls.read_tls_fed_offset, 0);
+            })
+            .expect("test executor run failed");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_fragmented_handshake_deframer_failure_is_terminal() {
+        assert_fragmented_handshake_deframer_failure_is_terminal(false);
+        assert_fragmented_handshake_deframer_failure_is_terminal(true);
     }
 
     #[test]

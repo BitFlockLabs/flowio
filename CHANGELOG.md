@@ -10,6 +10,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- Direct rustls input-buffer failures now permanently stop TLS transport reads,
+  retire buffered ciphertext, and repeat `InvalidData` without retaining an
+  owned error payload. Detailed protocol-error replay and authenticated
+  plaintext draining remain available. A zero rustls write-buffer limit is
+  documented as admitting no outgoing application plaintext.
+
 - **Breaking:** `TcpStream`, `UnixStream`, and `UdpSocket` are now explicitly
   `!Send + !Sync`, removing their incidental `Send` auto trait and matching
   FlowIO's owner-OS-thread runtime contract. Other descriptor-bearing public
