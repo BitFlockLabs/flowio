@@ -871,11 +871,16 @@ impl IoBuffMut {
     }
 
     /// Extends the payload capacity by taking `amount` bytes from the
-    /// tailroom region. Changing the region boundary discards all active
-    /// tailroom bytes (`tailroom_len` is reset to `0`).
+    /// tailroom region. A positive amount changes the region boundary and
+    /// discards all active tailroom bytes (`tailroom_len` is reset to `0`).
+    /// A zero amount leaves the buffer unchanged, including active tailroom
+    /// bytes and the payload seal.
     ///
     /// Returns an error if `amount` exceeds the current tailroom capacity.
     pub fn payload_extend_from_tailroom(&mut self, amount: usize) -> Result<(), IoBuffError> {
+        if amount == 0 {
+            return Ok(());
+        }
         let hdr = unsafe { self.header.as_mut() };
         if amount > hdr.tailroom_capacity {
             return Err(IoBuffError::TailroomInsufficient);

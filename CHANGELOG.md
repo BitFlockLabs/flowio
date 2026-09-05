@@ -10,6 +10,9 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- `IoBuffMut::payload_extend_from_tailroom(0)` now leaves the buffer unchanged,
+  preserving active trailer bytes and the payload seal. Positive extensions
+  continue to discard active tailroom data when moving the region boundary.
 - Direct rustls input-buffer failures now permanently stop TLS transport reads,
   retire buffered ciphertext, and repeat `InvalidData` without retaining an
   owned error payload. Detailed protocol-error replay and authenticated

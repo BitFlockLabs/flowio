@@ -676,6 +676,105 @@ fn buffer_mut_full_protocol_frame() {
 // IoBuffMut — payload_extend_from_tailroom
 // ============================================================================
 
+fn assert_zero_tailroom_extension_preserves_state(buf: &mut RealIoBuffMut) {
+    let bytes = buf.bytes().to_vec();
+    let payload = buf.payload_bytes().to_vec();
+    let active_ptr = IoBuffReadOnly::as_ptr(buf);
+    let payload_ptr = buf.payload_bytes().as_ptr();
+    let geometry = (
+        buf.headroom_capacity(),
+        buf.payload_capacity(),
+        buf.tailroom_capacity(),
+        buf.headroom_remaining(),
+        buf.payload_remaining(),
+        buf.tailroom_remaining(),
+        buf.payload_len(),
+        buf.len(),
+        IoBuffReadWrite::writable_len(buf),
+    );
+
+    assert_eq!(buf.payload_extend_from_tailroom(0), Ok(()));
+
+    assert_eq!(buf.bytes(), bytes);
+    assert_eq!(buf.payload_bytes(), payload);
+    assert_eq!(IoBuffReadOnly::as_ptr(buf), active_ptr);
+    assert_eq!(buf.payload_bytes().as_ptr(), payload_ptr);
+    assert_eq!(
+        (
+            buf.headroom_capacity(),
+            buf.payload_capacity(),
+            buf.tailroom_capacity(),
+            buf.headroom_remaining(),
+            buf.payload_remaining(),
+            buf.tailroom_remaining(),
+            buf.payload_len(),
+            buf.len(),
+            IoBuffReadWrite::writable_len(buf),
+        ),
+        geometry,
+    );
+}
+
+#[test]
+fn buffer_mut_zero_tailroom_extension_preserves_active_regions_and_seal() {
+    for advance in [0, 1, 3, 7] {
+        let mut buf = IoBuffMut::new(4, 8, 4);
+        buf.headroom_prepend(b"H:").unwrap();
+        buf.payload_append(b"BODY").unwrap();
+        buf.tailroom_append(b"TR").unwrap();
+        buf.advance(advance).unwrap();
+
+        assert_zero_tailroom_extension_preserves_state(&mut buf);
+
+        assert_eq!(buf.payload_append(b"!"), Err(IoBuffError::PayloadSealed));
+        assert_eq!(
+            buf.payload_set_len(buf.payload_len() + 1),
+            Err(IoBuffError::PayloadSealed),
+        );
+        assert!(buf.payload_unwritten_mut().is_empty());
+    }
+}
+
+#[test]
+fn buffer_mut_zero_tailroom_extension_preserves_reset_payload_frontier() {
+    let mut buf = IoBuffMut::new(4, 8, 4);
+    buf.payload_append(b"old").unwrap();
+    buf.tailroom_append(b"TR").unwrap();
+    buf.reset();
+    buf.headroom_prepend(b"H:").unwrap();
+    buf.payload_append(b"fresh").unwrap();
+    buf.payload_set_len(2).unwrap();
+
+    assert_zero_tailroom_extension_preserves_state(&mut buf);
+
+    buf.payload_set_len(5).unwrap();
+    assert_eq!(buf.bytes(), b"H:fresh");
+    assert_eq!(
+        buf.payload_set_len(6),
+        Err(IoBuffError::PayloadUninitialized)
+    );
+    buf.payload_append(b"!").unwrap();
+    assert_eq!(buf.bytes(), b"H:fresh!");
+}
+
+#[test]
+fn buffer_mut_zero_tailroom_extension_preserves_zero_capacity_regions() {
+    for (headroom, payload, tailroom) in [(0, 0, 0), (4, 8, 0), (4, 0, 4)] {
+        let mut buf = IoBuffMut::new(headroom, payload, tailroom);
+        if headroom != 0 {
+            buf.headroom_prepend(b"H:").unwrap();
+        }
+        if payload != 0 {
+            buf.payload_append(b"data").unwrap();
+        }
+        if tailroom != 0 {
+            buf.tailroom_append(b"TR").unwrap();
+        }
+
+        assert_zero_tailroom_extension_preserves_state(&mut buf);
+    }
+}
+
 #[test]
 fn buffer_mut_payload_extend_from_tailroom() {
     println!("--- Extend payload from tailroom ---");
