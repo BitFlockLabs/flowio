@@ -1,6 +1,9 @@
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig, IoBuffPoolConfigError};
 use flowio::runtime::buffer::{IoBuffError, IoBuffReadOnly, IoBuffReadWrite};
 
+static_assertions::assert_impl_all!(IoBuffPoolConfig: Clone, Copy, std::fmt::Debug, PartialEq, Eq);
+static_assertions::assert_not_impl_any!(IoBuffPoolConfig: Default, std::hash::Hash);
+
 macro_rules! seg {
     ($chain:expr, $index:expr) => {
         $chain

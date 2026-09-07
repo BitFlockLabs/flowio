@@ -423,7 +423,16 @@ fn vec_frozen_new_empty() {
     assert_eq!(chain.segments(), 0);
     assert_eq!(chain.capacity(), 4);
     assert_eq!(chain.len(), 0);
+    assert_eq!(chain.checked_len(), Some(0));
     assert!(chain.is_empty());
+    let zero_capacity = flowio::runtime::buffer::iobuffvec::IoBuffVec::<0>::new();
+    assert_eq!(zero_capacity.checked_len(), Some(0));
+    let empty_segment = flowio::runtime::buffer::iobuffvec::IoBuffVec::<1>::from_array([
+        IoBuffMut::new(0, 0, 0).freeze(),
+    ]);
+    assert_eq!(empty_segment.segments(), 1);
+    assert_eq!(empty_segment.checked_len(), Some(0));
+    assert!(empty_segment.is_empty());
 }
 
 #[test]
@@ -438,6 +447,7 @@ fn vec_frozen_push_multiple() {
     chain.push(b2.freeze()).unwrap();
 
     assert_eq!(chain.segments(), 2);
+    assert_eq!(chain.checked_len(), Some(10));
     assert_eq!(seg!(chain, 0).bytes(), b"hello");
     assert_eq!(seg!(chain, 1).bytes(), b"world");
 }
@@ -453,6 +463,7 @@ fn vec_frozen_from_array() {
         flowio::runtime::buffer::iobuffvec::IoBuffVec::<2>::from_array([b1.freeze(), b2.freeze()]);
 
     assert_eq!(chain.segments(), 2);
+    assert_eq!(chain.checked_len(), Some(8));
     assert_eq!(seg!(chain, 0).bytes(), b"seg0");
     assert_eq!(seg!(chain, 1).bytes(), b"seg1");
 }

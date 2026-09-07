@@ -10,6 +10,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** `PushError::value_mut` is removed. Preserve the copied reason
+  with `error()` and recover ownership with `into_value()`, or use
+  `into_parts()`, before mutating a rejected value.
+- `IoBuffVec::checked_len` is public and returns `None` when the aggregate
+  readable length overflows; `len()` continues to saturate at `usize::MAX`.
+- `IoBuffPoolConfig` implements `Clone`, `Copy`, `Debug`, `PartialEq`, and `Eq`.
 - DNS responses with conflicting CNAME targets for the active owner now return
   `InvalidData`, independent of record order. Equivalent duplicate targets and
   matching-family direct-address precedence remain supported.

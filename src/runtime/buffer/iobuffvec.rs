@@ -133,12 +133,6 @@ impl<T> PushError<T> {
         &self.value
     }
 
-    /// Returns a mutable reference to the original value.
-    #[inline(always)]
-    pub fn value_mut(&mut self) -> &mut T {
-        &mut self.value
-    }
-
     /// Consumes the error and returns the original value.
     #[inline(always)]
     pub fn into_value(self) -> T {
@@ -590,6 +584,25 @@ impl<const N: usize> IoBuffVec<N> {
         }
     }
 
+    /// Allocates an empty chain directly in heap storage during test setup.
+    ///
+    /// Available only with `test-support`; this is not a supported production
+    /// API. No segment handles are initialized and no large chain value is
+    /// constructed on the stack.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_boxed_empty() -> Box<Self> {
+        let mut storage = Box::<Self>::new_uninit();
+        // SAFETY: The array contains only MaybeUninit slots, which may remain
+        // uninitialized. Writing count = 0 establishes the empty initialized
+        // prefix. The raw field projection does not borrow an uninitialized
+        // Self, and assume_init preserves the allocation owned by the Box.
+        unsafe {
+            std::ptr::addr_of_mut!((*storage.as_mut_ptr()).count).write(0);
+            storage.assume_init()
+        }
+    }
+
     /// Creates a fully-initialized chain from an array of frozen segments.
     pub fn from_array(buffers: [IoBuff; N]) -> Self {
         Self {
@@ -612,14 +625,16 @@ impl<const N: usize> IoBuffVec<N> {
 
     /// Returns the total number of readable bytes across all segments.
     ///
-    /// An unrepresentable aggregate saturates at `usize::MAX`.
+    /// An unrepresentable aggregate saturates at `usize::MAX`. Use
+    /// [`Self::checked_len`] to distinguish overflow from an exact total.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.checked_len().unwrap_or(usize::MAX)
     }
 
+    /// Returns the total readable length, or `None` if the sum overflows.
     #[inline(always)]
-    pub(crate) fn checked_len(&self) -> Option<usize> {
+    pub fn checked_len(&self) -> Option<usize> {
         checked_readable_len(iter_inline(&self.buffers, self.count))
     }
 
@@ -908,6 +923,43 @@ impl<B: IoBuffReadOnly, const N: usize> Drop for IoBuffReadOnlyVecIntoIter<B, N>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn boxed_empty_frozen_chain_initializes_and_drops_exact_prefix() {
+        fn check<const N: usize>(segments: usize) {
+            let mut buffer = IoBuffMut::new(0, 8, 0).expect("source allocation should succeed");
+            buffer
+                .payload_append(b"kept")
+                .expect("source bytes should fit");
+            let source = buffer.freeze();
+            let source_ptr = source.as_ptr();
+            let mut chain = IoBuffVec::<N>::new_boxed_empty();
+            assert_eq!(chain.capacity(), N);
+            assert_eq!(chain.segments(), 0);
+            assert_eq!(chain.checked_len(), Some(0));
+            assert!(chain.is_empty());
+            for initialized in 0..segments {
+                chain
+                    .push(source.clone())
+                    .expect("declared prefix should fit");
+                assert_eq!(source.ref_count(), initialized + 2);
+            }
+            assert_eq!(chain.segments(), segments);
+            assert_eq!(chain.checked_len(), Some(segments * 4));
+            drop(chain);
+            assert_eq!(source.ref_count(), 1);
+            let source = source
+                .try_mut()
+                .expect("dropping the prefix should release every clone");
+            assert_eq!(source.as_ptr(), source_ptr);
+            assert_eq!(source.bytes(), b"kept");
+        }
+
+        check::<0>(0);
+        check::<1>(1);
+        check::<3>(2);
+    }
 
     #[test]
     fn checked_length_sum_accepts_exact_max_and_rejects_overflow() {

@@ -64,6 +64,7 @@ const _: () = {
 /// };
 /// assert_eq!(config.payload, 1500);
 /// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoBuffPoolConfig {
     /// Reserved headroom bytes for prepending protocol headers.
     pub headroom: usize,
