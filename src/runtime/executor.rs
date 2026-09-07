@@ -2982,13 +2982,7 @@ impl Executor {
                 let header = unsafe { &*header_ptr };
                 if let Poll::Ready(()) = poll_res {
                     // Batch: clear RUNNING+NOTIFIED+QUEUED, set COMPLETED.
-                    header.flags.set(
-                        (header.flags.get()
-                            & !(TaskHeader::FLAG_RUNNING
-                                | TaskHeader::FLAG_NOTIFIED
-                                | TaskHeader::FLAG_QUEUED))
-                            | TaskHeader::FLAG_COMPLETED,
-                    );
+                    header.flags.set(terminal_task_flags(header.flags.get()));
                     unsafe {
                         debug_assert!((*state_ptr).runtime_state.live_tasks > 0);
                         (*state_ptr).runtime_state.live_tasks -= 1;
@@ -3200,14 +3194,7 @@ impl Executor {
             let flags = unsafe { task_flags_unchecked(task_ptr) };
             if task_is_completed(flags) {
                 unsafe {
-                    replace_task_flags_unchecked(
-                        task_ptr,
-                        (flags
-                            & !(TaskHeader::FLAG_RUNNING
-                                | TaskHeader::FLAG_NOTIFIED
-                                | TaskHeader::FLAG_QUEUED))
-                            | TaskHeader::FLAG_COMPLETED,
-                    );
+                    replace_task_flags_unchecked(task_ptr, terminal_task_flags(flags));
                 }
                 continue;
             }
@@ -3335,13 +3322,7 @@ unsafe fn cancel_task_and_release_executor_ref(
         debug_assert!(live_tasks > 0, "live task accounting underflow");
     }
     unsafe {
-        (*task).flags.set(
-            (flags
-                & !(TaskHeader::FLAG_RUNNING
-                    | TaskHeader::FLAG_NOTIFIED
-                    | TaskHeader::FLAG_QUEUED))
-                | TaskHeader::FLAG_COMPLETED,
-        );
+        (*task).flags.set(terminal_task_flags(flags));
         // Saturation keeps exceptional cleanup non-panicking if a separate
         // internal accounting defect is encountered during an active unwind.
         (*runtime_state).live_tasks = live_tasks.saturating_sub(1);
@@ -4385,6 +4366,12 @@ fn task_is_notified(flags: u64) -> bool {
 #[inline(always)]
 fn task_is_completed(flags: u64) -> bool {
     (flags & TaskHeader::FLAG_COMPLETED) != 0
+}
+
+#[inline(always)]
+fn terminal_task_flags(flags: u64) -> u64 {
+    (flags & !(TaskHeader::FLAG_RUNNING | TaskHeader::FLAG_NOTIFIED | TaskHeader::FLAG_QUEUED))
+        | TaskHeader::FLAG_COMPLETED
 }
 
 #[inline(always)]
@@ -9871,6 +9858,42 @@ mod tests {
                 .set_provider_max_request_count(Some(1));
         }
         executor
+    }
+
+    #[test]
+    fn task_terminal_flag_transform_preserves_unrelated_bits_and_is_idempotent() {
+        assert_eq!(
+            [
+                TaskHeader::FLAG_NOTIFIED,
+                TaskHeader::FLAG_RUNNING,
+                TaskHeader::FLAG_QUEUED,
+                TaskHeader::FLAG_COMPLETED
+            ],
+            [1, 2, 4, 8],
+        );
+        for low in 0u64..16 {
+            for unrelated in [
+                0,
+                0x10,
+                0x8000_0000,
+                0x1_0000_0000,
+                0x8000_0000_0000_0000,
+                0xffff_ffff_ffff_fff0,
+            ] {
+                let actual = terminal_task_flags(low | unrelated);
+                assert_eq!(actual & 0xf, 0x8, "terminal bits: {low:#x}/{unrelated:#x}");
+                assert_eq!(
+                    actual & 0xffff_ffff_ffff_fff0,
+                    unrelated,
+                    "unrelated bits: {low:#x}/{unrelated:#x}"
+                );
+                assert_eq!(
+                    terminal_task_flags(actual),
+                    actual,
+                    "idempotence: {low:#x}/{unrelated:#x}"
+                );
+            }
+        }
     }
 
     #[test]
