@@ -28,10 +28,11 @@ use flowio::net::udp::{
 };
 use flowio::net::unix::UnixStream;
 use flowio::net::{
-    ReadExactAppendFuture, ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture,
-    WriteAllFuture, WriteFuture, WritevAllFuture, WritevAllProjectedFuture, WritevFuture,
-    WritevPieces, WritevProjectedFuture, WritevProjection,
+    ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture, WriteAllFuture, WriteFuture,
+    WritevAllFuture, WritevAllProjectedFuture, WritevFuture, WritevPieces, WritevProjectedFuture,
+    WritevProjection,
 };
+use flowio::runtime::buffer::IoBuffMut;
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec};
 #[cfg(not(miri))]
 use flowio::runtime::executor::{Executor, TrySpawnError};
@@ -68,7 +69,7 @@ type TcpRead = ReadFuture<'static, Vec<u8>, TcpStream>;
 type TcpWrite = WriteFuture<'static, Vec<u8>, TcpStream>;
 type TcpWriteAll = WriteAllFuture<'static, Vec<u8>, TcpStream>;
 type TcpReadExact = ReadExactFuture<'static, Vec<u8>, TcpStream>;
-type TcpReadExactAppend = ReadExactAppendFuture<'static, TcpStream>;
+type TcpReadExactIoBuff = ReadExactFuture<'static, IoBuffMut, TcpStream>;
 type TcpReadv = ReadvFuture<'static, SEGMENTS, TcpStream>;
 type TcpWritev = WritevFuture<'static, IoBuffVec<SEGMENTS>, SEGMENTS, TcpStream>;
 type TcpWritevAll = WritevAllFuture<'static, IoBuffVec<SEGMENTS>, SEGMENTS, TcpStream>;
@@ -116,7 +117,7 @@ assert_local_unwind_boundary!(
     TcpWrite,
     TcpWriteAll,
     TcpReadExact,
-    TcpReadExactAppend,
+    TcpReadExactIoBuff,
     TcpReadv,
     TcpWritevSend,
     TcpWritevAllSend,
@@ -191,7 +192,7 @@ fn descriptor_handle_and_future_layouts_match_x86_64_contract() {
     assert_layout::<TcpWrite>("WriteFuture<Vec>", 48, 8);
     assert_layout::<TcpWriteAll>("WriteAllFuture<Vec>", 64, 8);
     assert_layout::<TcpReadExact>("ReadExactFuture<Vec>", 72, 8);
-    assert_layout::<TcpReadExactAppend>("ReadExactAppendFuture", 88, 8);
+    assert_layout::<TcpReadExactIoBuff>("ReadExactFuture<IoBuffMut>", 88, 8);
     assert_layout::<TcpReadv>("ReadvFuture<2>", 128, 8);
     assert_layout::<TcpWritev>("WritevFuture<2>", 112, 8);
     assert_layout::<TcpWritevAll>("WritevAllFuture<2>", 112, 8);

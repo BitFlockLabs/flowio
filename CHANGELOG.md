@@ -10,6 +10,11 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** TCP and Unix streams use generic `try_read` and `read_exact`
+  for `IoBuffMut` append reads. `try_read_append`, `read_exact_append`, and
+  `ReadExactAppendFuture` are removed; named future types use
+  `ReadExactFuture<'a, IoBuffMut, S>`. Positive progress preserves existing
+  payload bytes and appends the received bytes through the buffer's write base.
 - **Breaking:** Checked byte accessors support `u8`/`i8` without endian
   suffixes and `u16`/`i16`/`u32`/`i32`/`u64`/`i64` with native, little-endian,
   and big-endian forms. One-byte endian aliases and all `u128`, `i128`, `f32`,

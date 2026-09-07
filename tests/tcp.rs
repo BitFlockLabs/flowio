@@ -813,41 +813,41 @@ fn runtime_tcp_try_read_rejects_invalid_len() {
 }
 
 #[test]
-fn runtime_tcp_try_read_append_success_and_partial() {
+fn runtime_tcp_try_read_iobuff_success_and_partial() {
     let (mut stream, mut peer) = connected_try_tcp_stream();
     peer.write_all(b"body").expect("std write failed");
 
     let mut recv = IoBuffMut::new(0, 12, 0);
     recv.payload_append(b"HEAD").unwrap();
-    let (res, recv) = stream.try_read_append(recv, 4);
-    assert_eq!(res.expect("try_read_append failed"), 4);
+    let (res, recv) = stream.try_read(recv, 4);
+    assert_eq!(res.expect("try_read failed"), 4);
     assert_eq!(recv.payload_bytes(), b"HEADbody");
 
     peer.write_all(b"!!").expect("std write failed");
-    let (res, recv) = stream.try_read_append(recv, 4);
-    assert_eq!(res.expect("partial try_read_append failed"), 2);
+    let (res, recv) = stream.try_read(recv, 4);
+    assert_eq!(res.expect("partial try_read failed"), 2);
     assert_eq!(recv.payload_bytes(), b"HEADbody!!");
 }
 
 #[test]
-fn runtime_tcp_try_read_append_would_block_and_invalid_len() {
+fn runtime_tcp_try_read_iobuff_would_block_and_invalid_len() {
     let (mut stream, _peer) = connected_try_tcp_stream();
     let mut recv = IoBuffMut::new(0, 6, 0);
     recv.payload_append(b"HEAD").unwrap();
 
-    let (res, recv) = stream.try_read_append(recv, 2);
-    let err = res.expect_err("try_read_append should report WouldBlock");
+    let (res, recv) = stream.try_read(recv, 2);
+    let err = res.expect_err("try_read should report WouldBlock");
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(recv.payload_bytes(), b"HEAD");
 
-    let (res, recv) = stream.try_read_append(recv, 3);
-    let err = res.expect_err("oversize try_read_append should fail");
+    let (res, recv) = stream.try_read(recv, 3);
+    let err = res.expect_err("oversize try_read should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(recv.payload_bytes(), b"HEAD");
 }
 
 #[test]
-fn runtime_tcp_try_read_append_eof_preserves_payload() {
+fn runtime_tcp_try_read_iobuff_eof_preserves_payload() {
     let (mut stream, peer) = connected_try_tcp_stream();
     peer.shutdown(Shutdown::Write)
         .expect("std shutdown write failed");
@@ -856,7 +856,7 @@ fn runtime_tcp_try_read_append_eof_preserves_payload() {
     recv.payload_append(b"HEAD").unwrap();
 
     for _ in 0..100 {
-        let (res, returned) = stream.try_read_append(recv, 4);
+        let (res, returned) = stream.try_read(recv, 4);
         recv = returned;
         match res {
             Ok(0) => {
@@ -864,11 +864,11 @@ fn runtime_tcp_try_read_append_eof_preserves_payload() {
                 return;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
-            other => panic!("unexpected try_read_append EOF result: {other:?}"),
+            other => panic!("unexpected try_read EOF result: {other:?}"),
         }
     }
 
-    panic!("try_read_append did not observe EOF");
+    panic!("try_read did not observe EOF");
 }
 
 #[test]
@@ -2534,7 +2534,7 @@ fn runtime_tcp_write_all_read_exact_iobuff() {
 
 /// Staged IoBuffMut append reads preserve previously-read payload bytes.
 #[test]
-fn runtime_tcp_read_exact_append_iobuff_staged() {
+fn runtime_tcp_read_exact_iobuff_staged() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     let mut listener =
@@ -2551,11 +2551,11 @@ fn runtime_tcp_read_exact_append_iobuff_staged() {
             let (mut stream, _addr) = listener.accept().await.expect("accept failed");
 
             let recv_buf = IoBuffMut::new(0, 8, 0);
-            let (res, buf) = stream.read_exact_append(recv_buf, 4).await;
+            let (res, buf) = stream.read_exact(recv_buf, 4).await;
             assert_eq!(res.expect("header append read failed"), 4);
             assert_eq!(buf.payload_bytes(), b"HEAD");
 
-            let (res, buf) = stream.read_exact_append(buf, 4).await;
+            let (res, buf) = stream.read_exact(buf, 4).await;
             assert_eq!(res.expect("body append read failed"), 4);
             assert_eq!(buf.payload_len(), 8);
             assert_eq!(buf.payload_bytes(), b"HEADbody");

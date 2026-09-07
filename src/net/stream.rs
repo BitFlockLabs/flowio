@@ -36,7 +36,7 @@ use crate::runtime::buffer::iobuffvec::{
     IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut, checked_iovec_count_and_length_sum,
     invalid_read_iovec_shape,
 };
-use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
+use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
     PollCtx, completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker,
     prepare_unsubmitted_op, refresh_op_waiter_from_waker, submit_initialized_retained_fd_sqe,
@@ -77,8 +77,9 @@ macro_rules! impl_stream_rw {
         /// or allocate. If no data is immediately available on the
         /// existing nonblocking socket, it returns
         /// [`io::ErrorKind::WouldBlock`] and returns `buffer` unchanged.
-        /// Positive progress appends to an [`IoBuffMut`] payload; buffers that
-        /// retain the provided zero write base publish from their beginning.
+        /// Positive progress appends to an
+        /// [`IoBuffMut`](crate::runtime::buffer::IoBuffMut) payload; buffers
+        /// that retain the provided zero write base publish from their beginning.
         /// The returned byte count is always relative to this call.
         ///
         /// Prefer [`Self::read`] for normal FlowIO async I/O.
@@ -102,41 +103,6 @@ macro_rules! impl_stream_rw {
             len: usize,
         ) -> (io::Result<usize>, B) {
             stream::try_read_once(self.fd.raw_fd(), buffer, len)
-        }
-
-        /// Attempts one nonblocking read syscall into the current payload
-        /// tail.
-        ///
-        /// On success, only the bytes actually read are appended to
-        /// `buffer`. Existing payload bytes are preserved. If no data is
-        /// immediately available, this returns
-        /// [`io::ErrorKind::WouldBlock`] and leaves the payload length
-        /// unchanged.
-        ///
-        /// This is a deadline-edge primitive, not a replacement for
-        /// [`Self::read_exact_append`] in normal async protocol flow.
-        /// `WouldBlock` does not register a wakeup; return to the async path
-        /// unless the caller is deliberately handling an expired deadline.
-        #[doc = concat!(
-            "# Example\n",
-            "```no_run\n",
-            "use ", $stream_path, ";\n",
-            "use flowio::runtime::buffer::IoBuffMut;\n\n",
-            "# fn deadline_edge_append(mut stream: ", stringify!($stream),
-            ", buffer: IoBuffMut) {\n",
-            "let (result, buffer) = stream.try_read_append(buffer, 128);\n",
-            "if result.is_err() {\n",
-            "    let _retry_later = buffer;\n",
-            "}\n",
-            "# }\n",
-            "```"
-        )]
-        pub fn try_read_append(
-            &mut self,
-            buffer: IoBuffMut,
-            len: usize,
-        ) -> (io::Result<usize>, IoBuffMut) {
-            stream::try_read_append_once(self.fd.raw_fd(), buffer, len)
         }
 
         /// Attempts one nonblocking write syscall and returns immediately.
@@ -235,8 +201,9 @@ macro_rules! impl_stream_rw {
         /// completion (rental pattern); the actual byte count is returned
         /// in the `Ok` variant.
         ///
-        /// Positive progress appends to an [`IoBuffMut`] payload. Buffers that
-        /// retain the provided zero write base publish from their beginning.
+        /// Positive progress appends to an
+        /// [`IoBuffMut`](crate::runtime::buffer::IoBuffMut) payload. Buffers
+        /// that retain the provided zero write base publish from their beginning.
         /// A zero-byte completion or an error before progress leaves the
         /// buffer's existing logical contents unchanged; the returned count is
         /// relative to this operation rather than the resulting total length.
@@ -293,11 +260,12 @@ macro_rules! impl_stream_rw {
         ///
         /// Returns `(Ok(len), buffer)` on success. Returns `UnexpectedEof`
         /// if the peer closes before `len` bytes arrive. Positive progress
-        /// appends to an [`IoBuffMut`] payload; buffers that retain the
-        /// provided zero write base publish from their beginning. Any prefix
-        /// read before EOF or another terminal error remains published, while
-        /// an error before progress preserves the existing logical contents.
-        /// The result count remains relative to this operation.
+        /// appends to an [`IoBuffMut`](crate::runtime::buffer::IoBuffMut)
+        /// payload; buffers that retain the provided zero write base publish
+        /// from their beginning. Any prefix read before EOF or another terminal
+        /// error remains published, while an error before progress preserves
+        /// the existing logical contents. The result count remains relative
+        /// to this operation.
         ///
         /// This complete-buffer API may resubmit after partial reads. Avoid
         /// that retry bookkeeping when exact-length semantics are not
@@ -308,28 +276,6 @@ macro_rules! impl_stream_rw {
             len: usize,
         ) -> stream::ReadExactFuture<'_, B, Self> {
             stream::ReadExactFuture::new(self.fd.op_state(), buffer, len)
-        }
-
-        /// Appends exactly `len` bytes to the current payload end of
-        /// `buffer`.
-        ///
-        /// Returns `UnexpectedEof` if the peer closes before `len` bytes
-        /// arrive. On success the returned buffer payload length is the
-        /// original payload length plus `len`; on EOF or error it includes
-        /// any bytes appended before completion.
-        ///
-        /// This preserves [`Self::read_exact`] semantics while supporting
-        /// staged protocol reads into one [`IoBuffMut`].
-        ///
-        /// This complete-buffer API may resubmit after partial reads. Avoid
-        /// that retry bookkeeping when the caller already manages staged
-        /// framing; use [`Self::read`] in that case.
-        pub fn read_exact_append(
-            &mut self,
-            buffer: IoBuffMut,
-            len: usize,
-        ) -> stream::ReadExactAppendFuture<'_, Self> {
-            stream::ReadExactAppendFuture::new(self.fd.op_state(), buffer, len)
         }
 
         /// Scatter-read into a vectored buffer chain.
@@ -1496,16 +1442,6 @@ pub(crate) fn try_read_once<B: IoBuffReadWrite>(
     }
 }
 
-/// Attempts one nonblocking read syscall into the current payload tail.
-#[inline]
-pub(crate) fn try_read_append_once(
-    fd: RawFd,
-    buffer: IoBuffMut,
-    len: usize,
-) -> (io::Result<usize>, IoBuffMut) {
-    try_read_once(fd, buffer, len)
-}
-
 /// Attempts one nonblocking write syscall from the caller-owned buffer.
 #[inline]
 pub(crate) fn try_write_once<B: IoBuffReadOnly>(fd: RawFd, buffer: B) -> (io::Result<usize>, B) {
@@ -2459,34 +2395,6 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
 impl<B: IoBuffReadWrite, S> Drop for ReadExactFuture<'_, B, S> {
     fn drop(&mut self) {
         unsafe { drop_fd_op_state_unchecked(&mut self.state_ptr) };
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ReadExactAppendFuture
-// ---------------------------------------------------------------------------
-
-/// Reads exactly `target` bytes into the current writable tail of an
-/// [`IoBuffMut`], preserving any existing payload bytes.
-pub struct ReadExactAppendFuture<'a, S> {
-    /// Shared exact-read implementation using `IoBuffMut`'s append-aware
-    /// writable base, capacity, and publication hooks.
-    inner: ReadExactFuture<'a, IoBuffMut, S>,
-}
-
-impl<'a, S> ReadExactAppendFuture<'a, S> {
-    pub(crate) fn new(fd: RuntimeFdOpState<'a>, buffer: IoBuffMut, len: usize) -> Self {
-        Self {
-            inner: ReadExactFuture::new(fd, buffer, len),
-        }
-    }
-}
-
-impl<S> Future for ReadExactAppendFuture<'_, S> {
-    type Output = (io::Result<usize>, IoBuffMut);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.get_mut().inner).poll(cx)
     }
 }
 
@@ -3716,6 +3624,7 @@ impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
 mod tests {
     use super::*;
     use crate::net::send_sqe::test_support::sqe_prefix;
+    use crate::runtime::buffer::IoBuffMut;
     use crate::runtime::executor::{CompletionDrainGuard, with_ringless_poll_context_for_test};
     #[cfg(not(miri))]
     use crate::runtime::executor::{Executor, ExecutorConfig};
@@ -6105,14 +6014,14 @@ mod tests {
     }
 
     #[test]
-    fn read_exact_append_future_remains_a_thin_nominal_wrapper() {
+    fn read_exact_iobuff_future_preserves_layout() {
         assert_eq!(
-            std::mem::size_of::<ReadExactAppendFuture<'static, ()>>(),
-            std::mem::size_of::<ReadExactFuture<'static, IoBuffMut, ()>>()
+            std::mem::size_of::<ReadExactFuture<'static, IoBuffMut, ()>>(),
+            88
         );
         assert_eq!(
-            std::mem::align_of::<ReadExactAppendFuture<'static, ()>>(),
-            std::mem::align_of::<ReadExactFuture<'static, IoBuffMut, ()>>()
+            std::mem::align_of::<ReadExactFuture<'static, IoBuffMut, ()>>(),
+            8
         );
     }
 

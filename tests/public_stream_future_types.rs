@@ -6,13 +6,12 @@
 use flowio::net::tcp::TcpStream;
 use flowio::net::unix::UnixStream;
 use flowio::net::{
-    ReadExactAppendFuture, ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture,
-    WriteAllFuture, WriteFuture, WritevAllFuture, WritevAllProjectedFuture, WritevFuture,
-    WritevPieces, WritevProjectedFuture, WritevProjection,
+    ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture, WriteAllFuture, WriteFuture,
+    WritevAllFuture, WritevAllProjectedFuture, WritevFuture, WritevPieces, WritevProjectedFuture,
+    WritevProjection,
 };
 use flowio::runtime::buffer::IoBuffMut;
 use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
-use std::any::TypeId;
 use std::io;
 
 const SEGMENTS: usize = 4;
@@ -31,12 +30,6 @@ impl WritevProjection for EmptyProjection {
 
 #[test]
 fn tcp_and_unix_stream_operation_futures_are_publicly_nameable() {
-    assert_ne!(
-        TypeId::of::<ReadExactAppendFuture<'static, UnixStream>>(),
-        TypeId::of::<ReadExactFuture<'static, IoBuffMut, UnixStream>>(),
-        "append and generic exact-read futures must remain distinct public types"
-    );
-
     let _: for<'a> fn(&'a mut TcpStream, Vec<u8>, usize) -> ReadFuture<'a, Vec<u8>, TcpStream> =
         TcpStream::read::<Vec<u8>>;
     let _: for<'a> fn(&'a mut TcpStream, Vec<u8>) -> WriteFuture<'a, Vec<u8>, TcpStream> =
@@ -48,8 +41,11 @@ fn tcp_and_unix_stream_operation_futures_are_publicly_nameable() {
         Vec<u8>,
         usize,
     ) -> ReadExactFuture<'a, Vec<u8>, TcpStream> = TcpStream::read_exact::<Vec<u8>>;
-    let _: for<'a> fn(&'a mut TcpStream, IoBuffMut, usize) -> ReadExactAppendFuture<'a, TcpStream> =
-        TcpStream::read_exact_append;
+    let _: for<'a> fn(
+        &'a mut TcpStream,
+        IoBuffMut,
+        usize,
+    ) -> ReadExactFuture<'a, IoBuffMut, TcpStream> = TcpStream::read_exact::<IoBuffMut>;
     let _: for<'a> fn(
         &'a mut TcpStream,
         IoBuffVecMut<SEGMENTS>,
@@ -95,7 +91,7 @@ fn tcp_and_unix_stream_operation_futures_are_publicly_nameable() {
         &'a mut UnixStream,
         IoBuffMut,
         usize,
-    ) -> ReadExactAppendFuture<'a, UnixStream> = UnixStream::read_exact_append;
+    ) -> ReadExactFuture<'a, IoBuffMut, UnixStream> = UnixStream::read_exact::<IoBuffMut>;
     let _: for<'a> fn(
         &'a mut UnixStream,
         IoBuffVecMut<SEGMENTS>,

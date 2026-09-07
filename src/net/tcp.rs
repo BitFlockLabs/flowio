@@ -187,7 +187,7 @@ use super::{
     set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
-use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
+use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::validate_local_io_result;
 use crate::runtime::fd::{LingerProvenance, RuntimeFd, RuntimeFdOpState};
 #[cfg(any(test, feature = "test-support"))]

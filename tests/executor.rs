@@ -5247,10 +5247,10 @@ fn runtime_cancel_read_exact_mid_flight() {
         .expect("executor run failed");
 }
 
-/// read_exact_append cancelled with no priming bytes must cancel the
+/// read_exact with IoBuffMut cancelled with no priming bytes must cancel the
 /// outstanding SQE cleanly and keep the executor usable.
 #[test]
-fn runtime_cancel_read_exact_append_mid_flight() {
+fn runtime_cancel_read_exact_iobuff_mid_flight() {
     let mut executor = new_executor();
 
     executor
@@ -5260,14 +5260,14 @@ fn runtime_cancel_read_exact_append_mid_flight() {
 
             let recv = IoBuffMut::new(0, 1024 * 1024, 0).expect("recv buffer allocation failed");
             let result = timeout(Duration::from_millis(50), async {
-                let (res, _buf) = reader.read_exact_append(recv, 1024 * 1024).await;
+                let (res, _buf) = reader.read_exact(recv, 1024 * 1024).await;
                 res
             })
             .await;
 
             assert!(
                 matches!(result, Err(TimeoutError::Elapsed)),
-                "read_exact_append should have timed out: {result:?}"
+                "read_exact should have timed out: {result:?}"
             );
 
             release_writer.set(true);
@@ -5278,10 +5278,10 @@ fn runtime_cancel_read_exact_append_mid_flight() {
         .expect("executor run failed");
 }
 
-/// read_exact_append cancelled after partial progress must keep its
+/// read_exact with IoBuffMut cancelled after partial progress must keep its
 /// pool-backed destination checked out until the cancelled read CQE retires.
 #[test]
-fn runtime_cancel_read_exact_append_retains_pool_buffer_until_cqe() {
+fn runtime_cancel_read_exact_iobuff_retains_pool_buffer_until_cqe() {
     let mut executor = new_executor();
 
     executor
@@ -5304,19 +5304,19 @@ fn runtime_cancel_read_exact_append_retains_pool_buffer_until_cqe() {
             assert_eq!(pool.live_slots_for_test(), 1);
 
             let result = timeout(Duration::from_millis(50), async {
-                let (res, _buf) = reader.read_exact_append(recv, 1024 * 1024).await;
+                let (res, _buf) = reader.read_exact(recv, 1024 * 1024).await;
                 res
             })
             .await;
 
             assert!(
                 matches!(result, Err(TimeoutError::Elapsed)),
-                "read_exact_append should have timed out: {result:?}"
+                "read_exact should have timed out: {result:?}"
             );
             assert_eq!(
                 pool.live_slots_for_test(),
                 1,
-                "read_exact_append buffer was released before the original CQE retired"
+                "read_exact buffer was released before the original CQE retired"
             );
 
             release_writer.set(true);

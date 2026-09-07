@@ -55,7 +55,7 @@ fn runtime_retry_initial_submissions_extract_poll_context_once() {
             }
             {
                 let (_peer, mut stream) = UnixStream::pair().expect("socketpair failed");
-                poll_once_pending(stream.read_exact_append(IoBuffMut::new(0, 1, 0), 1)).await;
+                poll_once_pending(stream.read_exact(IoBuffMut::new(0, 1, 0), 1)).await;
             }
             {
                 let (mut stream, _peer) = UnixStream::pair().expect("socketpair failed");
@@ -338,28 +338,28 @@ fn runtime_unix_try_read_prefilled_and_sealed_zero_preserve_payload() {
 }
 
 #[test]
-fn runtime_unix_try_read_append_success_partial_and_would_block() {
+fn runtime_unix_try_read_iobuff_success_partial_and_would_block() {
     let (mut stream, mut peer) = connected_try_unix_stream();
     peer.write_all(b"body").expect("std write failed");
 
     let mut recv = IoBuffMut::new(0, 12, 0);
     recv.payload_append(b"HEAD").unwrap();
-    let (res, recv) = stream.try_read_append(recv, 4);
-    assert_eq!(res.expect("try_read_append failed"), 4);
+    let (res, recv) = stream.try_read(recv, 4);
+    assert_eq!(res.expect("try_read failed"), 4);
     assert_eq!(recv.payload_bytes(), b"HEADbody");
 
     peer.write_all(b"!!").expect("std write failed");
-    let (res, recv) = stream.try_read_append(recv, 4);
-    assert_eq!(res.expect("partial try_read_append failed"), 2);
+    let (res, recv) = stream.try_read(recv, 4);
+    assert_eq!(res.expect("partial try_read failed"), 2);
     assert_eq!(recv.payload_bytes(), b"HEADbody!!");
 
-    let (res, recv) = stream.try_read_append(recv, 2);
-    let err = res.expect_err("try_read_append should report WouldBlock");
+    let (res, recv) = stream.try_read(recv, 2);
+    let err = res.expect_err("try_read should report WouldBlock");
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(recv.payload_bytes(), b"HEADbody!!");
 
-    let (res, recv) = stream.try_read_append(recv, 3);
-    let err = res.expect_err("oversize try_read_append should fail");
+    let (res, recv) = stream.try_read(recv, 3);
+    let err = res.expect_err("oversize try_read should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(recv.payload_bytes(), b"HEADbody!!");
 }
@@ -974,7 +974,7 @@ fn runtime_unix_write_all_read_exact_iobuff() {
 
 /// Staged IoBuffMut append reads preserve previously-read payload bytes.
 #[test]
-fn runtime_unix_read_exact_append_iobuff_staged() {
+fn runtime_unix_read_exact_iobuff_staged() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     executor
@@ -988,11 +988,11 @@ fn runtime_unix_read_exact_append_iobuff_staged() {
             .expect("spawn writer failed");
 
             let recv_buf = IoBuffMut::new(0, 8, 0);
-            let (res, buf) = reader.read_exact_append(recv_buf, 4).await;
+            let (res, buf) = reader.read_exact(recv_buf, 4).await;
             assert_eq!(res.expect("header append read failed"), 4);
             assert_eq!(buf.payload_bytes(), b"HEAD");
 
-            let (res, buf) = reader.read_exact_append(buf, 4).await;
+            let (res, buf) = reader.read_exact(buf, 4).await;
             assert_eq!(res.expect("body append read failed"), 4);
             assert_eq!(buf.payload_len(), 8);
             assert_eq!(buf.payload_bytes(), b"HEADbody");
@@ -1001,7 +1001,7 @@ fn runtime_unix_read_exact_append_iobuff_staged() {
 }
 
 #[test]
-fn runtime_unix_read_exact_append_rejects_oversize_iobuff() {
+fn runtime_unix_read_exact_rejects_oversize_prefilled_iobuff() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     executor
@@ -1011,8 +1011,8 @@ fn runtime_unix_read_exact_append_rejects_oversize_iobuff() {
             let mut recv = IoBuffMut::new(0, 6, 0);
             recv.payload_append(b"seed").unwrap();
 
-            let (res, buf) = reader.read_exact_append(recv, 3).await;
-            let err = res.expect_err("oversize read_exact_append should fail");
+            let (res, buf) = reader.read_exact(recv, 3).await;
+            let err = res.expect_err("oversize read_exact should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(buf.payload_len(), 4);
             assert_eq!(buf.payload_remaining(), 2);
@@ -1022,7 +1022,7 @@ fn runtime_unix_read_exact_append_rejects_oversize_iobuff() {
 }
 
 #[test]
-fn runtime_unix_read_exact_append_rejects_tailroom_sealed_iobuff() {
+fn runtime_unix_read_exact_rejects_tailroom_sealed_iobuff() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     executor
@@ -1034,8 +1034,8 @@ fn runtime_unix_read_exact_append_rejects_tailroom_sealed_iobuff() {
             recv.tailroom_append(b":T").unwrap();
             assert_eq!(recv.payload_remaining(), 0);
 
-            let (res, buf) = reader.read_exact_append(recv, 1).await;
-            let err = res.expect_err("tailroom-sealed read_exact_append should fail");
+            let (res, buf) = reader.read_exact(recv, 1).await;
+            let err = res.expect_err("tailroom-sealed read_exact should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(buf.payload_len(), 4);
             assert_eq!(buf.payload_remaining(), 0);
@@ -1046,7 +1046,7 @@ fn runtime_unix_read_exact_append_rejects_tailroom_sealed_iobuff() {
 }
 
 #[test]
-fn runtime_unix_read_exact_append_eof_preserves_partial_iobuff() {
+fn runtime_unix_read_exact_eof_preserves_partial_iobuff() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
     executor
@@ -1063,7 +1063,7 @@ fn runtime_unix_read_exact_append_eof_preserves_partial_iobuff() {
             let mut recv = IoBuffMut::new(0, 12, 0);
             recv.payload_append(b"head").unwrap();
 
-            let (res, buf) = reader.read_exact_append(recv, 8).await;
+            let (res, buf) = reader.read_exact(recv, 8).await;
             let err = res.expect_err("should fail with UnexpectedEof");
             assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
             assert_eq!(buf.payload_len(), 8);
@@ -1654,7 +1654,7 @@ fn runtime_unix_rental_futures_poll_after_ready_parks() {
         assert_poll_after_ready_parks(reader.read(Vec::<u8>::new(), 0)).await;
         assert_poll_after_ready_parks(writer.write_all(Vec::<u8>::new())).await;
         assert_poll_after_ready_parks(reader.read_exact(Vec::<u8>::new(), 0)).await;
-        assert_poll_after_ready_parks(reader.read_exact_append(IoBuffMut::new(0, 16, 0), 0)).await;
+        assert_poll_after_ready_parks(reader.read_exact(IoBuffMut::new(0, 16, 0), 0)).await;
         assert_poll_after_ready_parks(writer.writev(make_payload_chain::<0>([]))).await;
         assert_poll_after_ready_parks(writer.writev_all(make_payload_chain::<0>([]))).await;
         assert_poll_after_ready_parks(reader.readv(make_read_chain::<0>([]))).await;

@@ -214,9 +214,8 @@ pub(crate) mod stream;
 pub use stream::WriteBufferChain;
 #[doc(inline)]
 pub use stream::{
-    ReadExactAppendFuture, ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture,
-    WriteAllFuture, WriteFuture, WritevAllFuture, WritevAllProjectedFuture, WritevFuture,
-    WritevProjectedFuture,
+    ReadExactFuture, ReadFuture, ReadvExactFuture, ReadvFuture, WriteAllFuture, WriteFuture,
+    WritevAllFuture, WritevAllProjectedFuture, WritevFuture, WritevProjectedFuture,
 };
 pub mod tcp;
 pub mod tls;

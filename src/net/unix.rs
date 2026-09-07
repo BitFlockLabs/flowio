@@ -115,7 +115,7 @@
 
 use super::{WriteBufferChain, WritevProjection, stream};
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
-use crate::runtime::buffer::{IoBuffMut, IoBuffReadOnly, IoBuffReadWrite};
+use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::fd::RuntimeFd;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
