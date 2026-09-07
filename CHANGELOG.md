@@ -10,6 +10,11 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** Checked byte accessors support `u8`/`i8` without endian
+  suffixes and `u16`/`i16`/`u32`/`i32`/`u64`/`i64` with native, little-endian,
+  and big-endian forms. One-byte endian aliases and all `u128`, `i128`, `f32`,
+  and `f64` accessors are removed from free functions, extension traits, and
+  cursors. Retained operations preserve their bounds and cursor behavior.
 - **Breaking:** `PushError::value_mut` is removed. Preserve the copied reason
   with `error()` and recover ownership with `into_value()`, or use
   `into_parts()`, before mutating a rejected value.
