@@ -1409,56 +1409,34 @@ fn class_index_for<T>() -> Option<usize> {
         .position(|class_size| size <= *class_size)
 }
 
-#[inline(always)]
-fn pooled_vtable<T: 'static>(class_index: usize) -> &'static RetainedPayloadVtable {
-    match class_index {
-        0 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 0>,
-            free_storage: pooled_free_storage::<T, 0>,
-        },
-        1 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 1>,
-            free_storage: pooled_free_storage::<T, 1>,
-        },
-        2 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 2>,
-            free_storage: pooled_free_storage::<T, 2>,
-        },
-        3 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 3>,
-            free_storage: pooled_free_storage::<T, 3>,
-        },
-        4 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 4>,
-            free_storage: pooled_free_storage::<T, 4>,
-        },
-        5 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 5>,
-            free_storage: pooled_free_storage::<T, 5>,
-        },
-        6 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 6>,
-            free_storage: pooled_free_storage::<T, 6>,
-        },
-        7 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 7>,
-            free_storage: pooled_free_storage::<T, 7>,
-        },
-        8 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 8>,
-            free_storage: pooled_free_storage::<T, 8>,
-        },
-        9 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 9>,
-            free_storage: pooled_free_storage::<T, 9>,
-        },
-        10 => &RetainedPayloadVtable {
-            drop_and_free: pooled_drop_and_free::<T, 10>,
-            free_storage: pooled_free_storage::<T, 10>,
-        },
-        _ => unreachable!("invalid retained payload size class"),
-    }
+macro_rules! define_pooled_vtable {
+    ($($index:literal),+ $(,)?) => {
+        const _: () = {
+            let indices: &[usize] = &[$($index),+];
+            assert!(indices.len() == RETAINED_SIZE_CLASSES.len());
+            let mut position = 0;
+            while position < indices.len() {
+                assert!(indices[position] == position);
+                position += 1;
+            }
+        };
+
+        #[inline(always)]
+        fn pooled_vtable<T: 'static>(class_index: usize) -> &'static RetainedPayloadVtable {
+            match class_index {
+                $(
+                    $index => &RetainedPayloadVtable {
+                        drop_and_free: pooled_drop_and_free::<T, $index>,
+                        free_storage: pooled_free_storage::<T, $index>,
+                    },
+                )+
+                _ => unreachable!("invalid retained payload size class"),
+            }
+        }
+    };
 }
+
+define_pooled_vtable!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
 
 #[inline(always)]
 fn heap_vtable<T: 'static>() -> &'static RetainedPayloadVtable {
@@ -2005,6 +1983,131 @@ mod tests {
             let drops = unsafe { &*self.drops };
             drops.set(drops.get() + 1);
         }
+    }
+
+    #[repr(C)]
+    struct ClassPayload<const PADDING: usize> {
+        owner: DropProbe,
+        padding: [u8; PADDING],
+    }
+
+    fn assert_retained_class_slot_state(
+        pool: &RetainedPayloadPool,
+        class_index: usize,
+        returned: bool,
+        stage: &str,
+    ) {
+        let free_classes: [bool; RETAINED_SIZE_CLASSES.len()] =
+            std::array::from_fn(|index| !pool.classes[index].free_list.is_empty());
+        let expected_free_classes = std::array::from_fn(|index| returned && index == class_index);
+        // Check ownership before allocating again: a foreign free-list node
+        // must never be consumed as a block belonging to another size class.
+        assert_eq!(
+            free_classes, expected_free_classes,
+            "{stage}: free-list ownership for class {class_index}"
+        );
+
+        let slab_pages: [usize; RETAINED_SIZE_CLASSES.len()] =
+            std::array::from_fn(|index| pool.classes[index].slab_pages.page_count());
+        let expected_slab_pages = std::array::from_fn(|index| usize::from(index == class_index));
+        assert_eq!(
+            slab_pages, expected_slab_pages,
+            "{stage}: slab ownership for class {class_index}"
+        );
+    }
+
+    fn check_retained_class_callbacks<const PADDING: usize>(
+        class_index: usize,
+        visited: &mut [bool; RETAINED_SIZE_CLASSES.len()],
+    ) {
+        assert!(!visited[class_index], "class {class_index} visited twice");
+        assert_eq!(
+            std::mem::size_of::<ClassPayload<PADDING>>(),
+            RETAINED_SIZE_CLASSES[class_index]
+        );
+        assert_eq!(
+            class_index_for::<ClassPayload<PADDING>>(),
+            Some(class_index)
+        );
+
+        let drops = [Cell::new(0), Cell::new(0), Cell::new(0)];
+        let drop_counts = || drops.each_ref().map(Cell::get);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool init failed");
+        let first = pool.alloc(ClassPayload {
+            owner: DropProbe::new(&drops[0]),
+            padding: [0xa1; PADDING],
+        });
+        let slot_ptr = first.as_ptr();
+        assert_eq!(drop_counts(), [0, 0, 0]);
+        assert_retained_class_slot_state(&pool, class_index, false, "first allocation");
+
+        unsafe { first.drop_and_free(&mut pool) };
+        assert_eq!(drop_counts(), [1, 0, 0]);
+        assert_retained_class_slot_state(&pool, class_index, true, "drop_and_free");
+
+        let second = pool.alloc(ClassPayload {
+            owner: DropProbe::new(&drops[1]),
+            padding: [0xb2; PADDING],
+        });
+        assert_eq!(second.as_ptr(), slot_ptr);
+        assert_eq!(drop_counts(), [1, 0, 0]);
+        assert_retained_class_slot_state(&pool, class_index, false, "reuse after drop");
+
+        let moved = unsafe { second.take(&mut pool) };
+        assert_eq!(drop_counts(), [1, 0, 0]);
+        assert_eq!(moved.owner.drops, std::ptr::from_ref(&drops[1]));
+        assert!(moved.padding.iter().all(|byte| *byte == 0xb2));
+        assert_retained_class_slot_state(&pool, class_index, true, "free_storage");
+
+        let replacement = pool.alloc(ClassPayload {
+            owner: DropProbe::new(&drops[2]),
+            padding: [0xc3; PADDING],
+        });
+        assert_eq!(replacement.as_ptr(), slot_ptr);
+        assert_eq!(drop_counts(), [1, 0, 0]);
+        assert_retained_class_slot_state(&pool, class_index, false, "reuse after take");
+        assert!(moved.padding.iter().all(|byte| *byte == 0xb2));
+        assert_eq!(moved.owner.drops, std::ptr::from_ref(&drops[1]));
+
+        unsafe { replacement.drop_and_free(&mut pool) };
+        assert_eq!(drop_counts(), [1, 0, 1]);
+        assert_retained_class_slot_state(&pool, class_index, true, "replacement drop");
+        drop(moved);
+        assert_eq!(drop_counts(), [1, 1, 1]);
+
+        let stats = pool.stats();
+        assert_eq!(stats.pooled_allocs, 3);
+        assert_eq!(stats.pooled_reuses, 2);
+        assert_eq!(stats.slab_allocs, 1);
+        assert_eq!(stats.pooled_frees, 3);
+        assert_eq!(stats.heap_fallbacks, 0);
+        assert_eq!(stats.heap_frees, 0);
+        visited[class_index] = true;
+    }
+
+    #[test]
+    fn pooled_vtable_callbacks_recycle_every_size_class() {
+        let mut visited = [false; RETAINED_SIZE_CLASSES.len()];
+        macro_rules! check_class {
+            ($index:literal) => {
+                check_retained_class_callbacks::<
+                    { RETAINED_SIZE_CLASSES[$index] - std::mem::size_of::<DropProbe>() },
+                >($index, &mut visited);
+            };
+        }
+
+        check_class!(0);
+        check_class!(1);
+        check_class!(2);
+        check_class!(3);
+        check_class!(4);
+        check_class!(5);
+        check_class!(6);
+        check_class!(7);
+        check_class!(8);
+        check_class!(9);
+        check_class!(10);
+        assert!(visited.into_iter().all(|was_visited| was_visited));
     }
 
     struct PooledSlotPayload {
