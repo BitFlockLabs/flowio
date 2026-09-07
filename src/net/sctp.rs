@@ -5020,6 +5020,28 @@ unsafe fn sctp_scalar_received_slice<B: IoBuffReadWrite>(buffer: &mut B, actual:
     unsafe { std::slice::from_raw_parts(ptr, actual) }
 }
 
+/// Processes a scalar metadata completion without publishing buffer progress.
+/// The pointer callback runs before record-recovery changes. Zero progress
+/// skips that callback while still classifying the completion.
+///
+/// # Safety
+///
+/// `actual` bytes beginning at `buffer`'s current writable base must have
+/// been initialized by the completed kernel operation.
+#[inline(always)]
+unsafe fn process_scalar_sctp_completion<B: IoBuffReadWrite>(
+    buffer: &mut B,
+    actual: usize,
+    header: SctpRecvHeader,
+    recv_state: &mut SctpRecvState,
+    publication: SctpCompletionPublication,
+) -> SctpMetadataCompletion {
+    let data_slice = unsafe { sctp_scalar_received_slice(buffer, actual) };
+    let recovery_target = recv_state.bounded_recovery_prefix_target(actual, header.msg_flags);
+    let recovery_prefix = &data_slice[..recovery_target];
+    recv_state.process_metadata_completion(actual, header, data_slice, recovery_prefix, publication)
+}
+
 /// Returns the received prefix visible in the first vectored destination.
 ///
 /// # Safety
@@ -5199,17 +5221,15 @@ unsafe fn process_stashed_sctp_recv<B: IoBuffReadWrite>(
                 |payload| take_stashed_sctp_recv_completion(payload),
             )
         };
-        let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-        let recovery_target =
-            recv_state.bounded_recovery_prefix_target(actual, completion.header.msg_flags);
-        let recovery_prefix = &data_slice[..recovery_target];
-        let action = recv_state.process_metadata_completion(
-            actual,
-            completion.header,
-            data_slice,
-            recovery_prefix,
-            SctpCompletionPublication::Unpublished,
-        );
+        let action = unsafe {
+            process_scalar_sctp_completion(
+                &mut completion.buffer,
+                actual,
+                completion.header,
+                recv_state,
+                SctpCompletionPublication::Unpublished,
+            )
+        };
         debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
     }
 
@@ -5596,19 +5616,15 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                         // changing record-recovery state because its pointer
                         // callback may unwind. Zero progress bypasses the
                         // callback inside the shared slice helper.
-                        let data_slice =
-                            unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-                        let recovery_target = this
-                            .recv_state
-                            .bounded_recovery_prefix_target(actual, header.msg_flags);
-                        let recovery_prefix = &data_slice[..recovery_target];
-                        let action = this.recv_state.process_metadata_completion(
-                            actual,
-                            header,
-                            data_slice,
-                            recovery_prefix,
-                            SctpCompletionPublication::Unpublished,
-                        );
+                        let action = unsafe {
+                            process_scalar_sctp_completion(
+                                &mut completion.buffer,
+                                actual,
+                                header,
+                                this.recv_state,
+                                SctpCompletionPublication::Unpublished,
+                            )
+                        };
                         debug_assert!(matches!(action, SctpMetadataCompletion::Consume));
                     }
                     return Poll::Ready((
@@ -5623,18 +5639,15 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
             };
 
             let header = completion.meta.header;
-            let data_slice = unsafe { sctp_scalar_received_slice(&mut completion.buffer, actual) };
-            let recovery_target = this
-                .recv_state
-                .bounded_recovery_prefix_target(actual, header.msg_flags);
-            let recovery_prefix = &data_slice[..recovery_target];
-            let action = this.recv_state.process_metadata_completion(
-                actual,
-                header,
-                data_slice,
-                recovery_prefix,
-                SctpCompletionPublication::Visible(completion.meta.rcvinfo),
-            );
+            let action = unsafe {
+                process_scalar_sctp_completion(
+                    &mut completion.buffer,
+                    actual,
+                    header,
+                    this.recv_state,
+                    SctpCompletionPublication::Visible(completion.meta.rcvinfo),
+                )
+            };
             return match action {
                 SctpMetadataCompletion::Consume => {
                     let (_, buffer) = unsafe {
@@ -12018,6 +12031,417 @@ mod tests {
         unsafe fn set_written_len(&mut self, len: usize) {
             assert!(len <= self.bytes.len());
             self.published_len.set(len);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct ScalarCompletionBufferCalls {
+        as_ptr: usize,
+        len: usize,
+        as_mut_ptr: usize,
+        writable_len: usize,
+        write_base_len: usize,
+        set_written_len: usize,
+    }
+
+    #[derive(Default)]
+    struct ScalarCompletionObservation {
+        pointer_calls: Rc<Cell<usize>>,
+        published_len: Rc<Cell<usize>>,
+        other_calls: Cell<ScalarCompletionBufferCalls>,
+        drops: Cell<usize>,
+        dropped_bytes: Cell<Option<[u8; 32]>>,
+    }
+
+    impl ScalarCompletionObservation {
+        fn note(&self, update: impl FnOnce(&mut ScalarCompletionBufferCalls)) {
+            let mut calls = self.other_calls.get();
+            update(&mut calls);
+            self.other_calls.set(calls);
+        }
+
+        fn calls(&self) -> ScalarCompletionBufferCalls {
+            ScalarCompletionBufferCalls {
+                as_mut_ptr: self.pointer_calls.get(),
+                ..self.other_calls.get()
+            }
+        }
+    }
+
+    struct ScalarCompletionObservedBuffer {
+        inner: RejectedContextRecvBuffer,
+        observed: Rc<ScalarCompletionObservation>,
+    }
+
+    impl ScalarCompletionObservedBuffer {
+        fn new(observed: Rc<ScalarCompletionObservation>) -> Self {
+            let mut inner = RejectedContextRecvBuffer::new(
+                Rc::clone(&observed.pointer_calls),
+                Rc::clone(&observed.published_len),
+            );
+            inner.bytes.fill(0xa5);
+            inner.bytes[..5].copy_from_slice(b"start");
+            observed.published_len.set(5);
+            Self { inner, observed }
+        }
+    }
+
+    impl Drop for ScalarCompletionObservedBuffer {
+        fn drop(&mut self) {
+            self.observed.drops.set(self.observed.drops.get() + 1);
+            self.observed.dropped_bytes.set(Some(*self.inner.bytes));
+        }
+    }
+
+    unsafe impl IoBuffReadOnly for ScalarCompletionObservedBuffer {
+        fn as_ptr(&self) -> *const u8 {
+            self.observed.note(|calls| calls.as_ptr += 1);
+            self.inner.as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.observed.note(|calls| calls.len += 1);
+            self.inner.len()
+        }
+    }
+
+    unsafe impl IoBuffReadWrite for ScalarCompletionObservedBuffer {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.inner.as_mut_ptr()
+        }
+
+        fn writable_len(&self) -> usize {
+            self.observed.note(|calls| calls.writable_len += 1);
+            self.inner.writable_len()
+        }
+
+        fn write_base_len(&self) -> usize {
+            self.observed.note(|calls| calls.write_base_len += 1);
+            self.inner.write_base_len()
+        }
+
+        unsafe fn set_written_len(&mut self, len: usize) {
+            self.observed.note(|calls| calls.set_written_len += 1);
+            unsafe { self.inner.set_written_len(len) };
+        }
+    }
+
+    fn scalar_completion_recovery_snapshot(
+        state: &SctpRecvState,
+    ) -> (
+        SctpRecordSync,
+        bool,
+        bool,
+        bool,
+        u8,
+        [u8; SCTP_PDAPI_CLASSIFICATION_PREFIX_LEN],
+    ) {
+        let SctpRecvState {
+            record_sync,
+            recv_rcvinfo_requested,
+            partial_delivery_visible,
+            any_notification_visible,
+            stashed_state: _,
+            nested_prefix_state,
+            stashed: _,
+            nested_notification_prefix,
+        } = state;
+        (
+            *record_sync,
+            recv_rcvinfo_requested.get(),
+            partial_delivery_visible.get(),
+            any_notification_visible.get(),
+            *nested_prefix_state,
+            *nested_notification_prefix,
+        )
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ScalarCompletionRoute {
+        Stashed,
+        ContextRejected,
+        Accepted,
+    }
+
+    struct ScalarCompletionFixture {
+        state_ptr: *mut CompletionState,
+        retained_address: usize,
+        backing_address: usize,
+        write_base_len: usize,
+        expected_bytes: [u8; 32],
+        observed: Rc<ScalarCompletionObservation>,
+    }
+
+    fn stage_scalar_completion_fixture(
+        reactor: *mut Reactor,
+        route: ScalarCompletionRoute,
+        panic_on_pointer: bool,
+        data: &[u8],
+    ) -> ScalarCompletionFixture {
+        assert_eq!(data.len(), 4);
+        let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+        assert!(
+            !state_ptr.is_null(),
+            "scalar completion state allocation failed"
+        );
+        let observed = Rc::new(ScalarCompletionObservation::default());
+        let buffer = ScalarCompletionObservedBuffer::new(Rc::clone(&observed));
+        let backing_address = buffer.inner.backing_ptr() as usize;
+        let write_base_len = buffer.write_base_len();
+        assert_eq!(write_base_len, 5);
+        let mut buffer = Some(buffer);
+        let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+        let mut payload = unsafe { emplace_retained_sctp_recv_payload(pool, &mut buffer, 16) };
+        assert!(buffer.is_none());
+        let retained_address = unsafe { payload.as_ref() as *const _ as usize };
+        let expected_bytes;
+        unsafe {
+            let retained = payload.as_mut();
+            let iovec = retained.iovec.assume_init_ref();
+            assert_eq!(iovec.iov_len, 16);
+            assert!(data.len() <= iovec.iov_len);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), iovec.iov_base.cast::<u8>(), data.len());
+            let msg = retained.msghdr.assume_init_mut();
+            if panic_on_pointer {
+                msg.msg_controllen = 0;
+                msg.msg_flags = libc::MSG_NOTIFICATION | libc::MSG_EOR;
+            } else {
+                msg.msg_flags = libc::MSG_EOR;
+                if route == ScalarCompletionRoute::Accepted {
+                    retained.control[0].write(0);
+                    msg.msg_controllen = 1;
+                } else {
+                    assert_eq!(msg.msg_controllen, SCTP_RECV_CONTROL_LEN);
+                }
+            }
+            retained.buffer.inner.panic_on_pointer = panic_on_pointer;
+            expected_bytes = *retained.buffer.inner.bytes;
+            (*state_ptr).attach_retained_payload(payload);
+            (*state_ptr).result = data.len() as i32;
+        }
+        assert_eq!(observed.drops.get(), 0);
+        assert_eq!(
+            observed.calls(),
+            ScalarCompletionBufferCalls {
+                as_mut_ptr: 1,
+                write_base_len: 1,
+                ..ScalarCompletionBufferCalls::default()
+            }
+        );
+        ScalarCompletionFixture {
+            state_ptr,
+            retained_address,
+            backing_address,
+            write_base_len,
+            expected_bytes,
+            observed,
+        }
+    }
+
+    fn assert_scalar_completion_cleanup(reactor: *mut Reactor, fixture: &ScalarCompletionFixture) {
+        assert_eq!(fixture.observed.drops.get(), 1);
+        assert_eq!(
+            fixture.observed.dropped_bytes.get(),
+            Some(fixture.expected_bytes)
+        );
+        assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+        assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 1);
+        let injected = test_hooks::take_raw_sqe_submit_failure()
+            .expect("completed scalar processing consumed the submission sentinel");
+        assert_eq!(injected.kind(), io::ErrorKind::WouldBlock);
+        let stats = unsafe { (&*reactor).retained_payload_stats() };
+        assert_eq!(stats.pooled_allocs, 1);
+        assert_eq!(stats.pooled_frees, 1);
+        assert_eq!(stats.pooled_reuses, 0);
+        assert_eq!(stats.heap_fallbacks, 0);
+        assert_eq!(stats.heap_frees, 0);
+        let replacement = unsafe { (&mut *reactor).alloc_op() };
+        assert_eq!(replacement, fixture.state_ptr);
+        unsafe { (&mut *reactor).free_op(replacement) };
+        let retry_observed = Rc::new(ScalarCompletionObservation::default());
+        let mut retry_buffer = Some(ScalarCompletionObservedBuffer::new(Rc::clone(
+            &retry_observed,
+        )));
+        let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+        let retry = unsafe { emplace_retained_sctp_recv_payload(pool, &mut retry_buffer, 16) };
+        assert!(retry_buffer.is_none());
+        assert_eq!(
+            unsafe { retry.as_ref() as *const _ as usize },
+            fixture.retained_address
+        );
+        drop(unsafe { retry.take(&mut *pool.as_ptr()) });
+        assert_eq!(retry_observed.pointer_calls.get(), 1);
+        assert_eq!(retry_observed.drops.get(), 1);
+        let stats = unsafe { (&*reactor).retained_payload_stats() };
+        assert_eq!(stats.pooled_allocs, 2);
+        assert_eq!(stats.pooled_frees, 2);
+        assert_eq!(stats.pooled_reuses, 1);
+        assert_eq!(stats.heap_fallbacks, 0);
+        assert_eq!(stats.heap_frees, 0);
+        assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+    }
+
+    fn assert_scalar_completion_observation(route: ScalarCompletionRoute, panic_on_pointer: bool) {
+        with_ringless_poll_context_for_test(1, |owner, origin_cx| {
+            let reactor = owner.reactor_ptr();
+            let mut recv_state = SctpRecvState::external();
+            recv_state.recv_rcvinfo_requested.set(true);
+            recv_state.partial_delivery_visible.set(false);
+            recv_state.any_notification_visible.set(true);
+            recv_state.nested_notification_prefix.fill(0x6d);
+            let abort = test_partial_delivery_notification(SCTP_PARTIAL_DELIVERY_ABORTED);
+            let data = if panic_on_pointer {
+                recv_state.record_sync = SctpRecordSync::DataTail;
+                recv_state.begin_nested_notification();
+                assert!(
+                    recv_state
+                        .append_nested_notification_prefix(&abort[..8])
+                        .is_none()
+                );
+                assert_eq!(recv_state.record_sync, SctpRecordSync::DataNotificationTail);
+                assert_eq!(recv_state.nested_prefix_state, 8);
+                &abort[8..12]
+            } else {
+                b"tail"
+            };
+            let fixture = stage_scalar_completion_fixture(reactor, route, panic_on_pointer, data);
+            let before_recovery = scalar_completion_recovery_snapshot(&recv_state);
+            let before_calls = fixture.observed.calls();
+            let returned = if route == ScalarCompletionRoute::Stashed {
+                assert!(panic_on_pointer);
+                unsafe {
+                    recv_state.set_stashed_live_for_test(
+                        fixture.state_ptr,
+                        0,
+                        process_stashed_sctp_recv::<ScalarCompletionObservedBuffer>,
+                    );
+                    (*fixture.state_ptr).set_completed();
+                }
+                test_hooks::fail_next_raw_sqe_submit();
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    recv_state.poll_stashed(origin_cx)
+                }));
+                assert!(
+                    unwind.is_err(),
+                    "completed stashed pointer callback did not panic"
+                );
+                None
+            } else {
+                let mut future = RecvFuture::<ScalarCompletionObservedBuffer> {
+                    fd: RuntimeFd::INVALID,
+                    state_ptr: unsafe { invalid_submitted_fd_op_state(fixture.state_ptr) },
+                    buffer: None,
+                    write_base_len: fixture.write_base_len,
+                    len: 16,
+                    input_error: None,
+                    recv_state: &mut recv_state,
+                    _marker: PhantomData,
+                };
+                if route == ScalarCompletionRoute::ContextRejected {
+                    let mut rejected_cx = Context::from_waker(std::task::Waker::noop());
+                    assert!(Pin::new(&mut future).poll(&mut rejected_cx).is_pending());
+                    assert!(unsafe { (*fixture.state_ptr).is_context_rejected() });
+                    assert_eq!(fixture.observed.calls(), before_calls);
+                }
+                unsafe { (*fixture.state_ptr).set_completed() };
+                test_hooks::fail_next_raw_sqe_submit();
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Pin::new(&mut future).poll(origin_cx)
+                }));
+                let returned = if panic_on_pointer {
+                    assert!(
+                        unwind.is_err(),
+                        "completed scalar pointer callback did not panic"
+                    );
+                    None
+                } else {
+                    let completed = unwind.expect("completed scalar receive unexpectedly panicked");
+                    let Poll::Ready((result, buffer)) = completed else {
+                        panic!("completed scalar receive remained pending");
+                    };
+                    let error = result.expect_err("scalar error fixture unexpectedly succeeded");
+                    if route == ScalarCompletionRoute::ContextRejected {
+                        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+                    } else {
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                        assert_eq!(
+                            error.to_string(),
+                            "SCTP recvmsg control message header was malformed"
+                        );
+                    }
+                    Some(buffer)
+                };
+                assert!(future.state_ptr.is_null());
+                assert!(future.buffer.is_none());
+                drop(future);
+                returned
+            };
+            assert_eq!(
+                scalar_completion_recovery_snapshot(&recv_state),
+                before_recovery
+            );
+            assert_eq!(recv_state.stashed_state, StashedSctpRecvState::Empty);
+            let StashedSctpRecv {
+                state_ptr,
+                iov_count,
+                process_completed,
+            } = recv_state.stashed;
+            assert!(state_ptr.is_null());
+            assert_eq!(iov_count, 0);
+            assert!(process_completed.is_none());
+            let publish = !panic_on_pointer && route == ScalarCompletionRoute::Accepted;
+            let mut expected_calls = before_calls;
+            expected_calls.as_mut_ptr += 1;
+            if publish {
+                expected_calls.writable_len += 1;
+                expected_calls.set_written_len += 1;
+                expected_calls.write_base_len += usize::from(cfg!(debug_assertions));
+            }
+            assert_eq!(fixture.observed.calls(), expected_calls, "route {route:?}");
+            assert_eq!(
+                fixture.observed.published_len.get(),
+                if publish { 9 } else { 5 }
+            );
+            if let Some(buffer) = returned.as_ref() {
+                assert_eq!(buffer.inner.backing_ptr() as usize, fixture.backing_address);
+                assert_eq!(*buffer.inner.bytes, fixture.expected_bytes);
+                assert_eq!(&buffer.inner.bytes[..5], b"start");
+                assert_eq!(&buffer.inner.bytes[5..9], b"tail");
+                assert!(buffer.inner.bytes[9..].iter().all(|byte| *byte == 0xa5));
+                assert_eq!(fixture.observed.drops.get(), 0);
+                assert_eq!(fixture.observed.dropped_bytes.get(), None);
+            } else {
+                assert_eq!(fixture.observed.drops.get(), 1);
+                assert_eq!(
+                    fixture.observed.dropped_bytes.get(),
+                    Some(fixture.expected_bytes)
+                );
+            }
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            drop(returned);
+            assert_scalar_completion_cleanup(reactor, &fixture);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
+    }
+
+    #[test]
+    fn scalar_completion_pointer_panic_preserves_full_recovery_state() {
+        for route in [
+            ScalarCompletionRoute::Stashed,
+            ScalarCompletionRoute::ContextRejected,
+            ScalarCompletionRoute::Accepted,
+        ] {
+            assert_scalar_completion_observation(route, true);
+        }
+    }
+
+    #[test]
+    fn scalar_completion_context_and_metadata_errors_preserve_publication() {
+        for route in [
+            ScalarCompletionRoute::ContextRejected,
+            ScalarCompletionRoute::Accepted,
+        ] {
+            assert_scalar_completion_observation(route, false);
         }
     }
 
