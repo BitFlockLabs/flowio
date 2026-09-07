@@ -2511,6 +2511,33 @@ pub struct Executor {
 ))]
 const _: [(); 32] = [(); size_of::<Executor>()];
 
+/// Processes pending timers using one fresh clock sample.
+///
+/// Returns the initial pending state, sampled tick, and whether processing
+/// left work pending at that tick.
+///
+/// # Safety
+///
+/// `timers` must satisfy [`TimerRuntime::process_at_with_budget_unchecked`]'s
+/// requirements and belong to the active executor on this thread. No runtime
+/// borrow may span processing because waiter destruction can re-enter it.
+#[inline(always)]
+unsafe fn process_timer_pass_unchecked(
+    timers: *mut TimerRuntime,
+    process_quota: usize,
+) -> io::Result<(bool, Option<u64>, bool)> {
+    let timers_pending = unsafe { (*timers).has_pending() };
+    let mut now_tick = None;
+    let timer_budget_exhausted = if timers_pending {
+        let tick = unsafe { (*timers).now_tick()? };
+        now_tick = Some(tick);
+        unsafe { TimerRuntime::process_at_with_budget_unchecked(timers, tick, process_quota)? }
+    } else {
+        false
+    };
+    Ok((timers_pending, now_tick, timer_budget_exhausted))
+}
+
 #[inline(always)]
 fn timers_pending_after_processing(timers_pending: bool, recheck: impl FnOnce() -> bool) -> bool {
     timers_pending && recheck()
@@ -2850,16 +2877,7 @@ impl Executor {
             )
         }?;
         let timers = unsafe { std::ptr::addr_of_mut!((*state_ptr).timers) };
-        if unsafe { (*timers).has_pending() } {
-            let now_tick = unsafe { (*timers).now_tick()? };
-            let _ = unsafe {
-                TimerRuntime::process_at_with_budget_unchecked(
-                    timers,
-                    now_tick,
-                    self.process_quota,
-                )?
-            };
-        }
+        let _ = unsafe { process_timer_pass_unchecked(timers, self.process_quota) }?;
         Ok(())
     }
 
@@ -3034,21 +3052,12 @@ impl Executor {
                     std::ptr::addr_of_mut!((*state_ptr).ready_queue),
                 )
             }?;
-            let timers_pending = unsafe { (*state_ptr).timers.has_pending() };
-            let mut now_tick = None;
-            let timer_budget_exhausted = if timers_pending {
-                let tick = unsafe { (*state_ptr).timers.now_tick()? };
-                now_tick = Some(tick);
-                unsafe {
-                    TimerRuntime::process_at_with_budget_unchecked(
-                        std::ptr::addr_of_mut!((*state_ptr).timers),
-                        tick,
-                        self.process_quota,
-                    )?
-                }
-            } else {
-                false
-            };
+            let (timers_pending, now_tick, timer_budget_exhausted) = unsafe {
+                process_timer_pass_unchecked(
+                    std::ptr::addr_of_mut!((*state_ptr).timers),
+                    self.process_quota,
+                )
+            }?;
             let queue_empty = unsafe { (*state_ptr).ready_queue.is_empty() };
             let timers_pending_after = timers_pending_after_processing(timers_pending, || unsafe {
                 (*state_ptr).timers.has_pending()
