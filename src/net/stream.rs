@@ -46,7 +46,7 @@ use crate::runtime::executor::{
 use crate::runtime::executor::{
     record_retained_iovec_oversize_rejection, validate_local_iovec_oversize_rejection,
 };
-use crate::runtime::fd::RuntimeFdOpState;
+use crate::runtime::fd::{FdStateDiagnostic, RuntimeFdOpState};
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::{
@@ -418,15 +418,6 @@ macro_rules! impl_stream_rw {
 }
 
 pub(crate) use impl_stream_rw;
-
-#[inline(always)]
-fn debug_assert_stream_fd_state(fd: RawFd, fd_state: &RuntimeFdOpState<'_>) {
-    let state_fd = fd_state.raw_fd();
-    debug_assert!(
-        state_fd < 0 || fd == state_fd,
-        "stream future raw descriptor and typed operation state diverged"
-    );
-}
 
 #[inline(always)]
 /// Returns a completed result plus the retained payload, then retires the
@@ -1719,7 +1710,8 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
@@ -1851,7 +1843,8 @@ impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
@@ -1982,7 +1975,8 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
@@ -2194,7 +2188,8 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null()
             && let Some(err) = this.input_error.take()
@@ -2450,7 +2445,8 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if let Some(completion) = unsafe {
             take_completed_result_and_payload_with::<RetainedReadvPayload<N>, _>(
@@ -2612,7 +2608,8 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevFuture<'_, C, N
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if let Some(completion) = unsafe {
             take_completed_result_and_payload_with::<RetainedWritevPayload<C>, _>(
@@ -2758,7 +2755,8 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null() && this.buffer.is_none() {
             return Poll::Pending;
@@ -3035,7 +3033,8 @@ impl<T: WritevProjection, S> Future for WritevProjectedFuture<'_, T, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if let Some(completion) = unsafe {
             take_completed_result_and_payload::<RetainedProjectedWritevPayload<T>>(
@@ -3137,7 +3136,8 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null() && this.source.is_none() {
             return Poll::Pending;
@@ -3399,7 +3399,8 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_stream_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
 
         if this.state_ptr.state_ptr().is_null()
             && let Some(err) = this.input_error.take()

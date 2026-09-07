@@ -227,7 +227,7 @@ use crate::runtime::executor::{
     refresh_op_waiter_from_waker, submit_initialized_retained_fd_sqe, submit_retained_fd_sqe,
     validate_local_io_result,
 };
-use crate::runtime::fd::{LingerProvenance, RuntimeFd, RuntimeFdOpState};
+use crate::runtime::fd::{FdStateDiagnostic, LingerProvenance, RuntimeFd, RuntimeFdOpState};
 use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::retained::{
@@ -5272,15 +5272,6 @@ unsafe fn process_stashed_sctp_recv_vectored<const N: usize>(
 }
 
 #[inline(always)]
-fn debug_assert_sctp_fd_state(fd: RawFd, fd_state: &RuntimeFdOpState<'_>) {
-    let state_fd = fd_state.raw_fd();
-    debug_assert!(
-        state_fd < 0 || fd == state_fd,
-        "SCTP future raw descriptor and typed operation state diverged"
-    );
-}
-
-#[inline(always)]
 /// Extracts selected data from a completed SCTP payload and releases its
 /// operation slot.
 ///
@@ -5372,7 +5363,8 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Sctp);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -5469,7 +5461,8 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Sctp);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -5560,7 +5553,8 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Sctp);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -5756,7 +5750,8 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Sctp);
 
         if this.state_ptr.is_null()
             && let Some(err) = this.input_error.take()
@@ -5859,7 +5854,8 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Sctp);
 
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;
@@ -6103,7 +6099,8 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        debug_assert_sctp_fd_state(this.fd, &this.state_ptr);
+        this.state_ptr
+            .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Sctp);
 
         if this.state_ptr.is_null() && this.buffer.is_none() {
             return Poll::Pending;

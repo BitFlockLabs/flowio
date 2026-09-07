@@ -96,7 +96,7 @@ use crate::runtime::executor::{
     completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker, prepare_unsubmitted_op,
     refresh_op_waiter_from_waker, submit_retained_fd_sqe, validate_local_io_result,
 };
-use crate::runtime::fd::{RuntimeFd, RuntimeFdOpState};
+use crate::runtime::fd::{FdStateDiagnostic, RuntimeFd, RuntimeFdOpState};
 use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
@@ -697,15 +697,6 @@ unsafe fn take_completed_udp_payload<T: 'static>(
 }
 
 #[inline(always)]
-fn debug_assert_udp_fd_state(fd: RawFd, fd_state: &RuntimeFdOpState<'_>) {
-    let state_fd = fd_state.raw_fd();
-    debug_assert!(
-        state_fd < 0 || fd == state_fd,
-        "UDP future raw descriptor and typed operation state diverged"
-    );
-}
-
-#[inline(always)]
 fn udp_future_is_fused<T>(fd_state: &RuntimeFdOpState<'_>, buffer: &Option<T>) -> bool {
     fd_state.is_null() && buffer.is_none()
 }
@@ -765,7 +756,8 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
         }
 
         if this.fd_state.state_ptr().is_null() {
-            debug_assert_udp_fd_state(this.fd, &this.fd_state);
+            this.fd_state
+                .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Udp);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -875,7 +867,8 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
         }
 
         if this.fd_state.state_ptr().is_null() {
-            debug_assert_udp_fd_state(this.fd, &this.fd_state);
+            this.fd_state
+                .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Udp);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -978,7 +971,8 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
         }
 
         if this.fd_state.state_ptr().is_null() {
-            debug_assert_udp_fd_state(this.fd, &this.fd_state);
+            this.fd_state
+                .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Udp);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -1095,7 +1089,8 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
         }
 
         if this.fd_state.state_ptr().is_null() {
-            debug_assert_udp_fd_state(this.fd, &this.fd_state);
+            this.fd_state
+                .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Udp);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -1203,7 +1198,8 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
         }
 
         if this.fd_state.state_ptr().is_null() {
-            debug_assert_udp_fd_state(this.fd, &this.fd_state);
+            this.fd_state
+                .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Udp);
             let pctx = match poll_ctx_from_waker(cx) {
                 Ok(pctx) => pctx,
                 Err(err) => {
@@ -1321,7 +1317,9 @@ mod tests {
             input_error: None,
             _marker: PhantomData,
         };
-        debug_assert_udp_fd_state(future.fd, &future.fd_state);
+        future
+            .fd_state
+            .debug_assert_matches_raw_fd(future.fd, FdStateDiagnostic::Udp);
         assert!(udp_future_is_fused(&future.fd_state, &future.buffer));
 
         let waker = std::task::Waker::noop();

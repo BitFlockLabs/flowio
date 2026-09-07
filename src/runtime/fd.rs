@@ -396,6 +396,13 @@ impl RuntimeFdLease {
 
 impl std::panic::UnwindSafe for RuntimeFdLease {}
 
+/// Descriptor invariant diagnostic for each transport family.
+pub(crate) enum FdStateDiagnostic {
+    Stream,
+    Udp,
+    Sctp,
+}
+
 /// One-word descriptor-operation state replacing the future's raw state slot.
 ///
 /// Before initial submission, an untagged core pointer borrows the parent
@@ -456,6 +463,28 @@ impl<'a> RuntimeFdOpState<'a> {
                 }
             }
             _ => RuntimeFd::INVALID,
+        }
+    }
+
+    /// Checks a saved descriptor against this state when debug assertions are enabled.
+    ///
+    /// A negative state descriptor permits any saved descriptor value.
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn debug_assert_matches_raw_fd(&self, fd: RawFd, diagnostic: FdStateDiagnostic) {
+        let state_fd = self.raw_fd();
+        if cfg!(debug_assertions) && !(state_fd < 0 || fd == state_fd) {
+            match diagnostic {
+                FdStateDiagnostic::Stream => {
+                    panic!("stream future raw descriptor and typed operation state diverged")
+                }
+                FdStateDiagnostic::Udp => {
+                    panic!("UDP future raw descriptor and typed operation state diverged")
+                }
+                FdStateDiagnostic::Sctp => {
+                    panic!("SCTP future raw descriptor and typed operation state diverged")
+                }
+            }
         }
     }
 
@@ -1168,6 +1197,238 @@ mod policy_tests {
     assert_not_impl_any!(RuntimeFdRef<'static>: Send, Sync, std::panic::RefUnwindSafe);
     assert_not_impl_any!(RuntimeFdLease: Send, Sync, std::panic::RefUnwindSafe);
     assert_not_impl_any!(RuntimeFdOpState<'static>: Send, Sync, std::panic::RefUnwindSafe);
+
+    #[test]
+    fn fd_state_debug_invariant_accepts_negative_and_empty_states() {
+        use super::FdStateDiagnostic;
+
+        for raw_fd in [-1, -2, -7] {
+            let runtime = RuntimeFd::from_fresh_raw_fd(raw_fd);
+            assert_eq!(runtime.strong_count_for_test(), 1);
+            for staged in [false, true] {
+                let state = if staged {
+                    runtime.lease().into_op_state()
+                } else {
+                    runtime.op_state()
+                };
+                let expected_count = if staged { 2 } else { 1 };
+                let tagged = state.tagged;
+                assert_eq!(state.owns_staged_lease_for_test(), staged);
+                assert_eq!(runtime.strong_count_for_test(), expected_count);
+                for saved_fd in [-9, 0, 17] {
+                    state.debug_assert_matches_raw_fd(saved_fd, FdStateDiagnostic::Stream);
+                    assert_eq!(state.tagged, tagged);
+                    assert_eq!(state.raw_fd(), raw_fd);
+                    assert_eq!(runtime.strong_count_for_test(), expected_count);
+                }
+                drop(state);
+                assert_eq!(runtime.strong_count_for_test(), 1);
+            }
+
+            let mut empty = runtime.lease().into_op_state();
+            assert_eq!(runtime.strong_count_for_test(), 2);
+            // SAFETY: this state still owns its initial, unpublished lease.
+            let lease = unsafe { empty.take_initial_lease() };
+            assert_eq!(runtime.strong_count_for_test(), 2);
+            drop(lease);
+            assert!(empty.tagged.is_none());
+            assert_eq!(empty.raw_fd(), RuntimeFd::INVALID);
+            assert_eq!(runtime.strong_count_for_test(), 1);
+            for saved_fd in [-9, 0, 17] {
+                empty.debug_assert_matches_raw_fd(saved_fd, FdStateDiagnostic::Stream);
+                assert!(empty.tagged.is_none());
+                assert_eq!(empty.raw_fd(), RuntimeFd::INVALID);
+                assert_eq!(runtime.strong_count_for_test(), 1);
+            }
+            drop(empty);
+            assert_eq!(runtime.strong_count_for_test(), 1);
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn live_fd_for_debug_invariant() -> RuntimeFd {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let raw_fd = super::distinctive_closeable_test_fd()
+            .expect("create owned descriptor for fd invariant");
+        // SAFETY: the helper returned one fresh sole descriptor owner.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        RuntimeFd::from_fresh_owned(owned)
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn fd_state_debug_invariant_checks_live_descriptor_equality() {
+        use super::FdStateDiagnostic;
+
+        let runtime = live_fd_for_debug_invariant();
+        let raw_fd = runtime.raw_fd();
+        assert!(raw_fd >= 0);
+        assert_eq!(runtime.strong_count_for_test(), 1);
+        for staged in [false, true] {
+            let state = if staged {
+                runtime.lease().into_op_state()
+            } else {
+                runtime.op_state()
+            };
+            let expected_count = if staged { 2 } else { 1 };
+            let tagged = state.tagged;
+            assert_eq!(state.owns_staged_lease_for_test(), staged);
+            assert_eq!(runtime.strong_count_for_test(), expected_count);
+            state.debug_assert_matches_raw_fd(raw_fd, FdStateDiagnostic::Stream);
+            assert_eq!(state.tagged, tagged);
+            assert_eq!(state.raw_fd(), raw_fd);
+            assert_eq!(runtime.strong_count_for_test(), expected_count);
+
+            for (saved_fd, diagnostic, expected_message) in [
+                (
+                    raw_fd ^ 1,
+                    FdStateDiagnostic::Stream,
+                    "stream future raw descriptor and typed operation state diverged",
+                ),
+                (
+                    -1,
+                    FdStateDiagnostic::Udp,
+                    "UDP future raw descriptor and typed operation state diverged",
+                ),
+                (
+                    -7,
+                    FdStateDiagnostic::Sctp,
+                    "SCTP future raw descriptor and typed operation state diverged",
+                ),
+            ] {
+                let unwind = catch_unwind(AssertUnwindSafe(|| {
+                    state.debug_assert_matches_raw_fd(saved_fd, diagnostic);
+                }));
+                assert_eq!(unwind.is_err(), cfg!(debug_assertions));
+                if let Err(payload) = unwind {
+                    assert_eq!(
+                        payload.downcast_ref::<&'static str>().copied(),
+                        Some(expected_message),
+                        "fd mismatch changed its panic payload type or exact text",
+                    );
+                }
+                assert_eq!(state.tagged, tagged);
+                assert_eq!(state.raw_fd(), raw_fd);
+                assert_eq!(runtime.strong_count_for_test(), expected_count);
+            }
+            drop(state);
+            assert_eq!(runtime.strong_count_for_test(), 1);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn fd_state_debug_invariant_reports_direct_caller() {
+        use super::FdStateDiagnostic;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        const CHILD_ENV: &str = "FLOWIO_FD_INVARIANT_CALLER_CHILD";
+        const CHILD_TEST: &str =
+            "runtime::fd::policy_tests::fd_state_debug_invariant_reports_direct_caller";
+        const EXPECTED_MESSAGE: &str =
+            "stream future raw descriptor and typed operation state diverged";
+        const CALLER_MARKER: &str = "FD_ASSERT_CALLER=";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = live_fd_for_debug_invariant();
+            assert!(runtime.raw_fd() >= 0);
+            let state = runtime.op_state();
+            assert_eq!(runtime.strong_count_for_test(), 1);
+            eprintln!("FD_ASSERT_CALLER={}:{}", file!(), line!() + 1);
+            state.debug_assert_matches_raw_fd(-1, FdStateDiagnostic::Stream);
+            if cfg!(debug_assertions) {
+                panic!("debug fd mismatch did not panic");
+            }
+            assert_eq!(runtime.strong_count_for_test(), 1);
+            return;
+        }
+
+        let child = Command::new(std::env::current_exe().expect("current unit-test executable"))
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .env("RUST_BACKTRACE", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fd invariant caller child");
+        let output = crate::test_child::capture_child_with_watchdog(child, Duration::from_secs(8))
+            .unwrap_or_else(|error| panic!("fd invariant caller child capture failed: {error}"));
+        let stdout = std::str::from_utf8(&output.stdout).expect("child stdout must be UTF-8");
+        let stderr = std::str::from_utf8(&output.stderr).expect("child stderr must be UTF-8");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| *line == "running 1 test")
+                .count(),
+            1
+        );
+        let mut summaries = stdout
+            .lines()
+            .filter(|line| line.starts_with("test result: "));
+        let summary = summaries.next().expect("child test result summary");
+        assert!(summaries.next().is_none(), "multiple child test summaries");
+        let mut markers = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix(CALLER_MARKER));
+        let caller = markers.next().expect("direct caller marker");
+        assert!(markers.next().is_none(), "multiple direct caller markers");
+        let mut panic_headers = stderr.lines().filter_map(|line| {
+            line.split_once(" panicked at ")
+                .map(|(_, location)| location)
+        });
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                output.status.code(),
+                Some(101),
+                "stdout={stdout}, stderr={stderr}"
+            );
+            assert!(
+                summary.starts_with(
+                    "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; "
+                )
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {CHILD_TEST} ... FAILED"))
+            );
+            let header = panic_headers.next().expect("default panic header");
+            assert!(panic_headers.next().is_none(), "multiple panic headers");
+            let (actual_caller, column) = header
+                .strip_suffix(':')
+                .expect("panic header trailing colon")
+                .rsplit_once(':')
+                .expect("panic header column");
+            assert!(column.parse::<u32>().expect("numeric panic column") > 0);
+            assert_eq!(
+                actual_caller, caller,
+                "panic location must name the direct caller"
+            );
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| *line == EXPECTED_MESSAGE)
+                    .count(),
+                1
+            );
+        } else {
+            assert!(output.status.success(), "stdout={stdout}, stderr={stderr}");
+            assert!(
+                summary.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {CHILD_TEST} ... ok"))
+            );
+            assert!(
+                panic_headers.next().is_none(),
+                "release invariant emitted a panic header"
+            );
+        }
+    }
 
     #[test]
     fn final_core_drop_hook_scope_restores_previous_hook_after_unwind() {
