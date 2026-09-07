@@ -428,7 +428,26 @@ pub(crate) struct IoBuffHeader {
     // follows immediately after this header in memory.
 }
 
+// Reclamation frees storage or overlays a pool link without running header drop glue.
+const _: () = assert!(!std::mem::needs_drop::<IoBuffHeader>());
+
 impl IoBuffHeader {
+    #[inline(always)]
+    pub(super) fn new(
+        headroom: usize,
+        payload: usize,
+        tailroom: usize,
+        pool: *mut IoBuffPoolInner,
+    ) -> Self {
+        Self {
+            refcount: Cell::new(1),
+            headroom_capacity: headroom,
+            payload_capacity: payload,
+            tailroom_capacity: tailroom,
+            pool,
+        }
+    }
+
     /// Returns the total size of the trailing data region
     /// (headroom + payload + tailroom).
     #[inline(always)]
@@ -486,11 +505,10 @@ impl IoBuffHeader {
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut Self;
         let header = NonNull::new(ptr).ok_or(IoBuffError::AllocFailed)?;
         unsafe {
-            (*header.as_ptr()).refcount = Cell::new(1);
-            (*header.as_ptr()).headroom_capacity = headroom;
-            (*header.as_ptr()).payload_capacity = payload;
-            (*header.as_ptr()).tailroom_capacity = tailroom;
-            (*header.as_ptr()).pool = std::ptr::null_mut();
+            std::ptr::write(
+                header.as_ptr(),
+                Self::new(headroom, payload, tailroom, std::ptr::null_mut()),
+            );
         }
         Ok(header)
     }

@@ -169,6 +169,35 @@ fn pool_reuse_resets_state() {
     assert_eq!(reused.headroom_remaining(), 8);
     assert_eq!(reused.payload_remaining(), 64);
     assert_eq!(reused.tailroom_remaining(), 8);
+
+    let slot_ptr = IoBuffReadOnly::as_ptr(&reused);
+    assert_eq!(reused.headroom_capacity(), 8);
+    assert_eq!(reused.payload_capacity(), 64);
+    assert_eq!(reused.tailroom_capacity(), 8);
+
+    let mut resized = reused;
+    resized.payload_extend_from_tailroom(4).unwrap();
+    assert_eq!(IoBuffReadOnly::as_ptr(&resized), slot_ptr);
+    assert_eq!(resized.headroom_capacity(), 8);
+    assert_eq!(resized.payload_capacity(), 68);
+    assert_eq!(resized.tailroom_capacity(), 4);
+    assert_eq!(resized.payload_remaining(), 68);
+    assert_eq!(resized.tailroom_remaining(), 4);
+    drop(resized);
+
+    let restored = pool.alloc().unwrap();
+    assert_eq!(IoBuffReadOnly::as_ptr(&restored), slot_ptr);
+    assert_eq!(restored.headroom_capacity(), 8);
+    assert_eq!(restored.payload_capacity(), 64);
+    assert_eq!(restored.tailroom_capacity(), 8);
+    assert!(
+        restored.is_empty(),
+        "reused resized buffer must start empty"
+    );
+    assert_eq!(restored.payload_len(), 0);
+    assert_eq!(restored.headroom_remaining(), 8);
+    assert_eq!(restored.payload_remaining(), 64);
+    assert_eq!(restored.tailroom_remaining(), 8);
 }
 
 #[test]

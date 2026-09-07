@@ -30,7 +30,6 @@ use super::iobuff::{IoBuffHeader, IoBuffMut};
 use crate::utils::list::intrusive::slist::{Link as SListLink, SList};
 use crate::utils::memory::provider::{BasicMemoryProvider, ProviderOwner};
 use crate::utils::memory::slab::{SlabAllocator, SlabPageChain};
-use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
@@ -282,14 +281,18 @@ impl IoBuffPoolInner {
             (*pool_ptr).live_slots += 1;
         }
 
-        // Initialize the header in the slot.
+        // The detached slot may contain a free-list link; initialize the whole header.
         let header = slot_ptr as *mut IoBuffHeader;
         unsafe {
-            (*header).refcount = Cell::new(1);
-            (*header).headroom_capacity = (*pool_ptr).headroom;
-            (*header).payload_capacity = (*pool_ptr).payload;
-            (*header).tailroom_capacity = (*pool_ptr).tailroom;
-            (*header).pool = (*pool_ptr).pool_ptr;
+            std::ptr::write(
+                header,
+                IoBuffHeader::new(
+                    (*pool_ptr).headroom,
+                    (*pool_ptr).payload,
+                    (*pool_ptr).tailroom,
+                    (*pool_ptr).pool_ptr,
+                ),
+            );
         }
 
         Ok(IoBuffMut {
