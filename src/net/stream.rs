@@ -1130,11 +1130,6 @@ fn build_read_vectored_entry(
 }
 
 #[inline(always)]
-fn build_write_entry(fd: RawFd, ptr: *const u8, len: u32, user_data: u64) -> squeue::Entry {
-    build_send_entry(fd, ptr, len, user_data)
-}
-
-#[inline(always)]
 fn prepare_sendmsg_header(
     msg: &mut MaybeUninit<libc::msghdr>,
     iovecs: &[MaybeUninit<libc::iovec>],
@@ -1173,7 +1168,7 @@ fn build_write_vectored_entry(
     if count == 1 {
         let iov = unsafe { iovec_slice_ref(iovecs, skip) };
         if let Ok(len) = u32::try_from(iov.iov_len) {
-            return build_write_entry(fd, iov.iov_base as *const u8, len, user_data);
+            return build_send_entry(fd, iov.iov_base as *const u8, len, user_data);
         }
     }
 
@@ -1908,7 +1903,7 @@ impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(build_write_entry(fd, ptr, this.len, state_ptr as u64))
+                        Ok(build_send_entry(fd, ptr, this.len, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -2099,7 +2094,7 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
                         this.base_ptr = payload.buffer.as_ptr();
                         let ptr = this.base_ptr;
                         let remaining = this.total - this.offset;
-                        Ok(build_write_entry(fd, ptr, remaining, state_ptr as u64))
+                        Ok(build_send_entry(fd, ptr, remaining, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -2116,7 +2111,7 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
 
         unsafe {
             if let Err(e) = submit_resubmitted_fd_sqe(&pctx, &this.state_ptr, |fd| {
-                Ok(build_write_entry(fd, ptr, remaining, state_ptr as u64))
+                Ok(build_send_entry(fd, ptr, remaining, state_ptr as u64))
             }) {
                 let payload = take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
                     &pctx,
@@ -6197,7 +6192,7 @@ mod tests {
     #[test]
     fn stream_write_entry_uses_send_with_nosignal() {
         let bytes = [1u8, 2, 3, 4];
-        let entry = build_write_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
+        let entry = build_send_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
         let sqe = sqe_prefix(&entry);
 
         assert_eq!(sqe.opcode, opcode::Send::CODE);

@@ -236,7 +236,7 @@ use crate::runtime::retained::{
 use crate::runtime::task::release_task;
 use crate::runtime::timer::{Timeout, timeout};
 use crate::utils::disarm_unwind_guard;
-use io_uring::{opcode, squeue, types};
+use io_uring::{opcode, types};
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
@@ -5155,16 +5155,6 @@ fn sctp_eof_recv_meta() -> SctpRecvMeta {
     SctpRecvMeta::Data(SctpRecvInfo::default())
 }
 
-#[inline(always)]
-fn build_sctp_send_entry(fd: RawFd, ptr: *const u8, len: u32, user_data: u64) -> squeue::Entry {
-    build_send_entry(fd, ptr, len, user_data)
-}
-
-#[inline(always)]
-fn build_sctp_sendmsg_entry(fd: RawFd, msg: *const libc::msghdr, user_data: u64) -> squeue::Entry {
-    build_sendmsg_entry(fd, msg, user_data)
-}
-
 /// Returns a completed stashed receive state even if caller buffer inspection
 /// unwinds after its retained payload has been detached.
 struct StashedSctpStateReturnGuard {
@@ -5524,7 +5514,7 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(build_sctp_send_entry(fd, ptr, this.len, state_ptr as u64))
+                        Ok(build_send_entry(fd, ptr, this.len, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -5815,7 +5805,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                     &mut this.state_ptr,
                     payload,
                     |fd, payload| {
-                        Ok(build_sctp_sendmsg_entry(
+                        Ok(build_sendmsg_entry(
                             fd,
                             payload.msghdr.as_ptr(),
                             state_ptr as u64,
@@ -6179,7 +6169,7 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
                     &mut this.state_ptr,
                     payload,
                     |fd, payload| {
-                        Ok(build_sctp_sendmsg_entry(
+                        Ok(build_sendmsg_entry(
                             fd,
                             payload.msghdr.as_ptr(),
                             state_ptr as u64,
@@ -11367,7 +11357,7 @@ mod tests {
     #[test]
     fn sctp_data_send_entry_uses_send_with_nosignal() {
         let bytes = [1u8, 2, 3, 4];
-        let entry = build_sctp_send_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
+        let entry = build_send_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
         let sqe = sqe_prefix(&entry);
 
         assert_eq!(sqe.opcode, opcode::Send::CODE);
@@ -11386,7 +11376,7 @@ mod tests {
             msg_controllen: 0,
             msg_flags: 0,
         };
-        let entry = build_sctp_sendmsg_entry(7, &msg, 99);
+        let entry = build_sendmsg_entry(7, &msg, 99);
         let sqe = sqe_prefix(&entry);
 
         assert_eq!(sqe.opcode, opcode::SendMsg::CODE);
