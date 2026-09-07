@@ -8,6 +8,11 @@ Alpha prereleases carry no compatibility guarantee.
 
 ## [Unreleased]
 
+### Added
+
+- `TcpStream::keepalive` reads the live `SO_KEEPALIVE` setting, complementing
+  `set_keepalive`.
+
 ### Changed
 
 - **Breaking:** TCP and Unix streams use generic `try_read` and `read_exact`

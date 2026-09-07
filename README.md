@@ -323,7 +323,10 @@ progress logic and would otherwise duplicate the same retry work.
 
 For TCP read/write split ownership, call `TcpStream::try_clone_for_split`
 during connection setup only. It duplicates the connected descriptor; both
-handles share one kernel TCP stream and socket options.
+handles share one kernel TCP stream and socket options, and both remain on the
+same owner OS thread. This split-clone capability is provided for TCP.
+`TcpStream::keepalive` reads the live `SO_KEEPALIVE` setting; configure it with
+`set_keepalive` on the setup/control path.
 
 Use vectored APIs only when the payload is already segmented. For one
 contiguous payload, the contiguous APIs avoid iovec construction and

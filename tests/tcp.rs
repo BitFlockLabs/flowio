@@ -2395,6 +2395,11 @@ fn runtime_tcp_socket_options() {
             assert!(!stream.nodelay().expect("nodelay false failed"));
 
             stream.set_keepalive(true).expect("set_keepalive failed");
+            assert!(stream.keepalive().expect("keepalive failed"));
+            stream
+                .set_keepalive(false)
+                .expect("set_keepalive false failed");
+            assert!(!stream.keepalive().expect("keepalive false failed"));
 
             stream
                 .set_send_buffer_size(65536)

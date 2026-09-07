@@ -19,8 +19,8 @@
 //! - For fixed-shape hot-path buffers, pair TCP with
 //!   [`crate::runtime::buffer::pool::IoBuffPool`].
 //! - Use [`TcpStream::try_clone_for_split`] only during connection setup when
-//!   separate read/write owners are needed. The handles share one kernel TCP
-//!   stream.
+//!   separate read/write owners are needed. This TCP-only capability keeps both
+//!   handles on the same owner OS thread, sharing one kernel TCP stream.
 //!
 //! Avoid on the per-message fast path:
 //! - Avoid [`TcpStream::read_exact`] / [`TcpStream::write_all`]
@@ -398,7 +398,8 @@ impl TcpStream {
     /// needs to own reads while another owns writes. This is control-plane
     /// setup work, not a per-message fast-path operation. Dropping one handle
     /// closes only that descriptor; the underlying TCP stream remains open
-    /// while another duplicated handle is alive.
+    /// while another duplicated handle is alive. Both handles remain on the
+    /// same owner OS thread and share socket options.
     pub fn try_clone_for_split(&self) -> io::Result<Self> {
         let fd = unsafe { libc::fcntl(self.fd.raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         let duplicate = if fd < 0 {
@@ -461,6 +462,22 @@ impl TcpStream {
             libc::SO_KEEPALIVE,
             &(keepalive as libc::c_int),
         )
+    }
+
+    /// Returns the current `SO_KEEPALIVE` setting.
+    ///
+    /// This is socket status/control-plane lookup, not the per-message data
+    /// fast path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error from `getsockopt(2)`, or
+    /// [`io::ErrorKind::InvalidData`] if the returned option has an unexpected
+    /// size.
+    pub fn keepalive(&self) -> io::Result<bool> {
+        let val =
+            get_sock_opt::<libc::c_int>(self.fd.raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE)?;
+        Ok(val != 0)
     }
 
     /// Sets the `SO_SNDBUF` socket send buffer size.
