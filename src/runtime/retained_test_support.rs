@@ -5,14 +5,14 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
 macro_rules! define_retained_payload_pool_stats {
-    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+    ($($group:ident { $($field:ident => $runtime_field:ident: $doc:literal;)* })*) => {
         /// Debug counters for retained-pool white-box tests.
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         pub struct RetainedPayloadPoolStats {
-            $(
+            $($(
                 #[doc = $doc]
                 pub $field: usize,
-            )*
+            )*)*
         }
     };
 }
@@ -20,11 +20,11 @@ macro_rules! define_retained_payload_pool_stats {
 super::retained::retained_payload_stat_fields!(define_retained_payload_pool_stats);
 
 macro_rules! impl_retained_payload_pool_stats_conversion {
-    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+    ($($group:ident { $($field:ident => $runtime_field:ident: $doc:literal;)* })*) => {
         impl From<super::retained::RetainedPayloadPoolStats> for RetainedPayloadPoolStats {
             fn from(stats: super::retained::RetainedPayloadPoolStats) -> Self {
                 Self {
-                    $($field: stats.$field,)*
+                    $($($field: stats.$field,)*)*
                 }
             }
         }

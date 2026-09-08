@@ -403,13 +403,13 @@ pub struct RuntimeQuiescence {
 
 #[cfg(debug_assertions)]
 macro_rules! define_apply_retained_payload_stats {
-    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+    ($($group:ident { $($field:ident => $runtime_field:ident: $doc:literal;)* })*) => {
         #[inline(always)]
         fn apply_retained_payload_stats(
             stats: &mut RuntimeStats,
             retained: RetainedPayloadPoolStats,
         ) {
-            $(stats.$runtime_field = retained.$field;)*
+            $($(stats.$runtime_field = retained.$field;)*)*
         }
     };
 }

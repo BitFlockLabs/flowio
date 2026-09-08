@@ -103,32 +103,36 @@ pub(crate) struct RetainedPayloadVtable {
 macro_rules! retained_payload_stat_fields {
     ($callback:ident) => {
         $callback! {
-            pooled_allocs => retained_pooled_allocs:
-                "Retained payload allocations served by size-class storage.";
-            pooled_reuses => retained_pooled_reuses:
-                "Retained payload allocations served from returned blocks.";
-            pooled_frees => retained_pooled_frees:
-                "Retained payload blocks returned to size-class free lists.";
-            slab_allocs => retained_slab_allocs:
-                "Retained payload slab pages requested from providers.";
-            heap_fallbacks => retained_heap_fallbacks:
-                "Retained payload allocations that used the heap fallback.";
-            heap_frees => retained_heap_frees:
-                "Heap fallback payload blocks released.";
-            writev_scratch_inline_allocs => writev_scratch_inline_allocs:
-                "Iovec scratch requests served from inline storage.";
-            writev_scratch_pooled_allocs => writev_scratch_pooled_allocs:
-                "Iovec scratch requests served by pooled sidecar storage.";
-            writev_scratch_pooled_reuses => writev_scratch_pooled_reuses:
-                "Pooled sidecar scratch requests served from returned blocks.";
-            writev_scratch_pooled_frees => writev_scratch_pooled_frees:
-                "Pooled sidecar scratch blocks returned to size-class free lists.";
-            writev_scratch_slab_allocs => writev_scratch_slab_allocs:
-                "Sidecar scratch slab pages requested from providers.";
-            writev_scratch_oversize_rejections => writev_scratch_oversize_rejections:
-                "Stream requests rejected for exceeding the supported active iovec count.";
-            writev_scratch_alloc_failures => writev_scratch_alloc_failures:
-                "Scratch requests rejected because no sidecar block was available.";
+            payload {
+                pooled_allocs => retained_pooled_allocs:
+                    "Retained payload allocations served by size-class storage.";
+                pooled_reuses => retained_pooled_reuses:
+                    "Retained payload allocations served from returned blocks.";
+                pooled_frees => retained_pooled_frees:
+                    "Retained payload blocks returned to size-class free lists.";
+                slab_allocs => retained_slab_allocs:
+                    "Retained payload slab pages requested from providers.";
+                heap_fallbacks => retained_heap_fallbacks:
+                    "Retained payload allocations that used the heap fallback.";
+                heap_frees => retained_heap_frees:
+                    "Heap fallback payload blocks released.";
+            }
+            scratch {
+                writev_scratch_inline_allocs => writev_scratch_inline_allocs:
+                    "Iovec scratch requests served from inline storage.";
+                writev_scratch_pooled_allocs => writev_scratch_pooled_allocs:
+                    "Iovec scratch requests served by pooled sidecar storage.";
+                writev_scratch_pooled_reuses => writev_scratch_pooled_reuses:
+                    "Pooled sidecar scratch requests served from returned blocks.";
+                writev_scratch_pooled_frees => writev_scratch_pooled_frees:
+                    "Pooled sidecar scratch blocks returned to size-class free lists.";
+                writev_scratch_slab_allocs => writev_scratch_slab_allocs:
+                    "Sidecar scratch slab pages requested from providers.";
+                writev_scratch_oversize_rejections => writev_scratch_oversize_rejections:
+                    "Stream requests rejected for exceeding the supported active iovec count.";
+                writev_scratch_alloc_failures => writev_scratch_alloc_failures:
+                    "Scratch requests rejected because no sidecar block was available.";
+            }
         }
     };
 }
@@ -138,14 +142,14 @@ pub(crate) use retained_payload_stat_fields;
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 macro_rules! define_retained_payload_pool_stats {
-    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+    ($($group:ident { $($field:ident => $runtime_field:ident: $doc:literal;)* })*) => {
         /// Debug/test-support counters for asserting retained-pool behavior in tests.
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         pub(crate) struct RetainedPayloadPoolStats {
-            $(
+            $($(
                 #[doc = $doc]
                 pub(crate) $field: usize,
-            )*
+            )*)*
         }
     };
 }
@@ -155,7 +159,7 @@ retained_payload_stat_fields!(define_retained_payload_pool_stats);
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 macro_rules! impl_retained_payload_pool_stats_delta {
-    ($($field:ident => $runtime_field:ident: $doc:literal;)*) => {
+    ($($group:ident { $($field:ident => $runtime_field:ident: $doc:literal;)* })*) => {
         impl RetainedPayloadPoolStats {
             /// Returns counter activity observed since `baseline` without mutating the
             /// retained pools. Saturating subtraction preserves debug bookkeeping if a
@@ -166,9 +170,9 @@ macro_rules! impl_retained_payload_pool_stats_delta {
             )]
             pub(crate) fn saturating_delta_since(self, baseline: Self) -> Self {
                 Self {
-                    $(
+                    $($(
                         $field: self.$field.saturating_sub(baseline.$field),
-                    )*
+                    )*)*
                 }
             }
         }
@@ -196,15 +200,21 @@ pub(crate) struct RetainedPayloadDiagnosticCounters {
 impl RetainedPayloadDiagnosticCounters {
     #[inline(always)]
     fn record_payload_class(&mut self, class_index: usize, result: &ClassAllocResult) {
-        self.payload_class_allocs[class_index] =
-            self.payload_class_allocs[class_index].saturating_add(1);
-        self.payload_reuses = self
-            .payload_reuses
-            .saturating_add(usize::from(result.reused));
-        self.payload_slab_allocs = self
-            .payload_slab_allocs
-            .saturating_add(usize::from(result.new_slab));
+        record_class_allocation(
+            result,
+            &mut self.payload_class_allocs[class_index],
+            &mut self.payload_reuses,
+            &mut self.payload_slab_allocs,
+        );
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[inline(always)]
+fn count_retained_slab_pages(classes: &[RetainedSizeClass]) -> usize {
+    classes.iter().fold(0usize, |total, class| {
+        total.saturating_add(class.slab_pages.page_count())
+    })
 }
 
 /// Test-support-only retained-storage state sampled at executor quiescence.
@@ -228,26 +238,31 @@ fn record_class_allocation(
     // The class has already removed the block from its free list. Saturation
     // keeps debug/test bookkeeping from panicking after that ownership change.
     *allocations = allocations.saturating_add(1);
-    if result.reused {
-        *reuses = reuses.saturating_add(1);
-    }
-    if result.new_slab {
-        *slab_allocations = slab_allocations.saturating_add(1);
-    }
+    *reuses = reuses.saturating_add(usize::from(result.reused));
+    *slab_allocations = slab_allocations.saturating_add(usize::from(result.new_slab));
 }
 
-/// Scratch-only counters stored with the heap-stable iovec sidecar owner.
 #[cfg(any(debug_assertions, feature = "test-support"))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct RetainedIovecScratchStats {
-    writev_scratch_inline_allocs: usize,
-    writev_scratch_pooled_allocs: usize,
-    writev_scratch_pooled_reuses: usize,
-    writev_scratch_pooled_frees: usize,
-    writev_scratch_slab_allocs: usize,
-    writev_scratch_oversize_rejections: usize,
-    writev_scratch_alloc_failures: usize,
+macro_rules! define_retained_iovec_scratch_stats {
+    (payload { $($payload:tt)* } scratch { $($field:ident => $runtime_field:ident: $doc:literal;)* }) => {
+        /// Scratch-only counters stored with the heap-stable iovec sidecar owner.
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        struct RetainedIovecScratchStats {
+            $($field: usize,)*
+        }
+
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        impl RetainedIovecScratchStats {
+            fn apply_to(self, stats: &mut RetainedPayloadPoolStats) {
+                $(stats.$field = self.$field;)*
+            }
+        }
+    };
 }
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+retained_payload_stat_fields!(define_retained_iovec_scratch_stats);
 
 /// Feature-gated counters stored with the heap-stable scratch owner.
 #[cfg(feature = "diagnostic-counters")]
@@ -263,24 +278,12 @@ struct RetainedIovecDiagnosticCounters {
 impl RetainedIovecDiagnosticCounters {
     #[inline(always)]
     fn record_class(&mut self, class_index: usize, result: &ClassAllocResult) {
-        self.class_allocs[class_index] = self.class_allocs[class_index].saturating_add(1);
-        self.reuses = self.reuses.saturating_add(usize::from(result.reused));
-        self.slab_allocs = self
-            .slab_allocs
-            .saturating_add(usize::from(result.new_slab));
-    }
-}
-
-#[cfg(any(debug_assertions, feature = "test-support"))]
-impl RetainedIovecScratchStats {
-    fn apply_to(self, stats: &mut RetainedPayloadPoolStats) {
-        stats.writev_scratch_inline_allocs = self.writev_scratch_inline_allocs;
-        stats.writev_scratch_pooled_allocs = self.writev_scratch_pooled_allocs;
-        stats.writev_scratch_pooled_reuses = self.writev_scratch_pooled_reuses;
-        stats.writev_scratch_pooled_frees = self.writev_scratch_pooled_frees;
-        stats.writev_scratch_slab_allocs = self.writev_scratch_slab_allocs;
-        stats.writev_scratch_oversize_rejections = self.writev_scratch_oversize_rejections;
-        stats.writev_scratch_alloc_failures = self.writev_scratch_alloc_failures;
+        record_class_allocation(
+            result,
+            &mut self.class_allocs[class_index],
+            &mut self.reuses,
+            &mut self.slab_allocs,
+        );
     }
 }
 
@@ -768,15 +771,11 @@ impl RetainedPayloadPool {
     /// Samples retained payload/scratch ownership outside operation paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn quiescence(&self) -> RetainedPayloadPoolQuiescence {
-        let payload_slab_pages = self.classes.iter().fold(0usize, |total, class| {
-            total.saturating_add(class.slab_pages.page_count())
-        });
+        let payload_slab_pages = count_retained_slab_pages(&self.classes);
         // SAFETY: the retained pool and sidecar leases are owner-thread-only,
         // and an Executor snapshot cannot overlap allocation or release.
         let scratch_state = unsafe { &*self.iovec_pool.state.get() };
-        let scratch_slab_pages = scratch_state.classes.iter().fold(0usize, |total, class| {
-            total.saturating_add(class.slab_pages.page_count())
-        });
+        let scratch_slab_pages = count_retained_slab_pages(&scratch_state.classes);
         RetainedPayloadPoolQuiescence {
             stats: self.stats(),
             payload_slab_pages,
@@ -1639,6 +1638,55 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: len,
         }
+    }
+
+    #[test]
+    fn retained_scratch_stats_merge_overwrites_every_scratch_field_only() {
+        let mut stats = RetainedPayloadPoolStats {
+            pooled_allocs: 1,
+            pooled_reuses: 2,
+            pooled_frees: 3,
+            slab_allocs: 4,
+            heap_fallbacks: 5,
+            heap_frees: 6,
+            writev_scratch_inline_allocs: 101,
+            writev_scratch_pooled_allocs: 102,
+            writev_scratch_pooled_reuses: 103,
+            writev_scratch_pooled_frees: 104,
+            writev_scratch_slab_allocs: 105,
+            writev_scratch_oversize_rejections: 106,
+            writev_scratch_alloc_failures: 107,
+        };
+        let scratch = RetainedIovecScratchStats {
+            writev_scratch_inline_allocs: 11,
+            writev_scratch_pooled_allocs: 22,
+            writev_scratch_pooled_reuses: 33,
+            writev_scratch_pooled_frees: 44,
+            writev_scratch_slab_allocs: 55,
+            writev_scratch_oversize_rejections: 66,
+            writev_scratch_alloc_failures: 77,
+        };
+
+        scratch.apply_to(&mut stats);
+
+        assert_eq!(
+            stats,
+            RetainedPayloadPoolStats {
+                pooled_allocs: 1,
+                pooled_reuses: 2,
+                pooled_frees: 3,
+                slab_allocs: 4,
+                heap_fallbacks: 5,
+                heap_frees: 6,
+                writev_scratch_inline_allocs: 11,
+                writev_scratch_pooled_allocs: 22,
+                writev_scratch_pooled_reuses: 33,
+                writev_scratch_pooled_frees: 44,
+                writev_scratch_slab_allocs: 55,
+                writev_scratch_oversize_rejections: 66,
+                writev_scratch_alloc_failures: 77,
+            }
+        );
     }
 
     #[test]
