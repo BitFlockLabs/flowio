@@ -261,6 +261,184 @@ impl Drop for NopFuture<'_> {
     }
 }
 
+#[cfg(all(test, any(debug_assertions, feature = "test-support")))]
+mod preparation_tests {
+    use super::*;
+    use crate::runtime::executor::{
+        ExecutorOwner, poll_ctx_from_waker, with_ringless_poll_context_for_test,
+    };
+    use crate::runtime::reactor::ReactorQuiescence;
+    use crate::runtime::task::TaskHeader;
+    use crate::runtime::test_hooks;
+    use std::rc::Rc;
+
+    const REJECTIONS: [(io::ErrorKind, usize); 3] = [
+        (io::ErrorKind::WouldBlock, 1),
+        (io::ErrorKind::WouldBlock, 0),
+        (io::ErrorKind::BrokenPipe, 0),
+    ];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Snapshot {
+        task_refs: usize,
+        owner_refs: usize,
+        live_ops: usize,
+        inflight_ops: usize,
+        quiescence: ReactorQuiescence,
+    }
+
+    struct Recovery {
+        task: *mut TaskHeader,
+        first_slot: *mut CompletionState,
+        baseline: Snapshot,
+    }
+
+    impl Recovery {
+        fn new(owner: &Rc<ExecutorOwner>, cx: &Context<'_>) -> Self {
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
+            let pctx = poll_ctx_from_waker(cx).expect("ringless poll context missing");
+            assert_eq!(pctx.owner_ptr(), Rc::as_ptr(owner));
+            assert_eq!(pctx.reactor(), owner.reactor_ptr());
+            let task = pctx.owner_task();
+            assert!(!task.is_null());
+
+            // SAFETY: the active owner pins this reactor; the allocation is
+            // never submitted and has no waiter or retained payload.
+            let first_slot = unsafe { (*owner.reactor_ptr()).alloc_op() };
+            assert!(!first_slot.is_null());
+            Self::assert_fresh(owner, first_slot);
+            unsafe { Reactor::free_op_unchecked(owner.reactor_ptr(), first_slot) };
+
+            let baseline = Self::snapshot(owner, task);
+            assert_eq!(baseline.task_refs, 1);
+            assert_eq!(baseline.live_ops, 0);
+            assert_eq!(baseline.inflight_ops, 0);
+            assert_eq!(baseline.quiescence.live_ops, 0);
+            assert_eq!(baseline.quiescence.pending_cancels, 0);
+            assert_eq!(baseline.quiescence.queued_sqes, 0);
+            assert_eq!(baseline.quiescence.pending_closes, 0);
+            assert_eq!(baseline.quiescence.deferred_closes, 0);
+            assert_eq!(baseline.quiescence.operation_slab_pages, 1);
+            assert!(!baseline.quiescence.storage_abandoned);
+            Self {
+                task,
+                first_slot,
+                baseline,
+            }
+        }
+
+        fn snapshot(owner: &Rc<ExecutorOwner>, task: *mut TaskHeader) -> Snapshot {
+            // SAFETY: the cached task waker and owner remain live throughout
+            // the ringless closure. These short reads finish before polling
+            // or reclamation can mutate the corresponding state.
+            Snapshot {
+                task_refs: unsafe { (*task).refs.get() },
+                owner_refs: Rc::strong_count(owner),
+                live_ops: unsafe { (*owner.reactor_ptr()).live_op_count() },
+                inflight_ops: owner.inflight_op_count_for_test(),
+                quiescence: unsafe { (*owner.reactor_ptr()).quiescence() },
+            }
+        }
+
+        fn assert_live(&self, owner: &Rc<ExecutorOwner>, count: usize) {
+            let mut expected = self.baseline;
+            expected.owner_refs += count;
+            expected.live_ops += count;
+            expected.quiescence.live_ops += count;
+            assert_eq!(Self::snapshot(owner, self.task), expected);
+        }
+
+        fn assert_fresh(owner: &Rc<ExecutorOwner>, state: *mut CompletionState) {
+            // SAFETY: the caller passes one live, freshly allocated state.
+            // This borrow ends before another allocation or reclamation.
+            let state = unsafe { &*state };
+            assert_eq!(state.owner_ptr(), Rc::as_ptr(owner));
+            assert!(state.waiter.is_null());
+            assert_eq!(state.state_flags, 0);
+        }
+
+        fn assert_recovery(&self, owner: &Rc<ExecutorOwner>) {
+            self.assert_live(owner, 0);
+            // SAFETY: each state remains unsubmitted and waiter-free; the
+            // active owner pins the reactor through both returns to its pool.
+            let first = unsafe { (*owner.reactor_ptr()).alloc_op() };
+            assert!(!first.is_null());
+            assert_eq!(first, self.first_slot);
+            Self::assert_fresh(owner, first);
+            self.assert_live(owner, 1);
+
+            let second = unsafe { (*owner.reactor_ptr()).alloc_op() };
+            assert!(!second.is_null());
+            assert_ne!(second, first);
+            Self::assert_fresh(owner, second);
+            self.assert_live(owner, 2);
+
+            // Return the companion first so the prewarmed slot is the next
+            // free-list head. Neither raw pointer is dereferenced after free.
+            unsafe { Reactor::free_op_unchecked(owner.reactor_ptr(), second) };
+            self.assert_live(owner, 1);
+            unsafe { Reactor::free_op_unchecked(owner.reactor_ptr(), first) };
+            self.assert_live(owner, 0);
+        }
+    }
+
+    fn assert_rejected(poll: Poll<io::Result<i32>>, expected: io::ErrorKind) {
+        match poll {
+            Poll::Ready(Err(err)) => assert_eq!(err.kind(), expected),
+            other => panic!("NOP rejection was not ready with an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nop_preparation_rejections_release_owned_state() {
+        with_ringless_poll_context_for_test(2, |owner, cx| {
+            let recovery = Recovery::new(owner, cx);
+            test_hooks::fail_next_op_alloc();
+            test_hooks::fail_next_raw_sqe_submit();
+
+            for (expected, remaining) in REJECTIONS {
+                let mut future = Nop::new();
+                assert_rejected(Pin::new(&mut future).poll(cx), expected);
+                assert!(future.state_ptr.is_null());
+                assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), remaining);
+                recovery.assert_live(owner, 0);
+                drop(future);
+                recovery.assert_live(owner, 0);
+                recovery.assert_recovery(owner);
+                assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), remaining);
+            }
+        });
+    }
+
+    #[test]
+    fn nop_preparation_rejections_release_borrowed_slot() {
+        with_ringless_poll_context_for_test(2, |owner, cx| {
+            let recovery = Recovery::new(owner, cx);
+            let mut slot = NopSlot::new();
+            test_hooks::fail_next_op_alloc();
+            test_hooks::fail_next_raw_sqe_submit();
+
+            for (expected, remaining) in REJECTIONS {
+                assert!(slot.state_ptr.is_null());
+                assert!(!slot.in_use);
+                let mut future = slot.nop().expect("reclaimed NOP slot stayed borrowed");
+                assert!(future.slot.in_use);
+                assert_rejected(Pin::new(&mut future).poll(cx), expected);
+                assert!(future.slot.state_ptr.is_null());
+                assert!(!future.slot.in_use);
+                assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), remaining);
+                recovery.assert_live(owner, 0);
+                drop(future);
+                assert!(slot.state_ptr.is_null());
+                assert!(!slot.in_use);
+                recovery.assert_live(owner, 0);
+                recovery.assert_recovery(owner);
+                assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), remaining);
+            }
+        });
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
