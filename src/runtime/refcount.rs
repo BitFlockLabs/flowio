@@ -15,6 +15,17 @@ pub(crate) fn increment_refcount(counter: &Cell<usize>) {
     counter.set(next);
 }
 
+/// Decrements a live non-atomic reference count and reports its final release.
+///
+/// Stores zero before returning true so the caller can then destroy the owner.
+#[inline(always)]
+pub(crate) fn decrement_refcount(counter: &Cell<usize>) -> bool {
+    let prev = counter.get();
+    debug_assert!(prev > 0, "runtime refcount underflow");
+    counter.set(prev - 1);
+    prev == 1
+}
+
 #[cold]
 #[inline(never)]
 fn abort_refcount_overflow() -> ! {
@@ -23,6 +34,22 @@ fn abort_refcount_overflow() -> ! {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    fn decrement_refcount_underflow_preserves_zero_and_static_diagnostic() {
+        let counter = std::cell::Cell::new(0usize);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::decrement_refcount(&counter)
+        }))
+        .expect_err("zero reference count decrement unexpectedly succeeded");
+
+        assert_eq!(
+            panic.downcast_ref::<&'static str>(),
+            Some(&"runtime refcount underflow")
+        );
+        assert_eq!(counter.get(), 0);
+    }
+
     const CHILD_CASE_ENV: &str = "FLOWIO_REFCOUNT_OVERFLOW_CHILD_CASE";
     #[cfg(not(miri))]
     const CHILD_TEST_NAME: &str = "runtime::refcount::tests::refcount_overflow_child";

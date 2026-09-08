@@ -65,7 +65,7 @@
 //! | `&'static [u8]` | yes | — |
 
 use super::pool::IoBuffPoolInner;
-use crate::runtime::refcount::increment_refcount;
+use crate::runtime::refcount::{decrement_refcount, increment_refcount};
 use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::ops::RangeBounds;
@@ -521,10 +521,7 @@ impl IoBuffHeader {
     /// Decrements refcount and returns true if this was the last reference.
     #[inline(always)]
     fn release(&self) -> bool {
-        let prev = self.refcount.get();
-        debug_assert!(prev > 0, "IoBuffHeader refcount underflow");
-        self.refcount.set(prev - 1);
-        prev == 1
+        decrement_refcount(&self.refcount)
     }
 
     #[inline(always)]

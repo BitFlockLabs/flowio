@@ -6,7 +6,7 @@
 //! the non-atomic task reference count and intrusive ready-queue links.
 
 use crate::runtime::executor::ExecutorOwner;
-use crate::runtime::refcount::increment_refcount;
+use crate::runtime::refcount::{decrement_refcount, increment_refcount};
 use crate::utils::list::intrusive::dlist;
 use crate::utils::memory::pool::InPlaceInit;
 use std::cell::Cell;
@@ -310,11 +310,7 @@ pub unsafe fn retain_task(ptr: *mut TaskHeader) {
 /// caller must not access the task after releasing its final reference.
 pub unsafe fn release_task(ptr: *mut TaskHeader) {
     let header = unsafe { &*ptr };
-    let prev = header.refs.get();
-    debug_assert!(prev > 0, "runtime task refcount underflow");
-    header.refs.set(prev - 1);
-
-    if prev == 1 {
+    if decrement_refcount(&header.refs) {
         unsafe {
             (header.vtable.destroy)(ptr);
         }
@@ -398,7 +394,10 @@ pub(crate) mod tests {
         poll: |_| Poll::Ready(()),
         finish: |_| {},
         cancel: |_| {},
-        destroy: |_| DESTROY_COUNT.with(|count| count.set(count.get() + 1)),
+        destroy: |task| {
+            assert_eq!(unsafe { (*task).refs.get() }, 0);
+            DESTROY_COUNT.with(|count| count.set(count.get() + 1));
+        },
     };
 
     pub(crate) fn trigger_task_waker_refcount_overflow() {
