@@ -30,7 +30,8 @@
 
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::net::{
-    CompletionTake, MsgHdrInit, complete_read_with_progress, completion_cqe_result, write_msghdr,
+    CompletionTake, MsgHdrInit, complete_read_with_progress, completion_cqe_result,
+    finish_completed_payload_take, finish_completed_take, write_msghdr,
 };
 use crate::runtime::buffer::iobuffvec::{
     IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut, checked_iovec_count_and_length_sum,
@@ -442,16 +443,12 @@ unsafe fn take_completed_result_and_payload<T: 'static>(
     }
 
     let result = state.result;
-    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
-    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(state_ptr) };
-    let retired = fd_state.take_state_ptr();
-    debug_assert_eq!(retired, state_ptr);
-    unsafe { op_ctx.free_op_unchecked(state_ptr) };
-    Some(CompletionTake::from_context(
-        result,
-        payload,
-        op_ctx.context_rejected(),
-    ))
+    unsafe {
+        finish_completed_payload_take::<T>(cx, state_ptr, result, || {
+            let retired = fd_state.take_state_ptr();
+            debug_assert_eq!(retired, state_ptr);
+        })
+    }
 }
 
 #[inline(always)]
@@ -479,16 +476,20 @@ unsafe fn take_completed_result_and_payload_with<T: 'static, R>(
     }
 
     let result = state.result;
-    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
-    let value = unsafe { op_ctx.take_retained_payload_with_unchecked::<T, R>(state_ptr, extract) };
-    let retired = fd_state.take_state_ptr();
-    debug_assert_eq!(retired, state_ptr);
-    unsafe { op_ctx.free_op_unchecked(state_ptr) };
-    Some(CompletionTake::from_context(
-        result,
-        value,
-        op_ctx.context_rejected(),
-    ))
+    unsafe {
+        finish_completed_take(
+            cx,
+            state_ptr,
+            result,
+            |op_ctx, state_ptr| {
+                op_ctx.take_retained_payload_with_unchecked::<T, R>(state_ptr, extract)
+            },
+            || {
+                let retired = fd_state.take_state_ptr();
+                debug_assert_eq!(retired, state_ptr);
+            },
+        )
+    }
 }
 
 #[inline(always)]
@@ -6300,5 +6301,133 @@ mod tests {
         assert!(msg.msg_control.is_null());
         assert_eq!(msg.msg_controllen, 0);
         assert_eq!(msg.msg_flags, 0);
+    }
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    mod completion_retirement_tests {
+        use super::*;
+        use crate::runtime::op::completion_retirement_test_support::*;
+        use crate::runtime::retained::RetainedPayload;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::task::Waker;
+
+        #[test]
+        fn completed_stream_extractor_panic_preserves_state_for_drop_recovery() {
+            for staged in [false, true] {
+                for rejected in [false, true] {
+                    with_ringless_poll_context_for_test(2, |owner, cx| {
+                        let runtime = RuntimeFd::from_fresh_raw_fd(-7);
+                        let fd_state = if staged {
+                            runtime.lease().into_op_state()
+                        } else {
+                            runtime.op_state()
+                        };
+                        let owner_count = Rc::strong_count(owner);
+                        let mut future =
+                            WriteFuture::<Vec<u8>, ()>::new(fd_state, b"extractor-owner".to_vec());
+                        let buffer = future.buffer.take().expect("future lost its initial owner");
+                        let buffer_ptr = buffer.as_ptr();
+                        let capacity = buffer.capacity();
+                        let saved = unsafe {
+                            stage_payload(
+                                owner,
+                                &mut future.state_ptr,
+                                RetainedWritePayload { buffer },
+                                5,
+                                true,
+                            )
+                        };
+                        let before_state = unsafe { state_snapshot(saved.state) };
+                        let before_owner = owner_snapshot(owner, cx);
+                        assert_eq!(runtime.strong_count_for_test(), 2);
+                        assert_idle_queues(owner, 1);
+                        assert_payload_stats(owner, (1, 0, 0));
+                        let mut noop = Context::from_waker(Waker::noop());
+                        let selected = if rejected { &mut noop } else { &mut *cx };
+                        let unwind = catch_unwind(AssertUnwindSafe(|| {
+                            let _ = unsafe {
+                                take_completed_result_and_payload_with::<
+                                    RetainedWritePayload<Vec<u8>>,
+                                    (),
+                                >(
+                                    selected,
+                                    &mut future.state_ptr,
+                                    |payload| {
+                                        assert_eq!(payload, saved.payload);
+                                        panic!("stream extractor retirement probe");
+                                    },
+                                )
+                            };
+                        }));
+                        let panic = unwind.expect_err("extractor did not unwind");
+                        assert_eq!(
+                            panic.downcast_ref::<&'static str>(),
+                            Some(&"stream extractor retirement probe")
+                        );
+                        drop(panic);
+                        assert_eq!(future.state_ptr.state_ptr(), saved.state);
+                        assert_eq!(future.state_ptr.raw_fd(), -7);
+                        unsafe { assert_detached(&saved, before_state, rejected) };
+                        assert_eq!(owner_snapshot(owner, cx), before_owner);
+                        assert_eq!(runtime.strong_count_for_test(), 2);
+                        assert_payload_stats(owner, (1, 0, 0));
+                        {
+                            // The exact callback above neither read nor moved a
+                            // payload field. This detached T remains initialized.
+                            let payload = unsafe { &*saved.payload };
+                            assert_eq!(payload.buffer.as_ptr(), buffer_ptr);
+                            assert_eq!(payload.buffer.capacity(), capacity);
+                            assert_eq!(payload.buffer, b"extractor-owner");
+                        }
+
+                        drop(future);
+                        assert_idle_queues(owner, 0);
+                        assert_eq!(runtime.strong_count_for_test(), 1);
+                        assert_eq!(Rc::strong_count(owner), owner_count);
+                        assert_payload_stats(owner, (1, 0, 0));
+                        unsafe { assert_slot_recovery(owner, saved.state) };
+
+                        let reactor = owner.reactor_ptr();
+                        let companion = unsafe {
+                            (&mut *reactor).alloc_retained_payload(RetainedWritePayload {
+                                buffer: b"companion".to_vec(),
+                            })
+                        };
+                        assert_ne!(
+                            companion.as_ptr(),
+                            saved.payload,
+                            "detached initialized payload was recycled early"
+                        );
+                        assert_payload_stats(owner, (2, 0, 0));
+                        let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+                        unsafe { companion.drop_and_free(&mut *pool.as_ptr()) };
+                        assert_payload_stats(owner, (2, 1, 0));
+                        // Unlike whole-take storage unwind, this extractor
+                        // touched no field. Destroy the original initialized T
+                        // exactly once, then release its exact original backing.
+                        unsafe {
+                            RetainedPayload::<RetainedWritePayload<Vec<u8>>>::from_raw_parts(
+                                saved.payload,
+                                saved.original_vtable,
+                            )
+                            .drop_and_free(&mut *pool.as_ptr());
+                        }
+                        assert_payload_stats(owner, (2, 2, 0));
+                        let reused = unsafe {
+                            (&mut *reactor).alloc_retained_payload(RetainedWritePayload {
+                                buffer: b"reused".to_vec(),
+                            })
+                        };
+                        assert_eq!(reused.as_ptr(), saved.payload);
+                        assert_eq!(unsafe { &reused.as_ref().buffer[..] }, b"reused");
+                        let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+                        unsafe { reused.drop_and_free(&mut *pool.as_ptr()) };
+                        assert_payload_stats(owner, (3, 3, 1));
+                        assert_idle_queues(owner, 0);
+                        assert_eq!(runtime.strong_count_for_test(), 1);
+                        assert_eq!(Rc::strong_count(owner), owner_count);
+                    });
+                }
+            }
+        }
     }
 }

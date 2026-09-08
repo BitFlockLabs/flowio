@@ -197,7 +197,7 @@ use std::task::{Context, Poll};
 
 use crate::runtime::buffer::IoBuffReadWrite;
 use crate::runtime::executor::{
-    completed_op_ctx, drop_op_ptr_unchecked, note_accept_descriptor_exhaustion,
+    CompletedOpCtx, completed_op_ctx, drop_op_ptr_unchecked, note_accept_descriptor_exhaustion,
     note_accept_readiness_rearm, poll_ctx_from_waker, refresh_op_waiter_from_waker,
     submit_retained_sqe,
 };
@@ -482,6 +482,61 @@ impl<R, V> CompletionTake<R, V> {
                 (Err(io::Error::from(io::ErrorKind::NotConnected)), value)
             }
         }
+    }
+}
+
+/// Extracts a completed operation's result owner and retires its slot.
+///
+/// The extracted value remains local until reclamation completes, so unwinding
+/// drops it before releasing the origin context's keepalive.
+///
+/// # Safety
+///
+/// `state_ptr` must identify a live completed operation. `take` must extract
+/// its exact retained type through `op_ctx`, preserving that extraction's
+/// ownership contract. The typed pointer must be consumed before this call or
+/// by `retire_after_take`, before the operation and its descriptor lease are freed.
+#[inline(always)]
+unsafe fn finish_completed_take<R>(
+    cx: &mut Context<'_>,
+    state_ptr: *mut CompletionState,
+    result: i32,
+    take: impl FnOnce(&CompletedOpCtx, *mut CompletionState) -> R,
+    retire_after_take: impl FnOnce(),
+) -> Option<CompletionTake<i32, R>> {
+    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
+    let value = take(&op_ctx, state_ptr);
+    retire_after_take();
+    unsafe { op_ctx.free_op_unchecked(state_ptr) };
+    Some(CompletionTake::from_context(
+        result,
+        value,
+        op_ctx.context_rejected(),
+    ))
+}
+
+/// Moves the whole retained payload while retiring a completed operation.
+///
+/// # Safety
+///
+/// `state_ptr` must identify a live completed operation retaining exactly `T`.
+/// Its typed pointer must be consumed before this call or by
+/// `retire_after_take`, before the operation and its descriptor lease are freed.
+#[inline(always)]
+unsafe fn finish_completed_payload_take<T: 'static>(
+    cx: &mut Context<'_>,
+    state_ptr: *mut CompletionState,
+    result: i32,
+    retire_after_take: impl FnOnce(),
+) -> Option<CompletionTake<i32, T>> {
+    unsafe {
+        finish_completed_take(
+            cx,
+            state_ptr,
+            result,
+            |op_ctx, state_ptr| op_ctx.take_retained_payload_unchecked::<T>(state_ptr),
+            retire_after_take,
+        )
     }
 }
 

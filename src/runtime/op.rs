@@ -715,6 +715,204 @@ const _: [(); std::mem::size_of::<usize>()] =
 const _: [(); std::mem::size_of::<usize>()] =
     [(); std::mem::size_of::<Option<Rc<RuntimeFdCore>>>()];
 
+#[cfg(all(test, any(debug_assertions, feature = "test-support")))]
+pub(crate) mod completion_retirement_test_support {
+    use super::*;
+    use crate::runtime::executor::poll_ctx_from_waker;
+    use crate::runtime::fd::{RuntimeFd, RuntimeFdOpState};
+    use crate::runtime::reactor::{Reactor, ReactorQuiescence};
+    use crate::runtime::retained::RetainedPayloadPoolStats;
+    use std::task::Context;
+
+    pub(crate) struct SavedPayload<T: 'static> {
+        pub(crate) state: *mut CompletionState,
+        pub(crate) payload: *mut T,
+        pub(crate) original_vtable: &'static RetainedPayloadVtable,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct StateSnapshot {
+        result: i32,
+        flags: u32,
+        registry_index: u32,
+        waiter: *mut TaskHeader,
+        cancel_next: *mut CompletionState,
+        retained_payload: *mut (),
+        retained_vtable: Option<*const RetainedPayloadVtable>,
+        fd_core: Option<*const RuntimeFdCore>,
+        owner: Option<*const ExecutorOwner>,
+    }
+
+    pub(crate) unsafe fn state_snapshot(state: *const CompletionState) -> StateSnapshot {
+        // The fixture owns this live slot; no snapshot overlaps a callback or free.
+        let state = unsafe { &*state };
+        StateSnapshot {
+            result: state.result,
+            flags: state.state_flags,
+            registry_index: state.registry_index,
+            waiter: state.waiter,
+            cancel_next: state.cancel_next,
+            retained_payload: state.retained_payload,
+            retained_vtable: state.retained_payload_vtable.map(std::ptr::from_ref),
+            fd_core: state.fd_lease.as_ref().map(Rc::as_ptr),
+            owner: state.owner.as_ref().map(Rc::as_ptr),
+        }
+    }
+
+    pub(crate) unsafe fn stage_payload<T: 'static>(
+        owner: &Rc<ExecutorOwner>,
+        fd_state: &mut RuntimeFdOpState<'_>,
+        value: T,
+        result: i32,
+        completed: bool,
+    ) -> SavedPayload<T> {
+        let reactor = owner.reactor_ptr();
+        let state = unsafe { (&mut *reactor).alloc_op() };
+        assert!(!state.is_null());
+        let retained = unsafe { (&mut *reactor).alloc_retained_payload(value) };
+        let (payload, original_vtable) = retained.into_raw_parts();
+        let payload = payload.cast::<T>();
+        // Reconstruct the unique real allocation owner immediately; saved parts
+        // are observational until a tested path explicitly detaches its backing.
+        unsafe {
+            (*state).attach_retained_payload(RetainedPayload::<T>::from_raw_parts(
+                payload,
+                original_vtable,
+            ));
+            (*state).attach_fd_lease(fd_state.take_initial_lease());
+            (*state).result = result;
+            if completed {
+                (*state).set_completed();
+            }
+            fd_state.publish_submitted_state(state);
+        }
+        assert_eq!(unsafe { (*state).owner_ptr() }, Rc::as_ptr(owner));
+        assert!(unsafe { (*state).waiter.is_null() });
+        SavedPayload {
+            state,
+            payload,
+            original_vtable,
+        }
+    }
+
+    pub(crate) unsafe fn install_storage_probe(
+        saved: &SavedPayload<u64>,
+        vtable: &'static RetainedPayloadVtable,
+    ) {
+        // Only a fixture-owned live payload is changed, before any callback or
+        // mutable retained-pool borrow. Original release hooks remain saved.
+        let state = unsafe { &mut *saved.state };
+        assert_eq!(state.retained_payload, saved.payload.cast());
+        assert!(std::ptr::eq(
+            state
+                .retained_payload_vtable
+                .expect("attached payload lost vtable"),
+            saved.original_vtable,
+        ));
+        state.retained_payload_vtable = Some(vtable);
+    }
+
+    pub(crate) unsafe fn assert_detached<T: 'static>(
+        saved: &SavedPayload<T>,
+        before: StateSnapshot,
+        context_rejected: bool,
+    ) {
+        assert_eq!(before.flags, CompletionState::FLAG_COMPLETED);
+        let expected = StateSnapshot {
+            flags: CompletionState::FLAG_COMPLETED
+                | if context_rejected {
+                    CompletionState::FLAG_CONTEXT_REJECTED
+                } else {
+                    0
+                },
+            retained_payload: std::ptr::null_mut(),
+            retained_vtable: None,
+            ..before
+        };
+        assert_eq!(unsafe { state_snapshot(saved.state) }, expected);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct OwnerSnapshot {
+        reactor: ReactorQuiescence,
+        inflight: usize,
+        owners: usize,
+        task_refs: usize,
+    }
+
+    pub(crate) fn owner_snapshot(owner: &Rc<ExecutorOwner>, cx: &Context<'_>) -> OwnerSnapshot {
+        let pctx = poll_ctx_from_waker(cx).expect("ringless owner context was rejected");
+        assert_eq!(pctx.owner_ptr(), Rc::as_ptr(owner));
+        OwnerSnapshot {
+            reactor: unsafe { (&*owner.reactor_ptr()).quiescence() },
+            inflight: owner.inflight_op_count_for_test(),
+            owners: Rc::strong_count(owner),
+            task_refs: unsafe { (*pctx.owner_task()).refs.get() },
+        }
+    }
+
+    pub(crate) fn assert_idle_queues(owner: &Rc<ExecutorOwner>, live: usize) {
+        let q = unsafe { (&*owner.reactor_ptr()).quiescence() };
+        assert_eq!(q.live_ops, live);
+        assert_eq!(q.pending_cancels, 0);
+        assert_eq!(q.queued_sqes, 0);
+        assert_eq!(q.pending_closes, 0);
+        assert_eq!(q.deferred_closes, 0);
+        assert!(!q.storage_abandoned);
+        assert_eq!(owner.inflight_op_count_for_test(), 0);
+        assert_eq!(q.retained.scratch_slab_pages, 0);
+        assert_eq!(q.retained.scratch_owner_refs, 1);
+    }
+
+    pub(crate) fn assert_payload_stats(owner: &Rc<ExecutorOwner>, counts: (usize, usize, usize)) {
+        let (pooled_allocs, pooled_frees, pooled_reuses) = counts;
+        let stats = unsafe { (&*owner.reactor_ptr()).retained_payload_stats() };
+        assert_eq!(
+            stats,
+            RetainedPayloadPoolStats {
+                pooled_allocs,
+                pooled_frees,
+                pooled_reuses,
+                slab_allocs: usize::from(pooled_allocs != 0),
+                ..RetainedPayloadPoolStats::default()
+            }
+        );
+    }
+
+    pub(crate) unsafe fn assert_slot_recovery(
+        owner: &Rc<ExecutorOwner>,
+        original: *mut CompletionState,
+    ) {
+        assert_idle_queues(owner, 0);
+        let owners = Rc::strong_count(owner);
+        let reactor = owner.reactor_ptr();
+        let first = unsafe { (&mut *reactor).alloc_op() };
+        assert_eq!(
+            first, original,
+            "retired operation was not the next reusable slot"
+        );
+        let second = unsafe { (&mut *reactor).alloc_op() };
+        assert!(!second.is_null());
+        assert_ne!(
+            second, first,
+            "operation was linked into the free list twice"
+        );
+        assert_idle_queues(owner, 2);
+        assert_eq!(Rc::strong_count(owner), owners + 2);
+        // These synthetic allocations have no payload, lease, waiter or SQE.
+        unsafe {
+            Reactor::free_op_unchecked(reactor, second);
+            Reactor::free_op_unchecked(reactor, first);
+        }
+        assert_idle_queues(owner, 0);
+        assert_eq!(Rc::strong_count(owner), owners);
+    }
+
+    pub(crate) fn assert_retired_capability(state: &RuntimeFdOpState<'_>, staged: bool) {
+        assert!(state.state_ptr().is_null());
+        assert_eq!(state.raw_fd(), if staged { RuntimeFd::INVALID } else { -7 });
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

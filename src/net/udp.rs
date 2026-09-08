@@ -86,14 +86,14 @@
 
 use super::{
     CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, close_fd,
-    completion_cqe_result, current_local_addr, get_sock_opt, invalid_data, new_nonblocking_socket,
-    opt_take, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
-    write_msghdr,
+    completion_cqe_result, current_local_addr, finish_completed_payload_take, get_sock_opt,
+    invalid_data, new_nonblocking_socket, opt_take, set_reuse_addr, set_sock_opt,
+    socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
-    completed_op_ctx, drop_fd_op_state_unchecked, poll_ctx_from_waker, prepare_unsubmitted_op,
+    drop_fd_op_state_unchecked, poll_ctx_from_waker, prepare_unsubmitted_op,
     refresh_op_waiter_from_waker, submit_retained_fd_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::{FdStateDiagnostic, RuntimeFd, RuntimeFdOpState};
@@ -686,14 +686,7 @@ unsafe fn take_completed_udp_payload<T: 'static>(
 
     let state_ptr = fd_state.take_state_ptr();
     let result = unsafe { (*state_ptr).result };
-    let op_ctx = unsafe { completed_op_ctx(poll_ctx_from_waker(cx).ok(), state_ptr) };
-    let payload = unsafe { op_ctx.take_retained_payload_unchecked::<T>(state_ptr) };
-    unsafe { op_ctx.free_op_unchecked(state_ptr) };
-    Some(CompletionTake::from_context(
-        result,
-        payload,
-        op_ctx.context_rejected(),
-    ))
+    unsafe { finish_completed_payload_take::<T>(cx, state_ptr, result, || {}) }
 }
 
 #[inline(always)]
@@ -1481,5 +1474,286 @@ mod tests {
         );
         assert!(msghdr.msg_control.is_null());
         assert_eq!(msghdr.msg_controllen, 0);
+    }
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    mod completion_retirement_tests {
+        use super::*;
+        use crate::runtime::executor::{
+            drop_fd_op_state_unchecked, with_ringless_poll_context_for_test,
+        };
+        use crate::runtime::op::completion_retirement_test_support::*;
+        use crate::runtime::reactor::Reactor;
+        use crate::runtime::retained::{RetainedPayloadPool, RetainedPayloadVtable};
+        use std::cell::Cell;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::rc::Rc;
+        use std::task::Waker;
+
+        #[derive(Clone, Copy)]
+        struct StorageProbeRecord {
+            payload: *mut (),
+            pool: *mut RetainedPayloadPool,
+            original_vtable: &'static RetainedPayloadVtable,
+            armed: bool,
+            free_calls: usize,
+            drop_calls: usize,
+        }
+
+        thread_local! {
+            static STORAGE_PROBE_RECORD: Cell<Option<StorageProbeRecord>> = const { Cell::new(None) };
+        }
+
+        struct StorageProbeGuard;
+
+        impl StorageProbeGuard {
+            fn install(saved: &SavedPayload<u64>, pool: *mut RetainedPayloadPool) -> Self {
+                STORAGE_PROBE_RECORD.with(|record| {
+                    assert!(record.get().is_none(), "storage probe was nested");
+                    record.set(Some(StorageProbeRecord {
+                        payload: saved.payload.cast(),
+                        pool,
+                        original_vtable: saved.original_vtable,
+                        armed: true,
+                        free_calls: 0,
+                        drop_calls: 0,
+                    }));
+                });
+                Self
+            }
+
+            fn report(&self) -> (usize, usize, bool) {
+                STORAGE_PROBE_RECORD.with(|record| {
+                    let record = record.get().expect("storage probe disappeared");
+                    (record.free_calls, record.drop_calls, record.armed)
+                })
+            }
+        }
+
+        impl Drop for StorageProbeGuard {
+            fn drop(&mut self) {
+                // Restore only fixture metadata. Backing and operation cleanup
+                // remain explicit after the independent retirement assertions.
+                STORAGE_PROBE_RECORD.with(|record| record.set(None));
+            }
+        }
+
+        fn note_storage_callback(
+            payload: *mut (),
+            pool: *mut RetainedPayloadPool,
+            free_storage: bool,
+        ) -> (&'static RetainedPayloadVtable, bool) {
+            STORAGE_PROBE_RECORD.with(|cell| {
+                let mut record = cell.get().expect("unscoped storage callback");
+                assert_eq!(payload, record.payload);
+                assert_eq!(pool, record.pool);
+                let panic_before_release = free_storage && record.armed;
+                if free_storage {
+                    record.free_calls += 1;
+                    record.armed = false;
+                } else {
+                    record.drop_calls += 1;
+                }
+                cell.set(Some(record));
+                (record.original_vtable, panic_before_release)
+            })
+        }
+
+        unsafe fn probe_free_storage(payload: *mut (), pool: *mut RetainedPayloadPool) {
+            let (original, panic_before_release) = note_storage_callback(payload, pool, true);
+            if panic_before_release {
+                panic!("UDP storage retirement probe");
+            }
+            unsafe { (original.free_storage)(payload, pool) };
+        }
+
+        unsafe fn probe_drop_and_free(payload: *mut (), pool: *mut RetainedPayloadPool) {
+            let (original, _) = note_storage_callback(payload, pool, false);
+            unsafe { (original.drop_and_free)(payload, pool) };
+        }
+
+        static STORAGE_PROBE: RetainedPayloadVtable = RetainedPayloadVtable {
+            drop_and_free: probe_drop_and_free,
+            free_storage: probe_free_storage,
+        };
+
+        #[test]
+        fn completed_udp_rejection_retires_pointer_before_storage_unwind() {
+            for staged in [false, true] {
+                for result in [5, -libc::EIO] {
+                    let runtime = RuntimeFd::from_fresh_raw_fd(-7);
+                    let mut fd_state = if staged {
+                        runtime.lease().into_op_state()
+                    } else {
+                        runtime.op_state()
+                    };
+                    let buffer = b"origin".to_vec();
+                    let buffer_ptr = buffer.as_ptr();
+                    let capacity = buffer.capacity();
+                    let (origin, saved) = with_ringless_poll_context_for_test(2, |owner, cx| {
+                        let initial = owner_snapshot(owner, cx);
+                        let initial_core_count = runtime.strong_count_for_test();
+                        assert_eq!(initial_core_count, if staged { 2 } else { 1 });
+                        let mut noop = Context::from_waker(Waker::noop());
+                        assert!(
+                            unsafe {
+                                take_completed_udp_payload::<RetainedSendPayload<Vec<u8>>>(
+                                    &mut noop,
+                                    &mut fd_state,
+                                )
+                            }
+                            .is_none()
+                        );
+                        assert!(fd_state.state_ptr().is_null());
+                        assert_eq!(fd_state.raw_fd(), -7);
+                        assert_eq!(runtime.strong_count_for_test(), initial_core_count);
+                        assert_eq!(owner_snapshot(owner, cx), initial);
+
+                        let saved = unsafe {
+                            stage_payload(
+                                owner,
+                                &mut fd_state,
+                                RetainedSendPayload { buffer },
+                                result,
+                                false,
+                            )
+                        };
+                        let before_state = unsafe { state_snapshot(saved.state) };
+                        let before_owner = owner_snapshot(owner, cx);
+                        assert!(
+                            unsafe {
+                                take_completed_udp_payload::<RetainedSendPayload<Vec<u8>>>(
+                                    &mut noop,
+                                    &mut fd_state,
+                                )
+                            }
+                            .is_none()
+                        );
+                        assert_eq!(fd_state.state_ptr(), saved.state);
+                        assert_eq!(fd_state.raw_fd(), -7);
+                        assert_eq!(runtime.strong_count_for_test(), 2);
+                        assert_eq!(unsafe { state_snapshot(saved.state) }, before_state);
+                        assert_eq!(owner_snapshot(owner, cx), before_owner);
+                        assert_payload_stats(owner, (1, 0, 0));
+                        unsafe { (*saved.state).set_completed() };
+                        (Rc::clone(owner), saved)
+                    });
+                    assert_eq!(Rc::strong_count(&origin), 2);
+                    with_ringless_poll_context_for_test(2, |foreign, cx| {
+                        assert!(!Rc::ptr_eq(&origin, foreign));
+                        let foreign_before = owner_snapshot(foreign, cx);
+                        let completion = unsafe {
+                            take_completed_udp_payload::<RetainedSendPayload<Vec<u8>>>(
+                                cx,
+                                &mut fd_state,
+                            )
+                        }
+                        .expect("completed origin payload was not returned");
+                        let (result, payload) = completion.into_io_result::<usize>(|_| {
+                            panic!("rejected completion invoked accepted mapping");
+                        });
+                        assert_eq!(
+                            result.expect_err("foreign context was accepted").kind(),
+                            io::ErrorKind::NotConnected
+                        );
+                        assert_eq!(payload.buffer.as_ptr(), buffer_ptr);
+                        assert_eq!(payload.buffer.capacity(), capacity);
+                        assert_eq!(payload.buffer, b"origin");
+                        assert_retired_capability(&fd_state, staged);
+                        assert_eq!(runtime.strong_count_for_test(), 1);
+                        assert_eq!(Rc::strong_count(&origin), 1);
+                        assert_idle_queues(&origin, 0);
+                        assert_payload_stats(&origin, (1, 1, 0));
+                        assert_eq!(owner_snapshot(foreign, cx), foreign_before);
+                        drop(payload);
+                        unsafe { assert_slot_recovery(&origin, saved.state) };
+                        assert_eq!(owner_snapshot(foreign, cx), foreign_before);
+                    });
+                    drop(fd_state);
+                    assert_eq!(runtime.strong_count_for_test(), 1);
+                    assert_eq!(Rc::strong_count(&origin), 1);
+                    drop(origin);
+                }
+
+                with_ringless_poll_context_for_test(2, |owner, cx| {
+                    let runtime = RuntimeFd::from_fresh_raw_fd(-7);
+                    let mut fd_state = if staged {
+                        runtime.lease().into_op_state()
+                    } else {
+                        runtime.op_state()
+                    };
+                    let owner_count = Rc::strong_count(owner);
+                    let saved = unsafe { stage_payload(owner, &mut fd_state, 0x2600_u64, 5, true) };
+                    let probe_pool =
+                        unsafe { Reactor::retained_payload_pool_ptr(owner.reactor_ptr()) };
+                    let probe_guard = StorageProbeGuard::install(&saved, probe_pool.as_ptr());
+                    unsafe { install_storage_probe(&saved, &STORAGE_PROBE) };
+                    let before_state = unsafe { state_snapshot(saved.state) };
+                    let before_owner = owner_snapshot(owner, cx);
+                    assert_payload_stats(owner, (1, 0, 0));
+                    let mut noop = Context::from_waker(Waker::noop());
+                    let unwind = catch_unwind(AssertUnwindSafe(|| {
+                        let _ =
+                            unsafe { take_completed_udp_payload::<u64>(&mut noop, &mut fd_state) };
+                    }));
+                    assert_eq!(
+                        probe_guard.report(),
+                        (1, 0, false),
+                        "storage retirement used an unexpected callback or repeated the probe"
+                    );
+                    drop(probe_guard);
+                    let panic = unwind.expect_err("storage retirement did not unwind");
+                    assert_eq!(
+                        panic.downcast_ref::<&'static str>(),
+                        Some(&"UDP storage retirement probe")
+                    );
+                    drop(panic);
+                    assert_retired_capability(&fd_state, staged);
+                    unsafe { assert_detached(&saved, before_state, true) };
+                    assert_eq!(owner_snapshot(owner, cx), before_owner);
+                    assert_eq!(runtime.strong_count_for_test(), 2);
+                    assert_payload_stats(owner, (1, 0, 0));
+
+                    unsafe { drop_fd_op_state_unchecked(&mut fd_state) };
+                    drop(fd_state);
+                    assert_idle_queues(owner, 1);
+                    assert_eq!(Rc::strong_count(owner), owner_count + 1);
+                    assert_eq!(runtime.strong_count_for_test(), 2);
+                    assert_payload_stats(owner, (1, 0, 0));
+                    unsafe { Reactor::free_op_unchecked(owner.reactor_ptr(), saved.state) };
+                    assert_eq!(runtime.strong_count_for_test(), 1);
+                    assert_eq!(Rc::strong_count(owner), owner_count);
+                    unsafe { assert_slot_recovery(owner, saved.state) };
+
+                    let reactor = owner.reactor_ptr();
+                    let companion = unsafe { (&mut *reactor).alloc_retained_payload(0x2601_u64) };
+                    assert_ne!(
+                        companion.as_ptr(),
+                        saved.payload,
+                        "detached storage was reused before fixture release"
+                    );
+                    assert_payload_stats(owner, (2, 0, 0));
+                    // The callbacks below run with the original active owner;
+                    // no state or field borrow is live across either release.
+                    let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+                    unsafe { companion.drop_and_free(&mut *pool.as_ptr()) };
+                    assert_payload_stats(owner, (2, 1, 0));
+                    // Whole take moved T before its storage callback unwound.
+                    // Its local value has already unwound: never drop stale T.
+                    unsafe {
+                        (saved.original_vtable.free_storage)(saved.payload.cast(), pool.as_ptr())
+                    };
+                    assert_payload_stats(owner, (2, 2, 0));
+                    let reused = unsafe { (&mut *reactor).alloc_retained_payload(0x2602_u64) };
+                    assert_eq!(reused.as_ptr(), saved.payload);
+                    assert_eq!(unsafe { *reused.as_ref() }, 0x2602);
+                    let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+                    unsafe { reused.drop_and_free(&mut *pool.as_ptr()) };
+                    assert_payload_stats(owner, (3, 3, 1));
+                    assert_idle_queues(owner, 0);
+                    assert_eq!(Rc::strong_count(owner), owner_count);
+                    assert_eq!(runtime.strong_count_for_test(), 1);
+                });
+            }
+        }
     }
 }
