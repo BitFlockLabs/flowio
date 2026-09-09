@@ -664,8 +664,7 @@ impl TcpConnector {
 
 impl Drop for TcpConnector {
     fn drop(&mut self) {
-        self.connect_slot.retire_cached_state();
-        self.connect_slot.cleanup_fd();
+        self.connect_slot.drop_future();
     }
 }
 
@@ -1126,6 +1125,19 @@ impl Future for OwnedConnectTimeoutFuture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(miri))]
+    #[test]
+    fn tcp_connector_drop_retires_forgotten_completed_connect() {
+        super::super::assert_connector_drop_retires_completed_submission((), |slot, _remote| {
+            let mut connector = TcpConnector { connect_slot: slot };
+            let future = ConnectFuture {
+                slot: &mut connector.connect_slot,
+            };
+            std::mem::forget(future);
+            drop(connector);
+        });
+    }
 
     #[cfg(not(miri))]
     #[test]

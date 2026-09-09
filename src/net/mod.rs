@@ -1627,15 +1627,6 @@ impl<C> ConnectSubmissionSlot<C> {
         self.in_use = false;
     }
 
-    fn retire_cached_state(&mut self) {
-        unsafe { drop_op_ptr_unchecked(&mut self.state_ptr) };
-        self.in_use = false;
-    }
-
-    fn drop_cached_state(&mut self) {
-        self.drop_future();
-    }
-
     #[inline(always)]
     fn poll_connect<T, F>(
         &mut self,
@@ -1896,6 +1887,68 @@ fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) ->
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
     Ok(value)
+}
+
+#[cfg(all(test, not(miri)))]
+fn assert_connector_drop_retires_completed_submission<C: Copy>(
+    completion_data: C,
+    destroy_connector: impl FnOnce(ConnectSubmissionSlot<C>, SocketAddr),
+) {
+    crate::runtime::executor::with_ringless_poll_context_for_test(1, |owner, _cx| {
+        let reactor = owner.reactor_ptr();
+        let before = unsafe { (&*reactor).quiescence() };
+        assert_eq!(before.live_ops, 0);
+        assert_eq!(owner.inflight_op_count_for_test(), 0);
+        let remote_addr = SocketAddr::from(([127, 0, 0, 1], 9));
+        let raw_fd = crate::runtime::fd::distinctive_closeable_test_fd()
+            .expect("connect payload descriptor creation failed");
+        // SAFETY: the fixture-created descriptor has no other owner.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let state_ptr = unsafe { (&mut *reactor).alloc_op() };
+        assert!(!state_ptr.is_null(), "connect state allocation failed");
+        let retained = unsafe {
+            (&mut *reactor).alloc_retained_payload(RetainedConnectPayload::new(
+                fd,
+                RetainedConnectAddr::from_socket_addr(remote_addr),
+            ))
+        };
+        // SAFETY: this fresh operation and payload belong to the live ringless
+        // owner. No SQE was submitted; the completed state is safe to reclaim.
+        unsafe {
+            (*state_ptr).attach_retained_payload(retained);
+            (*state_ptr).result = 0;
+            (*state_ptr).set_completed();
+        }
+        let mut slot = ConnectSubmissionSlot::new(completion_data);
+        slot.state_ptr = state_ptr;
+        slot.in_use = true;
+        assert!(slot.fd.is_none());
+        assert!(slot.addr.is_none());
+        assert!(!crate::runtime::fd::raw_fd_is_closed(raw_fd));
+        assert_eq!(unsafe { (&*reactor).live_op_count() }, 1);
+        assert_eq!(owner.inflight_op_count_for_test(), 0);
+
+        destroy_connector(slot, remote_addr);
+
+        // Check the actual retained descriptor without reopening any fd. The
+        // connector has been dropped and its completion slot reclaimed; neither is read.
+        assert!(crate::runtime::fd::raw_fd_is_closed(raw_fd));
+        let after = unsafe { (&*reactor).quiescence() };
+        assert_eq!(after.live_ops, before.live_ops);
+        assert_eq!(owner.inflight_op_count_for_test(), 0);
+        let retained_delta = after
+            .retained
+            .stats
+            .saturating_delta_since(before.retained.stats);
+        assert_eq!(retained_delta.pooled_allocs, 1);
+        assert_eq!(retained_delta.pooled_frees, 1);
+        assert_eq!(retained_delta.heap_fallbacks, 0);
+        assert_eq!(retained_delta.heap_frees, 0);
+        assert_eq!(
+            after.retained.scratch_owner_refs,
+            before.retained.scratch_owner_refs
+        );
+    });
 }
 
 #[cfg(test)]

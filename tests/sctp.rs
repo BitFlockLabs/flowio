@@ -1775,7 +1775,7 @@ fn sctp_accept_slot_drop_cached_state_preserves_unrelated_fd() {
     test_accept_slot_drop_cached_state_preserves_unrelated_fd().unwrap();
 }
 
-/// Dropping an in-flight connect future closes the connecting socket fd and
+/// Dropping an unsubmitted connect future closes the prepared socket fd and
 /// resets the reusable slot.
 #[test]
 fn sctp_connect_slot_drop_future_closes_socket_fd() {

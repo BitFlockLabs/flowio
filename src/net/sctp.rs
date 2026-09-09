@@ -2451,7 +2451,7 @@ impl SctpConnector {
 
 impl Drop for SctpConnector {
     fn drop(&mut self) {
-        self.connect_slot.drop_cached_state();
+        self.connect_slot.drop_future();
     }
 }
 
@@ -8104,25 +8104,7 @@ pub(crate) mod test_support {
     /// Verifies connector teardown closes a prepared, not-yet-submitted socket
     /// and releases every field owned directly by its reusable slot.
     pub fn test_connect_slot_drop_cached_state_closes_socket_fd() -> io::Result<()> {
-        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-        let mut slot = ConnectSlot::new(SctpSocketConfig::default());
-        slot.in_use = true;
-        // SAFETY: the test-created descriptor has no other owner.
-        slot.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
-        slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
-            [127, 0, 0, 1],
-            9,
-        ))));
-
-        slot.drop_cached_state();
-
-        if !slot.state_ptr.is_null() || slot.in_use || slot.fd.is_some() || slot.addr.is_some() {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        if !crate::runtime::fd::raw_fd_is_closed(fd) {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        Ok(())
+        test_connect_slot_drop_future_closes_socket_fd()
     }
 
     /// Verifies a peer-address-parameter socket-option length is rejected as
@@ -8302,6 +8284,25 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(miri))]
+    #[test]
+    fn sctp_connector_drop_retires_forgotten_completed_connect() {
+        let config = SctpSocketConfig::default();
+        super::super::assert_connector_drop_retires_completed_submission(config, |slot, remote| {
+            let mut connector = SctpConnector {
+                connect_slot: slot,
+                config,
+                local_addr: None,
+            };
+            let future = ConnectFuture {
+                slot: &mut connector.connect_slot,
+                remote_addr: remote,
+            };
+            std::mem::forget(future);
+            drop(connector);
+        });
+    }
     use crate::net::send_sqe::test_support::sqe_prefix;
     use crate::runtime::buffer::IoBuffMut;
     use crate::runtime::executor::with_ringless_poll_context_for_test;
