@@ -108,6 +108,13 @@ pub mod runtime {
 }
 
 pub mod net {
+    /// Bounded owner-thread observation of socket setup boundaries.
+    pub mod bind_setup {
+        pub use crate::runtime::test_hooks::bind_setup::{
+            BindSetupProbe, BindSetupReport, BindStage, BindTransport, arm,
+        };
+    }
+
     pub mod resolver {
         pub use crate::net::resolver::test_support::{
             decode_name, extend_unique_socket_addrs, lookup_ipv4, parse_hosts_bytes,

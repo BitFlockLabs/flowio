@@ -206,6 +206,26 @@ use crate::runtime::op::CompletionState;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::timer::TimeoutError;
 
+// Observe each setup boundary without changing the default call expression.
+macro_rules! observe_bind_setup {
+    ($transport:ident, $stage:ident, $errno:ident => $error:expr, $call:expr) => {{
+        #[cfg(feature = "test-support")]
+        {
+            match crate::runtime::test_hooks::bind_setup::before_stage(
+                crate::runtime::test_hooks::bind_setup::BindTransport::$transport,
+                crate::runtime::test_hooks::bind_setup::BindStage::$stage,
+            ) {
+                Some($errno) => $error,
+                None => $call,
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            $call
+        }
+    }};
+}
+
 pub mod resolver;
 pub mod sctp;
 pub(crate) mod send_sqe;
@@ -1481,13 +1501,6 @@ fn shutdown_socket(fd: RawFd, how: std::net::Shutdown) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[inline(always)]
-fn close_fd(fd: RawFd) {
-    unsafe {
-        libc::close(fd);
-    }
 }
 
 fn set_reuse_addr(fd: RawFd) -> io::Result<()> {

@@ -232,3 +232,181 @@ pub(crate) fn take_reactor_shutdown_fallback() -> bool {
 pub fn reactor_shutdown_fallbacks_remaining() -> usize {
     FORCE_REACTOR_SHUTDOWN_FALLBACKS.with(Cell::get)
 }
+
+#[cfg(feature = "test-support")]
+pub(crate) mod bind_setup {
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+    use std::os::fd::RawFd;
+    use std::rc::Rc;
+
+    /// Socket constructor whose setup is being observed.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BindTransport {
+        /// TCP listener construction.
+        Tcp,
+        /// UDP socket construction.
+        Udp,
+        /// SCTP listener construction.
+        Sctp,
+    }
+
+    /// One explicit socket setup boundary.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BindStage {
+        /// Socket creation.
+        Socket,
+        /// SCTP socket configuration.
+        Configure,
+        /// Address reuse setup.
+        ReuseAddress,
+        /// Port reuse setup.
+        ReusePort,
+        /// Binding the local address.
+        Bind,
+        /// Starting listener operation.
+        Listen,
+        /// Reading the assigned local address.
+        LocalAddress,
+    }
+
+    /// Fixed-capacity record of one constructor invocation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct BindSetupReport {
+        /// Reached boundaries, followed by empty slots.
+        pub trace: [Option<BindStage>; 6],
+        /// Number of populated trace slots.
+        pub trace_len: usize,
+        /// Whether a seventh boundary was reached.
+        pub trace_overflow: bool,
+        /// Whether another transport used the active observation.
+        pub unexpected_transport: bool,
+        /// Descriptor acquired by the constructor, if creation succeeded.
+        pub socket_fd: Option<RawFd>,
+        /// Whether a second or negative acquired descriptor was reported.
+        pub invalid_socket_report: bool,
+        /// Number of injected failures, either zero or one.
+        pub injections: u8,
+        /// Whether the requested failure boundary was never reached.
+        pub failure_pending: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProbeState {
+        transport: BindTransport,
+        fail_at: Option<(BindStage, i32)>,
+        report: BindSetupReport,
+    }
+
+    thread_local! {
+        static PROBE: Cell<Option<ProbeState>> = const { Cell::new(None) };
+    }
+
+    /// Owner-thread scope for one bounded setup observation.
+    ///
+    /// Dropping the scope clears only observation metadata. It never closes a
+    /// descriptor or performs constructor cleanup.
+    pub struct BindSetupProbe {
+        active: bool,
+        owner_thread: PhantomData<Rc<()>>,
+    }
+
+    /// Starts one observation, optionally failing one boundary once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a scope is already active or the requested errno is not positive.
+    pub fn arm(transport: BindTransport, failure: Option<(BindStage, i32)>) -> BindSetupProbe {
+        assert!(failure.is_none_or(|(_, errno)| errno > 0));
+        PROBE.with(|slot| {
+            assert!(
+                slot.get().is_none(),
+                "bind setup observation already active"
+            );
+            slot.set(Some(ProbeState {
+                transport,
+                fail_at: failure,
+                report: BindSetupReport {
+                    trace: [None; 6],
+                    trace_len: 0,
+                    trace_overflow: false,
+                    unexpected_transport: false,
+                    socket_fd: None,
+                    invalid_socket_report: false,
+                    injections: 0,
+                    failure_pending: failure.is_some(),
+                },
+            }));
+        });
+        BindSetupProbe {
+            active: true,
+            owner_thread: PhantomData,
+        }
+    }
+
+    impl BindSetupProbe {
+        /// Ends this scope and returns its fixed-size observations.
+        pub fn finish(mut self) -> BindSetupReport {
+            let state = PROBE
+                .with(Cell::take)
+                .expect("active bind setup observation");
+            self.active = false;
+            state.report
+        }
+    }
+
+    impl Drop for BindSetupProbe {
+        fn drop(&mut self) {
+            if self.active {
+                PROBE.with(|slot| slot.set(None));
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn before_stage(transport: BindTransport, stage: BindStage) -> Option<i32> {
+        PROBE.with(|slot| {
+            let mut state = slot.get()?;
+            state.report.unexpected_transport |= state.transport != transport;
+            if state.report.trace_len < state.report.trace.len() {
+                state.report.trace[state.report.trace_len] = Some(stage);
+                state.report.trace_len += 1;
+            } else {
+                state.report.trace_overflow = true;
+            }
+            let failure = match state.fail_at {
+                Some((wanted, errno)) if state.transport == transport && wanted == stage => {
+                    state.fail_at = None;
+                    state.report.failure_pending = false;
+                    state.report.injections += 1;
+                    Some(errno)
+                }
+                _ => None,
+            };
+            slot.set(Some(state));
+            failure
+        })
+    }
+
+    #[inline]
+    pub(crate) fn note_socket(transport: BindTransport, fd: RawFd) {
+        PROBE.with(|slot| {
+            if let Some(mut state) = slot.get() {
+                state.report.unexpected_transport |= state.transport != transport;
+                state.report.invalid_socket_report |= state.report.socket_fd.is_some() || fd < 0;
+                state.report.socket_fd = Some(fd);
+                slot.set(Some(state));
+            }
+        });
+    }
+
+    #[inline]
+    pub(crate) fn raw_error(errno: i32) -> libc::c_int {
+        // SAFETY: Linux exposes a writable errno cell for the calling thread.
+        // The pointer is used only for this immediate store and is not retained.
+        unsafe {
+            *libc::__errno_location() = errno;
+        }
+        -1
+    }
+}

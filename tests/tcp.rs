@@ -2925,3 +2925,18 @@ fn runtime_tcp_writev_all_projected_to_std_peer() {
 
     peer.finish();
 }
+
+#[cfg(not(miri))]
+#[allow(dead_code)]
+#[path = "common/runtime_longevity.rs"]
+mod runtime_longevity_support;
+
+#[cfg(not(miri))]
+#[path = "common/bind_setup.rs"]
+mod bind_setup_support;
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_tcp_bind_setup_failures_recover_exact_descriptors() {
+    bind_setup_support::tcp();
+}

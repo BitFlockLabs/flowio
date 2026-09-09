@@ -210,7 +210,7 @@ use super::stream::{
 };
 use super::{
     AcceptReadinessSlot as AcceptSlot, CompletionTake, ConnectSubmissionSlot, MsgHdrInit,
-    RetainedConnectAddr, checked_read_len, checked_send_len, close_fd, complete_read_with_progress,
+    RetainedConnectAddr, checked_read_len, checked_send_len, complete_read_with_progress,
     completion_cqe_result, current_local_addr, get_sock_opt, invalid_input, invalid_input_kind,
     map_connect_timeout, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
     socket_domain, write_msghdr,
@@ -1982,46 +1982,59 @@ impl SctpListener {
         backlog: i32,
         config: SctpSocketConfig,
     ) -> io::Result<Self> {
-        let fd = new_sctp_socket(socket_domain(addr), libc::SOCK_STREAM)?;
-        if let Err(err) = configure_sctp_socket(fd, config) {
-            close_fd(fd);
-            return Err(err);
-        }
-        if let Err(err) = set_reuse_addr(fd) {
-            close_fd(fd);
-            return Err(err);
-        }
+        let raw_fd = observe_bind_setup!(
+            Sctp, Socket, errno => Err(io::Error::from_raw_os_error(errno)),
+            new_sctp_socket(socket_domain(addr), libc::SOCK_STREAM)
+        )?;
+        // SAFETY: successful socket creation returns this sole-owned fresh descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        #[cfg(feature = "test-support")]
+        crate::runtime::test_hooks::bind_setup::note_socket(
+            crate::runtime::test_hooks::bind_setup::BindTransport::Sctp,
+            fd.as_raw_fd(),
+        );
+
+        observe_bind_setup!(
+            Sctp, Configure, errno => Err(io::Error::from_raw_os_error(errno)),
+            configure_sctp_socket(fd.as_raw_fd(), config)
+        )?;
+
+        observe_bind_setup!(
+            Sctp, ReuseAddress, errno => Err(io::Error::from_raw_os_error(errno)),
+            set_reuse_addr(fd.as_raw_fd())
+        )?;
 
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
-        let bind_res = unsafe {
-            libc::bind(
-                fd,
-                &sockaddr as *const _ as *const libc::sockaddr,
-                sockaddr_len,
-            )
-        };
+        let bind_res = observe_bind_setup!(
+            Sctp, Bind, errno => crate::runtime::test_hooks::bind_setup::raw_error(errno),
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    &sockaddr as *const _ as *const libc::sockaddr,
+                    sockaddr_len,
+                )
+            }
+        );
         if bind_res < 0 {
             let err = io::Error::last_os_error();
-            close_fd(fd);
             return Err(err);
         }
 
-        let listen_res = unsafe { libc::listen(fd, backlog) };
+        let listen_res = observe_bind_setup!(
+            Sctp, Listen, errno => crate::runtime::test_hooks::bind_setup::raw_error(errno),
+            unsafe { libc::listen(fd.as_raw_fd(), backlog) }
+        );
         if listen_res < 0 {
             let err = io::Error::last_os_error();
-            close_fd(fd);
             return Err(err);
         }
 
-        let local_addr = match current_local_addr(fd) {
-            Ok(addr) => addr,
-            Err(err) => {
-                close_fd(fd);
-                return Err(err);
-            }
-        };
+        let local_addr = observe_bind_setup!(
+            Sctp, LocalAddress, errno => Err(io::Error::from_raw_os_error(errno)),
+            current_local_addr(fd.as_raw_fd())
+        )?;
 
-        let fd = RuntimeFd::from_fresh_raw_fd(fd);
+        let fd = RuntimeFd::from_fresh_owned(fd);
         Ok(Self {
             accept_slot: AcceptSlot::new(&fd),
             fd,

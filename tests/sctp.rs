@@ -6518,3 +6518,13 @@ fn runtime_sctp_ping_pong_vectored() {
         })
         .expect("executor run failed");
 }
+
+#[cfg(not(miri))]
+#[path = "common/bind_setup.rs"]
+mod bind_setup_support;
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_sctp_bind_setup_failures_recover_exact_descriptors() {
+    bind_setup_support::sctp();
+}

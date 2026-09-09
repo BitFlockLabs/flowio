@@ -182,9 +182,9 @@
 use super::stream;
 use super::{
     AcceptReadinessSlot as AcceptSlot, ConnectSubmissionSlot, RetainedConnectAddr,
-    WriteBufferChain, WritevProjection, close_fd, current_local_addr, current_peer_addr,
-    get_sock_opt, map_connect_timeout, new_nonblocking_socket, set_reuse_addr, set_reuse_port,
-    set_sock_opt, socket_addr_from_c, socket_addr_to_c, socket_domain,
+    WriteBufferChain, WritevProjection, current_local_addr, current_peer_addr, get_sock_opt,
+    map_connect_timeout, new_nonblocking_socket, set_reuse_addr, set_reuse_port, set_sock_opt,
+    socket_addr_from_c, socket_addr_to_c, socket_domain,
 };
 use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
@@ -719,48 +719,61 @@ impl TcpListener {
     }
 
     fn bind_inner(addr: SocketAddr, backlog: i32, reuse_port: bool) -> io::Result<Self> {
-        let fd = new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM)?;
+        let raw_fd = observe_bind_setup!(
+            Tcp, Socket, errno => Err(io::Error::from_raw_os_error(errno)),
+            new_nonblocking_socket(socket_domain(addr), libc::SOCK_STREAM)
+        )?;
+        // SAFETY: successful socket creation returns this sole-owned fresh descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        #[cfg(feature = "test-support")]
+        crate::runtime::test_hooks::bind_setup::note_socket(
+            crate::runtime::test_hooks::bind_setup::BindTransport::Tcp,
+            fd.as_raw_fd(),
+        );
 
-        if let Err(err) = set_reuse_addr(fd) {
-            close_fd(fd);
-            return Err(err);
-        }
+        observe_bind_setup!(
+            Tcp, ReuseAddress, errno => Err(io::Error::from_raw_os_error(errno)),
+            set_reuse_addr(fd.as_raw_fd())
+        )?;
 
-        if reuse_port && let Err(err) = set_reuse_port(fd) {
-            close_fd(fd);
-            return Err(err);
+        if reuse_port {
+            observe_bind_setup!(
+                Tcp, ReusePort, errno => Err(io::Error::from_raw_os_error(errno)),
+                set_reuse_port(fd.as_raw_fd())
+            )?;
         }
 
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
-        let bind_res = unsafe {
-            libc::bind(
-                fd,
-                &sockaddr as *const _ as *const libc::sockaddr,
-                sockaddr_len,
-            )
-        };
+        let bind_res = observe_bind_setup!(
+            Tcp, Bind, errno => crate::runtime::test_hooks::bind_setup::raw_error(errno),
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    &sockaddr as *const _ as *const libc::sockaddr,
+                    sockaddr_len,
+                )
+            }
+        );
         if bind_res < 0 {
             let err = io::Error::last_os_error();
-            close_fd(fd);
             return Err(err);
         }
 
-        let listen_res = unsafe { libc::listen(fd, backlog) };
+        let listen_res = observe_bind_setup!(
+            Tcp, Listen, errno => crate::runtime::test_hooks::bind_setup::raw_error(errno),
+            unsafe { libc::listen(fd.as_raw_fd(), backlog) }
+        );
         if listen_res < 0 {
             let err = io::Error::last_os_error();
-            close_fd(fd);
             return Err(err);
         }
 
-        let local_addr = match current_local_addr(fd) {
-            Ok(addr) => addr,
-            Err(err) => {
-                close_fd(fd);
-                return Err(err);
-            }
-        };
+        let local_addr = observe_bind_setup!(
+            Tcp, LocalAddress, errno => Err(io::Error::from_raw_os_error(errno)),
+            current_local_addr(fd.as_raw_fd())
+        )?;
 
-        let fd = RuntimeFd::from_fresh_raw_fd(fd);
+        let fd = RuntimeFd::from_fresh_owned(fd);
         Ok(Self {
             accept_slot: AcceptSlot::new(&fd),
             fd,

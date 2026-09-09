@@ -85,10 +85,10 @@
 //! ```
 
 use super::{
-    CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, close_fd,
-    completion_cqe_result, current_local_addr, finish_completed_payload_take, get_sock_opt,
-    invalid_data, new_nonblocking_socket, opt_take, set_reuse_addr, set_sock_opt,
-    socket_addr_from_c, socket_addr_to_c, socket_domain, write_msghdr,
+    CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, completion_cqe_result,
+    current_local_addr, finish_completed_payload_take, get_sock_opt, invalid_data,
+    new_nonblocking_socket, opt_take, set_reuse_addr, set_sock_opt, socket_addr_from_c,
+    socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
@@ -103,7 +103,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -152,29 +152,41 @@ impl UdpSocket {
     /// This is socket setup work. Keep the bound socket alive for steady-state
     /// datagram I/O rather than rebinding per message.
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let fd = new_nonblocking_socket(socket_domain(addr), libc::SOCK_DGRAM)?;
+        let raw_fd = observe_bind_setup!(
+            Udp, Socket, errno => Err(io::Error::from_raw_os_error(errno)),
+            new_nonblocking_socket(socket_domain(addr), libc::SOCK_DGRAM)
+        )?;
+        // SAFETY: successful socket creation returns this sole-owned fresh descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        #[cfg(feature = "test-support")]
+        crate::runtime::test_hooks::bind_setup::note_socket(
+            crate::runtime::test_hooks::bind_setup::BindTransport::Udp,
+            fd.as_raw_fd(),
+        );
 
-        if let Err(err) = set_reuse_addr(fd) {
-            close_fd(fd);
-            return Err(err);
-        }
+        observe_bind_setup!(
+            Udp, ReuseAddress, errno => Err(io::Error::from_raw_os_error(errno)),
+            set_reuse_addr(fd.as_raw_fd())
+        )?;
 
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
-        let bind_res = unsafe {
-            libc::bind(
-                fd,
-                &sockaddr as *const _ as *const libc::sockaddr,
-                sockaddr_len,
-            )
-        };
+        let bind_res = observe_bind_setup!(
+            Udp, Bind, errno => crate::runtime::test_hooks::bind_setup::raw_error(errno),
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    &sockaddr as *const _ as *const libc::sockaddr,
+                    sockaddr_len,
+                )
+            }
+        );
         if bind_res < 0 {
             let err = io::Error::last_os_error();
-            close_fd(fd);
             return Err(err);
         }
 
         Ok(Self {
-            fd: RuntimeFd::from_fresh_raw_fd(fd),
+            fd: RuntimeFd::from_fresh_owned(fd),
             peer_addr: None,
         })
     }
