@@ -2783,8 +2783,8 @@ mod completion_drain_probe {
     #[doc(hidden)]
     pub fn test_completion_drain_descriptor_close() -> io::Result<CompletionDrainDescriptorReport> {
         let runtime_raw = distinctive_closeable_test_fd()?;
-        let listener_raw = distinctive_closeable_test_fd()?;
         let runtime_fd = RuntimeFd::from_fresh_raw_fd(runtime_raw);
+        let listener_raw = distinctive_closeable_test_fd()?;
         let listener = RuntimeFd::from_fresh_raw_fd(listener_raw);
         let retained_listener = RetainedListenerFd::new(&listener);
         drop(listener);

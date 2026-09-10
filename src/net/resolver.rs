@@ -5085,6 +5085,54 @@ nameserver 192.0.2.9\n",
 
     #[cfg(not(miri))]
     #[test]
+    fn resolver_conflicting_cname_preserves_valid_sibling_followup() {
+        let nameserver = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
+        let sibling_target = "valid-sibling.example.test";
+        for conflict_type in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+            let sibling_type = if conflict_type == DNS_TYPE_A {
+                DNS_TYPE_AAAA
+            } else {
+                DNS_TYPE_A
+            };
+            let mut steps = Vec::new();
+            for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+                steps.push(ScriptedQueryStep {
+                    nameserver,
+                    host: CNAME_TEST_HOST,
+                    qtype,
+                    outcome: if qtype == conflict_type {
+                        ScriptedQueryOutcome::AnswerRecords(conflicting_cname_test_records(
+                            CNAME_TEST_HOST,
+                        ))
+                    } else {
+                        ScriptedQueryOutcome::Cname(sibling_target)
+                    },
+                });
+            }
+            // The exact script excludes both rejected targets and another follow-up.
+            for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+                steps.push(ScriptedQueryStep {
+                    nameserver,
+                    host: sibling_target,
+                    qtype,
+                    outcome: if qtype == sibling_type {
+                        ScriptedQueryOutcome::Address(cname_test_address(qtype))
+                    } else {
+                        ScriptedQueryOutcome::Empty
+                    },
+                });
+            }
+            let result = run_cname_query_script(vec![nameserver], steps)
+                .expect("valid sibling CNAME should survive conflicting-target rejection");
+            assert_eq!(
+                result,
+                [SocketAddr::new(cname_test_address(sibling_type), 5432)]
+            );
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn resolver_conflicting_cname_preserves_nameserver_failover() {
         let first = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), DNS_PORT));
         let second = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 54), DNS_PORT));

@@ -8077,19 +8077,21 @@ pub(crate) mod test_support {
         test_accept_slot_drop_preserves_readiness_mask(true)
     }
 
-    /// Verifies dropping a connector future closes the socket owned by its
-    /// reusable connection slot.
-    pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()> {
+    fn prepared_connect_slot() -> io::Result<(ConnectSlot, RawFd, SocketAddr)> {
         let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
         let mut slot = ConnectSlot::new(SctpSocketConfig::default());
         slot.in_use = true;
         // SAFETY: the test-created descriptor has no other owner.
         slot.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
-        slot.addr = Some(RetainedConnectAddr::from_socket_addr(SocketAddr::from((
-            [127, 0, 0, 1],
-            9,
-        ))));
+        let remote = SocketAddr::from(([127, 0, 0, 1], 9));
+        slot.addr = Some(RetainedConnectAddr::from_socket_addr(remote));
+        Ok((slot, fd, remote))
+    }
 
+    /// Verifies dropping a connector future closes the socket owned by its
+    /// reusable connection slot.
+    pub fn test_connect_slot_drop_future_closes_socket_fd() -> io::Result<()> {
+        let (mut slot, fd, _) = prepared_connect_slot()?;
         slot.drop_future();
 
         if !slot.state_ptr.is_null() || slot.in_use || slot.fd.is_some() || slot.addr.is_some() {
@@ -8102,9 +8104,27 @@ pub(crate) mod test_support {
     }
 
     /// Verifies connector teardown closes a prepared, not-yet-submitted socket
-    /// and releases every field owned directly by its reusable slot.
+    /// after its borrowing connect future is forgotten.
     pub fn test_connect_slot_drop_cached_state_closes_socket_fd() -> io::Result<()> {
-        test_connect_slot_drop_future_closes_socket_fd()
+        let (slot, fd, remote_addr) = prepared_connect_slot()?;
+        let mut connector = SctpConnector {
+            connect_slot: slot,
+            config: SctpSocketConfig::default(),
+            local_addr: None,
+        };
+        let future = ConnectFuture {
+            slot: &mut connector.connect_slot,
+            remote_addr,
+        };
+        // The unsubmitted future owns only a borrow; the connector retains the
+        // sole descriptor and prepared address until its normal destruction.
+        std::mem::forget(future);
+        drop(connector);
+
+        if !crate::runtime::fd::raw_fd_is_closed(fd) {
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        Ok(())
     }
 
     /// Verifies a peer-address-parameter socket-option length is rejected as
