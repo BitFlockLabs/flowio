@@ -5262,9 +5262,8 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state() {
                 let mut current_buf = vec![0u8; 256];
                 let mut saw_data = false;
                 let mut saw_shutdown_notification = false;
-                let mut saw_eof = false;
 
-                while !(saw_data && (saw_shutdown_notification || saw_eof)) {
+                while !(saw_data && saw_shutdown_notification) {
                     let recv_res =
                         timeout(Duration::from_secs(1), stream.recv_msg(current_buf, 256))
                             .await
@@ -5286,10 +5285,6 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state() {
                             saw_data = true;
                         }
                     }
-
-                    if recv_len == 0 {
-                        saw_eof = true;
-                    }
                 }
 
                 assert!(
@@ -5297,8 +5292,8 @@ fn runtime_sctp_shutdown_write_peer_observes_terminal_state() {
                     "peer did not receive the queued data before shutdown"
                 );
                 assert!(
-                    saw_shutdown_notification || saw_eof,
-                    "peer did not observe SCTP shutdown notification or EOF"
+                    saw_shutdown_notification,
+                    "peer did not observe SCTP shutdown notification"
                 );
             })
             .expect("server spawn failed");

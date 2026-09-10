@@ -5520,7 +5520,10 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(build_send_entry(fd, ptr, this.len, state_ptr as u64))
+                        let entry = build_send_entry(fd, ptr, this.len, state_ptr as u64);
+                        #[cfg(test)]
+                        tests::observe_data_send_entry(&entry);
+                        Ok(entry)
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -11394,6 +11397,120 @@ mod tests {
         assert_eq!(sqe.opcode, opcode::Send::CODE);
         assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
         assert_eq!(sqe.user_data, 99);
+    }
+
+    thread_local! {
+        static DATA_SEND_ENTRY: std::cell::RefCell<Option<Option<io_uring::squeue::Entry>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_data_send_entry(entry: &io_uring::squeue::Entry) {
+        DATA_SEND_ENTRY.with(|observed| {
+            if let Some(slot) = observed.borrow_mut().as_mut() {
+                assert!(slot.is_none(), "scalar SCTP send built more than one entry");
+                *slot = Some(entry.clone());
+            }
+        });
+    }
+
+    struct DataSendEntryCapture {
+        previous: Option<Option<io_uring::squeue::Entry>>,
+    }
+
+    impl DataSendEntryCapture {
+        fn new() -> Self {
+            Self {
+                previous: DATA_SEND_ENTRY.with(|observed| observed.replace(Some(None))),
+            }
+        }
+
+        fn take(&self) -> io_uring::squeue::Entry {
+            DATA_SEND_ENTRY.with(|observed| {
+                observed
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("scalar SCTP send observation is not active")
+                    .take()
+                    .expect("scalar SCTP send did not build an entry")
+            })
+        }
+    }
+
+    impl Drop for DataSendEntryCapture {
+        fn drop(&mut self) {
+            DATA_SEND_ENTRY.with(|observed| observed.replace(self.previous.take()));
+        }
+    }
+
+    #[test]
+    fn sctp_data_send_caller_submits_send_with_nosignal_and_own_state() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let reactor = owner.reactor_ptr();
+            let expected_state = unsafe { (&mut *reactor).alloc_op() };
+            assert!(
+                !expected_state.is_null(),
+                "send fixture state allocation failed"
+            );
+            // The pool reuses the most recently freed slot. No operation is
+            // allocated between this release and the send's first poll, so
+            // the expected correlation value is independent of the SQE.
+            unsafe { (&mut *reactor).free_op(expected_state) };
+
+            let pointer_calls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            let buffer = retained_constructor_buffer(
+                None,
+                Rc::clone(&pointer_calls),
+                Rc::clone(&drops),
+                false,
+            );
+            let expected_addr = buffer.bytes.as_ptr();
+            let expected_len = buffer.bytes.len();
+            let mut stream = ringless_sctp_stream();
+            let expected_fd = stream.fd.raw_fd();
+            let mut send = stream.send(buffer);
+            let capture = DataSendEntryCapture::new();
+            test_hooks::fail_next_raw_sqe_submit();
+            let Poll::Ready((result, returned)) = Pin::new(&mut send).poll(cx) else {
+                panic!("scalar SCTP send did not return its rejected submission");
+            };
+            let entry = capture.take();
+            drop(capture);
+            let sqe = sqe_prefix(&entry);
+
+            assert_eq!(sqe.opcode, opcode::Send::CODE);
+            assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
+            assert_eq!(sqe.user_data, expected_state as u64);
+            assert_eq!(sqe.fd, expected_fd);
+            assert_eq!(sqe.addr, expected_addr as u64);
+            assert_eq!(sqe.len, expected_len as u32);
+            assert_eq!(
+                result
+                    .expect_err("injected SCTP send submission succeeded")
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
+            assert_eq!(pointer_calls.get(), 1);
+            assert_eq!(returned.bytes.as_ptr(), expected_addr);
+            assert_eq!(returned.bytes.len(), expected_len);
+            assert_eq!(drops.get(), 0);
+            assert!(send.state_ptr.is_null());
+            assert!(send.buffer.is_none());
+            assert!(Pin::new(&mut send).poll(cx).is_pending());
+            drop(send);
+            drop(returned);
+            assert_eq!(drops.get(), 1);
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 1);
+            assert_eq!(stats.pooled_frees, 1);
+            assert_eq!(stats.heap_fallbacks, 0);
+            let reused = unsafe { (&mut *reactor).alloc_op() };
+            assert_eq!(reused, expected_state);
+            unsafe { (&mut *reactor).free_op(reused) };
+        });
     }
 
     #[test]

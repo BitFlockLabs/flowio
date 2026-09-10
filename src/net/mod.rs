@@ -1867,6 +1867,11 @@ fn set_sock_opt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &T) 
     Ok(())
 }
 
+/// Reads a fixed-size socket option whose complete representation is `T`.
+///
+/// A successful syscall must return exactly `size_of::<T>()` bytes; a mismatch
+/// is payload-free `InvalidData`; syscall errors retain precedence.
+/// Variable-length or versioned layouts require an option-specific decoder.
 fn get_sock_opt<T: Default>(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<T> {
     let mut value = T::default();
     let expected_len = std::mem::size_of::<T>();
