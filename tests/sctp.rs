@@ -1783,7 +1783,7 @@ fn sctp_connect_slot_drop_future_closes_socket_fd() {
 }
 
 /// Dropping the connector after forgetting its unsubmitted future closes the
-/// prepared socket and releases the slot-owned fields.
+/// prepared socket fd.
 #[test]
 fn sctp_connect_slot_drop_cached_state_closes_socket_fd() {
     test_connect_slot_drop_cached_state_closes_socket_fd().unwrap();
