@@ -3,6 +3,7 @@
 pub mod net;
 pub mod runtime;
 #[cfg(any(test, feature = "test-support"))]
+#[path = "utils/test_child.rs"]
 mod test_child;
 pub(crate) mod utils;
 
@@ -18,4 +19,5 @@ pub mod fuzzing;
 /// not part of the supported public API.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+#[path = "utils/test_support.rs"]
 pub mod test_support;

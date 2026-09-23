@@ -8673,7 +8673,8 @@ mod tests {
 
         let current_exe = std::env::current_exe().expect("current unit-test executable");
         let child = Command::new(current_exe)
-            .args(["--exact", test_name, "--nocapture"])
+            .args(["--exact", test_name])
+            .env_remove("RUST_TEST_NOCAPTURE")
             .env(child_env, "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -8690,6 +8691,43 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            crate::test_child::exact_test_completed(&output, test_name),
+            "{label} child did not complete exactly {test_name}: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn exact_unit_test_child_completion_checks_real_output() {
+        const CHILD_ENV: &str = "FLOWIO_EXACT_COMPLETION_CHILD";
+        const TEST_NAME: &str =
+            "runtime::executor::tests::exact_unit_test_child_completion_checks_real_output";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            println!("captured test diagnostics must not split the completion record");
+            return;
+        }
+        run_exact_unit_test_child_with_watchdog(TEST_NAME, CHILD_ENV, "completion control");
+        let wrong_selector = std::panic::catch_unwind(|| {
+            run_exact_unit_test_child_with_watchdog(
+                "runtime::executor::tests::missing_completion_control",
+                CHILD_ENV,
+                "wrong-selector control",
+            );
+        });
+        let failure = wrong_selector.expect_err("zero-test child was accepted");
+        let reason = failure
+            .downcast_ref::<String>()
+            .expect("completion failure must include its diagnostic");
+        assert!(
+            reason.starts_with(
+                "wrong-selector control child did not complete exactly \
+                 runtime::executor::tests::missing_completion_control:"
+            ),
+            "wrong-selector control failed for an unrelated reason: {reason}"
         );
     }
 

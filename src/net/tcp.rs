@@ -190,8 +190,6 @@ use crate::runtime::buffer::iobuffvec::IoBuffVecMut;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::validate_local_io_result;
 use crate::runtime::fd::{LingerProvenance, RuntimeFd, RuntimeFdOpState};
-#[cfg(any(test, feature = "test-support"))]
-use crate::runtime::op::CompletionState;
 use crate::runtime::timer::{Timeout, timeout};
 use std::future::Future;
 use std::io;
@@ -935,30 +933,7 @@ pub(crate) mod test_support {
     /// Verifies cached readiness teardown does not interpret a readiness mask
     /// as an accepted descriptor.
     pub fn test_accept_slot_drop_cached_state_preserves_unrelated_fd() -> io::Result<()> {
-        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-        let mut state = CompletionState::empty();
-        state.result = fd;
-        state.set_completed();
-
-        let listener_fd = RuntimeFd::from_fresh_raw_fd(fd);
-        let mut slot = AcceptSlot::new(&listener_fd);
-        slot.in_use = true;
-        slot.state_ptr = &mut state;
-
-        slot.drop_cached_state();
-
-        if !slot.state_ptr.is_null() || slot.in_use {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        if crate::runtime::fd::raw_fd_is_closed(fd) {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        drop(slot);
-        drop(listener_fd);
-        if !crate::runtime::fd::raw_fd_is_closed(fd) {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        Ok(())
+        crate::net::test_accept_slot_drop_preserves_readiness_mask(true)
     }
 }
 

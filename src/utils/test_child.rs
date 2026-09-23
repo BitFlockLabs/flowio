@@ -129,6 +129,52 @@ pub struct CapturedChildOutput {
     pub stderr: Vec<u8>,
 }
 
+/// Checks that one successful child completed exactly the selected test.
+#[cfg(all(test, not(miri)))]
+pub(crate) fn exact_test_completed(output: &CapturedChildOutput, test_name: &str) -> bool {
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    let expected_pass = format!("test {test_name} ... ok");
+    let mut starts = 0;
+    let mut passes = 0;
+    let mut summaries = 0;
+    for line in stdout.lines() {
+        if line == "running 1 test" {
+            starts += 1;
+        } else if line.starts_with("running ") {
+            return false;
+        } else if line == expected_pass {
+            passes += 1;
+        } else if let Some(tail) =
+            line.strip_prefix("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+        {
+            let Some((filtered, elapsed)) = tail.split_once(" filtered out; finished in ") else {
+                return false;
+            };
+            if filtered.is_empty() || !filtered.bytes().all(|byte| byte.is_ascii_digit()) {
+                return false;
+            }
+            let Some(elapsed) = elapsed.strip_suffix('s') else {
+                return false;
+            };
+            let Ok(seconds) = elapsed.parse::<f64>() else {
+                return false;
+            };
+            if !seconds.is_finite() || seconds < 0.0 {
+                return false;
+            }
+            summaries += 1;
+        } else if line.starts_with("test ") {
+            return false;
+        }
+    }
+    starts == 1 && passes == 1 && summaries == 1
+}
+
 #[derive(Debug)]
 struct CaptureFailure {
     kind: ChildCaptureErrorKind,
@@ -454,6 +500,44 @@ mod tests {
     const FIXTURE_ENV: &str = "FLOWIO_BOUNDED_CHILD_CAPTURE_FIXTURE";
     const FIXTURE_TEST: &str = "test_child::tests::bounded_child_capture_fixture";
     const LARGE_STREAM_BYTES: usize = 160 * 1024;
+
+    #[test]
+    fn exact_test_completion_requires_the_selected_finished_pass() {
+        use std::os::unix::process::ExitStatusExt;
+
+        const NAME: &str = "module::selected";
+        const PASS: &str = "running 1 test\ntest module::selected ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.01s\n";
+        let capture = |status, stdout: &str| CapturedChildOutput {
+            status: ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(exact_test_completed(&capture(0, PASS), NAME));
+        assert!(!exact_test_completed(&capture(23 << 8, PASS), NAME));
+        for invalid in [
+            String::new(),
+            PASS.replace(NAME, "module::other"),
+            PASS.replace("running 1 test", "running 0 tests")
+                .replace("1 passed", "0 passed"),
+            PASS.replace(" ... ok", " ... ignored")
+                .replace("1 passed", "0 passed")
+                .replace("0 ignored", "1 ignored"),
+            PASS.replace(" ... ok", " ... FAILED")
+                .replace("test result: ok", "test result: FAILED"),
+            PASS.replace("test module::selected ... ok\n", ""),
+            PASS.lines().take(2).collect::<Vec<_>>().join("\n"),
+            format!("{PASS}test module::selected ... ok\n"),
+            format!("{PASS}{PASS}"),
+            format!("{PASS}test module::other ... FAILED\n"),
+            PASS.replace("17 filtered", "unknown filtered"),
+            PASS.replace("0.01s", "NaNs"),
+        ] {
+            assert!(
+                !exact_test_completed(&capture(0, &invalid), NAME),
+                "accepted {invalid:?}"
+            );
+        }
+    }
 
     #[test]
     fn bounded_child_capture_fixture() {

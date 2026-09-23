@@ -1067,6 +1067,40 @@ impl AcceptReadinessSlot {
     }
 }
 
+/// Verifies that retiring completed accept readiness releases the slot without
+/// interpreting its readiness mask as a descriptor.
+#[cfg(feature = "test-support")]
+fn test_accept_slot_drop_preserves_readiness_mask(cached: bool) -> io::Result<()> {
+    let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
+    let mut state = CompletionState::empty();
+    state.result = fd;
+    state.set_completed();
+
+    let listener_fd = RuntimeFd::from_fresh_raw_fd(fd);
+    let mut slot = AcceptReadinessSlot::new(&listener_fd);
+    slot.in_use = true;
+    slot.state_ptr = &mut state;
+
+    if cached {
+        slot.drop_cached_state();
+    } else {
+        slot.drop_future();
+    }
+
+    if !slot.state_ptr.is_null() || slot.in_use {
+        return Err(io::Error::from(io::ErrorKind::Other));
+    }
+    if crate::runtime::fd::raw_fd_is_closed(fd) {
+        return Err(io::Error::from(io::ErrorKind::Other));
+    }
+    drop(slot);
+    drop(listener_fd);
+    if !crate::runtime::fd::raw_fd_is_closed(fd) {
+        return Err(io::Error::from(io::ErrorKind::Other));
+    }
+    Ok(())
+}
+
 /// Runs the failed-preparation regression through one transport's real accept
 /// future without requiring a live io_uring or transport-specific kernel
 /// support.

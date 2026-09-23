@@ -8037,47 +8037,16 @@ pub(crate) mod test_support {
         }
     }
 
-    fn test_accept_slot_drop_preserves_readiness_mask(cached: bool) -> io::Result<()> {
-        let fd = crate::runtime::fd::distinctive_closeable_test_fd()?;
-        let mut state = CompletionState::empty();
-        state.result = fd;
-        state.set_completed();
-
-        let listener_fd = RuntimeFd::from_fresh_raw_fd(fd);
-        let mut slot = AcceptSlot::new(&listener_fd);
-        slot.in_use = true;
-        slot.state_ptr = &mut state;
-
-        if cached {
-            slot.drop_cached_state();
-        } else {
-            slot.drop_future();
-        }
-
-        if !slot.state_ptr.is_null() || slot.in_use {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        if crate::runtime::fd::raw_fd_is_closed(fd) {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        drop(slot);
-        drop(listener_fd);
-        if !crate::runtime::fd::raw_fd_is_closed(fd) {
-            return Err(io::Error::from(io::ErrorKind::Other));
-        }
-        Ok(())
-    }
-
     /// Verifies future drop releases completed readiness state without
     /// interpreting its readiness mask as a descriptor.
     pub fn test_accept_slot_drop_future_preserves_unrelated_fd() -> io::Result<()> {
-        test_accept_slot_drop_preserves_readiness_mask(false)
+        crate::net::test_accept_slot_drop_preserves_readiness_mask(false)
     }
 
     /// Verifies forgotten-future listener teardown has the same
     /// readiness-only ownership behavior.
     pub fn test_accept_slot_drop_cached_state_preserves_unrelated_fd() -> io::Result<()> {
-        test_accept_slot_drop_preserves_readiness_mask(true)
+        crate::net::test_accept_slot_drop_preserves_readiness_mask(true)
     }
 
     fn prepared_connect_slot() -> io::Result<(ConnectSlot, RawFd, SocketAddr)> {
