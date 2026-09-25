@@ -1,3 +1,5 @@
+mod common;
+
 #[path = "common/counting_allocator.rs"]
 mod counting_allocator;
 #[path = "common/dns_allocation.rs"]
@@ -26,6 +28,12 @@ const DNS_RESPONSE_BUFFER_SIZE: usize = 2048;
 const DNS_FLAG_QR: u16 = 0x8000;
 const DNS_RCODE_SERVFAIL: u16 = 2;
 const DNS_RCODE_REFUSED: u16 = 5;
+const RESOLVER_COMPLETED_FAILOVER_CHILD_ENV: &str = "FLOWIO_RESOLVER_COMPLETED_FAILOVER_CHILD";
+const RESOLVER_COMPLETED_FAILOVER_TEST: &str =
+    "completed_nameserver_failover_reuses_one_response_buffer";
+const RESOLVER_TIMEOUT_FAILOVER_CHILD_ENV: &str = "FLOWIO_RESOLVER_TIMEOUT_FAILOVER_CHILD";
+const RESOLVER_TIMEOUT_FAILOVER_TEST: &str =
+    "timed_out_receive_uses_a_distinct_response_buffer_for_failover";
 
 async fn serve_error_responses(mut server: UdpSocket, rcodes: &'static [u16]) -> io::Result<()> {
     for &rcode in rcodes {
@@ -49,6 +57,15 @@ async fn serve_error_responses(mut server: UdpSocket, rcodes: &'static [u16]) ->
 
 #[test]
 fn completed_nameserver_failover_reuses_one_response_buffer() {
+    if std::env::var_os(RESOLVER_COMPLETED_FAILOVER_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            RESOLVER_COMPLETED_FAILOVER_TEST,
+            RESOLVER_COMPLETED_FAILOVER_CHILD_ENV,
+            Duration::from_secs(30),
+        );
+        return;
+    }
+
     let first_server = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind first FlowIO DNS server");
     let first_nameserver = first_server
@@ -101,6 +118,15 @@ fn completed_nameserver_failover_reuses_one_response_buffer() {
 
 #[test]
 fn timed_out_receive_uses_a_distinct_response_buffer_for_failover() {
+    if std::env::var_os(RESOLVER_TIMEOUT_FAILOVER_CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            RESOLVER_TIMEOUT_FAILOVER_TEST,
+            RESOLVER_TIMEOUT_FAILOVER_CHILD_ENV,
+            Duration::from_secs(30),
+        );
+        return;
+    }
+
     let silent_server = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind silent DNS server");
     let silent_nameserver = silent_server

@@ -1,3 +1,5 @@
+mod common;
+
 #[path = "common/counting_allocator.rs"]
 mod counting_allocator;
 
@@ -15,7 +17,12 @@ use std::time::Duration;
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
-fn spawn_tcp_echo(rounds: usize) -> (SocketAddr, JoinHandle<()>) {
+const CHILD_ENV: &str = "FLOWIO_STEADY_STATE_ALLOCATION_CHILD";
+const FRAGMENTED_REPLY_ENV: &str = "FLOWIO_STEADY_STATE_FRAGMENTED_REPLY";
+const TEST_NAME: &str = "steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup";
+const CHILD_DEADLINE: Duration = Duration::from_secs(30);
+
+fn spawn_tcp_echo(rounds: usize, reply_chunk_len: usize) -> (SocketAddr, JoinHandle<()>) {
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("tcp echo bind failed");
     let addr = listener.local_addr().expect("tcp echo local_addr failed");
@@ -27,7 +34,9 @@ fn spawn_tcp_echo(rounds: usize) -> (SocketAddr, JoinHandle<()>) {
         for _ in 0..rounds {
             stream.read_exact(&mut buf).expect("tcp echo read failed");
             assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").expect("tcp echo write failed");
+            for chunk in b"pong".chunks(reply_chunk_len) {
+                stream.write_all(chunk).expect("tcp echo write failed");
+            }
         }
     });
     (addr, handle)
@@ -49,14 +58,28 @@ fn spawn_udp_echo(rounds: usize) -> (SocketAddr, JoinHandle<()>) {
     (addr, handle)
 }
 
-async fn tcp_echo_once(stream: &mut TcpStream, recv: Vec<u8>) -> Vec<u8> {
+async fn tcp_echo_once(stream: &mut TcpStream, mut recv: Vec<u8>, read_limit: usize) -> Vec<u8> {
     let payload: &'static [u8] = b"ping";
     let (send_res, _payload) = stream.write_all(payload).await;
     assert_eq!(send_res.expect("tcp send failed"), 4);
 
-    let (recv_res, recv) = stream.read(recv, 4).await;
-    assert_eq!(recv_res.expect("tcp recv failed"), 4);
-    assert_eq!(&recv[..], b"pong");
+    let mut reply = [0u8; 4];
+    let mut completed = 0;
+    while completed < reply.len() {
+        let requested = (reply.len() - completed).min(read_limit);
+        let (recv_res, returned) = stream.read(recv, requested).await;
+        recv = returned;
+        let read = recv_res.expect("tcp recv failed");
+        assert!(read != 0, "TCP echo ended before four reply bytes");
+        assert!(read <= requested, "TCP read exceeded its requested length");
+        // Vec receives start at its allocation base on every direct read.
+        reply[completed..completed + read].copy_from_slice(&recv);
+        completed += read;
+    }
+    assert_eq!(&reply, b"pong");
+    assert!(recv.capacity() >= reply.len());
+    recv.clear();
+    recv.extend_from_slice(&reply);
     recv
 }
 
@@ -73,13 +96,23 @@ async fn udp_echo_once(socket: &mut UdpSocket, recv: Vec<u8>) -> Vec<u8> {
 
 #[test]
 fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
+    if std::env::var_os(CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(TEST_NAME, CHILD_ENV, CHILD_DEADLINE);
+        return;
+    }
+
     const STEADY_ROUNDS: usize = 4;
     const TOTAL_ROUNDS: usize = STEADY_ROUNDS + 2;
+    let tcp_chunk_len = if std::env::var_os(FRAGMENTED_REPLY_ENV).is_some() {
+        2
+    } else {
+        4
+    };
 
     // This test enforces the steady-state claim. DNS resolution and TLS
     // handshakes are setup/control-plane work and are intentionally outside
     // this measured data-path window.
-    let (tcp_addr, tcp_thread) = spawn_tcp_echo(TOTAL_ROUNDS);
+    let (tcp_addr, tcp_thread) = spawn_tcp_echo(TOTAL_ROUNDS, tcp_chunk_len);
     let (udp_addr, udp_thread) = spawn_udp_echo(TOTAL_ROUNDS);
 
     let sctp_config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
@@ -141,7 +174,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
                     None
                 };
 
-            tcp_recv = tcp_echo_once(&mut tcp, tcp_recv).await;
+            tcp_recv = tcp_echo_once(&mut tcp, tcp_recv, tcp_chunk_len).await;
             udp_recv = udp_echo_once(&mut udp, udp_recv).await;
             if let Some((client, _server, recv)) = sctp_client_and_server.as_mut() {
                 let payload: &'static [u8] = b"ping";
@@ -161,7 +194,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
             let before = ProcessWideAllocationSnapshot::current();
 
             for _ in 0..STEADY_ROUNDS {
-                tcp_recv = tcp_echo_once(&mut tcp, tcp_recv).await;
+                tcp_recv = tcp_echo_once(&mut tcp, tcp_recv, tcp_chunk_len).await;
                 udp_recv = udp_echo_once(&mut udp, udp_recv).await;
 
                 if let Some((client, _server, recv)) = sctp_client_and_server.as_mut() {
@@ -184,7 +217,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
             let after = ProcessWideAllocationSnapshot::current();
             after.assert_unchanged_since(before);
 
-            tcp_recv = tcp_echo_once(&mut tcp, tcp_recv).await;
+            tcp_recv = tcp_echo_once(&mut tcp, tcp_recv, tcp_chunk_len).await;
             udp_recv = udp_echo_once(&mut udp, udp_recv).await;
             let _ = (tcp_recv, udp_recv);
             if let Some((client, _server, recv)) = sctp_client_and_server.as_mut() {
@@ -201,4 +234,17 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
 
     tcp_thread.join().expect("tcp echo thread panicked");
     udp_thread.join().expect("udp echo thread panicked");
+}
+
+#[test]
+fn fragmented_tcp_replies_preserve_steady_state_allocation_bounds() {
+    // Limiting each direct read guarantees multiple completions even when TCP
+    // coalesces the peer's two writes. The complete allocation oracle runs in
+    // its own process so concurrent test bookkeeping cannot affect its counts.
+    common::run_exact_test_child_with_watchdog_env(
+        TEST_NAME,
+        CHILD_ENV,
+        CHILD_DEADLINE,
+        &[(FRAGMENTED_REPLY_ENV, "1")],
+    );
 }

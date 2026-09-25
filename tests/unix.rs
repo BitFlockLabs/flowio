@@ -8,10 +8,11 @@ use common::{
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{
-    OVERSIZED_VECTORED_ERROR, OVERSIZED_VECTORED_IOVECS, OVERSIZED_VECTORED_TEST_STACK_BYTES,
-    SparseOversizedReadOnly, assert_oversized_send_rejected, assert_oversized_try_send_rejected,
-    make_oversized_read_chain, make_oversized_write_chain, oversized_read_chain_endpoints,
-    oversized_write_chain_endpoints, run_test_output,
+    OVERSIZED_VECTORED_IOVECS, OVERSIZED_VECTORED_TEST_STACK_BYTES, SparseOversizedReadOnly,
+    assert_op_allocation_fault_preserved, assert_oversized_send_rejected,
+    assert_oversized_try_send_rejected, assert_vectored_overlimit, make_oversized_read_chain,
+    make_oversized_write_chain, oversized_read_chain_endpoints, oversized_write_chain_endpoints,
+    run_test_output,
 };
 use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
@@ -1522,17 +1523,6 @@ fn runtime_unix_vectored_overlimit_precedes_op_pressure() {
         return;
     }
 
-    fn assert_overlimit(result: io::Result<usize>, operation: &str) {
-        let err = result.expect_err(operation);
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(err.to_string(), OVERSIZED_VECTORED_ERROR);
-    }
-
-    fn assert_fault_probe(result: io::Result<i32>, operation: &str) {
-        let err = result.expect_err(operation);
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-    }
-
     let (stream, _peer) = connected_try_unix_stream();
     let mut read_chain = make_oversized_read_chain();
     let read_endpoints = oversized_read_chain_endpoints(&mut read_chain);
@@ -1548,11 +1538,11 @@ fn runtime_unix_vectored_overlimit_precedes_op_pressure() {
             test_hooks::fail_next_op_alloc();
             let (read_result, returned_read) = stream.readv(read_chain).await;
             let read_probe = Nop::new().await;
-            assert_overlimit(
+            assert_vectored_overlimit(
                 read_result,
                 "over-limit Unix readv should fail intrinsically",
             );
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 read_probe,
                 "Unix readv consumed the forced op-allocation fault",
             );
@@ -1561,11 +1551,11 @@ fn runtime_unix_vectored_overlimit_precedes_op_pressure() {
             test_hooks::fail_next_op_alloc();
             let (exact_result, returned_read) = stream.readv_exact(read_chain, 1).await;
             let exact_probe = Nop::new().await;
-            assert_overlimit(
+            assert_vectored_overlimit(
                 exact_result,
                 "over-limit Unix readv_exact should fail intrinsically",
             );
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 exact_probe,
                 "Unix readv_exact consumed the forced op-allocation fault",
             );
@@ -1575,7 +1565,7 @@ fn runtime_unix_vectored_overlimit_precedes_op_pressure() {
             let (zero_result, returned_read) = stream.readv_exact(read_chain, 0).await;
             let zero_probe = Nop::new().await;
             assert_eq!(zero_result.expect("zero-target Unix readv_exact failed"), 0);
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 zero_probe,
                 "zero-target Unix readv_exact consumed the forced op-allocation fault",
             );
@@ -1584,11 +1574,11 @@ fn runtime_unix_vectored_overlimit_precedes_op_pressure() {
             test_hooks::fail_next_op_alloc();
             let (write_result, write_chain) = stream.writev_all(write_chain).await;
             let write_probe = Nop::new().await;
-            assert_overlimit(
+            assert_vectored_overlimit(
                 write_result,
                 "over-limit Unix writev_all should fail intrinsically",
             );
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 write_probe,
                 "Unix writev_all consumed the forced op-allocation fault",
             );

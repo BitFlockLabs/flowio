@@ -3221,29 +3221,25 @@ fn runtime_sleep_zero_completes_without_timer_wake() {
 }
 
 #[cfg(all(target_os = "linux", not(miri)))]
-#[test]
-fn runtime_signal_interrupt_does_not_abort_wait() {
-    const SLEEP_TARGET: Duration = Duration::from_millis(80);
-    const MIN_ELAPSED: Duration = Duration::from_millis(60);
-    const MAX_ELAPSED: Duration = SLEEP_TARGET.saturating_mul(2);
+fn with_executor_signal_sender(
+    armed: &Arc<AtomicBool>,
+    sent: &Arc<AtomicUsize>,
+    run: impl FnOnce() -> io::Result<()>,
+) {
     const MAX_SIGNALS: usize = 64;
     const SIGNAL_INTERVAL: Duration = Duration::from_millis(2);
 
-    let _signal_lock = SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _signal_guard = SignalHandlerGuard::install(libc::SIGUSR1);
-
     let target_thread = unsafe { libc::pthread_self() };
-    let armed = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let sent = Arc::new(AtomicUsize::new(0));
-    let sender_armed = Arc::clone(&armed);
+    let sender_armed = Arc::clone(armed);
     let sender_done = Arc::clone(&done);
-    let sender_sent = Arc::clone(&sent);
+    let sender_sent = Arc::clone(sent);
 
     let sender = std::thread::spawn(move || {
         while !sender_armed.load(Ordering::Acquire) {
+            if sender_done.load(Ordering::Acquire) {
+                return;
+            }
             std::thread::yield_now();
         }
 
@@ -3258,24 +3254,50 @@ fn runtime_signal_interrupt_does_not_abort_wait() {
         }
     });
 
-    let mut executor = new_executor();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run().expect("executor run should absorb signal interruptions");
+    }));
+    done.store(true, Ordering::Release);
+    let joined = sender.join();
+    if let Err(payload) = outcome {
+        // The caller owns the signal handler until this sender is retired.
+        std::panic::resume_unwind(payload);
+    }
+    joined.expect("signal sender panicked");
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn runtime_signal_interrupt_does_not_abort_wait() {
+    const SLEEP_TARGET: Duration = Duration::from_millis(80);
+    const MIN_ELAPSED: Duration = Duration::from_millis(60);
+    const MAX_ELAPSED: Duration = SLEEP_TARGET.saturating_mul(2);
+
+    let _signal_lock = SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _signal_guard = SignalHandlerGuard::install(libc::SIGUSR1);
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicUsize::new(0));
     let observed = Rc::new(RefCell::new(None));
     let observed_flag = Rc::clone(&observed);
-    let run_result = executor.run({
-        let armed = Arc::clone(&armed);
-        async move {
-            let start = Instant::now();
-            armed.store(true, Ordering::Release);
-            sleep(SLEEP_TARGET)
-                .await
-                .expect("sleep interrupted by signal");
-            *observed_flag.borrow_mut() = Some(start.elapsed());
-        }
-    });
+    let mut executor = None;
 
-    done.store(true, Ordering::Release);
-    sender.join().expect("signal sender panicked");
-    run_result.expect("executor run should absorb signal interruptions");
+    with_executor_signal_sender(&armed, &sent, || {
+        let executor = executor.insert(new_executor());
+        executor.run({
+            let armed = Arc::clone(&armed);
+            async move {
+                let start = Instant::now();
+                armed.store(true, Ordering::Release);
+                sleep(SLEEP_TARGET)
+                    .await
+                    .expect("sleep interrupted by signal");
+                *observed_flag.borrow_mut() = Some(start.elapsed());
+            }
+        })
+    });
 
     assert!(
         sent.load(Ordering::Relaxed) > 0,
@@ -3292,6 +3314,45 @@ fn runtime_signal_interrupt_does_not_abort_wait() {
         elapsed < MAX_ELAPSED,
         "signal interruptions likely restarted the full wait timeout: {elapsed:?}"
     );
+}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn runtime_signal_sender_stops_before_arming() {
+    let _signal_lock = SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _signal_guard = SignalHandlerGuard::install(libc::SIGUSR1);
+
+    for panic_before_run in [true, false] {
+        let armed = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_executor_signal_sender(&armed, &sent, || {
+                assert!(!armed.load(Ordering::Acquire));
+                if panic_before_run {
+                    std::panic::panic_any("injected pre-arm constructor panic");
+                }
+                Err(io::Error::other("injected pre-arm run failure"))
+            });
+        }))
+        .expect_err("pre-arm failure was not propagated");
+
+        assert!(!armed.load(Ordering::Acquire));
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
+        if panic_before_run {
+            assert_eq!(
+                *failure.downcast::<&str>().expect("panic payload changed"),
+                "injected pre-arm constructor panic"
+            );
+        } else {
+            let message = failure
+                .downcast::<String>()
+                .expect("run error payload changed");
+            assert!(message.starts_with("executor run should absorb signal interruptions:"));
+            assert!(message.contains("injected pre-arm run failure"));
+        }
+    }
 }
 
 #[test]

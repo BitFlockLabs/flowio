@@ -2,14 +2,15 @@ mod common;
 
 use common::{
     BoundedTcpListener, BoundedTcpPeer, BoundedTcpStream, DYNAMIC_PROJECTED_PIECES,
-    DropTrackedProjected17, EmptyProjected, OVERSIZED_VECTORED_ERROR, OVERSIZED_VECTORED_IOVECS,
+    DropTrackedProjected17, EmptyProjected, OVERSIZED_VECTORED_IOVECS,
     OVERSIZED_VECTORED_TEST_STACK_BYTES, ProjectedSourceWitness, TestIoBuffMut as IoBuffMut,
     TestProjected, TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
-    connect_bounded_tcp_peer, fill_try_send_buffer, ipv6_loopback_capability_unavailable,
-    lowest_available_fd, make_oversized_read_chain, make_oversized_write_chain, make_payload_chain,
-    make_read_chain, make_read_only_chain, oversized_read_chain_endpoints,
-    oversized_write_chain_endpoints, poll_once_pending, raw_fd_is_open, run_test, run_test_output,
-    set_positive_linger, spawn_bounded_tcp_peer,
+    assert_op_allocation_fault_preserved, assert_vectored_overlimit, connect_bounded_tcp_peer,
+    fill_try_send_buffer, ipv6_loopback_capability_unavailable, lowest_available_fd,
+    make_oversized_read_chain, make_oversized_write_chain, make_payload_chain, make_read_chain,
+    make_read_only_chain, oversized_read_chain_endpoints, oversized_write_chain_endpoints,
+    poll_once_pending, raw_fd_is_open, run_test, run_test_output, set_positive_linger,
+    spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -2742,17 +2743,6 @@ fn runtime_tcp_vectored_overlimit_precedes_op_pressure() {
         return;
     }
 
-    fn assert_overlimit(result: io::Result<usize>, operation: &str) {
-        let err = result.expect_err(operation);
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(err.to_string(), OVERSIZED_VECTORED_ERROR);
-    }
-
-    fn assert_fault_probe(result: io::Result<i32>, operation: &str) {
-        let err = result.expect_err(operation);
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-    }
-
     let (stream, _peer) = connected_try_tcp_stream();
     let mut read_chain = make_oversized_read_chain();
     let read_endpoints = oversized_read_chain_endpoints(&mut read_chain);
@@ -2768,11 +2758,11 @@ fn runtime_tcp_vectored_overlimit_precedes_op_pressure() {
             test_hooks::fail_next_op_alloc();
             let (read_result, returned_read) = stream.readv(read_chain).await;
             let read_probe = Nop::new().await;
-            assert_overlimit(
+            assert_vectored_overlimit(
                 read_result,
                 "over-limit TCP readv should fail intrinsically",
             );
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 read_probe,
                 "TCP readv consumed the forced op-allocation fault",
             );
@@ -2781,11 +2771,11 @@ fn runtime_tcp_vectored_overlimit_precedes_op_pressure() {
             test_hooks::fail_next_op_alloc();
             let (exact_result, returned_read) = stream.readv_exact(read_chain, 1).await;
             let exact_probe = Nop::new().await;
-            assert_overlimit(
+            assert_vectored_overlimit(
                 exact_result,
                 "over-limit TCP readv_exact should fail intrinsically",
             );
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 exact_probe,
                 "TCP readv_exact consumed the forced op-allocation fault",
             );
@@ -2795,7 +2785,7 @@ fn runtime_tcp_vectored_overlimit_precedes_op_pressure() {
             let (zero_result, returned_read) = stream.readv_exact(read_chain, 0).await;
             let zero_probe = Nop::new().await;
             assert_eq!(zero_result.expect("zero-target TCP readv_exact failed"), 0);
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 zero_probe,
                 "zero-target TCP readv_exact consumed the forced op-allocation fault",
             );
@@ -2804,11 +2794,11 @@ fn runtime_tcp_vectored_overlimit_precedes_op_pressure() {
             test_hooks::fail_next_op_alloc();
             let (write_result, write_chain) = stream.writev_all(write_chain).await;
             let write_probe = Nop::new().await;
-            assert_overlimit(
+            assert_vectored_overlimit(
                 write_result,
                 "over-limit TCP writev_all should fail intrinsically",
             );
-            assert_fault_probe(
+            assert_op_allocation_fault_preserved(
                 write_probe,
                 "TCP writev_all consumed the forced op-allocation fault",
             );

@@ -720,6 +720,21 @@ pub const OVERSIZED_VECTORED_TEST_STACK_BYTES: &str = "33554432";
 #[allow(dead_code)]
 pub const OVERSIZED_VECTORED_ERROR: &str = "active iovec count exceeds retained scratch capacity";
 
+/// Asserts intrinsic rejection of an over-limit active-iovec count.
+#[allow(dead_code)]
+pub fn assert_vectored_overlimit(result: io::Result<usize>, operation: &str) {
+    let err = result.expect_err(operation);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(err.to_string(), OVERSIZED_VECTORED_ERROR);
+}
+
+/// Asserts that the forced operation-allocation failure remained for the probe.
+#[allow(dead_code)]
+pub fn assert_op_allocation_fault_preserved(result: io::Result<i32>, operation: &str) {
+    let err = result.expect_err(operation);
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+}
+
 /// Builds a genuine mutable chain with 1,025 active one-byte entries.
 #[allow(dead_code)]
 pub fn make_oversized_read_chain() -> IoBuffVecMut<OVERSIZED_VECTORED_IOVECS> {
