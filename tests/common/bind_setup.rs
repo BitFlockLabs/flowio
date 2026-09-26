@@ -72,7 +72,7 @@ const TCP_ROWS: [Row; 8] = [
     },
 ];
 
-const UDP_ROWS: [Row; 4] = [
+const UDP_ROWS: [Row; 3] = [
     Row {
         api: Api::Udp,
         failure: Some((Socket, libc::EMFILE)),
@@ -80,18 +80,13 @@ const UDP_ROWS: [Row; 4] = [
     },
     Row {
         api: Api::Udp,
-        failure: Some((ReuseAddress, libc::EACCES)),
-        trace: &[Socket, ReuseAddress],
-    },
-    Row {
-        api: Api::Udp,
         failure: Some((Bind, libc::EADDRINUSE)),
-        trace: &[Socket, ReuseAddress, Bind],
+        trace: &[Socket, Bind],
     },
     Row {
         api: Api::Udp,
         failure: None,
-        trace: &[Socket, ReuseAddress, Bind],
+        trace: &[Socket, Bind],
     },
 ];
 
@@ -158,7 +153,7 @@ impl Api {
     }
 }
 
-fn socket_option(fd: RawFd, name: libc::c_int) -> libc::c_int {
+pub(super) fn socket_option(fd: RawFd, name: libc::c_int) -> libc::c_int {
     let mut value: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: `value` is initialized writable storage for the supplied length;
@@ -219,7 +214,10 @@ fn assert_live_socket(socket: &BoundSocket, api: Api, expected_fd: RawFd) {
     let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     assert!(fd_flags >= 0);
     assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
-    assert_eq!(socket_option(fd, libc::SO_REUSEADDR), 1);
+    assert_eq!(
+        socket_option(fd, libc::SO_REUSEADDR),
+        i32::from(!matches!(api, Api::Udp))
+    );
     match api {
         Api::Tcp => {
             assert_eq!(socket_option(fd, libc::SO_ACCEPTCONN), 1);
@@ -229,7 +227,7 @@ fn assert_live_socket(socket: &BoundSocket, api: Api, expected_fd: RawFd) {
             assert_eq!(socket_option(fd, libc::SO_ACCEPTCONN), 1);
             assert_eq!(socket_option(fd, libc::SO_REUSEPORT), 1);
         }
-        Api::Udp => {}
+        Api::Udp => assert_eq!(socket_option(fd, libc::SO_REUSEPORT), 0),
         Api::Sctp => {
             assert_eq!(socket_option(fd, libc::SO_ACCEPTCONN), 1);
             let options =
@@ -327,7 +325,7 @@ pub fn udp() {
         "runtime_udp_bind_setup_failures_recover_exact_descriptors",
         "FLOWIO_UDP_BIND_SETUP_CHILD",
         &UDP_ROWS,
-        4,
+        3,
     );
 }
 

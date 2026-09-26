@@ -87,8 +87,8 @@
 use super::{
     CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, completion_cqe_result,
     current_local_addr, finish_completed_payload_take, get_sock_opt, invalid_data,
-    new_nonblocking_socket, opt_take, set_reuse_addr, set_sock_opt, socket_addr_from_c,
-    socket_addr_to_c, socket_domain, write_msghdr,
+    new_nonblocking_socket, opt_take, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
+    socket_domain, write_msghdr,
 };
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
@@ -146,8 +146,9 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// Binds a UDP socket to the requested local address.
     ///
-    /// This enables `SO_REUSEADDR` before binding. A socket-option failure is
-    /// returned before `bind(2)` is attempted.
+    /// Address and port reuse remain disabled. A live socket owns its local
+    /// address exclusively, including a port selected by a port-zero bind.
+    /// Binding another socket to that address returns [`io::ErrorKind::AddrInUse`].
     ///
     /// This is socket setup work. Keep the bound socket alive for steady-state
     /// datagram I/O rather than rebinding per message.
@@ -163,11 +164,6 @@ impl UdpSocket {
             crate::runtime::test_hooks::bind_setup::BindTransport::Udp,
             fd.as_raw_fd(),
         );
-
-        observe_bind_setup!(
-            Udp, ReuseAddress, errno => Err(io::Error::from_raw_os_error(errno)),
-            set_reuse_addr(fd.as_raw_fd())
-        )?;
 
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
         let bind_res = observe_bind_setup!(

@@ -2431,6 +2431,30 @@ fn runtime_tcp_listener_reuse_port() {
     assert_ne!(addr.port(), 0);
 }
 
+#[cfg(not(miri))]
+#[test]
+fn runtime_tcp_listener_bind_rejects_live_port() {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128)
+        .expect("initial TCP listener bind failed");
+    let addr = listener.local_addr();
+    assert_ne!(addr.port(), 0);
+
+    assert_eq!(
+        bind_setup_support::socket_option(listener.as_raw_fd(), libc::SO_REUSEADDR),
+        1,
+        "TCP must retain address reuse for TIME_WAIT"
+    );
+
+    let error = TcpListener::bind(addr, 128)
+        .err()
+        .expect("a live TCP listener must retain its local port exclusively");
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+    drop(listener);
+    TcpListener::bind(addr, 128)
+        .expect("TCP listener bind must recover after the port owner is dropped");
+}
+
 /// `TcpConnector::default()` produces a working connector identical to `TcpConnector::new()`.
 #[test]
 fn runtime_tcp_connector_default_trait() {

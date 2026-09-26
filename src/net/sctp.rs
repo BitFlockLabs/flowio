@@ -1907,10 +1907,6 @@ fn prepare_connect_slot(
     }
 
     if let Some(local_addr) = local_addr {
-        if let Err(err) = set_reuse_addr(fd.as_raw_fd()) {
-            slot.in_use = false;
-            return Err(err);
-        }
         let (sockaddr, sockaddr_len) = socket_addr_to_c(local_addr);
         let bind_res = unsafe {
             libc::bind(
@@ -2400,9 +2396,11 @@ impl SctpConnector {
 
     /// Pins the connector to a specific local address before connecting.
     ///
-    /// Each connect attempt enables `SO_REUSEADDR` before binding this
-    /// address. Socket-option and bind failures are returned by
-    /// [`SctpConnector::connect`] or [`SctpConnector::connect_timeout`].
+    /// Each connect attempt binds a fresh socket without address or port reuse.
+    /// A conflicting live bind returns [`io::ErrorKind::AddrInUse`]. Bind
+    /// failures preserve the operating-system error and are returned by
+    /// [`SctpConnector::connect`] or [`SctpConnector::connect_timeout`] before
+    /// the returned future is polled.
     pub fn with_local_addr(mut self, addr: SocketAddr) -> Self {
         self.local_addr = Some(addr);
         self
@@ -8300,6 +8298,59 @@ mod tests {
     use crate::runtime::executor::with_ringless_poll_context_for_test;
     use crate::runtime::task::{TaskHeader, TaskVTable};
     use crate::runtime::test_hooks;
+
+    #[cfg(all(not(miri), feature = "test-support"))]
+    #[test]
+    fn sctp_connector_local_bind_rejects_live_port() {
+        let probe = match new_sctp_socket(libc::AF_INET, libc::SOCK_STREAM) {
+            Ok(fd) => {
+                // SAFETY: the capability probe returned one fresh owned descriptor.
+                unsafe { OwnedFd::from_raw_fd(fd) }
+            }
+            Err(error) if test_support::capability_unavailable(&error) => {
+                eprintln!("SCTP capability unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("SCTP capability probe failed: {error}"),
+        };
+        drop(probe);
+        let config = SctpSocketConfig::data(SctpInitConfig::default());
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let mut first = SctpConnector::with_config(config)
+            .with_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        // Preparing an unpolled future holds the local bind without submitting a connect.
+        let held = first
+            .connect(remote)
+            .expect("initial SCTP local bind failed");
+        let addr = current_local_addr(held.slot.fd.as_ref().expect("missing bound fd").as_raw_fd())
+            .expect("bound SCTP local address failed");
+        assert_ne!(addr.port(), 0);
+
+        let mut second = SctpConnector::with_config(config).with_local_addr(addr);
+        let error = second
+            .connect(remote)
+            .err()
+            .expect("a live SCTP connector must retain its local port exclusively");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+
+        drop(held);
+        let rebound = second
+            .connect(remote)
+            .expect("SCTP local bind must recover after the port owner is dropped");
+        assert_eq!(
+            current_local_addr(
+                rebound
+                    .slot
+                    .fd
+                    .as_ref()
+                    .expect("missing rebound fd")
+                    .as_raw_fd()
+            )
+            .expect("rebound SCTP local address failed"),
+            addr
+        );
+    }
 
     #[test]
     fn recovery_fuzz_scenario_seam_exhausts_its_bounded_cross_product() {

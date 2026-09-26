@@ -6523,3 +6523,30 @@ mod bind_setup_support;
 fn runtime_sctp_bind_setup_failures_recover_exact_descriptors() {
     bind_setup_support::sctp();
 }
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_sctp_listener_bind_rejects_live_port() {
+    let config = SctpSocketConfig::data(SctpInitConfig::default());
+    let Some(listener) =
+        bind_sctp_listener_or_skip("runtime_sctp_listener_bind_rejects_live_port", config)
+    else {
+        return;
+    };
+    let addr = listener.local_addr();
+    assert_ne!(addr.port(), 0);
+
+    for result in [
+        SctpListener::bind(addr, 128, SctpInitConfig::default()),
+        SctpListener::bind_with_config(addr, 128, config),
+    ] {
+        let error = result
+            .err()
+            .expect("a live SCTP listener must retain its local port exclusively");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+    }
+    drop(listener);
+    SctpListener::bind_with_config(addr, 128, config)
+        .expect("SCTP listener bind must recover after the port owner is dropped");
+}

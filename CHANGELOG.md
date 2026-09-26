@@ -15,6 +15,14 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** `UdpSocket::bind` leaves `SO_REUSEADDR` disabled. Live UDP
+  sockets retain exclusive local endpoints, including kernel-assigned ephemeral
+  ports; a second bind to an occupied address returns `EADDRINUSE`.
+- **Breaking:** `SctpConnector::with_local_addr` binds without `SO_REUSEADDR`.
+  A live local endpoint cannot be shared by another connector; an occupied
+  address returns `EADDRINUSE` during connect preparation. TCP and SCTP listeners
+  retain address reuse while excluding a second default listener on the same port.
+
 - **Breaking:** TCP and Unix streams use generic `try_read` and `read_exact`
   for `IoBuffMut` append reads. `try_read_append`, `read_exact_append`, and
   `ReadExactAppendFuture` are removed; named future types use

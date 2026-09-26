@@ -246,6 +246,21 @@ fn raw_udp_local_addr(fd: RawFd) -> io::Result<SocketAddr> {
 }
 
 #[test]
+fn runtime_udp_bind_rejects_live_port() {
+    let first =
+        UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("first UDP bind failed");
+    let addr = first.local_addr().expect("first UDP local address failed");
+    assert_ne!(addr.port(), 0);
+    let error = UdpSocket::bind(addr)
+        .err()
+        .expect("second UDP socket shared the first socket's live port");
+    assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+    drop(first);
+    let rebound = UdpSocket::bind(addr).expect("released UDP port could not be rebound");
+    assert_eq!(rebound.local_addr().unwrap(), addr);
+}
+
+#[test]
 fn runtime_udp_wildcard_ipv4_local_addr_reports_kernel_assigned_port() {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
         .expect("wildcard IPv4 UDP bind failed");
