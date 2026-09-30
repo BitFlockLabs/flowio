@@ -46,9 +46,9 @@ fn overlong_question() -> Vec<u8> {
 
 #[test]
 fn malformed_dns_candidates_are_allocation_free() {
-    // The stable gate retains the full allocation-stress load. Under Miri the
-    // same nine malformed parser shapes run enough times for provenance and
-    // undefined-behaviour checking without spending minutes in repetition.
+    // Native runs repeat the nine malformed inputs 16,384 times so any
+    // per-call allocation shows up. Miri runs 16 rounds of the same cases to
+    // check pointer provenance and memory safety.
     const ROUNDS: usize = if cfg!(miri) { 16 } else { 16_384 };
     let overlong_question = overlong_question();
     let malformed: [&[u8]; 9] = [

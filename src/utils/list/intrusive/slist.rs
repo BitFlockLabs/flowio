@@ -8,8 +8,8 @@ macro_rules! debug_assert_slist_sanity {
     ($list:expr) => {{
         let mut slow = ($list).head;
         let mut fast = ($list).head;
-        // This debug-only whole-list oracle is deliberately exhaustive: stop
-        // only at the null terminator or when Floyd's walk finds a cycle.
+        // Debug-only whole-list check with no traversal cap: walk to the null
+        // terminator, and fail if Floyd's cycle detection meets a cycle first.
         while !fast.is_null() {
             unsafe {
                 fast = (*fast).next;
@@ -134,7 +134,7 @@ impl<T> SList<T> {
         }
     }
 
-    /// Alias for [`SList::new`], kept for symmetry with other intrusive
+    /// Alias for [`SList::new`], provided for symmetry with other intrusive
     /// structures that require a later `init`.
     pub const fn new_uninit() -> Self {
         Self::new()

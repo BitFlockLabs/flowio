@@ -9,7 +9,7 @@
 //! reactor close path. A final listener owner released during CQ reclamation
 //! cannot re-enter the borrowed ring, so its nonpositive descriptor moves to
 //! that reactor's bounded post-view close FIFO. Outside an executor, drop
-//! preserves ordinary direct-close behavior.
+//! closes the descriptor directly.
 
 use crate::runtime::executor::{
     CloseAdmission, CloseSubmission, completion_drain_active, has_active_close_context,
@@ -167,11 +167,12 @@ impl Drop for RuntimeFdCore {
 /// One-word, four-byte-aligned owner-thread handle for a descriptor core.
 ///
 /// `core` is the pointer returned by `Rc::into_raw` and therefore owns exactly
-/// one non-atomic strong count. The packed alignment preserves the established
-/// x86-64 public handle layout. Every access copies the pointer with an
-/// unaligned raw read; code must never form a reference to the packed field.
-/// Allocation failure follows `Rc::new` and the process global allocation-error
-/// handler.
+/// one non-atomic strong count. The packed 4-byte alignment keeps `RuntimeFd`
+/// from raising the alignment of the public handles that embed it; on x86-64,
+/// for example, `TcpStream` and `UnixStream` are 8 bytes with 4-byte alignment.
+/// Every access copies the pointer with an unaligned raw read; code must never
+/// form a reference to the packed field. Allocation failure follows `Rc::new`
+/// and the process global allocation-error handler.
 #[repr(C, packed(4))]
 pub(crate) struct RuntimeFd {
     core: NonNull<RuntimeFdCore>,
@@ -319,9 +320,9 @@ impl Drop for RuntimeFd {
 }
 
 // `Cell<bool>` records only monotonic owner-thread provenance. A panic cannot
-// expose a partially updated multi-field invariant through these wrappers, so
-// preserve the previous handle/future `UnwindSafe` contract. `RefUnwindSafe`
-// deliberately remains absent because shared provenance can change.
+// expose a partially updated multi-field invariant through this handle, so
+// `RuntimeFd` implements `UnwindSafe`. `RefUnwindSafe` is not implemented
+// because shared provenance can change.
 impl std::panic::UnwindSafe for RuntimeFd {}
 
 /// Copy, owner-local borrow of one runtime descriptor core.
@@ -403,17 +404,18 @@ pub(crate) enum FdStateDiagnostic {
     Sctp,
 }
 
-/// One-word descriptor-operation state replacing the future's raw state slot.
+/// One-word descriptor-operation state stored in a future's operation-state
+/// slot.
 ///
 /// Before initial submission, an untagged core pointer borrows the parent
 /// descriptor, while tag one owns a staged `Rc::into_raw` lease. After a
 /// successful userspace-SQ push, tags two and three identify a live
 /// [`CompletionState`] submitted from borrowed and owned initial state,
-/// respectively. Retiring a borrowed submission restores its initial
-/// capability so owner-borrowing internal futures can submit a fresh operation;
-/// retiring an owned submission leaves terminal empty state. Thus public
-/// futures retain their established raw-fd field and pointer-word footprint
-/// instead of adding a capability field.
+/// respectively. Retiring a borrowed submission restores its initial capability
+/// so owner-borrowing internal futures can submit a fresh operation; retiring
+/// an owned submission leaves terminal empty state. Public futures therefore
+/// need only their raw-fd field and this one pointer word, with no separate
+/// capability field.
 pub(crate) struct RuntimeFdOpState<'a> {
     tagged: Option<NonNull<()>>,
     _borrow: PhantomData<&'a RuntimeFd>,
@@ -614,8 +616,9 @@ impl<'a> RuntimeFdOpState<'a> {
         let tagged = unsafe { self.tagged.unwrap_unchecked() };
         tagged
             .map_addr(|addr| {
-                // SAFETY: each representation began as an aligned nonzero
-                // allocation pointer; this removes only our low tag bits.
+                // SAFETY: allocation pointers have at least four-byte alignment.
+                // Clearing the low tag bits recovers the nonzero allocation address
+                // and preserves provenance.
                 unsafe { NonZeroUsize::new_unchecked(addr.get() & !Self::TAG_MASK) }
             })
             .cast()
@@ -1416,12 +1419,8 @@ mod policy_tests {
         } else {
             assert!(output.status.success(), "stdout={stdout}, stderr={stderr}");
             assert!(
-                summary.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
-            );
-            assert!(
-                stdout
-                    .lines()
-                    .any(|line| line == format!("test {CHILD_TEST} ... ok"))
+                crate::test_child::exact_test_completed(&output, CHILD_TEST),
+                "stdout={stdout}, stderr={stderr}"
             );
             assert!(
                 panic_headers.next().is_none(),

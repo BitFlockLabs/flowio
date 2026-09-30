@@ -261,6 +261,116 @@ fn runtime_udp_bind_rejects_live_port() {
 }
 
 #[test]
+fn runtime_udp_reuse_port_rejects_zero_port() {
+    for addr in [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+    ] {
+        let error = UdpSocket::bind_reuse_port(addr)
+            .err()
+            .expect("UDP reuse-port bind accepted automatic port selection");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_udp_reuse_port_group_distributes_distinct_flows() {
+    const DATAGRAMS: usize = 64;
+
+    // Both group members bind before the held reservation closes, so another
+    // bind cannot claim the port between selection and group construction.
+    let reservation = bind_setup_support::reserve_udp_reuse_port();
+    let addr = reservation
+        .local_addr()
+        .expect("reserved UDP address failed");
+    assert_ne!(addr.port(), 0);
+    let first = UdpSocket::bind_reuse_port(addr).expect("first UDP group bind failed");
+    let second = UdpSocket::bind_reuse_port(addr).expect("second UDP group bind failed");
+    for socket in [&first, &second] {
+        assert_eq!(socket.local_addr().expect("UDP group address failed"), addr);
+        assert_eq!(
+            bind_setup_support::socket_option(socket.as_raw_fd(), libc::SO_REUSEADDR),
+            0
+        );
+        assert_eq!(
+            bind_setup_support::socket_option(socket.as_raw_fd(), libc::SO_REUSEPORT),
+            1
+        );
+    }
+    drop(reservation);
+    let error = UdpSocket::bind(addr)
+        .err()
+        .expect("exclusive UDP bind joined a reuse-port group");
+    assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+
+    let senders = (0..DATAGRAMS)
+        .map(|_| {
+            let socket = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .expect("distinct UDP sender bind failed");
+            socket
+                .set_nonblocking(true)
+                .expect("UDP sender nonblocking setup failed");
+            socket
+        })
+        .collect::<Vec<_>>();
+    let sources = senders
+        .iter()
+        .map(|sender| sender.local_addr().expect("UDP sender address failed"))
+        .collect::<Vec<_>>();
+    for (index, sender) in senders.iter().enumerate() {
+        assert!(!sources[..index].contains(&sources[index]));
+        assert_eq!(
+            sender
+                .send_to(&[index as u8], addr)
+                .expect("UDP group datagram send failed"),
+            1
+        );
+    }
+
+    let mut executor = Executor::new().expect("UDP group executor creation failed");
+    executor
+        .run(async move {
+            let receivers = [first, second].map(|mut socket| {
+                Executor::spawn(async move {
+                    let mut received = Vec::with_capacity(DATAGRAMS);
+                    let result: Result<(), TimeoutError> = timeout(UDP_TEST_TIMEOUT, async {
+                        loop {
+                            let (result, buffer) = socket.recv_from(vec![0u8; 1], 1).await;
+                            let (length, source) = result.expect("UDP group receive failed");
+                            assert_eq!(length, 1);
+                            assert!(received.len() < DATAGRAMS, "too many UDP group datagrams");
+                            received.push((buffer[0], source));
+                        }
+                    })
+                    .await;
+                    assert_udp_timeout_elapsed(result, "UDP group receive window");
+                    received
+                })
+                .expect("UDP group receiver spawn failed")
+            });
+            let mut seen = [false; DATAGRAMS];
+            let mut total = 0;
+            for receiver in receivers {
+                let received = receiver.await.expect("UDP group receiver task cancelled");
+                assert!(!received.is_empty(), "a UDP group member received no flows");
+                total += received.len();
+                for (id, source) in received {
+                    let index = usize::from(id);
+                    assert!(index < DATAGRAMS, "unexpected UDP datagram identifier");
+                    assert!(!seen[index], "duplicate UDP group datagram");
+                    assert_eq!(source, sources[index]);
+                    seen[index] = true;
+                }
+            }
+            assert_eq!(total, DATAGRAMS);
+            assert!(seen.into_iter().all(|received| received));
+        })
+        .expect("UDP group executor run failed");
+    drop(senders);
+}
+
+#[test]
 fn runtime_udp_wildcard_ipv4_local_addr_reports_kernel_assigned_port() {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
         .expect("wildcard IPv4 UDP bind failed");

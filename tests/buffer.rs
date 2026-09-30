@@ -1,7 +1,8 @@
 mod common;
 
 use common::TestIoBuffMut as IoBuffMut;
-use flowio::runtime::buffer::iobuffvec::{IoBuffVec, IoBuffVecMut};
+use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec, IoBuffVecMut};
+use flowio::runtime::buffer::pool::IoBuffPool;
 use flowio::runtime::buffer::{
     IoBuff, IoBuffError, IoBuffMut as RealIoBuffMut, IoBuffOwnedView, IoBuffReadOnly,
     IoBuffReadWrite, IoBuffView,
@@ -270,11 +271,10 @@ fn buffer_spare_capacity_api_signatures_are_initialization_safe() {
 fn default_initialized_writable_slice_clamps_oversized_request() {
     let mut buffer = DefaultInitializedWritable::new();
 
-    // SAFETY: this deliberately exceeds the documented caller bound to prove
-    // the default implementation's release-mode defensive seam. Native runs
-    // retain initialized guard bytes so the pre-fix implementation fails
-    // deterministically without leaving the allocation; release Miri uses an
-    // exact allocation and therefore also proves the raw write stays bounded.
+    // SAFETY: this exceeds the documented caller bound to check release-mode
+    // clamping. Native runs use initialized guard bytes to detect writes past
+    // the writable range without leaving the allocation. Miri uses an exact
+    // allocation to check that the raw write stays within that range.
     let initialized =
         unsafe { buffer.initialized_writable_slice(DefaultInitializedWritable::OVERSIZED) };
     assert_eq!(initialized.len(), DefaultInitializedWritable::WRITABLE);
@@ -1946,13 +1946,15 @@ fn trait_static_slice_read_only() {
 // ============================================================================
 
 #[test]
-fn buffer_types_are_not_send() {
-    assert_not_impl_any!(RealIoBuffMut: Send);
-    assert_not_impl_any!(IoBuff: Send);
-    assert_not_impl_any!(IoBuffView: Send);
-    assert_not_impl_any!(IoBuffOwnedView: Send);
-    assert_not_impl_any!(IoBuffVecMut<1>: Send);
-    assert_not_impl_any!(IoBuffVec<1>: Send);
+fn buffer_types_are_not_send_or_sync() {
+    assert_not_impl_any!(RealIoBuffMut: Send, Sync);
+    assert_not_impl_any!(IoBuff: Send, Sync);
+    assert_not_impl_any!(IoBuffView: Send, Sync);
+    assert_not_impl_any!(IoBuffOwnedView: Send, Sync);
+    assert_not_impl_any!(IoBuffVecMut<1>: Send, Sync);
+    assert_not_impl_any!(IoBuffVec<1>: Send, Sync);
+    assert_not_impl_any!(IoBuffReadOnlyVec<IoBuff, 1>: Send, Sync);
+    assert_not_impl_any!(IoBuffPool: Send, Sync);
 }
 
 // ============================================================================

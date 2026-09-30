@@ -31,6 +31,25 @@
 //! visible length only within bytes already known to be initialized. Borrowing
 //! spare capacity discards initialization knowledge beyond the visible length.
 //!
+//! [`IoBuffMut`], [`IoBuff`], [`IoBuffView`], [`IoBuffOwnedView`],
+//! [`pool::IoBuffPool`] and the [`iobuffvec::IoBuffVecMut`] /
+//! [`iobuffvec::IoBuffVec`] chains are neither `Send` nor `Sync`; their shared
+//! buffer and pool state uses non-atomic reference counts. Keep them on their
+//! owner thread. [`iobuffvec::IoBuffReadOnlyVec`] is `Send` or `Sync` when its
+//! segment type is.
+//!
+//! # Provided trait implementations
+//!
+//! | Type | [`IoBuffReadOnly`] | [`IoBuffReadWrite`] |
+//! |------|---------------------|----------------------|
+//! | [`IoBuff`] | yes | — |
+//! | [`IoBuffView`] | yes | — |
+//! | [`IoBuffOwnedView`] | yes | — |
+//! | [`IoBuffMut`] | yes | yes |
+//! | `Vec<u8>` | yes | yes |
+//! | `Box<[u8]>` | yes | yes |
+//! | `&'static [u8]` | yes | — |
+//!
 //! # Fast-Path Guidance
 //!
 //! Preferred on the fast path:
@@ -53,8 +72,8 @@
 //! - Avoid [`IoBuff::make_mut`] when the buffer may be shared: that path
 //!   allocates and copies. Keep exclusive [`IoBuffMut`] ownership or use
 //!   [`IoBuff::try_mut`] when copying is not acceptable.
-//! - A vectored chain adds no value for one already-contiguous payload; one
-//!   contiguous buffer represents that layout directly.
+//! - A vectored chain adds no value for one already-contiguous payload; pass
+//!   that payload as one contiguous buffer instead.
 //! - [`IoBuffView`] exposes only a byte range. Keep an [`IoBuff`] or
 //!   [`IoBuffMut`] when later code needs the structured region metadata.
 //!

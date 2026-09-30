@@ -15,7 +15,7 @@
 //!   `Duration::ZERO`, the `try_*` methods attempt one nonblocking syscall on
 //!   the existing socket and return immediately with the rental buffer.
 //! - Use vectored APIs only when data is already segmented. For one
-//!   contiguous payload, the contiguous APIs avoid iovec scratch.
+//!   contiguous payload, the contiguous APIs avoid building an `iovec` array.
 //! - For fixed-shape hot-path buffers, pair TCP with
 //!   [`crate::runtime::buffer::pool::IoBuffPool`].
 //! - Use [`TcpStream::try_clone_for_split`] only during connection setup when
@@ -33,7 +33,7 @@
 //!
 //! On a repeated connection path, prefer [`TcpConnector`] over
 //! [`TcpStream::connect`] / [`TcpStream::connect_timeout`]. It reuses the
-//! connector's slot wrapper, although every attempt still creates and
+//! connector's connect slot, although every attempt still creates and
 //! configures a fresh nonblocking socket.
 //!
 //! The examples below often use `_all` / `_exact` variants because they keep
@@ -278,11 +278,11 @@ fn poll_tcp_connect(slot: &mut ConnectSlot, cx: &mut Context<'_>) -> Poll<io::Re
 /// On the steady-state fast path, keep the stream alive and reuse it for many
 /// reads and writes rather than reconnecting repeatedly.
 ///
-/// The stream is an owner-OS-thread value and is neither [`Send`]
-/// nor [`Sync`].
+/// The stream is an owner-OS-thread value and is neither [`Send`] nor [`Sync`].
 /// An idle stream may be used by another FlowIO executor on that same thread;
-/// once I/O is submitted, its future and completion state remain with the
-/// originating executor through the target completion.
+/// once FlowIO queues I/O for submission, its future and completion state stay
+/// bound to the originating executor until FlowIO observes the operation's own
+/// completion (see [`crate::net`] for exceptional ring abandonment).
 ///
 /// # Example
 /// ```no_run
@@ -362,7 +362,7 @@ impl TcpStream {
     /// close responsibility. After this call, the caller must not close `fd`,
     /// reuse it, or create another owning wrapper for the same descriptor.
     ///
-    /// Calling raw adoption without an explicit safety boundary is rejected:
+    /// Calling it from safe code without an `unsafe` block does not compile:
     /// ```compile_fail
     /// use flowio::net::tcp::TcpStream;
     ///
@@ -522,7 +522,7 @@ impl TcpStream {
     /// outside the crate or invalidating known linger provenance.
     ///
     /// Callers must not leak the descriptor or mutate shared socket options.
-    /// Public raw-descriptor access continues to use [`AsRawFd`] below and
+    /// Public raw-descriptor access goes through [`AsRawFd`] below, which
     /// permanently marks the descriptor's linger state uncertain.
     #[cfg(test)]
     #[inline(always)]
@@ -553,11 +553,10 @@ impl AsRawFd for TcpStream {
 
 impl TcpStream {
     /// Convenience method that creates a one-shot connection to the given
-    /// address. For repeated connections, use [`TcpConnector`] to reuse the
-    /// connector's slot metadata across attempts.
+    /// address. For repeated connections, use [`TcpConnector`], which reuses
+    /// one connect slot across attempts.
     ///
-    /// This is appropriate for an isolated setup-time attempt. For repeated
-    /// attempts, [`TcpConnector`] reuses its slot wrapper.
+    /// This is appropriate for an isolated setup-time attempt.
     pub fn connect(addr: SocketAddr) -> io::Result<OwnedConnectFuture> {
         OwnedConnectFuture::new(addr)
     }
@@ -567,11 +566,10 @@ impl TcpStream {
     /// Returns `TimedOut` if the connection does not complete before the
     /// provided duration elapses. Timer-runtime failures, including
     /// `OutOfMemory`, propagate with their original [`io::ErrorKind`]. For
-    /// repeated outbound connections, prefer [`TcpConnector::connect_timeout`]
-    /// so the connector can reuse its slot metadata across attempts.
+    /// repeated outbound connections, prefer [`TcpConnector::connect_timeout`],
+    /// which reuses the connector's connect slot across attempts.
     ///
-    /// This is appropriate for an isolated timed attempt. For repeated timed
-    /// attempts, reuse [`TcpConnector::connect_timeout`].
+    /// This is appropriate for an isolated timed attempt.
     pub fn connect_timeout(
         addr: SocketAddr,
         timeout_duration: Duration,
@@ -584,12 +582,12 @@ impl TcpStream {
 
 /// TCP connector that reuses one connect slot across attempts.
 ///
-/// The connector reuses its slot storage across attempts. Each attempt creates
-/// a fresh nonblocking socket and prepared peer address, and each submission
-/// still uses the reactor completion-state pool.
+/// Each attempt creates a fresh nonblocking socket and prepares its peer
+/// address. Each submission uses an operation slot, which counts against the
+/// executor's
+/// [`ring_entries`](crate::runtime::reactor::ReactorConfig::ring_entries) capacity.
 ///
-/// Reusing this type avoids rebuilding the slot wrapper for each outbound
-/// attempt. [`TcpStream::connect`] provides a self-contained one-shot future.
+/// [`TcpStream::connect`] provides a self-contained one-shot future.
 ///
 /// # Example
 /// ```no_run
@@ -631,9 +629,9 @@ impl TcpConnector {
     /// Starts connecting to the provided remote address.
     ///
     /// This is the preferred repeated-connection API because it reuses the
-    /// connector-owned slot wrapper. It still creates and configures a fresh
-    /// socket for this attempt. Use [`TcpStream::connect`] for an isolated
-    /// convenience connection.
+    /// connector's connect slot. It still creates and configures a fresh socket
+    /// for this attempt. Use [`TcpStream::connect`] for an isolated convenience
+    /// connection.
     pub fn connect(&mut self, addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
         prepare_connect_slot(&mut self.connect_slot, addr)?;
         Ok(ConnectFuture {
@@ -821,7 +819,7 @@ impl TcpListener {
     ///
     /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
     /// listener's reusable accept slot is still occupied by a previous future
-    /// or if runtime operation capacity cannot accept the submission. A
+    /// or if no operation slot is available. A
     /// `POLLHUP` or `POLLNVAL` readiness with no queued connection latches the
     /// listener and returns [`io::ErrorKind::ConnectionAborted`]. Later accepts
     /// return the same non-retryable kind without another readiness submission.
@@ -844,12 +842,12 @@ impl TcpListener {
     /// A future that reports the occupied-slot error never claims that slot;
     /// later polls park without replacing the previous accept's waiter.
     ///
-    /// Dropping a prepared pending accept cancels only its readiness wait; it
-    /// does not consume a connection already queued in the listener backlog.
-    /// An unprepared future owns no wait, so dropping it leaves the earlier
-    /// accept untouched. If the listener's raw fd is exposed, the caller must
-    /// not concurrently accept from it or race changes to its file-status
-    /// flags.
+    /// Dropping a pending accept that claimed the slot cancels only its
+    /// readiness wait; it does not consume a connection already queued in the
+    /// listener backlog. A future that did not claim the slot owns no wait, so
+    /// dropping it leaves the earlier accept untouched. If the listener's raw
+    /// fd is exposed, the caller must not concurrently accept from it or race
+    /// changes to its file-status flags.
     pub fn accept(&mut self) -> AcceptFuture<'_> {
         let input_error = self.accept_slot.prepare().err();
         let prepared = input_error.is_none();
@@ -882,11 +880,12 @@ impl Drop for TcpListener {
 
 /// Future returned by [`TcpListener::accept`] for one incoming connection.
 ///
-/// It resolves to the connected [`TcpStream`] and its peer address. The
-/// future borrows the listener's reusable accept slot, so a listener can have
-/// at most one live accept future. Dropping a prepared pending future cancels
-/// its readiness wait without consuming a connection from the listener
-/// backlog; dropping an unprepared future cannot affect the earlier owner.
+/// It resolves to the connected [`TcpStream`] and its peer address. The future
+/// borrows the listener's reusable accept slot, so a listener can have at most
+/// one live accept future. Dropping a pending future that claimed the slot
+/// cancels its readiness wait without consuming a connection from the listener
+/// backlog; dropping a future that did not claim the slot cannot affect the
+/// future that holds it.
 ///
 /// # Example
 /// ```no_run
@@ -1020,10 +1019,10 @@ impl Future for ConnectTimeoutFuture<'_> {
 // OwnedConnectFuture
 // ---------------------------------------------------------------------------
 
-/// Self-contained connect future returned by [`TcpStream::connect`].
-/// Owns its socket and prepared address so no external [`TcpConnector`] is
-/// needed. Repeated connections should use [`TcpConnector`] to avoid rebuilding
-/// the reusable slot wrapper.
+/// Self-contained connect future returned by [`TcpStream::connect`]. Owns its
+/// socket and prepared address so no external [`TcpConnector`] is needed.
+/// Repeated connections should use [`TcpConnector`], which reuses one connect
+/// slot across attempts.
 ///
 /// # Example
 /// ```no_run

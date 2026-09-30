@@ -1,68 +1,9 @@
-//! Buffer traits and types for runtime I/O operations.
+//! Buffer types, traits and errors re-exported by the parent `buffer` module.
 //!
-//! The buffer system provides four core buffer types:
-//!
-//! - [`IoBuffMut`] — mutable, exclusively owned. Used for recv/read operations.
-//! - [`IoBuff`] — frozen (immutable), reference-counted, cheaply clonable.
-//!   Used for send/write operations where the same data goes to multiple destinations.
-//! - [`IoBuffView`] — read-only byte subview. Useful for parsing/slicing
-//!   without keeping region structure.
-//! - [`IoBuffOwnedView`] — consuming read-only byte subview that owns the
-//!   original [`IoBuff`] without taking another reference.
-//!
-//! Every buffer has three regions: headroom (for prepending protocol headers),
-//! payload (the main data region), and tailroom (for appending trailers).
-//! The trailing data region is `headroom + payload + tailroom` bytes. Heap-
-//! and pool-backed allocations also contain an [`IoBuffHeader`] before that
-//! region.
-//!
-//! Buffers can be created individually on the heap via [`IoBuffMut::new`], or
-//! from a pool via [`super::pool::IoBuffPool`] for slot reuse without
-//! per-buffer heap allocation once sufficient slab capacity exists.
-//!
-//! All buffer types implement the [`IoBuffReadOnly`] and/or [`IoBuffReadWrite`] traits,
-//! which are the generic interface used by all transport operations.
-//!
-//! The structured FlowIO buffer handles use a non-atomic reference count and
-//! are intentionally single-threaded; they do not implement `Send` or `Sync`.
-//!
-//! # Fast-Path Guidance
-//!
-//! Preferred on the fast path:
-//! - For fixed-shape steady-state transport I/O, prefer
-//!   [`super::pool::IoBuffPool`] plus [`IoBuffMut`] to reuse slots after the
-//!   pool has acquired enough slab capacity.
-//! - Freeze into [`IoBuff`] when data should be reused or fanned out to
-//!   multiple send paths without copying.
-//! - Use [`IoBuff::try_mut`] when a sole-owned frozen buffer should become
-//!   mutable again without allocation or copying.
-//!
-//! Avoid on the fast path:
-//! - Avoid [`IoBuffMut::new`] for fixed-shape steady-state
-//!   buffers. It is the convenience API for heap-backed buffers and is a good
-//!   choice for setup code, tests, and variable-size workloads instead.
-//! - Avoid [`IoBuff::make_mut`] when the buffer may be shared. Its shared path
-//!   allocates a new heap buffer and copies the active regions; keep
-//!   [`IoBuffMut`] exclusive or use [`IoBuff::try_mut`] when copying is not
-//!   acceptable.
-//! - [`IoBuffView`] does not preserve headroom/payload/tailroom boundaries.
-//!   Keep the original [`IoBuff`] or [`IoBuffMut`] when those boundaries or a
-//!   later zero-copy thaw are required.
-//!
-//! The examples below often use [`IoBuffMut::new`] because it keeps the code
-//! short. On the fixed-shape hot path, prefer pool-backed allocation from
-//! [`super::pool::IoBuffPool`].
-//!
-//! # Provided trait implementations
-//!
-//! | Type | [`IoBuffReadOnly`] | [`IoBuffReadWrite`] |
-//! |------|---------------------|----------------------|
-//! | [`IoBuff`] | yes | — |
-//! | [`IoBuffOwnedView`] | yes | — |
-//! | [`IoBuffMut`] | yes | yes |
-//! | `Vec<u8>` | yes | yes |
-//! | `Box<[u8]>` | yes | yes |
-//! | `&'static [u8]` | yes | — |
+//! Structured buffers contain headroom, payload and tailroom after an
+//! allocation header. Heap allocation uses [`IoBuffMut::new`]; the buffer pool
+//! reuses fixed-shape slots after acquiring slab capacity. The parent module
+//! documents ownership, thread restrictions and fast-path choices.
 
 use super::pool::IoBuffPoolInner;
 use crate::runtime::refcount::{decrement_refcount, increment_refcount};
@@ -102,7 +43,7 @@ pub enum IoBuffError {
     PayloadFull,
     /// Vectored buffer chain is already at segment capacity.
     ChainFull,
-    /// Pool/provider failed to allocate backing storage for another buffer.
+    /// A buffer pool or the heap could not allocate backing storage for a buffer.
     AllocFailed,
     /// Buffer pool allocation requested before the pool was initialized.
     PoolNotInitialized,
@@ -286,8 +227,8 @@ pub(crate) fn readable_slice<B: IoBuffReadOnly>(buffer: &B) -> &[u8] {
 /// initialized through [`IoBuffReadWrite::initialized_writable_slice`] must
 /// remain initialized at that base after the returned borrow ends; writing
 /// through that borrow may change byte values but not their initialization.
-/// [`IoBuffReadWrite::write_base_len`] must identify the logical publication
-/// length immediately before that writable base. It must remain stable with
+/// [`IoBuffReadWrite::write_base_len`] must identify the logical base length
+/// used to publish bytes written at this writable base. It must remain stable with
 /// the writable window, and adding any value through `writable_len()` to it
 /// must not overflow `usize`. Calling `set_written_len(write_base_len() + n)`
 /// after the first `n` writable bytes are initialized must preserve the
@@ -316,9 +257,10 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     ///
     /// The runtime snapshots this value before a contiguous receive and adds
     /// the relative completion byte count when publishing positive progress.
-    /// The default is zero, preserving overwrite-style behavior for flat and
-    /// existing custom buffers. Structured append-style buffers override it
-    /// with the length of the readable prefix preceding `as_mut_ptr()`.
+    /// The default is zero: flat buffers and custom implementations that do not
+    /// override it receive only the completed receive's byte count in
+    /// `set_written_len()`. Structured append-style buffers return the logical
+    /// base length for their current writable window.
     #[inline(always)]
     fn write_base_len(&self) -> usize {
         0
@@ -332,9 +274,13 @@ pub unsafe trait IoBuffReadWrite: Unpin + 'static {
     /// the slice. Implementations may avoid rewriting bytes they already know
     /// are initialized, but must preserve the same postconditions.
     ///
-    /// Kernel read paths should continue using [`IoBuffReadWrite::as_mut_ptr`]
-    /// and [`IoBuffReadWrite::writable_len`] directly so fresh capacity does
-    /// not acquire a mandatory initialization pass.
+    /// [`IoBuffMut`] reuses its initialized prefix; `Vec<u8>` initializes only
+    /// bytes beyond its logical length, and `Box<[u8]>` reuses its initialized
+    /// slice storage.
+    ///
+    /// Kernel read paths use [`IoBuffReadWrite::as_mut_ptr`] and
+    /// [`IoBuffReadWrite::writable_len`] directly; raw kernel writes do not
+    /// require writable capacity to be initialized first.
     ///
     /// This does not publish bytes or change the buffer's logical readable
     /// length.
@@ -484,8 +430,9 @@ impl IoBuffHeader {
     }
 
     fn layout(total_data_capacity: usize) -> std::alloc::Layout {
-        // Internal callers only use this after successful checked geometry
-        // construction; keep the infallible form for deallocation paths.
+        // Only `dealloc` calls this, for geometry that already passed
+        // `try_layout` when the buffer was allocated, so the unchecked unwrap
+        // cannot fail.
         let result = Self::try_layout(total_data_capacity);
         debug_assert!(result.is_ok(), "IoBuffHeader layout invariant broken");
         unsafe { result.unwrap_unchecked() }
@@ -1143,10 +1090,10 @@ impl std::ops::DerefMut for IoBuffMut {
 /// Frozen (immutable) buffer with reference-counted sharing.
 ///
 /// `IoBuff` is cheaply clonable — each clone shares the same backing storage
-/// and increments a non-atomic reference count.  Implements [`IoBuffReadOnly`]
-/// only (no mutable access).
-/// The frozen handle preserves structured headroom/payload/tailroom metadata,
-/// so zero-copy `try_mut()` remains exact for full frozen buffers.
+/// and increments a non-atomic reference count. Implements [`IoBuffReadOnly`]
+/// only (no mutable access). The frozen handle keeps the
+/// headroom/payload/tailroom boundaries and active lengths. When it is the sole
+/// owner, [`IoBuff::try_mut`] restores them without allocation or copying.
 ///
 /// Created by calling [`IoBuffMut::freeze`] on a mutable buffer.
 ///
@@ -1445,9 +1392,10 @@ impl std::ops::Deref for IoBuff {
 /// that consume an `IoBuff` and need a narrowed immutable view without the
 /// extra retain/release performed by [`IoBuffView`].
 ///
-/// This type is O(1), zero-copy, allocation-free, and has no public unsafe API.
-/// Internally it keeps the original `IoBuff` alive, so the backing allocation
-/// remains valid for the lifetime of the view.
+/// Creating the view and recovering its original buffer are O(1), zero-copy and
+/// allocation-free; the view has no public unsafe API. Internally it keeps the
+/// original `IoBuff` alive, so the backing allocation remains valid for the
+/// lifetime of the view.
 ///
 /// # Example
 /// ```

@@ -121,8 +121,8 @@ fn zero_answer_many_ignored_records_validate_without_result_reservation() {
     let result = parse_ipv4_response(&packet, QUERY_ID, QUERY_HOST);
     let after = ThreadLocalAllocationSnapshot::current();
     result.expect("valid ignored records should produce an empty successful result");
-    // The echoed question is the sole allocation. The old all-section reserve
-    // added one result-vector allocation and matching deallocation here.
+    // Decoding the echoed question is the sole allocation. Ignored records
+    // need no result-vector allocation or deallocation.
     after.assert_delta_since(before, 1, 1);
 
     let mut malformed = packet;

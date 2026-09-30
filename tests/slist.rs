@@ -82,8 +82,8 @@ fn test_push_front_unchecked_edge_case() {
     let mut list: utils::list::intrusive::slist::SList<Node> =
         utils::list::intrusive::slist::SList::new();
 
-    // Simulate a node coming from a pool where the link might still hold garbage
-    // or old pointers because we bypass `utils::list::intrusive::slist::Link::new_unlinked()` in the hot loop.
+    // A pooled node can retain a stale link when reused without
+    // `Link::new_unlinked()`. `push_front_unchecked` overwrites that link.
     let mut n1 = Node {
         link: utils::list::intrusive::slist::Link {
             next: 0xdeadbeef as *mut _,
@@ -121,7 +121,7 @@ fn test_node_reuse() {
         list.push_front(node_link_ptr(&mut n1));
         let _ = list.pop_front().unwrap();
 
-        // Because pop_front unlinks the node, we can immediately push it back in without panicking.
+        // pop_front unlinks the node, allowing immediate reinsertion.
         list.push_front(node_link_ptr(&mut n1));
         let popped = list.pop_front().unwrap();
         assert_eq!((*popped).value, 1);

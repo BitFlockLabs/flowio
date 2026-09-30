@@ -82,7 +82,9 @@ impl<T: InPlaceInit, P: MemoryProvider + 'static> ProviderOwnedPool<T, P> {
         self.provider.as_ref()
     }
 
-    /// Resets provider counters through a relation-preserving narrow control.
+    /// Clears the provider's debug counters through
+    /// [`ProviderOwnedPoolControl`], which cannot move the provider or
+    /// invalidate its allocations.
     #[inline(always)]
     pub(crate) fn reset_provider_debug_counts(&mut self)
     where

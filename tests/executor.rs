@@ -3101,7 +3101,7 @@ fn runtime_try_spawn_task_too_large_returns_future() {
 }
 
 #[test]
-fn runtime_spawn_preserves_existing_error_mapping() {
+fn runtime_spawn_rejection_returns_invalid_input_and_drops_future() {
     let drops = Rc::new(Cell::new(0usize));
     let polls = Rc::new(Cell::new(0usize));
 
@@ -3111,11 +3111,7 @@ fn runtime_spawn_preserves_existing_error_mapping() {
     };
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(polls.get(), 0);
-    assert_eq!(
-        drops.get(),
-        1,
-        "legacy spawn still consumes rejected futures"
-    );
+    assert_eq!(drops.get(), 1, "spawn drops a future it rejects");
 
     let mut executor = new_executor();
     let oversized_drops = Rc::new(Cell::new(0usize));
@@ -3138,7 +3134,7 @@ fn runtime_spawn_preserves_existing_error_mapping() {
             assert_eq!(
                 oversized_drops_flag.get(),
                 1,
-                "legacy spawn still consumes oversized rejected futures"
+                "spawn drops an oversized future it rejects"
             );
         })
         .expect("executor run failed");
@@ -4162,7 +4158,7 @@ fn runtime_cancel_write_all_mid_flight() {
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
-            "cancelled write_all regression took {elapsed:?}; expected explicit release well below the old ten-second floor"
+            "cancelled write_all regression took {elapsed:?}; expected explicit release in under five seconds"
         );
         return;
     }

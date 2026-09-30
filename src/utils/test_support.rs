@@ -1,14 +1,15 @@
 //! Test-support-only re-export facade.
 //!
-//! The `test-support` feature exposes narrow internal re-exports for
-//! out-of-source integration tests and benchmarks. These paths are not part of
-//! the default production surface.
+//! The `test-support` feature exposes narrow internal re-exports for the
+//! crate's integration tests and benchmark harnesses. These paths are not part
+//! of the default production surface.
 
-/// Bounded subprocess capture for exact test-child watchdogs.
+/// Bounded output capture for a child process that runs one exact test under a
+/// watchdog.
 pub mod child {
     pub use crate::test_child::{
         CapturedChildOutput, ChildCaptureError, ChildCaptureErrorKind, ChildOutputStream,
-        capture_child_with_watchdog,
+        capture_child_with_watchdog, exact_test_completed, run_exact_test_child_with_watchdog,
     };
 }
 
@@ -43,7 +44,7 @@ pub mod utils {
 }
 
 pub mod runtime {
-    /// Opt-in executor-local counters for bounded diagnostic campaigns.
+    /// Opt-in executor-local counters for bounded diagnostic runs.
     #[cfg(feature = "diagnostic-counters")]
     pub mod diagnostics {
         use crate::runtime::executor::Executor;
@@ -51,8 +52,8 @@ pub mod runtime {
 
         /// Takes one executor's counters and resets them to zero.
         ///
-        /// Call this only after [`Executor::run`] returns. Snapshot and reset
-        /// are deliberately separate from the benchmark's timed row.
+        /// Call this only after [`Executor::run`] returns, so the snapshot and
+        /// reset stay outside any timed measurement.
         pub fn take(executor: &mut Executor) -> RuntimeDiagnosticCounters {
             executor.take_diagnostic_counters()
         }
@@ -138,24 +139,24 @@ pub mod net {
     pub mod sctp {
         pub use crate::net::sctp::test_support::{
             SctpRecordRecoverySnapshot, SctpSocketOptionSnapshot, SctpStashedRecvStateSnapshot,
-            append_initialized_test_cmsg, capability_unavailable,
+            append_initialized_test_cmsg, capability_unavailable, require_sctp_capability,
             test_accept_slot_drop_cached_state_preserves_unrelated_fd,
             test_accept_slot_drop_future_preserves_unrelated_fd,
             test_accept_with_established_config_error, test_adaptation_indication_type,
             test_apply_sctp_socket_options, test_assoc_change_type, test_assoc_reset_event_type,
             test_authentication_event_type, test_connect_slot_drop_cached_state_closes_socket_fd,
             test_connect_slot_drop_future_closes_socket_fd, test_construct_sctp_accept_result,
-            test_construct_sctp_connect_result, test_fail_notification_mask_after_query,
-            test_parse_notification, test_parse_recv_meta, test_parse_recv_meta_bare_with_policy,
-            test_parse_recv_meta_with_policy, test_parse_stream_recv_meta,
-            test_partial_delivery_event_type, test_peer_addr_change_type,
-            test_peer_addr_params_rejects_optlen, test_remote_error_type, test_sctp_socket_options,
-            test_sctp_socket_receive_options, test_sctp_stream_apply_unpublished_completion,
-            test_sctp_stream_begin_data_tail, test_sctp_stream_receive_policy,
-            test_sctp_stream_stashed_recv_state, test_send_failed_error_offset,
-            test_send_failed_event_type, test_send_failed_info_offset, test_send_failed_type,
-            test_sender_dry_event_type, test_shutdown_event_type, test_stream_change_event_type,
-            test_stream_reset_event_type,
+            test_construct_sctp_connect_result, test_enable_sctp_pair_reconfiguration,
+            test_fail_notification_mask_after_query, test_parse_notification, test_parse_recv_meta,
+            test_parse_recv_meta_bare_with_policy, test_parse_recv_meta_with_policy,
+            test_parse_stream_recv_meta, test_partial_delivery_event_type,
+            test_peer_addr_change_type, test_peer_addr_params_rejects_optlen,
+            test_remote_error_type, test_sctp_socket_options, test_sctp_socket_receive_options,
+            test_sctp_stream_apply_unpublished_completion, test_sctp_stream_begin_data_tail,
+            test_sctp_stream_receive_policy, test_sctp_stream_stashed_recv_state,
+            test_send_failed_error_offset, test_send_failed_event_type,
+            test_send_failed_info_offset, test_send_failed_type, test_sender_dry_event_type,
+            test_shutdown_event_type, test_stream_change_event_type, test_stream_reset_event_type,
         };
     }
 

@@ -6,25 +6,29 @@
 //! - the caller supplies an owned [`rustls::pki_types::ServerName`]
 //! - TLS handshake driving is explicit via [`TlsClientStream::handshake`]
 //!
-//! The wrapper keeps the socket ownership boundary clear and avoids adding an
-//! extra plaintext buffering layer on top of rustls. The only wrapper-owned
-//! buffers are reusable ciphertext scratch buffers used to move TLS records
-//! between rustls and the underlying TCP stream. If rustls applies plaintext
-//! or handshake-output backpressure partway through one raw read, the read
-//! scratch retains its bounded unfed suffix and resumes it before another
-//! socket read.
-//! A fatal inbound TLS protocol error permanently stops raw transport reads.
-//! Plaintext authenticated before that error remains readable; after it is
-//! drained, reads repeat the detailed `InvalidData` failure. Reads do not
-//! implicitly send the queued fatal alert, so callers can explicitly
-//! [`TlsClientStream::flush`] it before closing the connection.
-//! A direct rustls input-buffer failure also stops raw reads. Its first error
-//! is preserved; later calls return `InvalidData` without an owned payload.
+//! The wrapper takes ownership of the connected TCP stream and adds no
+//! plaintext buffering layer on top of rustls. The only wrapper-owned buffers
+//! are reusable ciphertext scratch buffers used to move TLS records between
+//! rustls and the underlying TCP stream. If rustls applies plaintext or
+//! handshake-output backpressure partway through one raw read, the read scratch
+//! retains its bounded unfed suffix and resumes it before another socket read.
+//! After an authenticated `close_notify`, bytes following it in the same raw
+//! read are discarded. After a fatal inbound TLS failure the stream stops
+//! reading the transport; [`TlsClientStream`] documents how authenticated
+//! plaintext, repeated errors, and the queued fatal alert are handled.
 //!
 //! `rustls` still has its own internal protocol buffers. This wrapper exposes
 //! the public `rustls` write-direction limit via [`TlsClientOptions`] so that
 //! buffering stays explicit and caller-controlled instead of silently relying
 //! on crate defaults.
+//!
+//! Plaintext reads call [`IoBuffReadWrite::initialized_writable_slice`] once
+//! for each nonempty destination that reaches plaintext polling, before rustls
+//! receives a mutable byte slice. Kernel reads use raw writable capacity
+//! without that initialization pass. A write whose source has an empty
+//! readable window never inspects the source's raw pointer; it follows normal
+//! context, stream-state, and ciphertext-flush handling and returns zero on
+//! success.
 //!
 //! # Fast-Path Guidance
 //!
@@ -400,18 +404,12 @@ unsafe fn tls_userspace_destination<'a, B: IoBuffReadWrite>(
 /// This type intentionally does not implement `Default` so callers must make
 /// the buffering decision explicitly.
 ///
-/// `transport_read_buffer_size` is the nonzero requested reusable ciphertext
-/// scratch bound. The stored effective raw-read bound and reservation request
-/// are the smaller of the requested value and 18,437 bytes (the maximum TLS
-/// wire-record byte bound), so internal rustls ciphertext and plaintext
-/// staging is drained between bounded transport feeds. The allocator may
-/// provide a larger `Vec` capacity, but that spare capacity never enlarges a
-/// raw read.
-/// `transport_write_buffer_size` is the nonzero hard bound for each reusable
-/// ciphertext chunk collected from rustls before writing it to the socket.
-/// Rustls output beyond that bound is drained only after the current owned
-/// chunk is fully submitted. Both capacities must fit in `isize` and are
-/// reserved fallibly when the wrapper is created.
+/// Both transport buffer sizes must be nonzero and fit in `isize`; the wrapper
+/// reserves both buffers fallibly when it is created. FlowIO processes buffered
+/// ciphertext and plaintext before feeding another bounded transport read.
+/// Further rustls output is drained only after the current ciphertext chunk is
+/// fully submitted. See the fields below for the read and write bounds. A
+/// smaller write-chunk bound can require more raw TCP writes.
 ///
 /// For steady-state use, pick values once per connection profile and reuse
 /// them. Recomputing or reallocating these choices per operation is not the
@@ -474,9 +472,9 @@ pub struct TlsClientOptions {
 /// # Cancellation semantics
 /// Dropping a `handshake`, `read`, `write`, `flush`, or `shutdown` future does
 /// not discard already-started raw transport work. Any in-flight TLS record
-/// read/write remains owned by the stream and will be resumed or retired by
-/// the next TLS operation. This keeps TLS record handling correct without
-/// introducing background threads or a broader transport abstraction.
+/// read/write remains owned by the stream and will be resumed or retired by the
+/// next TLS operation. This keeps TLS record handling correct without adding a
+/// TLS-specific background thread.
 ///
 /// Every live TLS future poll validates that its waker belongs to the active
 /// FlowIO executor before it completes locally or touches rustls or staged raw
@@ -919,14 +917,14 @@ impl TlsClientStream {
     /// Returns `NotConnected` if called before handshake completion or polled
     /// without its active FlowIO executor task context, and `BrokenPipe` if
     /// logical TLS write shutdown has begun, physical transport-write shutdown
-    /// has completed, or a prior outbound ciphertext drain failed. Within
-    /// these write-state checks, a prior transport-write failure retains
-    /// precedence over either shutdown state. Shutdown rejection returns the
-    /// exact source owner before plaintext admission or scratch mutation.
-    /// If rustls accepts plaintext but the following TLS-record flush fails,
-    /// this future returns an error without a progress count; the stream is
-    /// failed and callers must not retry the same plaintext on it.
-    /// An invalid-context repoll after an earlier valid poll can instead return
+    /// has completed, or a prior outbound ciphertext drain failed. Within these
+    /// write-state checks, a prior transport-write failure retains precedence
+    /// over either shutdown state. Shutdown rejection returns the caller's
+    /// buffer before any plaintext reaches rustls or the ciphertext buffers
+    /// change. If rustls accepts plaintext but the following TLS-record flush
+    /// fails, this future returns an error without a progress count; the stream
+    /// is failed and callers must not retry the same plaintext on it. An
+    /// invalid-context repoll after an earlier valid poll can instead return
     /// the source while its ciphertext remains staged; callers must not retry
     /// that source because a later valid TLS operation resumes the raw write.
     ///
@@ -943,17 +941,17 @@ impl TlsClientStream {
     /// Returns `NotConnected` if called before handshake completion or polled
     /// without its active FlowIO executor task context, and `BrokenPipe` if
     /// logical TLS write shutdown has begun, physical transport-write shutdown
-    /// has completed, or a prior outbound ciphertext drain failed. Within
-    /// these write-state checks, a prior transport-write failure retains
-    /// precedence over either shutdown state. Shutdown rejection returns the
-    /// exact source owner before plaintext admission or scratch mutation.
-    /// If rustls accepts plaintext but a later TLS-record flush fails, this
-    /// future returns an error even though some plaintext may already be queued
-    /// as TLS records; the stream is failed and callers must not retry the
-    /// same plaintext on it.
-    /// An invalid-context repoll after an earlier valid poll can instead return
-    /// the source while its ciphertext remains staged; callers must not retry
-    /// that source because a later valid TLS operation resumes the raw write.
+    /// has completed, or a prior outbound ciphertext drain failed. Within these
+    /// write-state checks, a prior transport-write failure retains precedence
+    /// over either shutdown state. Shutdown rejection returns the caller's
+    /// buffer before any plaintext reaches rustls or the ciphertext buffers
+    /// change. If rustls accepts plaintext but a later TLS-record flush fails,
+    /// this future returns an error even though some plaintext may already be
+    /// queued as TLS records; the stream is failed and callers must not retry
+    /// the same plaintext on it. An invalid-context repoll after an earlier
+    /// valid poll can instead return the source while its ciphertext remains
+    /// staged; callers must not retry that source because a later valid TLS
+    /// operation resumes the raw write.
     ///
     /// This complete-buffer API repeatedly offers plaintext to rustls until
     /// the full input is accepted. Avoid that loop when complete-buffer

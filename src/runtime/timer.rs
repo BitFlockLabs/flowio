@@ -18,7 +18,7 @@
 //! - Compute one absolute phase deadline and use [`timeout_at`] when several
 //!   operations share the same budget.
 //! - Account for timer storage explicitly: entries are acquired in fixed
-//!   1024-entry slabs, but there is currently no user-configurable total timer
+//!   1024-entry slabs, but there is no user-configurable total timer
 //!   cap.
 //!
 //! Avoid on the fast path:

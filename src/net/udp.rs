@@ -87,8 +87,8 @@
 use super::{
     CompletionTake, MsgHdrInit, checked_read_len, checked_send_len, completion_cqe_result,
     current_local_addr, finish_completed_payload_take, get_sock_opt, invalid_data,
-    new_nonblocking_socket, opt_take, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
-    socket_domain, write_msghdr,
+    new_nonblocking_socket, opt_take, set_reuse_port, set_sock_opt, socket_addr_from_c,
+    socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::complete_read_with_progress;
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
@@ -115,11 +115,11 @@ use std::task::{Context, Poll};
 /// fixed-peer fast path. Use `recv_msg` on connected sockets when the caller
 /// must reject truncated datagrams.
 ///
-/// The socket is an owner-OS-thread value and is neither [`Send`]
-/// nor [`Sync`].
+/// The socket is an owner-OS-thread value and is neither [`Send`] nor [`Sync`].
 /// An idle socket may be used by another FlowIO executor on that same thread;
-/// once I/O is submitted, its future and completion state remain with the
-/// originating executor through the target completion.
+/// once FlowIO queues I/O for submission, its future and completion state stay
+/// bound to the originating executor until FlowIO observes the operation's own
+/// completion (see [`crate::net`] for exceptional ring abandonment).
 ///
 /// # Example
 /// ```no_run
@@ -153,6 +153,37 @@ impl UdpSocket {
     /// This is socket setup work. Keep the bound socket alive for steady-state
     /// datagram I/O rather than rebinding per message.
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_inner(addr, false)
+    }
+
+    /// Binds a UDP socket with `SO_REUSEPORT`, leaving `SO_REUSEADDR` disabled.
+    ///
+    /// Every member of the group must use this method with the same explicit
+    /// local address and port and the same effective user ID. The kernel
+    /// distributes incoming datagrams among unconnected members by flow hash.
+    /// [`Self::bind`] binds exclusively.
+    ///
+    /// Choose a port outside the kernel's ephemeral range (`ip_local_port_range`)
+    /// or listed in `ip_local_reserved_ports`, so automatic UDP port assignment
+    /// does not select the group's port.
+    ///
+    /// This is socket setup work, not part of per-datagram I/O.
+    ///
+    /// # Errors
+    ///
+    /// Port zero returns [`io::ErrorKind::InvalidInput`] before a socket is
+    /// created: automatic UDP port selection can select a port already held
+    /// by another reuse-port group. Choose an explicit port for the group.
+    /// If enabling `SO_REUSEPORT` fails, the new socket is closed and the
+    /// operating system's error is returned.
+    pub fn bind_reuse_port(addr: SocketAddr) -> io::Result<Self> {
+        if addr.port() == 0 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        Self::bind_inner(addr, true)
+    }
+
+    fn bind_inner(addr: SocketAddr, reuse_port: bool) -> io::Result<Self> {
         let raw_fd = observe_bind_setup!(
             Udp, Socket, errno => Err(io::Error::from_raw_os_error(errno)),
             new_nonblocking_socket(socket_domain(addr), libc::SOCK_DGRAM)
@@ -164,6 +195,13 @@ impl UdpSocket {
             crate::runtime::test_hooks::bind_setup::BindTransport::Udp,
             fd.as_raw_fd(),
         );
+
+        if reuse_port {
+            observe_bind_setup!(
+                Udp, ReusePort, errno => Err(io::Error::from_raw_os_error(errno)),
+                set_reuse_port(fd.as_raw_fd())
+            )?;
+        }
 
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
         let bind_res = observe_bind_setup!(
@@ -363,6 +401,10 @@ impl UdpSocket {
     /// Starts one connected send from the provided buffer.
     ///
     /// This omits per-datagram destination handling on a connected socket.
+    /// After owner-context validation, a source longer than the io_uring
+    /// 32-bit byte-count limit returns [`io::ErrorKind::InvalidInput`] before
+    /// pointer access or submission. An empty source is submitted as a
+    /// zero-length datagram.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B> {
         let mut input_error = None;
         let len = match checked_send_len(buffer.len()) {
@@ -708,8 +750,9 @@ fn udp_future_is_fused<T>(fd_state: &RuntimeFdOpState<'_>, buffer: &Option<T>) -
 
 #[doc(hidden)]
 pub struct RecvFuture<'a, B: IoBuffReadWrite> {
-    /// Connected descriptor snapshot retained in the established layout.
-    /// SQE construction derives the live descriptor from `fd_state`.
+    /// Connected descriptor number captured at construction; debug builds check
+    /// it against `fd_state`. SQE construction derives the live descriptor from
+    /// `fd_state`.
     fd: RawFd,
     /// Borrowed descriptor capability before submission, then completion state.
     fd_state: RuntimeFdOpState<'a>,
@@ -815,8 +858,9 @@ impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct RecvMsgFuture<'a, B: IoBuffReadWrite> {
-    /// Connected descriptor snapshot retained in the established layout.
-    /// SQE construction derives the live descriptor from `fd_state`.
+    /// Connected descriptor number captured at construction; debug builds check
+    /// it against `fd_state`. SQE construction derives the live descriptor from
+    /// `fd_state`.
     fd: RawFd,
     /// Borrowed descriptor capability before submission, then completion state.
     fd_state: RuntimeFdOpState<'a>,
@@ -932,8 +976,9 @@ impl<B: IoBuffReadWrite> Drop for RecvMsgFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct SendFuture<'a, B: IoBuffReadOnly> {
-    /// Connected descriptor snapshot retained in the established layout.
-    /// SQE construction derives the live descriptor from `fd_state`.
+    /// Connected descriptor number captured at construction; debug builds check
+    /// it against `fd_state`. SQE construction derives the live descriptor from
+    /// `fd_state`.
     fd: RawFd,
     /// Borrowed descriptor capability before submission, then completion state.
     fd_state: RuntimeFdOpState<'a>,
@@ -1030,10 +1075,10 @@ impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct RecvFromFuture<'a, B: IoBuffReadWrite> {
-    /// Descriptor snapshot retained in the established layout for the
-    /// explicit-peer `recvmsg` path. The socket may also be connected; this
-    /// API still asks the kernel for the source address. SQE construction
-    /// derives the live descriptor from `fd_state`.
+    /// Descriptor number captured at construction for the explicit-peer
+    /// `recvmsg` path; debug builds check it against `fd_state`. The socket may
+    /// also be connected; this API still asks the kernel for the source
+    /// address. SQE construction derives the live descriptor from `fd_state`.
     fd: RawFd,
     /// Borrowed descriptor capability before submission, then completion state.
     fd_state: RuntimeFdOpState<'a>,
@@ -1155,10 +1200,10 @@ impl<B: IoBuffReadWrite> Drop for RecvFromFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct SendToFuture<'a, B: IoBuffReadOnly> {
-    /// Descriptor snapshot retained in the established layout for the
-    /// explicit-destination `sendmsg` path. The socket may also be connected;
-    /// this API still sends to the provided destination address. SQE
-    /// construction derives the live descriptor from `fd_state`.
+    /// Descriptor number captured at construction for the explicit-destination
+    /// `sendmsg` path; debug builds check it against `fd_state`. The socket may
+    /// also be connected; this API still sends to the provided destination
+    /// address. SQE construction derives the live descriptor from `fd_state`.
     fd: RawFd,
     /// Borrowed descriptor capability before submission, then completion state.
     fd_state: RuntimeFdOpState<'a>,

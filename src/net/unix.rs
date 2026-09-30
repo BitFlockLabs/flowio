@@ -7,7 +7,7 @@
 //!   perform one contiguous submission and return short reads or writes to the
 //!   caller.
 //! - Use vectored APIs only when data is already segmented. For one
-//!   contiguous payload, the contiguous APIs avoid iovec scratch.
+//!   contiguous payload, the contiguous APIs avoid building an `iovec` array.
 //! - For fixed-shape hot-path buffers, pair Unix stream I/O with
 //!   [`crate::runtime::buffer::pool::IoBuffPool`].
 //!
@@ -24,8 +24,9 @@
 //! framing simple in documentation. On the hot path, prefer the partial-I/O
 //! APIs when the caller can handle progress explicitly.
 //!
-//! Setup uses the immediate [`UnixStream::pair`] API; once connected, the
-//! asynchronous stream I/O surface has TCP parity.
+//! Setup uses the immediate [`UnixStream::pair`] API; once connected, a Unix
+//! stream provides the same asynchronous stream I/O methods as
+//! [`TcpStream`](crate::net::tcp::TcpStream).
 //!
 //! # Example
 //! ```no_run
@@ -125,11 +126,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 /// On the steady-state fast path, keep the stream alive and reuse it for many
 /// reads and writes rather than reconstructing it around each operation.
 ///
-/// The stream is an owner-OS-thread value and is neither [`Send`]
-/// nor [`Sync`].
+/// The stream is an owner-OS-thread value and is neither [`Send`] nor [`Sync`].
 /// An idle stream may be used by another FlowIO executor on that same thread;
-/// once I/O is submitted, its future and completion state remain with the
-/// originating executor through the target completion.
+/// once FlowIO queues I/O for submission, its future and completion state stay
+/// bound to the originating executor until FlowIO observes the operation's own
+/// completion (see [`crate::net`] for exceptional ring abandonment).
 ///
 /// # Example
 /// ```no_run
@@ -237,7 +238,7 @@ impl UnixStream {
     /// close responsibility. After this call, the caller must not close `fd`,
     /// reuse it, or create another owning wrapper for the same descriptor.
     ///
-    /// Calling raw adoption without an explicit safety boundary is rejected:
+    /// Calling it from safe code without an `unsafe` block does not compile:
     /// ```compile_fail
     /// use flowio::net::unix::UnixStream;
     ///

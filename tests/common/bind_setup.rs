@@ -8,7 +8,7 @@ use flowio::test_support::net::bind_setup::{BindSetupReport, BindStage, BindTran
 use flowio::test_support::net::sctp::test_sctp_socket_options;
 use std::fs::File;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
@@ -17,7 +17,9 @@ enum Api {
     Tcp,
     TcpReusePort,
     Udp,
+    UdpReusePort,
     Sctp,
+    SctpReusePort,
 }
 
 #[derive(Clone, Copy)]
@@ -72,7 +74,7 @@ const TCP_ROWS: [Row; 8] = [
     },
 ];
 
-const UDP_ROWS: [Row; 3] = [
+const UDP_ROWS: [Row; 5] = [
     Row {
         api: Api::Udp,
         failure: Some((Socket, libc::EMFILE)),
@@ -88,9 +90,19 @@ const UDP_ROWS: [Row; 3] = [
         failure: None,
         trace: &[Socket, Bind],
     },
+    Row {
+        api: Api::UdpReusePort,
+        failure: Some((ReusePort, libc::ENOPROTOOPT)),
+        trace: &[Socket, ReusePort],
+    },
+    Row {
+        api: Api::UdpReusePort,
+        failure: None,
+        trace: &[Socket, ReusePort, Bind],
+    },
 ];
 
-const SCTP_ROWS: [Row; 7] = [
+const SCTP_ROWS: [Row; 9] = [
     Row {
         api: Api::Sctp,
         failure: Some((Socket, libc::EMFILE)),
@@ -126,6 +138,24 @@ const SCTP_ROWS: [Row; 7] = [
         failure: None,
         trace: &[Socket, Configure, ReuseAddress, Bind, Listen, LocalAddress],
     },
+    Row {
+        api: Api::SctpReusePort,
+        failure: Some((ReusePort, libc::ENOPROTOOPT)),
+        trace: &[Socket, Configure, ReuseAddress, ReusePort],
+    },
+    Row {
+        api: Api::SctpReusePort,
+        failure: None,
+        trace: &[
+            Socket,
+            Configure,
+            ReuseAddress,
+            ReusePort,
+            Bind,
+            Listen,
+            LocalAddress,
+        ],
+    },
 ];
 
 enum BoundSocket {
@@ -138,8 +168,8 @@ impl Api {
     fn transport(self) -> BindTransport {
         match self {
             Self::Tcp | Self::TcpReusePort => BindTransport::Tcp,
-            Self::Udp => BindTransport::Udp,
-            Self::Sctp => BindTransport::Sctp,
+            Self::Udp | Self::UdpReusePort => BindTransport::Udp,
+            Self::Sctp | Self::SctpReusePort => BindTransport::Sctp,
         }
     }
 
@@ -148,9 +178,39 @@ impl Api {
             Self::Tcp => TcpListener::bind(addr, 8).map(BoundSocket::Tcp),
             Self::TcpReusePort => TcpListener::bind_reuse_port(addr, 8).map(BoundSocket::Tcp),
             Self::Udp => UdpSocket::bind(addr).map(BoundSocket::Udp),
+            Self::UdpReusePort => UdpSocket::bind_reuse_port(addr).map(BoundSocket::Udp),
             Self::Sctp => SctpListener::bind_with_config(addr, 8, config).map(BoundSocket::Sctp),
+            Self::SctpReusePort => {
+                SctpListener::bind_reuse_port_with_config(addr, 8, config).map(BoundSocket::Sctp)
+            }
         }
     }
+}
+
+pub(super) fn reserve_udp_reuse_port() -> StdUdpSocket {
+    // Claim an exclusive automatic port before enabling sharing on the held
+    // reservation, so group construction does not leave the port unbound.
+    let reservation = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("exclusive UDP port reservation failed");
+    let enabled: libc::c_int = 1;
+    // SAFETY: The descriptor is owned by the live reservation, and the option
+    // points to one initialized integer for the duration of setsockopt.
+    let rc = unsafe {
+        libc::setsockopt(
+            reservation.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "UDP port reservation could not permit group membership: {}",
+        io::Error::last_os_error()
+    );
+    reservation
 }
 
 pub(super) fn socket_option(fd: RawFd, name: libc::c_int) -> libc::c_int {
@@ -216,7 +276,7 @@ fn assert_live_socket(socket: &BoundSocket, api: Api, expected_fd: RawFd) {
     assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
     assert_eq!(
         socket_option(fd, libc::SO_REUSEADDR),
-        i32::from(!matches!(api, Api::Udp))
+        i32::from(!matches!(api, Api::Udp | Api::UdpReusePort))
     );
     match api {
         Api::Tcp => {
@@ -227,8 +287,15 @@ fn assert_live_socket(socket: &BoundSocket, api: Api, expected_fd: RawFd) {
             assert_eq!(socket_option(fd, libc::SO_ACCEPTCONN), 1);
             assert_eq!(socket_option(fd, libc::SO_REUSEPORT), 1);
         }
-        Api::Udp => assert_eq!(socket_option(fd, libc::SO_REUSEPORT), 0),
-        Api::Sctp => {
+        Api::Udp | Api::UdpReusePort => assert_eq!(
+            socket_option(fd, libc::SO_REUSEPORT),
+            i32::from(matches!(api, Api::UdpReusePort))
+        ),
+        Api::Sctp | Api::SctpReusePort => {
+            assert_eq!(
+                socket_option(fd, libc::SO_REUSEPORT),
+                i32::from(matches!(api, Api::SctpReusePort))
+            );
             assert_eq!(socket_option(fd, libc::SO_ACCEPTCONN), 1);
             let options =
                 test_sctp_socket_options(fd).expect("real configured SCTP listener options");
@@ -247,9 +314,23 @@ fn run_rows(rows: &[Row], expected_rows: usize) {
     assert_eq!(fd_observation::process_fd_count(), initial + 1);
     let mut completed = 0;
     for &row in rows {
+        assert_eq!(fd_observation::process_fd_count(), initial + 1);
+        // Keep the failure row's reservation exclusive so an unintended bind
+        // cannot join another process's group. The success row permits sharing
+        // while the reservation holds its explicit address.
+        let reservation = matches!(row.api, Api::UdpReusePort).then(|| {
+            if row.failure.is_some() {
+                StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve UDP failure address")
+            } else {
+                reserve_udp_reuse_port()
+            }
+        });
         let baseline = fd_observation::process_fd_count();
-        assert_eq!(baseline, initial + 1);
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        assert_eq!(baseline, initial + 1 + usize::from(reservation.is_some()));
+        let addr = reservation.as_ref().map_or_else(
+            || SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            |socket| socket.local_addr().expect("reserved UDP local address"),
+        );
         let config = SctpSocketConfig::data(SctpInitConfig::default());
         let probe = arm(row.api.transport(), row.failure);
         let expected_fd = crate::common::lowest_available_fd();
@@ -288,6 +369,8 @@ fn run_rows(rows: &[Row], expected_rows: usize) {
             (Some(_), Ok(_socket)) => panic!("injected setup failure unexpectedly succeeded"),
             (None, Err(error)) => panic!("real {:?} setup must succeed: {error}", row.api),
         }
+        drop(reservation);
+        assert_eq!(fd_observation::process_fd_count(), initial + 1);
         completed += 1;
     }
     assert_eq!(completed, expected_rows);
@@ -299,11 +382,10 @@ fn run_rows(rows: &[Row], expected_rows: usize) {
 
 fn run(test_name: &str, child_env: &str, rows: &[Row], expected_rows: usize) {
     if std::env::var_os(child_env).is_none() {
-        crate::common::run_exact_test_child_with_watchdog_env(
+        crate::common::run_exact_test_child_with_watchdog(
             test_name,
             child_env,
             Duration::from_secs(30),
-            &[("RUST_TEST_THREADS", "1")],
         );
         return;
     }
@@ -321,11 +403,32 @@ pub fn tcp() {
 }
 
 pub fn udp() {
+    if std::env::var_os("FLOWIO_UDP_BIND_SETUP_CHILD").is_some() {
+        for addr in [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+        ] {
+            let probe = arm(BindTransport::Udp, Some((Socket, libc::EMFILE)));
+            let error = UdpSocket::bind_reuse_port(addr)
+                .err()
+                .expect("UDP reuse-port must reject automatic port selection");
+            let report = probe.finish();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(report.trace_len, 0);
+            assert!(report.trace.iter().all(Option::is_none));
+            assert_eq!(report.socket_fd, None);
+            assert_eq!(report.injections, 0);
+            assert!(report.failure_pending);
+            assert!(!report.trace_overflow);
+            assert!(!report.unexpected_transport);
+            assert!(!report.invalid_socket_report);
+        }
+    }
     run(
         "runtime_udp_bind_setup_failures_recover_exact_descriptors",
         "FLOWIO_UDP_BIND_SETUP_CHILD",
         &UDP_ROWS,
-        3,
+        5,
     );
 }
 
@@ -334,6 +437,6 @@ pub fn sctp() {
         "runtime_sctp_bind_setup_failures_recover_exact_descriptors",
         "FLOWIO_SCTP_BIND_SETUP_CHILD",
         &SCTP_ROWS,
-        7,
+        9,
     );
 }

@@ -564,7 +564,7 @@ unsafe fn release_shutdown_waiter(waiter: *mut TaskHeader, first_panic: &mut Opt
     );
 }
 
-/// User-facing `io_uring` setup configuration embedded inside
+/// `io_uring` setup configuration embedded inside
 /// [`crate::runtime::executor::ExecutorConfig`].
 ///
 /// This is construction-time configuration, not a per-operation data fast-path
@@ -985,8 +985,9 @@ impl Reactor {
     ///
     /// A valid plain socket-close SQE removes its fd-table entry while the
     /// kernel consumes the SQE. Until this function suppresses the matching
-    /// `OwnedFd`, that numeric fd may already be reusable. Keep this loop free
-    /// of allocation, callbacks, logging, and panic-capable invariant checks.
+    /// `OwnedFd`, that numeric fd may already be reusable, so the retirement
+    /// loop performs no allocation, callbacks, logging, or panic-capable
+    /// invariant checks.
     #[inline(always)]
     fn retire_submitted(&mut self, submitted: usize) -> io::Result<()> {
         let old_head = self.queued_head;
@@ -1558,8 +1559,8 @@ impl Reactor {
                 let args = types::SubmitArgs::new().timespec(&timespec);
                 match self.submit_with_args(1, &args) {
                     // `flush_sqes` emptied the userspace SQ before this wait.
-                    // Keep this cheap check as defense if a future submit
-                    // wrapper can leave an unconsumed suffix.
+                    // This cheap defensive check reports `Busy` if the submit
+                    // call leaves an unconsumed suffix.
                     Ok(_) if self.has_queued_sqes() => {
                         return Ok(ReactorSubmitStatus::Busy);
                     }
@@ -6169,33 +6170,12 @@ mod tests {
     #[test]
     fn wait_for_events_duration_max_uses_bounded_kernel_timespec() {
         if std::env::var_os(KERNEL_TIMESPEC_CHILD_ENV).is_none() {
-            use std::process::{Command, Stdio};
-
-            let current_exe = std::env::current_exe().expect("current unit-test executable");
-            let child = Command::new(current_exe)
-                .args(["--exact", KERNEL_TIMESPEC_CHILD_TEST, "--nocapture"])
-                .env(KERNEL_TIMESPEC_CHILD_ENV, "1")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn bounded-timespec child");
-            let output =
-                crate::test_child::capture_child_with_watchdog(child, Duration::from_secs(8))
-                    .unwrap_or_else(|err| panic!("bounded-timespec child capture failed: {err}"));
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success(),
-                "bounded-timespec child failed: status={:?}, stdout={}, stderr={}",
-                output.status,
-                stdout,
-                stderr
-            );
-            assert!(
-                stdout.contains("1 passed;"),
-                "bounded-timespec child did not run exactly one test: stdout={}, stderr={}",
-                stdout,
-                stderr
+            crate::test_child::run_exact_test_child_with_watchdog(
+                KERNEL_TIMESPEC_CHILD_TEST,
+                KERNEL_TIMESPEC_CHILD_ENV,
+                Duration::from_secs(8),
+                &[],
+                "bounded-timespec",
             );
             return;
         }

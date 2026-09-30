@@ -47,7 +47,8 @@ pub const SLAB_LINK_ALIGN: usize = std::mem::align_of::<utils::list::intrusive::
 /// pool free list instead. Its raw cursor and link fields are intentionally
 /// opaque so safe feature consumers cannot forge allocator state.
 ///
-/// The type remains available for alignment and pointer-based test support:
+/// The `test-support` feature exports the type for alignment and pointer-based
+/// tests:
 ///
 /// ```
 /// use flowio::test_support::utils::memory::slab::Slab;
@@ -116,9 +117,10 @@ pub(crate) struct SlabPageAlloc {
 
 /// Move-safe owner of a singly-linked chain of slab pages.
 ///
-/// The chain uses each slab header's intrusive `link.next` pointer, avoiding
-/// self-referential sentinels while giving pools one shared implementation for
-/// current-page bump allocation, page growth, and teardown.
+/// The chain uses each slab header's intrusive `link.next` pointer, so it has
+/// no self-referential sentinel. The object pool, I/O buffer pool and retained
+/// payload and `iovec` size classes use it for current-page bump allocation,
+/// page growth and teardown.
 pub(crate) struct SlabPageChain {
     /// Head of the singly-linked list of allocated slab pages.
     head: *mut Slab,

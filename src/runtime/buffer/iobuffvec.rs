@@ -14,9 +14,11 @@
 //! operation returns [`PushError`] with the original segment so the caller
 //! retains ownership; the container never drops a value it failed to insert.
 //!
-//! These chain types own only buffer segments. Kernel-facing `iovec` arrays
-//! are materialized into caller- or future-owned scratch storage at I/O
-//! submission time instead of being cached inside the chain.
+//! These chain types own only buffer segments. An I/O operation builds its
+//! kernel-facing `iovec` array in storage owned by the operation. Once
+//! submitted, that storage stays alive until FlowIO observes the operation's
+//! completion, even if its future is dropped. The chain stores no `iovec`
+//! entries.
 //!
 //! # Fast-Path Guidance
 //!
@@ -24,16 +26,17 @@
 //! - Use these chain types when a protocol is already naturally segmented and
 //!   that segmentation is worth preserving.
 //! - Choose the smallest practical `N`: it sets both the inline handle
-//!   footprint and the maximum segment count. I/O futures materialize bounded
-//!   kernel `iovec` scratch only for active entries.
+//!   footprint and the maximum segment count. I/O futures build a bounded
+//!   kernel `iovec` array with entries only for active segments.
 //!
 //! Avoid on the fast path:
 //! - A vectored chain adds no segmentation benefit for one already-contiguous
-//!   payload; [`IoBuffMut`], [`IoBuff`], or another contiguous implementation
-//!   represents that input directly.
+//!   payload; pass it as an [`IoBuffMut`], [`IoBuff`], or another contiguous
+//!   buffer implementation instead.
 //! - Do not choose a large `N` speculatively. Async transport operations reject
 //!   more than 1024 active iovecs, and larger inline arrays increase the chain
-//!   value's footprint even when only a few entries are used.
+//!   value's footprint even when only a few entries are used. SCTP vectored
+//!   operations also reserve `N` `iovec` slots in their per-operation storage.
 //!
 //! # Example
 //! ```
@@ -326,8 +329,9 @@ macro_rules! define_distribute_written {
         /// each buffer's payload length. The kernel fills iovecs sequentially.
         ///
         /// # Safety
-        /// The caller must guarantee that the first `total_bytes` bytes across
-        /// the materialized iovec array have been initialized by the kernel.
+        /// The first `total_bytes` bytes of the chain's writable regions, in
+        /// segment order, must be initialized. These are the ranges an `iovec`
+        /// array built from this chain would describe.
         $visibility unsafe fn distribute_written(&mut self, total_bytes: usize) {
             let writable = self.writable_len();
             debug_assert!(
@@ -344,7 +348,7 @@ macro_rules! define_distribute_written {
                 let new_len = buf.payload_len() + written;
                 // SAFETY: `written` is bounded by this segment's writable
                 // capacity, and this method's caller guarantees that the
-                // corresponding materialized iovec bytes were initialized.
+                // corresponding writable bytes were initialized.
                 unsafe { buf.publish_initialized_len_unchecked(new_len) };
                 remaining -= written;
                 if remaining == 0 {
@@ -533,13 +537,13 @@ impl<const N: usize> Drop for IoBuffVecMut<N> {
 
 /// Frozen vectored buffer chain with fixed inline segment capacity.
 ///
-/// Created by calling [`IoBuffVecMut::freeze`]. All segments are [`IoBuff`]
-/// and cloning the chain clones each segment zero-copy. Like
-/// [`IoBuffVecMut`], it stores only segment handles; `iovec` scratch belongs
-/// to the calling I/O operation.
+/// Created by [`IoBuffVecMut::freeze`], [`IoBuffVec::from_array`] or by pushing
+/// [`IoBuff`] segments. Cloning the chain clones each segment zero-copy. Like
+/// [`IoBuffVecMut`], it stores only segment handles; the `iovec` array is owned
+/// by the I/O operation that submits the chain.
 ///
-/// This preserves existing send-side segmentation. A single [`IoBuff`] or
-/// [`IoBuffMut`] represents one contiguous payload.
+/// Use it to send data that is already split into segments; a single [`IoBuff`]
+/// or [`IoBuffMut`] represents one contiguous payload.
 ///
 /// # Example
 /// ```

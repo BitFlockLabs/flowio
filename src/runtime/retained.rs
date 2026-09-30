@@ -11,10 +11,10 @@
 //!
 //! The common path is slab-backed and heap-free after warmup. Payloads larger
 //! than 65536 bytes, payloads requiring alignment greater than 64 bytes, and
-//! slab-allocation failures fall back to the global heap. That fallback is
-//! intentional so I/O submission does not fail merely because a retained
-//! payload is unusual, but it must stay visible through debug counters and
-//! documentation because it is not the desired steady-state fast path.
+//! slab-allocation failures fall back to the global heap. That fallback lets
+//! unusual payloads use I/O without fitting a size class. It allocates on the
+//! global heap; enabled debug/test-support and diagnostic counters record these
+//! allocations.
 //!
 //! Retained vectored I/O scratch is separate from retained payload storage. The
 //! scratch stores only kernel-facing `iovec` pointer/length metadata; message
@@ -47,7 +47,7 @@ pub(crate) const RETAINED_IOVEC_SIZE_CLASSES: [usize; 4] = [64, 128, 512, 1024];
 pub(crate) const RETAINED_IOVEC_MAX_COUNT: usize =
     RETAINED_IOVEC_SIZE_CLASSES[RETAINED_IOVEC_SIZE_CLASSES.len() - 1];
 pub(crate) const RETAINED_IOVEC_OVERSIZE_MESSAGE: &str =
-    "active iovec count exceeds retained scratch capacity";
+    "too many iovec segments for this operation";
 
 const _: () = {
     assert!(RETAINED_BLOCK_ALIGN.is_power_of_two());
@@ -508,9 +508,9 @@ impl RetainedPayloadPool {
     /// [`RetainedPayload::take`] or [`RetainedPayload::drop_and_free`].
     #[inline(always)]
     pub(crate) fn alloc<T: 'static>(&mut self, value: T) -> RetainedPayload<T> {
-        // Keep this by-value path independent of the raw-slot RAII guard below:
+        // This by-value path bypasses the raw-slot RAII guard below because
         // routing safe callers through that guard enlarges codegen for
-        // whole-payload stream transfers, which this direct shape preserves.
+        // whole-payload stream transfers.
         match class_index_for::<T>() {
             Some(class_index) => {
                 if let Some(result) = self.classes[class_index].alloc_block() {

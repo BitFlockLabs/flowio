@@ -1,14 +1,15 @@
 //! Fuzzing-only re-exports of internal parsers.
 //!
-//! Gated behind the dev-only `fuzzing` feature so the real public API is
-//! unchanged. These wrappers exist purely so the out-of-source `flowio/fuzz/`
-//! crate (a separate package) can reach parsers that are otherwise
-//! crate-private. Not a stable API; do not depend on this module.
+//! Compiled only with the dev-only `fuzzing` feature, so the default public API
+//! does not include it. These wrappers let the separate cargo-fuzz package in
+//! `fuzz/` reach parsers that are otherwise crate-private. Fixture integration
+//! tests also use these parsers and, with `test-support`, observation hooks.
+//! Not a stable API; do not depend on this module.
 //!
-//! Each wrapper takes raw bytes and exercises an internal parser. All targets
-//! enforce no panic, out-of-bounds access, or unbounded termination; the DNS
-//! prefilter target also asserts differential structural-acceptance parity
-//! with the full response-envelope parser.
+//! Each wrapper takes raw bytes and exercises an internal parser. Every target
+//! checks for panics, out-of-bounds accesses, and failure to terminate. The DNS
+//! prefilter target also checks that the prefilter and full response-envelope
+//! parser accept the same packet structure.
 
 use std::borrow::Cow;
 
@@ -75,10 +76,10 @@ struct DnsResponseCase<'a> {
 /// Decode `[length/id hint, control, host length, host, packet]`.
 ///
 /// Normal cases derive the expected ID from the response packet so packet
-/// mutations continue past the ID gate. Control bit 7 deliberately mismatches
-/// it, preserving coverage of that rejection path. The two-byte hint remains a
-/// fallback for packets shorter than an ID and drives the received-length
-/// target below.
+/// mutations get past the ID check. Control bit 7 alters the expected ID so it
+/// cannot match, which covers the ID-mismatch rejection path. For packets
+/// shorter than two bytes the two-byte hint supplies the ID; the hint also
+/// drives the received-length target below.
 fn dns_response_case(data: &[u8]) -> DnsResponseCase<'_> {
     let length_hint = u16::from_be_bytes([
         data.first().copied().unwrap_or_default(),
@@ -211,6 +212,8 @@ fn observe_sctp_parse_notification_bytes(
 }
 
 /// Fuzz entry: parse an SCTP notification from arbitrary control bytes.
+///
+/// Also exercises record recovery across every bounded split of the input prefix.
 pub fn sctp_parse_notification(data: &[u8]) {
     let decoded = maybe_decode_hex_seed(data);
     let decoded = decoded.as_ref();
@@ -277,20 +280,11 @@ pub fn sctp_parse_assoc_addrs(data: &[u8]) {
 
 fn sctp_assoc_addrs_case(data: &[u8]) -> (usize, &[u8]) {
     let addr_count = data.first().copied().unwrap_or_default() as usize;
-    // Byte one used to select synthetic entry layouts. Keep it reserved so
-    // the existing corpus continues to place packed address bytes at offset 2.
+    // Byte one is reserved; packed address bytes begin at offset 2.
     let payload = data.get(2..).unwrap_or_default();
     (addr_count, payload)
 }
 
-/// Fuzz entry: the DNS response prefilter (`response_is_decodable_candidate`),
-/// which uses the non-materializing mode of the shared question-name walker
-/// before `parse_response_packet` in the drain loop. The query id is derived
-/// from the packet's first two bytes so the ID gate passes; QR, QUERY-opcode,
-/// and name-walk acceptance remain input-controlled. The mismatch call also
-/// covers the early-return path. Property: candidate and full-envelope
-/// structural acceptance stay identical, pointer recursion stays bounded, and
-/// arbitrary input cannot panic or read OOB.
 fn observe_dns_response_prefilter(data: &[u8]) -> bool {
     let data = maybe_decode_hex_seed(data);
     let data = data.as_ref();
@@ -308,6 +302,14 @@ fn observe_dns_response_prefilter(data: &[u8]) -> bool {
     candidate
 }
 
+/// Fuzz entry: the DNS response prefilter (`response_is_decodable_candidate`),
+/// which uses the non-materializing mode of the shared question-name walker
+/// before `parse_response_packet` in the drain loop. The query id is derived
+/// from the packet's first two bytes so the ID gate passes; QR, QUERY-opcode,
+/// and name-walk acceptance remain input-controlled. The mismatch call also
+/// covers the early-return path. Property: candidate and full-envelope
+/// structural acceptance stay identical, pointer recursion stays bounded, and
+/// arbitrary input cannot panic or read OOB.
 pub fn dns_response_prefilter(data: &[u8]) {
     let _ = std::hint::black_box(observe_dns_response_prefilter(data));
 }

@@ -1,7 +1,8 @@
-# Out-of-source libFuzzer crate (cargo-fuzz). Detached from the parent
-# workspace via the empty [workspace] table below so the stable build/test of
-# the main workspace ignores it. Build/run with nightly:
-#   cargo +nightly fuzz run <target>   (or: make fuzz-smoke)
+# libFuzzer targets for cargo-fuzz. The empty [workspace] table below makes
+# this package its own workspace root, so cargo-fuzz can build it inside an
+# enclosing workspace. It is not a member of the main crate's workspace.
+# Build and run with nightly:
+#   cargo +nightly fuzz run <target>
 [package]
 name = "flowio-fuzz"
 version = "0.0.0"

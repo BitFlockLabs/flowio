@@ -1,7 +1,8 @@
-//! Concrete frozen-chain overflow with genuinely readable sparse backing.
+//! Frozen-chain length overflow over one real, readable sparse mapping.
 //!
-//! The mapping requires native Linux virtual-memory facilities. Ordinary small
-//! chain initialization, ownership, and arithmetic tests also run under Miri.
+//! The mapping requires native Linux virtual-memory facilities, so this test
+//! does not run under Miri. Smaller chain initialization, ownership, and
+//! arithmetic tests do run under Miri.
 #![cfg(not(miri))]
 
 mod common;

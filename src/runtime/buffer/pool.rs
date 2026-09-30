@@ -1,11 +1,10 @@
 //! Pool allocator for [`IoBuffMut`] buffers.
 //!
-//! [`IoBuffPool`] acquires slab pages of identically-shaped buffer slots lazily
-//! through the library's slab allocator and memory provider. Reused slots are
-//! obtained with an O(1) intrusive free-list pop. When a pool-allocated
-//! buffer's last reference drops, its slot returns to that free list. Once
-//! sufficient slab capacity exists, reuse performs no heap allocation or
-//! deallocation per buffer.
+//! [`IoBuffPool`] lazily allocates slab pages of identically-shaped buffer
+//! slots from the global allocator. Reused slots are obtained with an O(1)
+//! intrusive free-list pop. When a pool-allocated buffer's last reference
+//! drops, its slot returns to that free list. Once sufficient slab capacity
+//! exists, reuse performs no heap allocation or deallocation per buffer.
 //!
 //! Each pool produces buffers with a fixed headroom/payload/tailroom layout
 //! configured at creation time.
@@ -71,8 +70,8 @@ pub struct IoBuffPoolConfig {
     pub payload: usize,
     /// Reserved tailroom bytes for appending protocol trailers.
     pub tailroom: usize,
-    /// Number of buffer slots per slab page.  Controls memory granularity:
-    /// more slots per slab = fewer provider calls, larger pages.
+    /// Number of buffer slots per slab page. Controls memory granularity: more
+    /// slots per slab means fewer, larger slab-page allocations.
     pub objs_per_slab: usize,
 }
 
@@ -121,11 +120,11 @@ impl std::error::Error for IoBuffPoolConfigError {}
 /// after the headroom region.
 ///
 /// Fixed, recurring buffer geometries can reuse acquired slots without
-/// per-buffer allocator traffic. [`super::IoBuffMut::new`] directly represents
-/// geometries that do not fit a configured pool.
+/// per-buffer allocator traffic. Use [`super::IoBuffMut::new`] for geometries
+/// that do not fit a configured pool.
 ///
 /// # Example
-/// ```no_run
+/// ```
 /// use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 ///
 /// let mut pool = IoBuffPool::new(IoBuffPoolConfig {
@@ -137,19 +136,38 @@ impl std::error::Error for IoBuffPoolConfigError {}
 /// .unwrap();
 /// pool.init();
 ///
-/// // Setup may acquire the expected working set up front. Dropping these
-/// // handles returns their slots to the pool's free list.
-/// let mut warm = Vec::with_capacity(64);
-/// for _ in 0..64 {
-///     warm.push(pool.alloc().unwrap());
-/// }
-/// drop(warm);
-///
 /// let mut buf = pool.alloc().unwrap();
 /// buf.payload_append(b"fast path data").unwrap();
 /// buf.headroom_prepend(b"HDR:").unwrap();
 /// assert_eq!(buf.bytes(), b"HDR:fast path data");
-/// // buf drops → slot returned to pool's free list (no heap dealloc)
+/// // Dropping the buffer returns its slot to the pool.
+/// ```
+///
+/// # Warming a pool
+///
+/// Slabs are acquired lazily. Allocate the expected working set during setup
+/// and return it before the latency-sensitive path:
+///
+/// ```
+/// use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
+///
+/// let mut pool = IoBuffPool::new(IoBuffPoolConfig {
+///     headroom: 0,
+///     payload: 1024,
+///     tailroom: 0,
+///     objs_per_slab: 64,
+/// }).unwrap();
+/// pool.init();
+///
+/// let mut warm = Vec::with_capacity(64);
+/// for _ in 0..64 {
+///     warm.push(pool.alloc().unwrap());
+/// }
+/// drop(warm); // All 64 slots are now reusable.
+///
+/// let mut buffer = pool.alloc().unwrap();
+/// buffer.payload_append(b"frame").unwrap();
+/// assert_eq!(buffer.bytes(), b"frame");
 /// ```
 pub struct IoBuffPool {
     /// Stable heap-allocated pool state converted to a raw pointer and later
@@ -396,8 +414,8 @@ impl IoBuffPool {
     /// Returns `IoBuffError::PoolNotInitialized` if [`init()`](Self::init)
     /// has not been called yet.
     ///
-    /// Returns `IoBuffError::AllocFailed` if the memory provider cannot
-    /// supply more slab pages.
+    /// Returns `IoBuffError::AllocFailed` if a new slab page cannot be
+    /// allocated.
     pub fn alloc(&mut self) -> Result<IoBuffMut, IoBuffError> {
         unsafe { IoBuffPoolInner::alloc(self.inner.as_ptr()) }
     }

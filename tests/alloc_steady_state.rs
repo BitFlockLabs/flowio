@@ -9,7 +9,7 @@ use flowio::net::tcp::TcpStream;
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
-use flowio::test_support::net::sctp::capability_unavailable;
+use flowio::test_support::net::sctp::{capability_unavailable, require_sctp_capability};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -126,7 +126,7 @@ fn steady_state_runtime_and_transport_paths_do_not_allocate_after_warmup() {
             Some((listener, SctpConnector::with_config(sctp_config), addr))
         }
         Err(err) if capability_unavailable(&err) => {
-            eprintln!("skipping SCTP allocation-counting segment: SCTP unsupported ({err})");
+            require_sctp_capability(Some(&err)).expect("SCTP allocation capability is required");
             None
         }
         Err(err) => panic!("failed to bind SCTP allocation-counting listener: {err}"),

@@ -5,8 +5,8 @@
 //! This implementation targets the x86-64 Linux SCTP socket API and FlowIO's
 //! crate-wide x86-64 Linux 5.11-or-newer runtime floor.
 //!
-//! Baseline one-to-one SCTP operations are expected to work on supported
-//! x86-64 Linux kernels where SCTP is enabled:
+//! Baseline one-to-one SCTP operations are expected to work on supported x86-64
+//! Linux kernels where SCTP is enabled:
 //! - [`SctpListener::bind`]
 //! - [`SctpListener::accept`]
 //! - [`SctpConnector::connect`]
@@ -14,8 +14,8 @@
 //! - [`SctpStream::recv_msg`]
 //!
 //! FlowIO uses the 14-byte `SCTP_EVENTS` subscription layout available since
-//! Linux 5.5. That predates the binding x86-64 Linux 5.11 runtime floor, so no
-//! legacy 13-byte subscription fallback is attempted.
+//! Linux 5.5. That predates the x86-64 Linux 5.11 runtime floor, so FlowIO does
+//! not fall back to the legacy 13-byte subscription layout.
 //!
 //! More advanced SCTP controls and introspection depend on kernel support and
 //! runtime policy for the specific socket option involved. These methods may
@@ -38,38 +38,41 @@
 //! # Fast-Path Guidance
 //!
 //! Preferred on the per-message data fast path:
-//! - If the socket is configured for data-only traffic without notifications
-//!   or `SCTP_RCVINFO`, prefer [`SctpStream::send`] / [`SctpStream::recv`] on
-//!   the hot path when the application guarantees receive sizing. The lean
-//!   receive does not expose EOR or truncation metadata.
-//! - If most sends use the same stream/PPID/flags, install
-//!   [`SctpSendInfo`] once with [`SctpStream::set_default_send_info`] and keep
-//!   using [`SctpStream::send`].
+//! - If the socket is configured for data-only traffic without notifications or
+//!   `SCTP_RCVINFO`, prefer [`SctpStream::send`] / [`SctpStream::recv`] on the
+//!   hot path when the application guarantees receive sizing. The lean receive
+//!   does not expose EOR or truncation metadata.
+//! - If most sends use the same stream/PPID/flags, install [`SctpSendInfo`]
+//!   once with [`SctpStream::set_default_send_info`] and keep using
+//!   [`SctpStream::send`].
 //! - Use vectored SCTP APIs only when payloads are already segmented. For a
-//!   single contiguous message, the contiguous APIs avoid iovec scratch.
+//!   single contiguous message, the contiguous APIs avoid building an `iovec`
+//!   array.
 //!
 //! Avoid on the per-message data fast path:
-//! - Avoid the default rich socket configuration when the intended workload
-//!   is data-only. Use [`SctpSocketConfig::data`] instead.
-//! - Avoid [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
-//!   when metadata and notifications are not needed. Use
-//!   [`SctpStream::send`] / [`SctpStream::recv`] instead.
+//! - Avoid the default rich socket configuration when the intended workload is
+//!   data-only. Use [`SctpSocketConfig::data`] instead.
+//! - Avoid [`SctpStream::send_msg`] / [`SctpStream::recv_msg`] when metadata
+//!   and notifications are not needed. Use [`SctpStream::send`] /
+//!   [`SctpStream::recv`] instead.
 //! - Do not use the lean [`SctpStream::recv`] when record boundaries,
 //!   truncation detection, or notifications are required. Use
 //!   [`SctpStream::recv_msg`] or its vectored form.
-//! - After dropping a rich receive, continue with a rich receive to retire its
-//!   stream-owned recovery slot. Lean [`SctpStream::recv`] returns
-//!   [`io::ErrorKind::InvalidInput`] without submission until that happens.
+//! - After dropping an in-flight [`SctpStream::recv_msg`] or
+//!   [`SctpStream::recv_msg_vectored`], call one of them again so the stream
+//!   can consume the dropped receive's completion. Until that happens,
+//!   [`SctpStream::recv`] returns [`io::ErrorKind::InvalidInput`] without
+//!   submitting a receive.
 //!
-//! On a repeated association path, reuse [`SctpConnector`] to preserve its
-//! slot wrapper. Every attempt still creates and configures a fresh SCTP
-//! socket; association establishment is not the per-message fast path. For a
-//! data-only workload, construct it with [`SctpConnector::with_config`] and
-//! [`SctpSocketConfig::data`].
+//! On a repeated association path, reuse one [`SctpConnector`] so its connect
+//! slot is kept across attempts. Every attempt still creates and configures a
+//! fresh SCTP socket; association establishment is not the per-message fast
+//! path. For a data-only workload, construct it with
+//! [`SctpConnector::with_config`] and [`SctpSocketConfig::data`].
 //!
-//! The examples below show message-oriented APIs because they are the most
-//! explicit in documentation. For data-only hot paths, prefer
-//! [`SctpStream::send`] / [`SctpStream::recv`] when their constraints fit.
+//! The first example uses data-only `send`/`recv`. The general and vectored
+//! examples use message I/O with metadata; the timed-connect example shows
+//! connector reuse without sending or receiving data.
 //!
 //! Data-only SCTP fast path:
 //! ```no_run
@@ -212,8 +215,8 @@ use super::{
     AcceptReadinessSlot as AcceptSlot, CompletionTake, ConnectSubmissionSlot, MsgHdrInit,
     RetainedConnectAddr, checked_read_len, checked_send_len, complete_read_with_progress,
     completion_cqe_result, current_local_addr, get_sock_opt, invalid_input, invalid_input_kind,
-    map_connect_timeout, set_reuse_addr, set_sock_opt, socket_addr_from_c, socket_addr_to_c,
-    socket_domain, write_msghdr,
+    map_connect_timeout, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
+    socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
 use crate::runtime::buffer::bytes::{
@@ -353,14 +356,10 @@ const SCTP_STREAM_RESET_OUTGOING: u16 = 0x02;
 
 /// Per-message SCTP send metadata.
 ///
-/// Passed to [`SctpStream::send_msg`] and
-/// [`SctpStream::send_msg_vectored`], and installable as the socket default
-/// with [`SctpStream::set_default_send_info`] for use by
-/// [`SctpStream::send`].
-///
-/// This is metadata for explicit message sends. If the same metadata applies
-/// to most messages, install it once with [`SctpStream::set_default_send_info`]
-/// and use [`SctpStream::send`] on the data fast path.
+/// Passed to [`SctpStream::send_msg`] and [`SctpStream::send_msg_vectored`].
+/// When the same metadata applies to most messages, install it once as the
+/// socket default with [`SctpStream::set_default_send_info`] and use
+/// [`SctpStream::send`] on the data fast path.
 ///
 /// # Example
 /// ```
@@ -563,17 +562,27 @@ impl SctpReconfigFlags {
 /// intent makes the request invalid.
 ///
 /// # Example
-/// ```no_run
+/// ```
 /// use flowio::net::sctp::{SctpResetStreams, SctpReconfigFlags};
 ///
 /// let request = SctpResetStreams::outgoing(&[1, 3]);
-/// let all = SctpResetStreams::all_bidirectional();
-/// assert!(all.streams.is_empty());
+/// assert_eq!(request.streams, [1, 3]);
 /// let flags = SctpReconfigFlags {
 ///     flags: SctpReconfigFlags::RESET_STREAMS,
 ///     ..SctpReconfigFlags::association_default()
 /// };
-/// # let _ = (request, all, flags);
+/// # let _ = (request, flags);
+/// ```
+///
+/// To reset every outgoing stream of an association:
+///
+/// ```
+/// use flowio::net::sctp::SctpResetStreams;
+///
+/// let mut request = SctpResetStreams::all_outgoing();
+/// request.assoc_id = 7;
+/// assert!(request.streams.is_empty());
+/// assert_eq!(request.assoc_id, 7);
 /// ```
 ///
 /// The private intent tag prevents a downstream struct literal from turning an
@@ -889,7 +898,10 @@ impl SctpAssocStatus {
 ///
 /// Notifications are part of the metadata/signaling receive path. Data-only
 /// fast paths should configure the socket with [`SctpSocketConfig::data`] and
-/// use [`SctpStream::recv`], which returns only a byte count.
+/// use [`SctpStream::recv`], which returns only a byte count. After the common
+/// header and record bounds are validated, a known notification shorter than
+/// its required fixed fields returns [`io::ErrorKind::InvalidData`] naming the
+/// raw kind, declared length, and required length.
 ///
 /// # Example
 /// ```
@@ -938,7 +950,8 @@ pub enum SctpNotification {
     },
     /// A send failed and the kernel returned the original send metadata.
     SendFailed {
-        /// Raw kernel disposition flags, including `SCTP_DATA_UNSENT` and
+        /// Raw kernel disposition flags from either the legacy or modern Linux
+        /// send-failure layout, including `SCTP_DATA_UNSENT` and
         /// `SCTP_DATA_SENT`; unfamiliar values are preserved.
         flags: u16,
         /// Kernel error code for the failed send.
@@ -974,8 +987,8 @@ pub enum SctpNotification {
     /// Stream reset completion or state change notification.
     ///
     /// Linux may append a variable list of stream identifiers after the
-    /// association ID. FlowIO bounds that tail by the declared notification
-    /// length but intentionally does not materialize it, keeping this value
+    /// association ID. FlowIO validates the declared notification bounds but
+    /// does not decode or return the stream-ID tail, keeping this value
     /// fixed-size, allocation-free, and [`Copy`].
     StreamReset {
         /// Kernel flags for the reset event.
@@ -1000,12 +1013,12 @@ pub enum SctpNotification {
         flags: u16,
         /// Association identifier reported by the kernel.
         assoc_id: libc::sctp_assoc_t,
-        /// New inbound stream count.
+        /// Requested number of additional inbound streams, not the total count.
         inbound_streams: u16,
-        /// New outbound stream count.
+        /// Requested number of additional outbound streams, not the total count.
         outbound_streams: u16,
     },
-    /// Notification kind not decoded by the crate yet.
+    /// Notification kind that FlowIO does not decode.
     Other {
         /// Raw SCTP notification type.
         kind: u16,
@@ -1015,6 +1028,9 @@ pub enum SctpNotification {
         length: u32,
     },
     /// Authentication key state changed for an association.
+    ///
+    /// The declared record must contain at least 20 bytes; a shorter record
+    /// returns [`io::ErrorKind::InvalidData`].
     Authentication {
         /// Kernel flags for the authentication event.
         flags: u16,
@@ -1192,9 +1208,11 @@ pub struct SctpNotificationMask {
     pub shutdown: bool,
     /// Caller-visible partial-delivery notifications.
     ///
-    /// FlowIO may keep the kernel event subscribed when receive metadata is
-    /// enabled even if this field is false; aborts identifiable as forced only
-    /// for internal resynchronization are not returned to the caller.
+    /// When receive metadata is enabled, FlowIO may keep the kernel event
+    /// subscribed even if this field is false, because it uses partial-delivery
+    /// aborts to resynchronize metadata receives; aborts that FlowIO can
+    /// identify as arriving only through that internal subscription are not
+    /// returned to the caller.
     pub partial_delivery: bool,
     /// Adaptation-layer notifications.
     pub adaptation: bool,
@@ -1307,9 +1325,9 @@ const fn effective_sctp_notification_mask(
 #[repr(C, packed(4))]
 /// Linux `sctp_prim` layout used to select the local primary destination.
 ///
-/// This intentionally remains distinct from the layout-identical
-/// [`SctpSetPeerPrimRaw`]: the two socket options give the address field
-/// opposite local/peer meanings.
+/// It is layout-identical to [`SctpSetPeerPrimRaw`] but a separate type,
+/// because the two socket options give the address field opposite local/peer
+/// meanings.
 struct SctpPrimRaw {
     /// Association selected by the socket option.
     assoc_id: libc::sctp_assoc_t,
@@ -1963,7 +1981,7 @@ impl SctpListener {
     /// This is setup/control-plane work performed once before serving; it is
     /// not on the per-message data fast path.
     pub fn bind(addr: SocketAddr, backlog: i32, initmsg: SctpInitConfig) -> io::Result<Self> {
-        Self::bind_with_config(addr, backlog, SctpSocketConfig::rich(initmsg))
+        Self::bind_inner(addr, backlog, SctpSocketConfig::rich(initmsg), false)
     }
 
     /// Binds a listener using the provided SCTP socket configuration.
@@ -1977,6 +1995,59 @@ impl SctpListener {
         addr: SocketAddr,
         backlog: i32,
         config: SctpSocketConfig,
+    ) -> io::Result<Self> {
+        Self::bind_inner(addr, backlog, config, false)
+    }
+
+    /// Binds a listener with `SO_REUSEADDR` and `SO_REUSEPORT`, applies init
+    /// parameters, enables notifications, and starts listening.
+    ///
+    /// Listeners in one group must use a reuse-port constructor with the same
+    /// local address, port, and effective user ID. The kernel
+    /// distributes incoming associations among the group members.
+    ///
+    /// The first member may use port zero, as for TCP. To share its automatically
+    /// selected port, subsequent members pass the address returned by
+    /// [`Self::local_addr`].
+    /// UDP's reuse-port API instead requires an explicit port because automatic
+    /// UDP port assignment can alias another live reuse-port socket.
+    ///
+    /// Linux also permits a non-listening socket with `SO_REUSEADDR` to bind
+    /// the group's port. The effective-user-ID check applies only to listening
+    /// group members.
+    ///
+    /// This is setup/control-plane work; established I/O uses the same paths
+    /// as associations accepted by [`Self::bind`].
+    pub fn bind_reuse_port(
+        addr: SocketAddr,
+        backlog: i32,
+        initmsg: SctpInitConfig,
+    ) -> io::Result<Self> {
+        Self::bind_inner(addr, backlog, SctpSocketConfig::rich(initmsg), true)
+    }
+
+    /// Binds a reuse-port listener using the provided SCTP socket configuration.
+    ///
+    /// This enables `SO_REUSEADDR` and `SO_REUSEPORT` before binding. Group
+    /// membership and automatic-port behavior follow [`Self::bind_reuse_port`].
+    /// Each accepted association retains this listener's configured socket and
+    /// receive-policy settings. A setup failure closes the new socket and
+    /// returns its error without changing any other group member.
+    ///
+    /// This is setup/control-plane work, not a per-message data fast path.
+    pub fn bind_reuse_port_with_config(
+        addr: SocketAddr,
+        backlog: i32,
+        config: SctpSocketConfig,
+    ) -> io::Result<Self> {
+        Self::bind_inner(addr, backlog, config, true)
+    }
+
+    fn bind_inner(
+        addr: SocketAddr,
+        backlog: i32,
+        config: SctpSocketConfig,
+        reuse_port: bool,
     ) -> io::Result<Self> {
         let raw_fd = observe_bind_setup!(
             Sctp, Socket, errno => Err(io::Error::from_raw_os_error(errno)),
@@ -1999,6 +2070,13 @@ impl SctpListener {
             Sctp, ReuseAddress, errno => Err(io::Error::from_raw_os_error(errno)),
             set_reuse_addr(fd.as_raw_fd())
         )?;
+
+        if reuse_port {
+            observe_bind_setup!(
+                Sctp, ReusePort, errno => Err(io::Error::from_raw_os_error(errno)),
+                set_reuse_port(fd.as_raw_fd())
+            )?;
+        }
 
         let (sockaddr, sockaddr_len) = socket_addr_to_c(addr);
         let bind_res = observe_bind_setup!(
@@ -2042,11 +2120,12 @@ impl SctpListener {
     /// Returns the local address captured during successful listener
     /// construction.
     ///
-    /// [`Self::bind`] and [`Self::bind_with_config`] query `getsockname(2)`
-    /// once after `bind(2)` and `listen(2)` succeed, so a kernel-selected port
-    /// from a port-zero bind is included. This method copies that cached
-    /// address without a syscall, allocation, or runtime-context lookup. It
-    /// does not refresh after changes made through the raw descriptor.
+    /// [`Self::bind`], [`Self::bind_with_config`], [`Self::bind_reuse_port`], and
+    /// [`Self::bind_reuse_port_with_config`] query `getsockname(2)` once after
+    /// `bind(2)` and `listen(2)` succeed, so a kernel-selected port from a
+    /// port-zero bind is included. This method copies that cached address
+    /// without a syscall, allocation, or runtime-context lookup. It does not
+    /// refresh after changes made through the raw descriptor.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -2085,38 +2164,38 @@ impl SctpListener {
     /// # Errors
     ///
     /// The returned future resolves with [`io::ErrorKind::WouldBlock`] if the
-    /// listener's reusable accept slot is occupied or runtime operation
-    /// capacity cannot accept the submission. `POLLHUP` or `POLLNVAL`
-    /// readiness with no queued association latches the listener and returns
+    /// listener's reusable accept slot is occupied or no operation slot is
+    /// available. `POLLHUP` or `POLLNVAL` readiness with no queued association
+    /// latches the listener and returns
     /// [`io::ErrorKind::ConnectionAborted`]. Later accepts return the same
     /// non-retryable kind without another readiness submission. A bare
     /// `POLLERR` gets one internal readiness rearm; if it recurs for the same
     /// accept while `accept4` still reports `EAGAIN`, that exact
-    /// [`io::ErrorKind::WouldBlock`] result is returned without latching.
-    /// If applying post-accept SCTP socket or association configuration fails,
+    /// [`io::ErrorKind::WouldBlock`] result is returned without latching. If
+    /// applying post-accept SCTP socket or association configuration fails,
     /// that error is returned, the new association is closed, no stream is
-    /// published, and the listener remains reusable.
-    /// Readiness containing `POLLHUP` or `POLLNVAL` remains terminal even when
-    /// `POLLERR` is also present. A positive `POLLNVAL` confirmed as `EBADF`
-    /// preserves that raw errno for the current future while latching the same
-    /// later fail-fast state.
-    /// `EMFILE` and `ENFILE` propagate exactly without latching or rearming.
-    /// The slot preserves the observed readiness, so the next accept polled in
-    /// the owner context makes one direct nonblocking `accept4` attempt without
-    /// another readiness submission. FlowIO performs no hidden retry, timer,
-    /// or backoff; callers should relieve descriptor pressure and apply bounded
-    /// backoff before retrying. If the direct attempt returns
+    /// returned, and the listener remains reusable. Readiness containing
+    /// `POLLHUP` or `POLLNVAL` remains terminal even when `POLLERR` is also
+    /// present. A positive `POLLNVAL` confirmed as `EBADF` preserves that raw
+    /// errno for the current future while latching the same later fail-fast
+    /// state. `EMFILE` and `ENFILE` propagate exactly without latching or
+    /// rearming. The slot preserves the observed readiness, so the next accept
+    /// polled in the owner context makes one direct nonblocking `accept4`
+    /// attempt without another readiness submission. FlowIO performs no hidden
+    /// retry, timer, or backoff; callers should relieve descriptor pressure and
+    /// apply bounded backoff before retrying. If the direct attempt returns
     /// [`io::ErrorKind::WouldBlock`], the retained mask is classified by the
     /// same rules above: HUP/NVAL latches, bare `POLLERR` uses its bounded
-    /// budget, and plain stale readiness takes the ordinary rearm.
-    /// A future that reports the occupied-slot error never claims that slot;
-    /// later polls park without replacing the previous accept's waiter.
+    /// budget, and plain stale readiness takes the ordinary rearm. A future
+    /// that reports the occupied-slot error never claims that slot; later polls
+    /// park without replacing the previous accept's waiter.
     ///
-    /// Dropping a prepared pending accept cancels only its readiness wait and
-    /// leaves an already queued association for the next accept. An unprepared
-    /// future owns no wait, so dropping it leaves the earlier accept untouched.
-    /// If the listener's raw fd is exposed, the caller must not concurrently
-    /// accept from it or race changes to its file-status flags.
+    /// Dropping a pending accept that claimed the slot cancels only its
+    /// readiness wait and leaves a queued association for the next accept. A
+    /// future that did not claim the slot owns no wait, so dropping it cannot
+    /// affect the accept that holds the slot. If the listener's raw fd is
+    /// exposed, the caller must not concurrently accept from it or race changes
+    /// to its file-status flags.
     pub fn accept(&mut self) -> AcceptFuture<'_> {
         let input_error = self.accept_slot.prepare().err();
         let prepared = input_error.is_none();
@@ -2246,7 +2325,9 @@ pub struct SctpSocketConfig {
     /// Which SCTP notifications are requested for caller-visible delivery.
     ///
     /// When `recv_rcvinfo` is true, FlowIO additionally keeps the kernel
-    /// partial-delivery event subscribed for internal receive recovery.
+    /// partial-delivery event subscribed for internal receive recovery. With an
+    /// empty requested mask, its fragments are consumed internally through
+    /// end-of-record, even when the receive buffer is too short for the event.
     pub notifications: SctpNotificationMask,
     /// Whether `SCTP_RCVINFO` ancillary metadata is requested from the kernel.
     pub recv_rcvinfo: bool,
@@ -2336,13 +2417,14 @@ impl SctpSocketConfig {
 
 /// SCTP connector that reuses one connect slot across attempts.
 ///
-/// Each individual connect submission still gets its own `CompletionState`
-/// from the reactor pool. The connector reuses slot storage, while each attempt
-/// creates and configures a fresh socket and prepared remote address.
+/// The connector keeps its connect slot between attempts, so reusing it avoids
+/// setting up that slot for each outbound connection. Each submitted attempt
+/// uses an operation slot, which counts against the executor's
+/// [`ring_entries`](crate::runtime::reactor::ReactorConfig::ring_entries)
+/// capacity, and creates and configures a fresh socket and remote address.
 ///
-/// Reusing this type avoids rebuilding the slot wrapper across outbound
-/// attempts. For data-only associations, pair it with
-/// [`SctpSocketConfig::data`] instead of the richer default config.
+/// For data-only associations, pair it with [`SctpSocketConfig::data`] instead
+/// of the richer default config.
 ///
 /// # Example
 /// ```no_run
@@ -2409,8 +2491,8 @@ impl SctpConnector {
     /// Starts connecting to the provided remote SCTP peer.
     ///
     /// Establishing an association is setup/control-plane work, not the
-    /// per-message data fast path. Reusing this connector preserves its slot
-    /// wrapper, while each attempt still creates and configures a fresh socket.
+    /// per-message data fast path. Reusing this connector keeps its connect
+    /// slot, while each attempt still creates and configures a fresh socket.
     /// Once connected, keep suitable steady-state traffic on
     /// [`SctpStream::send`] / [`SctpStream::recv`].
     pub fn connect(&mut self, remote_addr: SocketAddr) -> io::Result<ConnectFuture<'_>> {
@@ -2548,12 +2630,13 @@ struct SctpRecvState {
     /// forced PDAPI subscription and can be consumed without first assembling
     /// the complete notification in a short caller buffer.
     any_notification_visible: Cell<bool>,
-    /// Explicit lifecycle tag for `stashed`. This stays separate from the
-    /// payload so the full-width iovec count and existing layouts are retained.
+    /// Explicit lifecycle tag for `stashed`. It is stored outside
+    /// [`StashedSctpRecv`] so that `iov_count` keeps its full `usize` width and
+    /// the tag occupies padding instead of enlarging either struct.
     stashed_state: StashedSctpRecvState,
     /// Low seven bits retain the nested notification prefix length. The high
     /// bit records that the full bounded prefix was classified as non-abort.
-    /// This control byte consumes prior natural padding.
+    /// This control byte occupies natural padding in `SctpRecvState`.
     nested_prefix_state: u8,
     /// Dropped metadata receive completion that must be adopted before the
     /// next metadata receive can preserve record-boundary state, or terminal
@@ -2867,7 +2950,7 @@ impl SctpRecvState {
     /// Classifies and transitions one successful metadata completion exactly
     /// once. `recovery_prefix` is the first at most 24 bytes across all active
     /// iovecs only while nested recovery needs missing classifier bytes;
-    /// `data_slice` preserves the ordinary contiguous parsing surface.
+    /// `data_slice` is the contiguous view that ordinary parsing reads.
     fn process_metadata_completion(
         &mut self,
         actual: usize,
@@ -3137,7 +3220,9 @@ struct SctpRecoveryFuzzScenario {
     second_is_notification: bool,
 }
 
-/// Visits the exact bounded scenario inventory used by record-recovery fuzzing.
+/// Visits every record-recovery fuzz scenario for `data`: each split point up
+/// to the 24-byte classifier prefix, crossed with the terminal, visibility, and
+/// second-fragment-kind choices.
 #[cfg(any(test, feature = "fuzzing"))]
 #[inline(always)]
 fn for_each_sctp_recovery_fuzz_scenario(
@@ -3245,8 +3330,8 @@ where
 ///   metadata or notifications.
 ///
 /// Avoid on the per-message data fast path:
-/// - Avoid [`SctpStream::send_msg`] / [`SctpStream::recv_msg`]
-///   or the richer signaling config when the workload is just message data.
+/// - Avoid [`SctpStream::send_msg`] / [`SctpStream::recv_msg`] or the richer
+///   signaling config when the workload is just message data.
 /// - Do not use [`SctpStream::recv`] when EOR, truncation detection, receive
 ///   metadata, or notifications are part of the protocol contract.
 ///
@@ -3260,68 +3345,71 @@ where
 /// boundary is restored, the data-only [`SctpStream::recv`] path returns
 /// [`io::ErrorKind::InvalidInput`] instead of consuming recovery bytes. Keep
 /// using [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until a
-/// rich receive completes recovery.
+/// metadata receive completes recovery.
 ///
 /// A kernel zero-byte completion with no control message and no flags is clean
-/// peer EOF and resolves as
-/// `Ok((0, SctpRecvMeta::Data(SctpRecvInfo::default())))`. Both methods reject
-/// zero-length caller destinations before submission or adoption of a prior
-/// dropped metadata receive, so such a request cannot masquerade as EOF. The
-/// one-entry dropped-receive stash remains owned by the stream for the next
-/// valid metadata receive or stream destruction. When polled without a valid
-/// FlowIO context, `NotConnected` retains precedence over local `InvalidInput`
-/// and the stash is likewise untouched. When the stream's stored receive-info
-/// policy is disabled, ordinary data with no receive info succeeds with default
-/// ancillary fields and the kernel's end-of-record flag, including when
-/// complete unrelated socket control records are present. An externally
-/// adopted descriptor initially has that disabled policy because adoption
-/// performs no option query. A successful later
-/// [`SctpStream::set_notification_mask`] call refreshes the policy from the
-/// descriptor's live `SCTP_RECVRCVINFO` setting. When the stored policy is
+/// peer EOF and resolves as `Ok((0,
+/// SctpRecvMeta::Data(SctpRecvInfo::default())))`. Both methods reject
+/// zero-length caller destinations before submitting and before consuming a
+/// previously dropped metadata receive, so such a request cannot masquerade as
+/// EOF. The stream holds at most one dropped metadata receive; it stays
+/// attached for the next valid metadata receive or until the stream is dropped.
+/// When polled without a valid FlowIO context, `NotConnected` takes precedence
+/// over the local `InvalidInput`, and a dropped receive is likewise left
+/// attached. When the stream's stored receive-info policy is disabled, ordinary
+/// data with no receive info succeeds with default ancillary fields and the
+/// kernel's end-of-record flag, including when complete unrelated socket
+/// control records are present. An externally adopted descriptor initially has
+/// that disabled policy because adoption performs no option query. A successful
+/// later [`SctpStream::set_notification_mask`] call refreshes the policy from
+/// the descriptor's live `SCTP_RECVRCVINFO` setting. When the stored policy is
 /// enabled, ordinary data that omits receive info is `InvalidData`. Metadata
-/// receive uses fixed-capacity control storage sized for common Linux timestamp,
-/// timestamping packet-info, receive-queue-overflow, and RCVINFO records; it
-/// never allocates control storage per message. Additional externally enabled
-/// records such as `SCTP_NXTINFO`, socket mark/priority, or Wi-Fi status are
-/// skipped if they fit but are outside that guaranteed combination. When
-/// `MSG_CTRUNC` arrives without usable `SCTP_RCVINFO`, `InvalidData` identifies
-/// fixed control-buffer capacity exhaustion. Present malformed control instead
-/// retains its specific parser diagnostic even if `MSG_CTRUNC` is also set.
-/// Intact receive info remains usable when only later control was truncated.
-/// Kernel receive errors are returned as `io::Error` values from the completed
-/// operation.
+/// receive uses fixed-capacity control storage sized for common Linux
+/// timestamp, timestamping packet-info, receive-queue-overflow, and RCVINFO
+/// records; it never allocates control storage per message. Additional
+/// externally enabled records such as `SCTP_NXTINFO`, socket mark/priority, or
+/// Wi-Fi status are skipped if they fit but are outside that guaranteed
+/// combination. When `MSG_CTRUNC` arrives without usable `SCTP_RCVINFO`,
+/// `InvalidData` identifies fixed control-buffer capacity exhaustion. Present
+/// malformed control instead retains its specific parser diagnostic even if
+/// `MSG_CTRUNC` is also set. Intact receive info remains usable when only later
+/// control was truncated. Kernel receive errors are returned as `io::Error`
+/// values from the completed operation.
 ///
 /// # In-flight drop ownership
 ///
-/// Dropping an in-flight receive or send future relinquishes the caller buffer
-/// to the runtime until the original kernel completion retires; the buffer is
-/// not returned to the caller on that cancellation path. Dropped metadata
-/// receives retain the stream's single rich-receive lineage until they are
-/// adopted by the next valid metadata receive or reclaimed by stream
-/// destruction. While that rich operation occupies the stream-owned stash,
-/// whether pending, completed, or exceptionally ring-abandoned, or while rich
-/// receive is discarding an oversized record tail,
-/// [`SctpStream::recv`] returns allocation-free
-/// [`io::ErrorKind::InvalidInput`] with the exact rental buffer and submits no
-/// second receive. Repeated lean rejections do not consume or modify the
-/// recovery state. If the stash's origin ring is abandoned before its target
-/// CQE is observed, the first rich recovery that detects abandonment converts
-/// the stash to a terminal opaque ownership marker. That receive and every
-/// later rich receive return [`io::ErrorKind::NotConnected`] with their exact
-/// unsubmitted buffer; stream destruction clears only the local marker while
-/// the abandoned operation and retained payload remain unreclaimed. Otherwise,
-/// adoption updates SCTP record-boundary resynchronization state from the
-/// retired completion. Keep using
-/// [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`] until the next
-/// record boundary is reached unless rich recovery reports terminal
-/// abandonment. Dropping a lean receive
-/// retains its established terminal-framing policy; a later receive cannot
-/// recover bytes consumed by that cancelled bare receive. Notifications
-/// observed during internal discard are consumed as control events, except an
-/// explicitly requested partial-delivery abort remains caller-visible while
-/// retiring discard. An EOR-marked notification tail or a partial-delivery-
-/// aborted notification retires discard; other notification fragments keep
-/// discard active.
+/// Dropping an in-flight receive or send future leaves its buffer owned by the
+/// runtime until FlowIO observes the operation's own completion; that
+/// cancellation path does not return the buffer to the caller. A dropped
+/// in-flight [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`]
+/// stays attached to the stream, which holds at most one such receive, until
+/// the next valid metadata receive consumes its completion or the stream is
+/// dropped. While such a dropped receive is attached (pending, completed, or
+/// stranded on an abandoned `io_uring`), or while a metadata receive is
+/// discarding the tail of an oversized record, [`SctpStream::recv`] returns
+/// [`io::ErrorKind::InvalidInput`] without allocating or submitting a receive,
+/// and hands back the caller's buffer. Repeated rejected [`SctpStream::recv`]
+/// calls do not consume or modify the recovery state. If executor shutdown's
+/// bounded drain (see [`crate::net`]) abandons the `io_uring` that owns the
+/// dropped receive before FlowIO observes its completion, metadata receives
+/// with valid local inputs fail permanently: the receive that detects
+/// abandonment and every later valid receive return
+/// [`io::ErrorKind::NotConnected`] with their buffer unsubmitted. Dropping the
+/// stream clears only its own record of that receive; the abandoned operation
+/// and its buffer are never reclaimed. Otherwise, the next metadata receive
+/// consumes the dropped receive's completion and uses it to update SCTP
+/// record-boundary tracking. Keep using [`SctpStream::recv_msg`] or
+/// [`SctpStream::recv_msg_vectored`] until the next record boundary is reached,
+/// unless they have returned that permanent [`io::ErrorKind::NotConnected`].
+/// Dropping an in-flight [`SctpStream::recv`] starts no recovery: as for other
+/// transports (see [`crate::net`]), a later receive cannot recover bytes
+/// consumed by the cancelled receive, so framed protocols should treat that
+/// cancellation as terminal. Notifications that arrive while a record tail is
+/// being discarded are consumed internally, except that a partial-delivery
+/// abort is returned to the caller when the caller requested partial-delivery
+/// notifications. Discarding ends at a notification tail marked with EOR or at
+/// a partial-delivery abort notification; other notification fragments do not
+/// end it.
 ///
 /// # Example
 /// ```no_run
@@ -3360,8 +3448,14 @@ impl SctpStream {
     /// The descriptor is closed exactly once when the FlowIO stream is
     /// dropped. `OwnedFd` proves unique close ownership, but does not validate
     /// the socket type, supplied peer address, or configuration. The caller is
-    /// responsible for nonblocking mode and socket options compatible with the
-    /// data or metadata APIs it uses. Existing partial-delivery subscriptions
+    /// responsible for nonblocking mode before any runtime I/O. Adoption makes
+    /// no syscalls and does not configure socket options. Enable
+    /// `SCTP_RECVRCVINFO` to receive ancillary fields; without receive-info,
+    /// message receives return default ancillary fields. For assisted recovery
+    /// after an oversized record, also subscribe to
+    /// `SCTP_PARTIAL_DELIVERY_EVENT`, or call
+    /// [`SctpStream::set_notification_mask`] after enabling receive-info so
+    /// FlowIO retains that subscription. Existing partial-delivery subscriptions
     /// on an adopted descriptor remain caller-visible unless a later
     /// [`SctpStream::set_notification_mask`] call changes that policy.
     ///
@@ -3420,11 +3514,14 @@ impl SctpStream {
 
     /// Takes ownership of a bare SCTP socket descriptor and records its peer.
     ///
-    /// Callers supplying an external descriptor are responsible for applying
-    /// nonblocking mode and socket options compatible with the data or
-    /// metadata APIs they use. Existing partial-delivery subscriptions remain
-    /// caller-visible unless a later [`SctpStream::set_notification_mask`]
-    /// call changes that policy.
+    /// Adoption makes no syscalls. The caller must set nonblocking mode before
+    /// runtime I/O, enable `SCTP_RECVRCVINFO` for ancillary receive fields, and
+    /// subscribe to `SCTP_PARTIAL_DELIVERY_EVENT` for assisted discard recovery.
+    /// Without receive-info, message receives return default ancillary fields.
+    /// Calling [`SctpStream::set_notification_mask`] after enabling receive-info
+    /// retains the partial-delivery subscription. Existing subscriptions remain
+    /// caller-visible unless a later [`SctpStream::set_notification_mask`] call
+    /// changes that policy.
     ///
     /// # Safety
     ///
@@ -3432,7 +3529,8 @@ impl SctpStream {
     /// close responsibility. After this call, the caller must not close `fd`,
     /// reuse it, or create another owning wrapper for the same descriptor.
     ///
-    /// Calling raw adoption without an explicit safety boundary is rejected:
+    /// Calling `from_raw_fd` from safe code without an `unsafe` block does not
+    /// compile:
     /// ```compile_fail
     /// use flowio::net::sctp::SctpStream;
     /// use std::net::{Ipv4Addr, SocketAddr};
@@ -3784,10 +3882,11 @@ impl SctpStream {
     /// Requests that the peer send to the provided local address by default.
     ///
     /// Unlike [`SctpStream::set_primary_dest_addr`], this sends a wire request
-    /// to the peer. Some Linux SCTP deployments reject it with `EPERM`/`EACCES`
-    /// when dynamic address reconfiguration is disabled by kernel policy or
-    /// association capabilities. This is path control-plane work, not the
-    /// per-message data fast path.
+    /// to the peer. For sockets using Linux defaults, `net.sctp.addip_enable=0`
+    /// makes it return `EPERM` before the kernel checks the request length or
+    /// address. Enabling ADD-IP alone does not guarantee success: association
+    /// capabilities and security policy can still reject the request. This is
+    /// path control-plane work, not the per-message data fast path.
     pub fn request_peer_use_local_addr(&self, local_addr: SocketAddr) -> io::Result<()> {
         let raw = SctpSetPeerPrimRaw {
             assoc_id: 0,
@@ -3819,15 +3918,16 @@ impl SctpStream {
     ///
     /// If the socket currently has `SCTP_RECVRCVINFO` enabled, the effective
     /// kernel mask retains the partial-delivery event even when
-    /// `mask.partial_delivery` is false. Abort events identifiable as forced
-    /// by that dependency are consumed as internal metadata-receive recovery;
-    /// setting the field to true keeps complete abort notifications
-    /// caller-visible. If other notification types are also requested, a
-    /// caller buffer too short to identify a fragmented notification retains
-    /// the normal truncated-notification error behavior. After the kernel
-    /// accepts the new mask, the stream also records the observed
-    /// `SCTP_RECVRCVINFO` setting so later metadata receives apply the matching
-    /// strict-or-default ancillary policy.
+    /// `mask.partial_delivery` is false. Partial-delivery aborts that FlowIO
+    /// can identify as arriving only because of that forced subscription are
+    /// consumed by metadata-receive recovery; setting the field to true returns
+    /// complete abort notifications to the caller. If other notification types
+    /// are also requested, a caller buffer too short to identify a fragmented
+    /// notification gets the usual truncated-notification error. After the
+    /// kernel accepts the new mask, the stream also records the observed
+    /// `SCTP_RECVRCVINFO` setting: while it is enabled, later metadata receives
+    /// reject ordinary data that lacks receive info as `InvalidData`; while it
+    /// is disabled, they return default ancillary fields.
     ///
     /// This is signaling setup/control-plane work. Data-only fast paths should
     /// use [`SctpSocketConfig::data`] and avoid per-message mask changes.
@@ -3874,33 +3974,31 @@ impl SctpStream {
 
     /// Starts one connected data receive on the fast path.
     ///
-    /// This path is intended for sockets configured without SCTP
-    /// notifications and without `SCTP_RCVINFO`. Its result carries only the
-    /// received byte count; the rental buffer is returned beside that result.
-    /// It does not expose `MSG_EOR` or truncation flags, so use it only when
-    /// application framing guarantees the supplied buffer is large enough.
-    /// Use [`SctpStream::recv_msg`] when record-boundary or truncation
-    /// correctness depends on kernel metadata.
-    /// Positive progress appends to an `IoBuffMut` payload; buffers that keep
-    /// the provided zero write base publish from their beginning. A kernel
-    /// zero-byte completion is clean peer EOF and preserves existing logical
-    /// contents; the returned count is relative to this receive. Zero-length
-    /// caller requests are rejected before submission so they cannot
-    /// masquerade as EOF.
-    /// This data-only path does not drive metadata receive resynchronization.
-    /// If rich receive is discarding a record tail, or if a dropped
-    /// `recv_msg` / `recv_msg_vectored` operation occupies the stream-owned
-    /// recovery slot, this method rejects the request without changing that
-    /// recovery state or submitting another receive.
+    /// This path is intended for sockets configured without SCTP notifications
+    /// and without `SCTP_RCVINFO`. Its result carries only the received byte
+    /// count; the rental buffer is returned beside that result. It does not
+    /// expose `MSG_EOR` or truncation flags, so use it only when application
+    /// framing guarantees the supplied buffer is large enough. Use
+    /// [`SctpStream::recv_msg`] when record-boundary or truncation correctness
+    /// depends on kernel metadata. Positive progress appends to an `IoBuffMut`
+    /// payload; buffers that keep the provided zero write base publish from
+    /// their beginning. A kernel zero-byte completion is clean peer EOF and
+    /// preserves existing logical contents; the returned count is relative to
+    /// this receive. Zero-length caller requests are rejected before submission
+    /// so they cannot masquerade as EOF. This data-only path does not drive
+    /// metadata receive resynchronization. If a metadata receive is discarding
+    /// a record tail, or a dropped `recv_msg` / `recv_msg_vectored` is still
+    /// attached to the stream, this method rejects the request without changing
+    /// that state or submitting another receive.
     ///
     /// # Errors
     /// Returns `InvalidInput` if `len` is zero, exceeds
-    /// `buffer.writable_len()`, or rich receive recovery is pending. Local
-    /// length validation retains precedence;
-    /// all three cases return the exact buffer after owner-context validation
-    /// and before operation allocation, buffer-pointer access, or submission.
-    /// Kernel receive errors are returned as `io::Error` values from the
-    /// completed operation.
+    /// `buffer.writable_len()`, or metadata-receive recovery is pending. Length
+    /// validation takes precedence over the pending-recovery check; all three
+    /// cases return the buffer after owner-context validation and before
+    /// operation allocation, buffer-pointer access, or submission. Kernel
+    /// receive errors are returned as `io::Error` values from the completed
+    /// operation.
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> DataRecvFuture<'_, B> {
@@ -3969,14 +4067,14 @@ impl SctpStream {
     /// # Errors
     /// Returns `InvalidInput` if `len` is zero or exceeds
     /// `buffer.writable_len()`. After owner-context validation, this local
-    /// error returns the exact buffer before adopting a prior dropped metadata
-    /// receive; that stash remains for the next valid request.
-    /// A ring-abandoned dropped receive is terminal: the detecting request and
-    /// every later metadata receive return `NotConnected` without submitting
-    /// the new caller buffer, and stream drop clears only the opaque local
-    /// marker.
-    /// Shared metadata parsing, truncation, EOF, and record-tail recovery
-    /// behavior is documented on [`SctpStream`].
+    /// error returns the buffer before any previously dropped metadata receive
+    /// is consumed; that dropped receive stays attached for the next valid
+    /// request. If the `io_uring` of a dropped receive was abandoned, metadata
+    /// receives with valid local inputs fail permanently: the request that
+    /// detects it and every later valid metadata receive return `NotConnected`
+    /// without submitting the new caller buffer, and dropping the stream does
+    /// not reclaim the abandoned receive. Shared metadata parsing, truncation,
+    /// EOF, and record-tail recovery behavior is documented on [`SctpStream`].
     ///
     /// Positive delivered bytes append to an `IoBuffMut` payload; buffers that
     /// keep the provided zero write base publish from their beginning. Bytes
@@ -4049,31 +4147,31 @@ impl SctpStream {
     /// Scatter-receive into a vectored buffer chain with SCTP metadata.
     ///
     /// The chain is consumed and returned alongside the result (rental
-    /// pattern).  On success, returns the total bytes received and
-    /// per-message metadata (stream id, PPID, etc.) or a notification.
+    /// pattern).  On success, returns the total bytes received and per-message
+    /// metadata (stream id, PPID, etc.) or a notification.
     ///
     /// Notification data must fit within the first writable segment of the
-    /// chain; zero-length destinations are not submitted to the kernel.
-    /// Use this when both segmentation and SCTP metadata/notifications matter.
-    /// For a single contiguous data-only receive, prefer [`SctpStream::recv`]
-    /// only when EOR and truncation reporting are unnecessary.
+    /// chain; zero-length destinations are not submitted to the kernel. Use
+    /// this when both segmentation and SCTP metadata/notifications matter. For
+    /// a single contiguous data-only receive, prefer [`SctpStream::recv`] only
+    /// when EOR and truncation reporting are unnecessary.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if the chain has no writable
     /// bytes, has more than 1,024 active writable segments, its aggregate
-    /// writable byte count cannot be represented by `usize`, iovec
-    /// materialization fails, or the materialized active writable-segment
-    /// count or byte total differs from the construction-time snapshot. After
-    /// owner-context validation, an empty, zero-writable, or over-limit chain
-    /// returns unchanged before adopting a prior dropped metadata receive;
-    /// that stash remains for the next valid request. Materialization and shape
-    /// failures return the exact chain without submitting kernel I/O. Shared
-    /// metadata requests remain terminally `NotConnected` after a dropped
-    /// receive's origin ring is abandoned; they return the exact unsubmitted
-    /// chain until stream destruction clears the opaque local marker. Shared
-    /// metadata parsing, truncation, EOF, and record-tail recovery behavior is
-    /// documented on [`SctpStream`].
+    /// writable byte count cannot be represented by `usize`, building its
+    /// `iovec` array fails, or the active writable-segment count or byte
+    /// total at submission differs from the values measured when this method
+    /// was called. After owner-context validation, an empty, zero-writable, or
+    /// over-limit chain is returned unchanged before any previously dropped
+    /// metadata receive is consumed; that dropped receive stays attached for
+    /// the next valid request. `iovec` construction and shape failures return
+    /// the chain without submitting kernel I/O. Once the `io_uring` of a
+    /// dropped metadata receive has been abandoned, every metadata receive with
+    /// valid local inputs returns `NotConnected` with its chain unsubmitted,
+    /// for the rest of the stream's life. Shared metadata parsing, truncation,
+    /// EOF, and record-tail recovery behavior is documented on [`SctpStream`].
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn recv_msg_vectored<const N: usize>(
@@ -4103,15 +4201,15 @@ impl SctpStream {
     ///
     /// The chain is consumed and returned alongside the result (rental
     /// pattern). The total number of bytes sent is returned in `Ok`. Empty and
-    /// zero-readable chains are rejected without submitting kernel I/O.
-    /// Use this when both segmentation and explicit SCTP metadata matter. For
-    /// a single contiguous data-only send, prefer [`SctpStream::send`].
+    /// zero-readable chains are rejected without submitting kernel I/O. Use
+    /// this when both segmentation and explicit SCTP metadata matter. For a
+    /// single contiguous data-only send, prefer [`SctpStream::send`].
     ///
     /// # Errors
     /// Returns `InvalidInput` if the chain has no readable bytes, has more than
     /// 1,024 active readable segments, or its aggregate readable byte count
-    /// cannot be represented by `usize`. Validation returns the exact chain
-    /// before retained allocation or kernel submission.
+    /// cannot be represented by `usize`. These validation failures return the
+    /// chain before any operation allocation or kernel submission.
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn send_msg_vectored<const N: usize>(
@@ -5113,9 +5211,10 @@ unsafe fn sctp_vectored_received_prefix<'a, const N: usize>(
     unsafe { std::slice::from_raw_parts(destination, copied) }
 }
 
-/// Defines the ordinary first-iovec view and independently bounded recovery
-/// prefix for one completed vectored receive without changing the expanded
-/// fast-path code shape.
+/// Defines, in the caller's scope, the ordinary first-iovec view and an
+/// independently bounded recovery prefix for one completed vectored receive.
+/// The prefix is gathered across iovecs only when the first iovec holds fewer
+/// bytes than the recovery target.
 macro_rules! sctp_vectored_received_slices {
     (
         $buffer:expr,
@@ -6207,11 +6306,12 @@ impl<const N: usize> Drop for SendVectoredFuture<'_, N> {
 
 /// Future returned by [`SctpListener::accept`] for one incoming association.
 ///
-/// It resolves to the connected [`SctpStream`] and its peer address. The
-/// future borrows the listener's reusable accept slot, so a listener can have
-/// at most one live accept future. Dropping a prepared pending future cancels
-/// its readiness wait without consuming an association from the listener
-/// backlog; dropping an unprepared future cannot affect the earlier owner.
+/// It resolves to the connected [`SctpStream`] and its peer address. The future
+/// borrows the listener's reusable accept slot, so a listener can have at most
+/// one live accept future. Dropping a pending accept that claimed the slot
+/// cancels only its readiness wait and leaves a queued association for the next
+/// accept. A future that did not claim the slot owns no wait, so dropping it
+/// cannot affect the accept that holds the slot.
 ///
 /// # Example
 /// ```no_run
@@ -7822,13 +7922,16 @@ pub(crate) mod test_support {
         },
     }
 
-    /// Returns whether a general SCTP capability probe may be treated as
-    /// unavailable rather than as a test or benchmark failure.
+    /// Classifies errors from a general SCTP capability probe.
     ///
-    /// This policy is intentionally narrower than option-specific SCTP
-    /// feature probing. Errors such as `EINVAL` and `ENOPROTOOPT` must remain
-    /// visible to catch invalid probe setup and unsupported socket options
-    /// separately.
+    /// Returns `true` only for errors meaning the kernel lacks or denies SCTP
+    /// sockets (`EPROTONOSUPPORT`, `ESOCKTNOSUPPORT`, `EAFNOSUPPORT`,
+    /// `EPFNOSUPPORT`, `EPERM`, `EACCES`). It does not decide whether a test
+    /// may skip; [`require_sctp_capability`] does. This classification is
+    /// narrower than option-specific SCTP feature probing: errors such as
+    /// `EINVAL` and `ENOPROTOOPT` return `false`, so invalid probe setup and
+    /// unsupported socket options are reported separately from missing SCTP
+    /// support.
     pub fn capability_unavailable(err: &io::Error) -> bool {
         matches!(
             err.raw_os_error(),
@@ -7841,13 +7944,84 @@ pub(crate) mod test_support {
         )
     }
 
-    /// Constructs the exact post-`accept4` SCTP stream owner without requiring
-    /// a live SCTP association.
+    /// Requires kernel SCTP support unless `FLOWIO_ALLOW_SCTP_SKIP=1` permits a
+    /// capability-dependent test to skip. Pass `None` when SCTP is available.
+    /// An allowed skip prints one `FLOWIO_SCTP_SKIP:` line to standard error;
+    /// otherwise the returned error keeps the probe's error kind and its
+    /// message names the cause and the `FLOWIO_ALLOW_SCTP_SKIP=1` opt-out.
+    pub fn require_sctp_capability(unavailable: Option<&io::Error>) -> io::Result<()> {
+        let opt_out = std::env::var_os("FLOWIO_ALLOW_SCTP_SKIP");
+        require_sctp_capability_with(unavailable, opt_out.as_deref(), |marker| {
+            eprintln!("{marker}");
+        })
+    }
+
+    fn require_sctp_capability_with(
+        unavailable: Option<&io::Error>,
+        opt_out: Option<&std::ffi::OsStr>,
+        emit: impl FnOnce(&'static str),
+    ) -> io::Result<()> {
+        let Some(error) = unavailable else {
+            return Ok(());
+        };
+        if opt_out == Some(std::ffi::OsStr::new("1")) {
+            emit(
+                "FLOWIO_SCTP_SKIP: required kernel SCTP support unavailable (FLOWIO_ALLOW_SCTP_SKIP=1)",
+            );
+            return Ok(());
+        }
+        Err(io::Error::new(
+            error.kind(),
+            format!(
+                "required kernel SCTP support unavailable ({error}); set FLOWIO_ALLOW_SCTP_SKIP=1 to skip capability-dependent tests"
+            ),
+        ))
+    }
+
+    #[test]
+    fn sctp_capability_policy_requires_explicit_opt_out() {
+        use std::ffi::OsStr;
+
+        let unavailable = io::Error::from_raw_os_error(libc::EPROTONOSUPPORT);
+        let mut markers = Vec::new();
+        for opt_out in [None, Some(""), Some("0"), Some("true")] {
+            let opt_out = opt_out.map(OsStr::new);
+            require_sctp_capability_with(None, opt_out, |marker| markers.push(marker))
+                .expect("available SCTP must run without an opt-out");
+            let error = require_sctp_capability_with(Some(&unavailable), opt_out, |marker| {
+                markers.push(marker);
+            })
+            .expect_err("unavailable SCTP requires an exact explicit opt-out");
+            assert_eq!(error.kind(), unavailable.kind());
+            let message = error.to_string();
+            assert!(message.contains("kernel SCTP support unavailable"));
+            assert!(message.contains("FLOWIO_ALLOW_SCTP_SKIP=1"));
+            assert!(message.contains(&unavailable.to_string()));
+        }
+        require_sctp_capability_with(None, Some(OsStr::new("1")), |marker| {
+            markers.push(marker);
+        })
+        .expect("available SCTP must run even with an opt-out");
+        assert!(markers.is_empty(), "only actual skips may emit a marker");
+        require_sctp_capability_with(Some(&unavailable), Some(OsStr::new("1")), |marker| {
+            markers.push(marker);
+        })
+        .expect("the explicit opt-out must allow unavailable SCTP");
+        assert_eq!(
+            markers,
+            [
+                "FLOWIO_SCTP_SKIP: required kernel SCTP support unavailable (FLOWIO_ALLOW_SCTP_SKIP=1)"
+            ]
+        );
+    }
+
+    /// Builds the [`SctpStream`] that [`SctpListener::accept`] produces after a
+    /// successful `accept4`, without a live SCTP association.
     ///
-    /// This deterministic allocation oracle consumes the supplied sole fd
-    /// owner, routes it through the maintained accept-result descriptor-core
-    /// seam, and deliberately replaces kernel established-socket configuration
-    /// with a no-op. It is available only through the test-support feature.
+    /// It takes ownership of `accepted_fd`, runs it through the same
+    /// accept-result construction path, and replaces the established-socket
+    /// configuration step with a no-op, for deterministic allocation-count
+    /// tests. It is available only through the `test-support` feature.
     pub fn test_construct_sctp_accept_result(
         accepted_fd: OwnedFd,
         remote_addr: SocketAddr,
@@ -7864,12 +8038,13 @@ pub(crate) mod test_support {
         .map(|(stream, _remote_addr)| stream)
     }
 
-    /// Constructs the exact successful SCTP connect-result owner without
-    /// requiring a live SCTP association.
+    /// Builds the [`SctpStream`] that a successful [`SctpConnector::connect`]
+    /// produces, without a live SCTP association.
     ///
-    /// This deterministic allocation oracle consumes the supplied sole fd
-    /// owner at the maintained post-configuration connect-result seam. It is
-    /// available only through the test-support feature.
+    /// It takes ownership of `connected_fd` and runs only the stream
+    /// construction that follows established-socket configuration, for
+    /// deterministic allocation-count tests. It is available only through the
+    /// `test-support` feature.
     pub fn test_construct_sctp_connect_result(
         connected_fd: OwnedFd,
         remote_addr: SocketAddr,
@@ -7879,6 +8054,37 @@ pub(crate) mod test_support {
             remote_addr,
             SctpSocketConfig::data(SctpInitConfig::default()),
         )
+    }
+
+    /// Enables reconfiguration negotiation on both endpoints before the
+    /// connect future is first polled. Stream-reset permission is still
+    /// configured separately on each established association.
+    pub fn test_enable_sctp_pair_reconfiguration(
+        listener: &SctpListener,
+        connect: &ConnectFuture<'_>,
+    ) -> io::Result<()> {
+        if !connect.slot.state_ptr.is_null() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let fd = connect
+            .slot
+            .fd
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // Negotiation state does not change linger or inherited socket options,
+        // so retain the listener's managed provenance.
+        for fd in [listener.fd.raw_fd(), fd.as_raw_fd()] {
+            set_sock_opt(
+                fd,
+                libc::IPPROTO_SCTP,
+                SCTP_RECONFIG_SUPPORTED_OPT,
+                &SctpAssocValueRaw {
+                    assoc_id: 0,
+                    assoc_value: 1,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Reads the effective Linux SCTP receive-notification options for tests.
@@ -8308,7 +8514,8 @@ mod tests {
                 unsafe { OwnedFd::from_raw_fd(fd) }
             }
             Err(error) if test_support::capability_unavailable(&error) => {
-                eprintln!("SCTP capability unavailable: {error}");
+                test_support::require_sctp_capability(Some(&error))
+                    .expect("SCTP connector capability is required");
                 return;
             }
             Err(error) => panic!("SCTP capability probe failed: {error}"),

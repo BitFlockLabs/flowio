@@ -1025,7 +1025,7 @@ fn vec_mut_large_segment_count() {
 }
 
 #[test]
-fn vec_mut_freeze_reflects_modified_buffers_without_rebuild() {
+fn vec_mut_freeze_reflects_segments_modified_after_push() {
     let mut chain = IoBuffVecMut::<2>::new();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();
     chain.push(IoBuffMut::new(0, 64, 0)).unwrap();

@@ -4,7 +4,7 @@ version = "0.2.0-alpha.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "Single-threaded async runtime and TCP/UDP/SCTP/TLS transport library on x86-64 Linux io_uring, with pooled allocation-avoiding fast paths"
+description = "Single-threaded io_uring runtime for x86-64 Linux with Unix, TCP, UDP, SCTP, TLS client and DNS APIs, plus pooled I/O buffers"
 readme = "README.md"
 keywords = ["async", "io-uring", "runtime", "networking"]
 categories = ["asynchronous", "network-programming"]
@@ -12,13 +12,14 @@ exclude = ["fixtures/fuzzing/", "tests/", "public-api.txt"]
 repository = "https://github.com/BitFlockLabs/flowio"
 
 [features]
-# Dev-only: re-exports internal parsers for the out-of-source `fuzz/` crate.
-# Off by default; does not change the real public API.
+# Dev-only: exposes internal parsers to the cargo-fuzz crate in `fuzz/` and,
+# with `test-support`, fixture-replay hooks to the integration tests.
+# Off by default; not part of the supported public API.
 fuzzing = []
-# Dev-only: re-exports internal hooks used by out-of-source tests/benches.
+# Dev-only: re-exports internal hooks for integration tests and benchmark harnesses.
 # Off by default; not part of the supported public API.
 test-support = []
-# Dev-only: adds executor-local counters for bounded diagnostic runs.
+# Dev-only: adds executor-local diagnostic counters.
 # Implies the unsupported test-support facade used to snapshot and reset them.
 diagnostic-counters = ["test-support"]
 

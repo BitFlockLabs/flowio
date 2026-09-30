@@ -7,16 +7,17 @@ pub mod runtime;
 mod test_child;
 pub(crate) mod utils;
 
-/// Fuzzing-only re-exports of internal parsers. Enabled by the dev-only
-/// `fuzzing` feature and consumed exclusively by the out-of-source `fuzz/`
-/// crate; not part of the supported public API.
+/// Internal parser entry points for the cargo-fuzz crate in `fuzz/` and the
+/// fixture integration tests. Enabled by the dev-only `fuzzing` feature; not
+/// part of the supported public API. Fixture observation hooks additionally
+/// require `test-support`.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
 
 /// Test-support-only re-exports of internal hooks. Enabled by the dev-only
-/// `test-support` feature and consumed by out-of-source tests and benchmarks;
-/// not part of the supported public API.
+/// `test-support` feature and used by the crate's integration tests and
+/// benchmark harnesses; not part of the supported public API.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 #[path = "utils/test_support.rs"]

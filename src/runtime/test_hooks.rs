@@ -274,10 +274,10 @@ pub(crate) mod bind_setup {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct BindSetupReport {
         /// Reached boundaries, followed by empty slots.
-        pub trace: [Option<BindStage>; 6],
+        pub trace: [Option<BindStage>; 7],
         /// Number of populated trace slots.
         pub trace_len: usize,
-        /// Whether a seventh boundary was reached.
+        /// Whether an eighth boundary was reached.
         pub trace_overflow: bool,
         /// Whether another transport used the active observation.
         pub unexpected_transport: bool,
@@ -327,7 +327,7 @@ pub(crate) mod bind_setup {
                 transport,
                 fail_at: failure,
                 report: BindSetupReport {
-                    trace: [None; 6],
+                    trace: [None; 7],
                     trace_len: 0,
                     trace_overflow: false,
                     unexpected_transport: false,

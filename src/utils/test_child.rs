@@ -66,7 +66,7 @@ pub struct ChildCaptureError {
 }
 
 impl ChildCaptureError {
-    /// Returns the precise capture failure classification.
+    /// Returns the capture failure kind.
     pub fn kind(&self) -> ChildCaptureErrorKind {
         self.kind
     }
@@ -130,8 +130,8 @@ pub struct CapturedChildOutput {
 }
 
 /// Checks that one successful child completed exactly the selected test.
-#[cfg(all(test, not(miri)))]
-pub(crate) fn exact_test_completed(output: &CapturedChildOutput, test_name: &str) -> bool {
+#[cfg(any(all(test, not(miri)), feature = "test-support"))]
+pub fn exact_test_completed(output: &CapturedChildOutput, test_name: &str) -> bool {
     if !output.status.success() {
         return false;
     }
@@ -173,6 +173,49 @@ pub(crate) fn exact_test_completed(output: &CapturedChildOutput, test_name: &str
         }
     }
     starts == 1 && passes == 1 && summaries == 1
+}
+
+/// Runs exactly one test in the current executable with bounded output capture.
+///
+/// The child receives `child_env=1`, followed by `extra_env`. A spawn, capture,
+/// exit-status or exact-completion failure panics with the supplied label.
+#[cfg(any(all(test, not(miri)), feature = "test-support"))]
+pub fn run_exact_test_child_with_watchdog(
+    test_name: &str,
+    child_env: &str,
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+    label: &str,
+) {
+    use std::process::{Command, Stdio};
+
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let child = Command::new(current_exe)
+        // Fix libtest's execution/output mode independently of inherited
+        // RUST_TEST_THREADS; captured diagnostics cannot split the pass line.
+        .args(["--exact", test_name, "--test-threads=1"])
+        .env_remove("RUST_TEST_NOCAPTURE")
+        .env(child_env, "1")
+        .envs(extra_env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("spawn {label} child: {err}"));
+    let output = capture_child_with_watchdog(child, timeout)
+        .unwrap_or_else(|err| panic!("{label} child capture failed: {err}"));
+    assert!(
+        output.status.success(),
+        "{label} child failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        exact_test_completed(&output, test_name),
+        "{label} child did not complete exactly {test_name}: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[derive(Debug)]

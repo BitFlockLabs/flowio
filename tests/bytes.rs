@@ -460,7 +460,7 @@ macro_rules! extension_method_case {
 }
 
 #[test]
-fn extension_methods_cover_all_retained_integer_operations() {
+fn extension_methods_cover_all_integer_operations() {
     extension_method_case!(write_u8_at, read_u8_at, 0xA5u8, to_ne_bytes);
     extension_method_case!(write_i8_at, read_i8_at, -7i8, to_ne_bytes);
     extension_method_case!(write_u16_at, read_u16_at, 0x1234u16, to_ne_bytes);

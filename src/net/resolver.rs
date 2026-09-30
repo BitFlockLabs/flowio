@@ -16,7 +16,7 @@
 //!   otherwise DNS-equivalent CNAME targets are accepted and conflicting
 //!   targets return `InvalidData`
 //! - upstream asynchronous work has one five-second aggregate deadline by
-//!   default, while each matching-response wait retains its independent cap
+//!   default, and each matching-response wait also has its own cap
 //! - search domains and TCP fallback for truncated replies are not yet
 //!   implemented
 //!
@@ -326,10 +326,10 @@ fn classify_dns_timeout<T>(
 /// resolution creates one owned query and reusable response buffer shared by
 /// its sequential A, AAAA, and CNAME-follow-up work, attempts create UDP
 /// sockets, and non-literal names inspect `/etc/hosts` for each call. A receive
-/// that times out after submission retains its buffer until the target CQE, so
-/// a later attempt allocates a replacement. An aggregate timeout during send
-/// likewise leaves the query owner retained until its target CQE, but starts no
-/// later attempt.
+/// that times out after submission retains its buffer until FlowIO observes
+/// that receive's own completion, so a later attempt allocates a replacement.
+/// An aggregate timeout during send likewise keeps the query buffer until
+/// FlowIO observes the send's own completion, but starts no later attempt.
 ///
 /// # Example
 /// ```
@@ -384,7 +384,7 @@ impl DnsResolver {
     ///
     /// Returns [`io::ErrorKind::InvalidData`] when the file exceeds 64 KiB and
     /// [`io::ErrorKind::NotFound`] when no valid nameserver remains. Other file
-    /// errors retain their existing classifications.
+    /// open and read errors are returned unchanged.
     pub fn from_system() -> io::Result<Self> {
         let configuration = read_resolv_conf(RESOLV_CONF_PATH)?;
         Ok(Self::from_effective_nameservers(
@@ -517,10 +517,11 @@ impl DnsResolver {
     /// across its sequential A, AAAA, and CNAME-follow-up work, and each
     /// attempt creates a connected UDP socket. A true per-attempt response
     /// expiry advances to the next nameserver; a submitted timed-out receive
-    /// retains its buffer until target-CQE retirement, so a later attempt
-    /// allocates a replacement. A timer-runtime failure preserves its exact
-    /// `io::Error` and stops that family lookup without attempting another
-    /// server; ordinary UDP I/O errors retain nameserver failover.
+    /// retains its buffer until FlowIO observes that receive's own completion,
+    /// so a later attempt allocates a replacement. A timer-runtime failure is
+    /// returned as its original `io::Error` and stops that family lookup
+    /// without attempting another server; ordinary UDP I/O errors fail over to
+    /// the next nameserver.
     ///
     /// One aggregate deadline starts only after literal, `localhost`, and
     /// hosts-file lookup miss. Its default is five seconds and it spans every
@@ -529,8 +530,8 @@ impl DnsResolver {
     /// per-attempt deadline and that aggregate deadline. When both deadlines
     /// are equal, expiry is aggregate and no later attempt begins. A response
     /// completion wins the timer when both become ready in the same poll,
-    /// following FlowIO's general timeout contract. A completed address also
-    /// keeps the existing result precedence over a later family's aggregate
+    /// following FlowIO's general timeout contract. An address already obtained
+    /// from one family also takes precedence over a later family's aggregate
     /// expiry or timer-runtime failure.
     ///
     /// The aggregate deadline cannot preempt the bounded synchronous hosts
@@ -542,7 +543,7 @@ impl DnsResolver {
     /// [`io::ErrorKind::TimedOut`] with the diagnostic
     /// `DNS total query timed out`.
     ///
-    /// A and AAAA remain sequential, in that order. Their outcomes are
+    /// A and AAAA queries run sequentially, A first. Their outcomes are
     /// combined as: any address, a terminal local/runtime error, an A-first
     /// CNAME, NXDOMAIN, an A-first recoverable error, then `NotFound` for two
     /// empty answers. An A-side terminal error stops before the AAAA query; a
@@ -564,21 +565,22 @@ impl DnsResolver {
     /// transaction ID matches; unrelated full datagrams are drained, while a
     /// matching-ID full datagram is rejected as anomalously truncated. A
     /// matching-ID response must be marked as a response and use the QUERY
-    /// opcode. The allocation-free UDP candidate gate drains other opcodes;
-    /// full parsing rejects them with `InvalidData` before question,
-    /// response-code, or resource-record handling. Every present echoed
-    /// question is matched by name, type, and class before its response code
-    /// is applied. Questionless FORMERR, SERVFAIL, NOTIMP, and REFUSED replies
-    /// remain prompt nameserver-failover results, while a questionless
-    /// NXDOMAIN is drained as an unrelated datagram.
+    /// opcode. The allocation-free receive prefilter drains datagrams with any
+    /// other opcode, and the full response parser rejects them with
+    /// `InvalidData` before question, response-code, or resource-record
+    /// handling. Every present echoed question is matched by name, type, and
+    /// class before its response code is applied. Questionless FORMERR,
+    /// SERVFAIL, NOTIMP, and REFUSED replies trigger immediate nameserver
+    /// failover, while a questionless NXDOMAIN is drained as an unrelated
+    /// datagram.
     ///
     /// Every literal label in a response name, including a compressed suffix,
     /// must be valid UTF-8 and contain no literal `.`; dots are inserted only
-    /// between wire labels in the decoded presentation. The shared name walker
-    /// rejects an invalid echoed question before comparison and rejects an
-    /// invalid record owner or CNAME target with `InvalidData` before
-    /// response-code or chain processing. Valid non-ASCII label text is
-    /// preserved; name comparison folds ASCII case only.
+    /// between wire labels in the decoded presentation. The resolver rejects an
+    /// invalid echoed question before comparison and rejects an invalid record
+    /// owner or CNAME target with `InvalidData` before response-code or chain
+    /// processing. Valid non-ASCII label text is preserved; name comparison
+    /// folds ASCII case only.
     ///
     /// Every declared Answer, Authority, and Additional record is structurally
     /// validated before NXDOMAIN or another response code is applied. Known A
@@ -586,18 +588,18 @@ impl DnsResolver {
     /// contain exactly one complete encoded name, regardless of section or
     /// class. A CNAME is therefore malformed unless its encoded (possibly
     /// compressed) name consumes its declared RDATA length exactly. Malformed
-    /// responses participate in the existing nameserver and address-family
-    /// error selection.
+    /// responses go through the nameserver-failover and address-family error
+    /// selection described above.
     ///
     /// Only Internet-class Answer CNAME and address records contribute to
     /// resolution; all other valid records are ignored. A structurally valid
-    /// root name remains allowed in an ignored record, but a root target
-    /// reached while interpreting an Answer CNAME is upstream `InvalidData`
-    /// and advances nameserver failover.
-    /// Positive-response record storage reserves at most the lesser of the
-    /// declared Answer count and the packet's minimum-record density. Authority
-    /// and Additional counts do not reserve result capacity, but every record
-    /// in those sections is still completely validated.
+    /// root name is allowed in an ignored record, but a root target reached
+    /// while interpreting an Answer CNAME is upstream `InvalidData` and
+    /// advances nameserver failover. Positive-response record storage reserves
+    /// at most the lesser of the declared Answer count and the packet's
+    /// minimum-record density. Authority and Additional counts do not reserve
+    /// result capacity, but every record in those sections is still completely
+    /// validated.
     ///
     /// # Bounds
     ///

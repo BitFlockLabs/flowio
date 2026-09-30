@@ -4,12 +4,10 @@ use flowio::runtime::buffer::pool::IoBuffPool;
 use flowio::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use flowio::runtime::executor::Executor;
 use flowio::runtime::timer::sleep;
-use flowio::test_support::child::capture_child_with_watchdog;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::os::fd::RawFd;
-use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -568,29 +566,8 @@ pub fn run_exact_test_child_with_watchdog_env(
     timeout: Duration,
     extra_env: &[(&str, &str)],
 ) {
-    let current_exe = std::env::current_exe().expect("current integration-test executable");
-    let child = Command::new(current_exe)
-        .args(["--exact", test_name, "--nocapture"])
-        .env(child_env, "1")
-        .envs(extra_env.iter().copied())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn integration-test watchdog child");
-    let output = capture_child_with_watchdog(child, timeout)
-        .unwrap_or_else(|err| panic!("watchdog child {test_name} capture failed: {err}"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "watchdog child {test_name} failed: status={:?}, stdout={}, stderr={}",
-        output.status,
-        stdout,
-        stderr
-    );
-    assert!(
-        stdout.contains("1 passed;"),
-        "watchdog child {test_name} did not execute exactly one test: stdout={stdout}, stderr={stderr}"
+    flowio::test_support::child::run_exact_test_child_with_watchdog(
+        test_name, child_env, timeout, extra_env, test_name,
     );
 }
 
@@ -718,7 +695,7 @@ pub const OVERSIZED_VECTORED_TEST_STACK_BYTES: &str = "33554432";
 
 /// Exact allocation-free diagnostic for retained stream scratch overflow.
 #[allow(dead_code)]
-pub const OVERSIZED_VECTORED_ERROR: &str = "active iovec count exceeds retained scratch capacity";
+pub const OVERSIZED_VECTORED_ERROR: &str = "too many iovec segments for this operation";
 
 /// Asserts intrinsic rejection of an over-limit active-iovec count.
 #[allow(dead_code)]

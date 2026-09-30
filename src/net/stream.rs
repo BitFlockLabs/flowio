@@ -138,18 +138,17 @@ macro_rules! impl_stream_rw {
         /// Attempts one nonblocking projected gather-write syscall.
         ///
         /// FlowIO projects borrowed byte pieces from the owned `source`,
-        /// performs one `sendmsg`, and returns the source immediately. Up to
-        /// 16 pieces use inline stack scratch; larger projections normally use
+        /// performs one `sendmsg`, and returns the source immediately. Up to 16
+        /// pieces use inline stack scratch; larger projections normally use
         /// bounded reusable thread-local `Vec` scratch and may allocate when
         /// capacity must grow. Re-entry or thread-local teardown uses one
         /// bounded local vector instead; if its reservation fails, this returns
         /// [`io::ErrorKind::WouldBlock`] with the exact source. Message bytes
-        /// are not copied, and no retained operation state is created.
+        /// are not copied, and no operation slot is used.
         /// Projections above 1024 non-empty pieces are rejected with
-        /// [`io::ErrorKind::InvalidInput`].
-        /// A declared-empty projection is still invoked once for contract
-        /// validation; a valid empty projection completes with `Ok(0)` and no
-        /// syscall.
+        /// [`io::ErrorKind::InvalidInput`]. A declared-empty projection is
+        /// still invoked once for contract validation; a valid empty projection
+        /// completes with `Ok(0)` and no syscall.
         ///
         /// This is a deadline-edge primitive. Prefer
         /// [`Self::writev_projected`] / [`Self::writev_all_projected`] for
@@ -284,16 +283,17 @@ macro_rules! impl_stream_rw {
         /// The chain is consumed and returned alongside the result (rental
         /// pattern). The total number of bytes read is returned in `Ok`.
         ///
-        /// Use this when the receive path is already naturally segmented.
-        /// For a single contiguous destination buffer, prefer
-        /// [`Self::read`] to avoid iovec materialization.
+        /// Use this when the receive path is already naturally segmented. For a
+        /// single contiguous destination buffer, prefer [`Self::read`] to avoid
+        /// building an `iovec` array.
         ///
         /// # Errors
         ///
-        /// Returns [`io::ErrorKind::InvalidInput`] if the chain has no
-        /// writable segments, iovec materialization overflows, or its writable
-        /// segment count or byte total changes before submission.
-        /// Materialization and shape failures return the exact chain without
+        /// Returns [`io::ErrorKind::InvalidInput`] if the chain has no writable
+        /// segments, has more than 1024 non-empty writable segments, has a
+        /// total writable length that overflows `usize`, or its writable
+        /// segment count or byte total changes before submission. The
+        /// segment-count, overflow, and shape failures return the chain without
         /// submitting kernel I/O.
         pub fn readv<const N: usize>(
             &mut self,
@@ -310,9 +310,9 @@ macro_rules! impl_stream_rw {
         /// kernel I/O. Both FlowIO frozen chains and generic read-only
         /// chains are accepted.
         ///
-        /// Use this when the send path is already naturally segmented. For
-        /// one contiguous payload, prefer [`Self::write`] to avoid iovec
-        /// materialization.
+        /// Use this when the send path is already naturally segmented. For one
+        /// contiguous payload, prefer [`Self::write`] to avoid building an
+        /// `iovec` array.
         ///
         /// # Errors
         ///
@@ -327,17 +327,19 @@ macro_rules! impl_stream_rw {
 
         /// Gather-write projected pieces from one compact owned source.
         ///
-        /// FlowIO retains `source`, then projects borrowed byte slices from
-        /// that retained source into retained kernel-facing `iovec`
-        /// scratch. Projection copies only pointer/length metadata, not message
-        /// bytes. After runtime-context validation succeeds, declared-empty
+        /// FlowIO takes ownership of `source`. For a non-empty write, it moves
+        /// `source` into storage owned by the operation, then projects borrowed
+        /// byte slices into an `iovec` array that FlowIO owns. Both stay alive
+        /// until FlowIO observes the write's own completion, even if the future
+        /// is dropped. Projection copies only pointer/length metadata, not
+        /// message bytes. After runtime-context validation succeeds, declared-empty
         /// projections are still invoked once for contract validation; valid
-        /// empty projections complete with `Ok(0)` without submitting kernel
-        /// I/O.
+        /// empty projections complete with
+        /// `Ok(0)` without submitting kernel I/O.
         ///
-        /// Use this when the send path is already naturally segmented
-        /// inside the retained carrier. For one contiguous payload, prefer
-        /// [`Self::write`] to avoid projection and iovec materialization.
+        /// Use this when the send path is already naturally segmented inside
+        /// `source`. For one contiguous payload, prefer [`Self::write`] to
+        /// avoid projection and building an `iovec` array.
         pub fn writev_projected<T: WritevProjection>(
             &mut self,
             source: T,
@@ -401,13 +403,14 @@ macro_rules! impl_stream_rw {
         ///
         /// # Errors
         ///
-        /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds the
-        /// chain's writable capacity or the `io_uring` 32-bit byte-count
-        /// limit, iovec materialization overflows, or the chain's writable
-        /// segment count or byte total changes before submission.
-        /// Materialization and shape failures return the exact chain without
-        /// submitting kernel I/O. A zero `len` remains valid even when the
-        /// chain has no writable segments.
+        /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds the chain's
+        /// writable capacity or the `io_uring` 32-bit byte-count limit, the
+        /// chain's total writable length overflows `usize`, a nonzero `len`
+        /// targets a chain with more than 1024 non-empty writable segments, or
+        /// the chain's writable segment count or byte total changes before
+        /// submission. The overflow, segment-count, and shape failures return
+        /// the chain without submitting kernel I/O. A zero `len` is valid even
+        /// when the chain has no writable segments.
         pub fn readv_exact<const N: usize>(
             &mut self,
             buffer: IoBuffVecMut<N>,
@@ -1924,9 +1927,10 @@ impl<B: IoBuffReadOnly, S> Drop for WriteFuture<'_, B, S> {
 
 /// Writes the entire buffer, re-submitting on partial writes.
 ///
-/// The base buffer pointer is captured during the initial retained submission
-/// and reused for retries, avoiding repeated `as_ptr()` trait calls. Context is
-/// validated once for each completion/resubmission pass.
+/// The buffer's base pointer is captured when the first write is submitted and
+/// reused for resubmissions, avoiding repeated `as_ptr()` calls. A poll that
+/// handles a completion and resubmits validates the runtime context once for
+/// both steps.
 pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
     /// Completion state reused across sequential retry submissions.
     state_ptr: RuntimeFdOpState<'a>,
@@ -2130,13 +2134,13 @@ impl<B: IoBuffReadOnly, S> Drop for WriteAllFuture<'_, B, S> {
 // ReadExactFuture
 // ---------------------------------------------------------------------------
 
-/// Reads exactly `target` bytes, re-submitting on partial reads.
+/// Reads exactly the requested number of bytes, re-submitting on partial reads.
 ///
-/// Returns `UnexpectedEof` if the peer closes before the target is reached.
-/// On error the buffer reflects the bytes received so far.  Like
-/// [`WriteAllFuture`], the base pointer is captured during the initial
-/// retained submission and one context extraction covers state handling and
-/// submission per poll.
+/// Returns `UnexpectedEof` if the peer closes before that many bytes arrive. On
+/// error the buffer reflects the bytes received so far. Like
+/// [`WriteAllFuture`], it captures the buffer's base pointer when the first
+/// read is submitted and reuses it for resubmissions. A poll that handles a
+/// completion and resubmits validates the runtime context once for both steps.
 pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
     /// Completion state reused across sequential retry submissions.
     state_ptr: RuntimeFdOpState<'a>,
@@ -2994,7 +2998,7 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Drop for WritevAllFuture<'_, C, 
 // Projected WritevFuture
 // ---------------------------------------------------------------------------
 
-/// Gather-write from one compact retained source projected into write pieces.
+/// Gather-write from one compact owned source projected into write pieces.
 pub struct WritevProjectedFuture<'a, T: WritevProjection, S> {
     /// Completion state for the submitted projected writev/write SQE, if any.
     state_ptr: RuntimeFdOpState<'a>,
@@ -3101,7 +3105,7 @@ impl<T: WritevProjection, S> Drop for WritevProjectedFuture<'_, T, S> {
 // Projected WritevAllFuture
 // ---------------------------------------------------------------------------
 
-/// Gather-write all projected pieces from one compact retained source.
+/// Gather-write all projected pieces from one compact owned source.
 pub struct WritevAllProjectedFuture<'a, T: WritevProjection, S> {
     /// Completion state reused across projected retry submissions.
     state_ptr: RuntimeFdOpState<'a>,
@@ -3311,9 +3315,9 @@ impl<T: WritevProjection, S> Drop for WritevAllProjectedFuture<'_, T, S> {
 // ReadvExactFuture
 // ---------------------------------------------------------------------------
 
-/// Scatter-read exactly `target` bytes into a vectored buffer chain,
-/// re-submitting on partial reads with retained `iovec` scratch.
-/// Returns `UnexpectedEof` if the peer closes before the target is reached.
+/// Scatter-read exactly the requested number of bytes into a vectored buffer
+/// chain, re-submitting on partial reads with the same `iovec` array. Returns
+/// `UnexpectedEof` if the peer closes before that many bytes arrive.
 pub struct ReadvExactFuture<'a, const N: usize, S> {
     /// Completion state reused across sequential retry submissions.
     state_ptr: RuntimeFdOpState<'a>,

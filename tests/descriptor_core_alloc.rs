@@ -2,7 +2,7 @@
 
 // These process/fd/io_uring allocation oracles exercise facilities that Miri
 // intentionally does not emulate. The public trait and layout guards remain in
-// `descriptor_core_public_compat` and do run under Miri.
+// `public_type_traits_and_layout` and do run under Miri.
 #![cfg(not(miri))]
 
 mod common;

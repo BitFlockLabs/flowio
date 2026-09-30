@@ -19,13 +19,13 @@
 //!   ownership of the submitted future if the scheduler cannot accept it, such
 //!   as work carrying a response or cleanup obligation.
 //! - Account for task storage explicitly: each task must fit a fixed slot, but
-//!   the task pool acquires 1024-slot slabs on demand and currently has no
+//!   the task pool acquires 1024-slot slabs on demand and has no
 //!   user-configurable total slot cap.
 //!
 //! Avoid on the fast path:
 //! - Do not construct a fresh [`Executor`] or enter a new [`Executor::run`]
 //!   boundary around each operation. Spawn work inside the existing run.
-//! - Do not use [`Executor::spawn`] when admission failure must preserve the
+//! - Do not use [`Executor::spawn`] when a spawn failure must preserve the
 //!   submitted future: its `io::Error` conversion drops that future. Use
 //!   [`Executor::try_spawn`] and handle [`TrySpawnError`] instead.
 //!
@@ -77,12 +77,12 @@ use std::thread::JoinHandle as ThreadJoinHandle;
 pub const DEFAULT_PROCESS_QUOTA: usize = 128;
 /// Bytes reserved for each fixed executor task slot.
 const TASK_POOL_SIZE: usize = 4096;
-/// Maximum alignment currently guaranteed for payloads stored in `Task::data`.
+/// Maximum alignment guaranteed for payloads stored in `Task::data`.
 const TASK_DATA_ALIGN: usize = align_of::<TaskHeader>();
 /// Number of task slots allocated per task-pool slab page.
 const TASKS_PER_SLAB: usize = 1024;
-/// The owner pointer and all-task link consume prior padding at the fixed
-/// payload boundary, so adding them does not change the 64-bit task slot size.
+/// The owner pointer and all-task link occupy padding that precedes the fixed
+/// payload boundary, so they do not increase the 64-bit task slot size.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(TASK_DATA_ALIGN == 64);
@@ -220,8 +220,8 @@ macro_rules! define_runtime_stats {
             /// Vectored I/O scratch sidecar allocation failures.
             #[cfg(debug_assertions)]
             pub writev_scratch_alloc_failures: usize,
-            /// Partial vectored-write completions that advanced retained iovec
-            /// metadata before resubmitting the remaining write window.
+            /// Partial vectored-write completions that advanced the operation's
+            /// iovec array before resubmitting the remaining write window.
             #[cfg(debug_assertions)]
             pub writev_partial_continuations: usize,
             /// Descriptor owners transferred to the executor's bounded close
@@ -241,11 +241,11 @@ macro_rules! define_runtime_stats {
             #[cfg(debug_assertions)]
             pub close_linger_queries: usize,
             /// Descriptor owners closed directly on unsupported/non-socket,
-            /// ring-rejection, or worker-admission fallback paths.
+            /// ring-rejection, or worker-queue fallback paths.
             #[cfg(debug_assertions)]
             pub close_direct_closes: usize,
             /// Descriptor linger states that could not be classified before
-            /// conservative worker admission.
+            /// routing them to the close worker.
             #[cfg(debug_assertions)]
             pub close_linger_classification_failures: usize,
             /// Descriptor owners rejected because the bounded close-worker
@@ -279,12 +279,12 @@ const _: [(); 0] = [(); size_of::<RuntimeStats>()];
 
 /// Opt-in executor-local counters for bounded diagnostic runs.
 ///
-/// These counters are available only with the dev-only
-/// `diagnostic-counters` feature and are not a supported production metrics
-/// API. They use plain owner-thread-local integers: no atomics, locks, queues,
-/// allocation, or background work is introduced. Use the test-support facade
-/// to snapshot and reset them only after [`Executor::run`] returns, so the
-/// observation work stays outside the timed benchmark interval.
+/// These counters are available only with the dev-only `diagnostic-counters`
+/// feature and are not a supported production metrics API. They are plain
+/// owner-thread-local integers: updating them uses no atomics, locks, queues,
+/// allocation, or background work. Use the test-support facade to snapshot and
+/// reset them only after [`Executor::run`] returns, so the observation work
+/// stays outside the timed benchmark interval.
 #[cfg(feature = "diagnostic-counters")]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -543,7 +543,7 @@ unsafe impl MemoryProvider for ExecutorTaskMemProvider {
     }
 }
 
-/// User-facing runtime configuration.
+/// Runtime configuration passed to [`Executor::new_with_config`].
 ///
 /// The configuration is typically chosen once when the executor is built.
 /// Mutating these knobs per request is not a fast-path pattern.
@@ -1909,23 +1909,24 @@ unsafe fn drop_join_task_with_cleanup<F: Future, C: TaskDestroyCleanup + ?Sized>
 /// destructors on the owner thread produce entries; the outermost iterative
 /// destructor consumes them in FIFO order. The queue has no independent
 /// allocation, configured capacity, or full condition: it can contain at most
-/// the allocator-limited live task slots that nested destruction releases.
-/// Null head/tail terminates an empty drain. Shutdown and cancellation reach
-/// this queue only through the same unique final-reference path, and the outer
-/// drain keeps the first panic while clearing its TLS registration. Reentrant
+/// the allocator-limited live task slots that nested destruction releases. Null
+/// head/tail terminates an empty drain. Shutdown and cancellation reach this
+/// queue only through the same unique final-reference path, and the outer drain
+/// keeps the first panic while clearing its TLS registration. Reentrant
 /// executor shutdown also uses one embedded node per distinct live executor:
 /// task cancellation runs immediately, but timer/reactor teardown and the
-/// existing terminal-descriptor worker join wait until callback-capable task
-/// destruction has drained under each task's exact owner context. A temporary
-/// self-pin keeps each deferred state alive; it adds no allocation, queue
-/// storage, thread, or worker responsibility. No metric is emitted.
+/// terminal-descriptor worker join wait until callback-capable task destruction
+/// has drained under each task's exact owner context. A temporary self-pin
+/// keeps each deferred state alive; deferral allocates nothing, needs no queue
+/// storage beyond the embedded node, and assigns no work to another thread or
+/// to the close worker. No metric is emitted.
 ///
 /// `ready_link` is the queue node and is detached from `all_tasks` before
 /// publication. A singleton node has null link fields even while head/tail own
 /// it, so the link itself does not encode membership. Valid task ownership
 /// makes duplicate publication unreachable: `release_task` dispatches the
 /// iterative destructor only on the unique 1-to-0 transition, which installs
-/// the RAW vtable before any nested publication. This unsafe contract is not
+/// the raw vtable before any nested publication. This unsafe contract is not
 /// repaired or coalesced on the fast path.
 struct IterativeTaskDestroyQueue {
     head: *mut crate::utils::list::intrusive::dlist::Link,
@@ -2088,8 +2089,8 @@ fn set_active_owner_for_iterative_destroy(owner: *const ExecutorOwner) {
     });
 }
 
-/// Detaches one nested RAW task from registry ownership and appends it to the
-/// active destruction FIFO before returning to the outer raw destructor.
+/// Detaches one nested raw-vtable task from registry ownership and appends it
+/// to the active destruction FIFO before returning to the outer raw destructor.
 unsafe fn enqueue_nested_task_destroy(
     queue: *mut IterativeTaskDestroyQueue,
     task: *mut TaskHeader,
@@ -2292,7 +2293,8 @@ unsafe fn drop_join_future_in_place<F>(slot: *mut Option<F>) {
 /// Error returned when a spawned task cannot produce its output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinError {
-    /// The task was cancelled before publishing an output.
+    /// The task was cancelled before its output was stored for the
+    /// [`JoinHandle`].
     ///
     /// This occurs when the owning executor shuts down or when the task's
     /// [`Future::poll`] implementation panics. The original poll panic is
@@ -2332,8 +2334,8 @@ pub enum TrySpawnError<F> {
         /// The original future passed to `try_spawn`.
         future: F,
     },
-    /// The concrete `JoinTask<F>` does not fit in the executor's fixed task
-    /// slot size or alignment.
+    /// The future, storage for its output and the join-handle state together
+    /// do not fit in the fixed task slot size or alignment.
     TaskTooLarge {
         /// The original future passed to `try_spawn`.
         future: F,
@@ -2615,10 +2617,8 @@ impl Executor {
     /// in the steady-state fast path.
     ///
     /// # Errors
-    /// Returns `Unsupported` when the running Linux kernel does not provide
-    /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
-    /// Returns the operating-system error if the bounded close-worker thread
-    /// cannot be created.
+    /// Returns the setup, reservation and feature errors described by
+    /// [`Executor::new_with_config`].
     ///
     /// # Example
     /// ```no_run
@@ -2640,8 +2640,12 @@ impl Executor {
     /// # Errors
     /// Returns `Unsupported` when the running Linux kernel does not provide
     /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
-    /// Returns `InvalidInput` for a zero close-worker capacity and the
-    /// operating-system error if its thread cannot be created.
+    /// Returns `InvalidInput` when the kernel rejects
+    /// `config.reactor.ring_entries`, including zero or a value above its
+    /// ring-size limit. Other `io_uring` setup errors are returned unchanged.
+    /// Returns `OutOfMemory` if the ring-sized bookkeeping cannot be reserved,
+    /// and the operating-system error if the close-worker thread cannot be
+    /// created.
     ///
     /// # Example
     /// ```no_run
@@ -2730,8 +2734,8 @@ impl Executor {
     /// # Errors
     ///
     /// Returns `InvalidInput` when no executor is active or the task does not
-    /// fit a fixed task slot. Returns `OutOfMemory` when the task pool's memory
-    /// provider cannot allocate another slot.
+    /// fit a fixed task slot. Returns `OutOfMemory` when the task pool cannot
+    /// allocate memory for another slot.
     ///
     /// # Example
     /// ```no_run
@@ -2762,12 +2766,12 @@ impl Executor {
     ///
     /// On success, ownership transfers to the executor exactly as with
     /// [`Executor::spawn`], and the returned [`JoinHandle`] yields
-    /// `Ok(future_output)` or [`JoinError::Cancelled`] if executor shutdown or
-    /// a panic from the task's [`Future::poll`] wins before output publication.
-    /// On failure, the future has not been polled, pinned, stored in a task slot,
-    /// or dropped by the executor path.
+    /// `Ok(future_output)`, or [`JoinError::Cancelled`] if executor shutdown or
+    /// a panic from the task's [`Future::poll`] occurs before the task's output
+    /// is stored for the handle. On failure, the future has not been polled,
+    /// pinned, stored in a task slot, or dropped by the executor path.
     ///
-    /// This is the preferred admission API on overload-sensitive fast paths
+    /// This is the preferred spawning API on overload-sensitive fast paths
     /// because pressure is explicit and ownership is preserved.
     ///
     /// # Example
@@ -2914,9 +2918,9 @@ impl Executor {
     ///
     /// Re-raises a panic from a spawned task's [`Future::poll`] after
     /// terminalizing that task. A surviving [`JoinHandle`] observes
-    /// [`JoinError::Cancelled`] unless the task had already published its
-    /// output before a join-waker panic. Other queued tasks remain owned by
-    /// this executor and can run on a later call.
+    /// [`JoinError::Cancelled`] unless the task had already stored its output
+    /// for the handle before a join-waker panic. Other queued tasks remain
+    /// owned by this executor and can run on a later call.
     ///
     /// # Example
     /// ```no_run
@@ -3094,9 +3098,9 @@ impl Executor {
 
             if matches!(timer_wait, Some(duration) if duration.is_zero()) {
                 // A due timer should normally have been consumed by the pass
-                // above. Keep this cheap defensive branch so a clock/tick
-                // boundary is processed locally instead of entering a
-                // nominally timed kernel wait.
+                // above. This cheap defensive branch processes a clock/tick
+                // boundary locally instead of entering a nominally timed
+                // kernel wait.
                 // SAFETY: now_tick is Some when timer_wait is Some (set in the
                 // has_pending() branch above), and the raw timer pointer remains
                 // owner-thread confined for this call.
@@ -3506,7 +3510,7 @@ pub(crate) unsafe fn drop_fd_op_state_unchecked(fd_state: &mut RuntimeFdOpState<
 /// fallible or user-controlled preparation runs. Dropping it returns the
 /// unsubmitted slot; successful submission consumes it without a conditional
 /// drop branch. Typed fd submission publishes through `RuntimeFdOpState`, while
-/// older lease-free routes can still take the raw pointer directly.
+/// lease-free routes can take the raw pointer directly.
 pub(crate) struct UnsubmittedOpGuard {
     /// Reactor that owns the allocated completion-state slot.
     reactor: NonNull<Reactor>,
@@ -3648,8 +3652,8 @@ impl<T: 'static> Drop for AttachedRetainedPayloadGuard<T> {
     }
 }
 
-/// Submit an SQE and account for one tracked in-flight operation.
-/// Consolidates the normal submission bookkeeping shared by I/O futures.
+/// Submit an SQE and account for one tracked in-flight operation. Performs the
+/// normal submission bookkeeping shared by I/O futures.
 ///
 /// # Safety
 ///
@@ -3728,8 +3732,8 @@ where
 ///
 /// `fd_state` must point to a live published [`RuntimeFdOpState`] whose
 /// completion state retains its original descriptor lease. `poll_ctx` is a
-/// reserved opaque argument and may be null; the probe isolates only the
-/// ownership fragment used before the separately inspected ring submission.
+/// reserved opaque argument and may be null; the probe covers only the
+/// descriptor lookup that precedes ring submission and submits nothing.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 #[unsafe(no_mangle)]
@@ -4312,9 +4316,9 @@ unsafe fn schedule_task(task_ptr: *mut TaskHeader) {
         return;
     };
     let state = owner.state_ptr();
-    // `try_spawn`'s `shutting_down` check is the load-bearing gate that rejects
-    // new tasks during teardown. This wake-side check remains defense in depth
-    // against notifications raised while cancellation drains existing tasks.
+    // `try_spawn`'s `shutting_down` check rejects new tasks during teardown.
+    // This wake-side check additionally ignores notifications raised while
+    // cancellation drains existing tasks.
     if unsafe { (*state).shutting_down } {
         return;
     }
@@ -8669,34 +8673,12 @@ mod tests {
 
     #[cfg(not(miri))]
     fn run_exact_unit_test_child_with_watchdog(test_name: &str, child_env: &str, label: &str) {
-        use std::process::{Command, Stdio};
-
-        let current_exe = std::env::current_exe().expect("current unit-test executable");
-        let child = Command::new(current_exe)
-            .args(["--exact", test_name])
-            .env_remove("RUST_TEST_NOCAPTURE")
-            .env(child_env, "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|err| panic!("spawn {label} child: {err}"));
-        let output = crate::test_child::capture_child_with_watchdog(
-            child,
+        crate::test_child::run_exact_test_child_with_watchdog(
+            test_name,
+            child_env,
             std::time::Duration::from_secs(8),
-        )
-        .unwrap_or_else(|err| panic!("{label} child capture failed: {err}"));
-        assert!(
-            output.status.success(),
-            "{label} child failed: status={:?}, stdout={}, stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            crate::test_child::exact_test_completed(&output, test_name),
-            "{label} child did not complete exactly {test_name}: stdout={}, stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            &[],
+            label,
         );
     }
 
@@ -10247,12 +10229,12 @@ mod tests {
                 assert_eq!(
                     rejected_polls_flag.get(),
                     0,
-                    "legacy spawn AtCapacity future must not be polled"
+                    "spawn must not poll a future rejected at task-pool capacity"
                 );
                 assert_eq!(
                     rejected_drops_flag.get(),
                     1,
-                    "legacy spawn consumes the rejected future"
+                    "spawn drops a future it rejects at task-pool capacity"
                 );
 
                 release_flag.set(true);

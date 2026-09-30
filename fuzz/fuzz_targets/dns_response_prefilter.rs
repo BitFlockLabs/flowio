@@ -3,8 +3,8 @@
 //! Property: the drain-loop candidate mode and full response-envelope mode use
 //! the same bounded question-name walker and retain identical structural
 //! acceptance. Neither mode may panic, read out of bounds, or recurse without
-//! a bound. Named cases live in
-//! `flowio/fixtures/fuzzing/dns_response_prefilter/`.
+//! a bound. Fixture cases live in the `flowio` package's
+//! `fixtures/fuzzing/dns_response_prefilter/` directory.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

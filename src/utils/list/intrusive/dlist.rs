@@ -331,16 +331,16 @@ impl<T> DList<T> {
 
     /// Unlinks every payload node without requiring the container offset.
     ///
-    /// This is for owner teardown paths that are already discarding the
-    /// backing storage for every linked node. Normal list users should remove
-    /// or pop nodes explicitly so ownership remains visible. A fully
-    /// uninitialized list sentinel is tolerated for defensive teardown, but a
-    /// partially initialized sentinel is rejected in debug builds. Initialized
-    /// non-empty lists must not move after `init`; moved-empty sentinels remain
-    /// tolerated for teardown. Unlike [`DList::drain_all_for_drop`], this
-    /// offset-free helper cannot re-anchor a moved non-empty sentinel without
-    /// dereferencing its stale boundary, so it deliberately retains the
-    /// non-move contract.
+    /// This is for owner teardown paths that are already discarding the backing
+    /// storage for every linked node. Normal list users should remove or pop
+    /// nodes explicitly so ownership remains visible. A fully uninitialized
+    /// list sentinel is tolerated for defensive teardown, but a partially
+    /// initialized sentinel is rejected in debug builds. Initialized non-empty
+    /// lists must not move after `init`; a moved empty sentinel is tolerated
+    /// for teardown. Unlike [`DList::drain_all_for_drop`], this offset-free
+    /// helper cannot re-anchor a moved non-empty sentinel without dereferencing
+    /// its stale boundary, so a non-empty initialized list must stay in place
+    /// until this call.
     pub(crate) fn unlink_all_for_drop(&mut self) {
         let next_null = self.head.next.is_null();
         let prev_null = self.head.prev.is_null();

@@ -1,4 +1,6 @@
-//! Public compatibility guards for the owner-thread descriptor core.
+//! Send/Sync and unwind-safety assertions for public handles, futures,
+//! configuration and error types; x86-64 size and alignment of public handles
+//! and futures; and the fixed task-slot size boundary.
 
 #![allow(clippy::type_complexity)]
 
@@ -263,12 +265,12 @@ impl<const N: usize> Future for FixedSlotFuture<N> {
 
 #[test]
 #[cfg(not(miri))]
-fn fixed_task_slot_admission_boundary_is_unchanged() {
+fn fixed_task_slot_accepts_4078_byte_future_and_rejects_4079_byte_future() {
     let mut executor = Executor::new().expect("executor construction failed");
     executor
         .run(async {
             Executor::try_spawn(FixedSlotFuture::<4_078>::new())
-                .expect("largest fixed-slot payload should remain admissible")
+                .expect("largest fixed-slot payload should fit")
                 .await
                 .expect("admitted boundary task should complete");
 

@@ -11,8 +11,9 @@
 //! - SCTP: `recv_msg_vectored`, `send_msg_vectored`
 //!
 //! TCP and Unix streams also support [`WritevProjection`], which lets a caller
-//! pass one compact owned carrier and project borrowed byte pieces from that
-//! retained carrier into FlowIO-owned kernel-facing `iovec` scratch.
+//! pass one owned value and project borrowed byte pieces from it. Async writes
+//! keep the value and `iovec` array until FlowIO observes the write's completion;
+//! immediate writes borrow the value in place and use temporary `iovec` storage.
 //!
 //! Client-side TLS is provided separately by [`tls`], which wraps an existing
 //! connected [`tcp::TcpStream`] with an explicit rustls-driven handshake and
@@ -22,31 +23,32 @@
 //! FlowIO-native DNS helper for turning host names into `SocketAddr` values
 //! before connecting transports such as TCP or SCTP.
 //!
-//! UDP remains single-datagram and therefore uses single-buffer sends and
-//! receives only.
+//! UDP transfers one datagram per operation and therefore uses single-buffer
+//! sends and receives only.
 //!
 //! # Nameable TCP and Unix operation futures
 //!
 //! TCP and Unix stream methods return the concrete futures re-exported from
-//! this module, including [`ReadFuture`], [`ReadExactFuture`],
-//! [`WriteFuture`], and their vectored and projected variants. Directly
-//! awaiting these methods remains allocation-free without naming the return
-//! type. The public names additionally let downstream protocol libraries use
-//! the operations in concrete associated types or inline state machines
-//! without erasing them behind `Box<dyn Future>`.
+//! this module, including [`ReadFuture`], [`ReadExactFuture`], [`WriteFuture`],
+//! and their vectored and projected variants. Directly awaiting these methods
+//! requires neither naming the return type nor boxing the future. The public
+//! names let downstream protocol libraries use the operations in concrete
+//! associated types or inline state machines without erasing them behind
+//! `Box<dyn Future>`.
 //!
 //! Each operation mutably borrows its parent [`tcp::TcpStream`] or
 //! [`unix::UnixStream`] and owns the submitted rental buffer, chain, or
 //! projection source until completion. It must be polled on the executor owner
 //! thread and, after submission, in its originating executor. Dropping an
-//! in-flight operation is nonblocking: FlowIO retains any kernel-visible
-//! payload until the target completion retires. Racing read bytes can be
-//! discarded after cancellation, so framed protocols should treat read
+//! in-flight operation is nonblocking: FlowIO keeps any kernel-visible payload
+//! alive until it observes the operation's own completion. Racing read bytes
+//! can be discarded after cancellation, so framed protocols should treat read
 //! cancellation as terminal unless they provide stronger recovery semantics.
 //!
-//! The operation fields and constructors remain private, their layouts are not
-//! stable, and exposing their names does not make them cross-thread values. The
-//! private implementation module is intentionally inaccessible:
+//! The operation fields and constructors are private, their layouts are not
+//! stable, and the futures are neither `Send` nor `Sync`. The implementation
+//! module is private, so the futures are nameable only through these
+//! re-exports:
 //!
 //! ```compile_fail
 //! use flowio::net::stream::ReadFuture;
@@ -58,11 +60,21 @@
 //! rental I/O methods, the caller-owned buffer or chain is returned alongside
 //! the result, including on recoverable errors.
 //!
+//! ```
+//! # use flowio::net::unix::UnixStream;
+//! # use flowio::runtime::buffer::IoBuffMut;
+//! # async fn example(mut stream: UnixStream, buffer: IoBuffMut, len: usize) {
+//! let (result, buffer) = stream.read_exact(buffer, len).await;
+//! # let _ = (result, buffer);
+//! # }
+//! ```
+//!
 //! [`io::ErrorKind::WouldBlock`] can report internal FlowIO pressure rather
-//! than socket readiness: completion-state capacity exhaustion capped by the
-//! executor's `ReactorConfig::ring_entries`, io_uring submission-queue
-//! pressure, retained `iovec` scratch allocation pressure, or a reusable
-//! listener/connector slot that is still occupied by an active or intentionally
+//! than socket readiness: exhausted operation slots capped by the executor's
+//! [`ring_entries`](crate::runtime::reactor::ReactorConfig::ring_entries),
+//! io_uring submission-queue pressure, allocation failure in FlowIO's pooled
+//! `iovec` storage for an operation with more than 16 active segments, or a
+//! reusable listener/connector slot occupied by an active or intentionally
 //! forgotten future. The first three cases may become available after the
 //! executor makes progress; a busy reusable slot becomes available only when
 //! the previous future completes or is dropped, or when the owning
@@ -71,34 +83,35 @@
 //! or replace the earlier owner's readiness waiter. TCP/SCTP accept latches
 //! [`io::ErrorKind::ConnectionAborted`] when `POLLHUP` or `POLLNVAL` remains
 //! after owner-thread `accept4` finds no queued connection. That listener is no
-//! longer retryable; later accepts fail without another readiness submission.
-//! A bare `POLLERR` receives one internal rearm per accept future, then exact
+//! longer retryable; later accepts fail without another readiness submission. A
+//! bare `POLLERR` receives one internal rearm per accept future, then exact
 //! `EAGAIN` propagates without latching. A positive `POLLNVAL` confirmed by
 //! `accept4` as `EBADF` preserves that raw errno for the current future while
 //! latching the same later fail-fast state. The listener terminal-state
 //! accessors expose only this sticky FlowIO latch; `false` is not a general
 //! socket-health result. `EMFILE` and `ENFILE` propagate with their exact errno
-//! without latching or rearming. The slot preserves the observed
-//! readiness, so the next accept polled in the owner context makes one direct
-//! nonblocking `accept4` attempt without another readiness submission. FlowIO
-//! performs no hidden retry, timer, or backoff; callers should relieve
-//! descriptor pressure and apply bounded backoff before retrying. If that
-//! direct attempt returns `WouldBlock`, the retained mask is classified by the
-//! same rules above: HUP/NVAL latches, bare `POLLERR` uses its bounded budget,
-//! and plain stale readiness takes the ordinary one-shot rearm. Other
-//! `accept4` errors propagate unchanged.
+//! without latching or rearming. The slot preserves the observed readiness, so
+//! the next accept polled in the owner context makes one direct nonblocking
+//! `accept4` attempt without another readiness submission. FlowIO performs no
+//! hidden retry, timer, or backoff; callers should relieve descriptor pressure
+//! and apply bounded backoff before retrying. If that direct attempt returns
+//! `WouldBlock`, the retained mask is classified by the same rules above:
+//! HUP/NVAL latches, bare `POLLERR` uses its bounded budget, and plain stale
+//! readiness takes the ordinary one-shot rearm. Other `accept4` errors
+//! propagate unchanged.
 //!
-//! [`io::ErrorKind::NotConnected`] also reports an invalid runtime poll context:
-//! transport futures must be polled inside the FlowIO executor that submitted
-//! them. An unsubmitted rental operation returns the buffer immediately. Once
-//! submitted, it keeps the buffer retained until the original CQE and then
-//! returns the buffer with `NotConnected`. Bytes reported by a completion first
-//! observed from a rejected context are not published into the returned
-//! buffer; only progress published by earlier valid exact-read iterations
-//! remains visible. The exceptional bounded shutdown fallback cannot return
-//! ownership if it abandons a ring without observing that target CQE; the
-//! operation remains pending and its kernel-visible state and buffer are
-//! intentionally retained until process exit.
+//! [`io::ErrorKind::NotConnected`] also reports an invalid runtime poll
+//! context: transport futures must be polled inside the FlowIO executor that
+//! submitted them. An unsubmitted rental operation returns the buffer
+//! immediately. Once submitted, it keeps the buffer until FlowIO observes the
+//! operation's own completion, then returns it with `NotConnected`. Bytes
+//! reported by a completion first observed from an invalid context are not
+//! published into the returned buffer; only progress published during earlier
+//! valid polls of an exact-length read is visible. If executor shutdown's
+//! bounded drain abandons the ring before FlowIO observes this operation's
+//! completion, ownership cannot be returned: the operation stays pending, and
+//! its kernel-visible state and buffer are intentionally retained until process
+//! exit.
 //!
 //! # Fast-Path Guidance
 //!
@@ -111,9 +124,9 @@
 //!   contiguous payload, the contiguous APIs are the simpler fast-path
 //!   alternative.
 //!
-//! - Use projected writes when a compact owned carrier already contains
-//!   segmented fields; use ordinary owned chains when the segments are
-//!   independent buffer values.
+//! - Use projected writes when an owned source value already contains segmented
+//!   fields; use ordinary owned chains when the segments are independent buffer
+//!   values.
 //!
 //! Avoid on the per-message fast path:
 //! - Avoid `_exact` / `_all` variants unless complete-buffer
@@ -126,9 +139,9 @@
 //!   `SocketAddr` values.
 //!
 //! On the connection path, reuse [`tcp::TcpConnector`] or
-//! [`sctp::SctpConnector`] across repeated attempts. Reuse preserves the
-//! connector-owned slot wrapper, but each attempt still creates and configures
-//! a fresh socket; connection establishment is not the message data path.
+//! [`sctp::SctpConnector`] across repeated attempts. Reuse keeps the
+//! connector's connect slot, but each attempt creates and configures a fresh
+//! socket; connection establishment is not the message data path.
 //!
 //! The examples below often use `_all` / `_exact` variants because they make
 //! protocol framing obvious in docs. On the hot path, prefer partial-I/O APIs
@@ -244,16 +257,21 @@ pub(crate) mod tls_test_peer;
 pub mod udp;
 pub mod unix;
 
-/// Safe projection interface for retained owned vectored writes.
+/// Safe projection interface for owned vectored writes.
 ///
-/// Implement this for compact owned message carriers that can expose their
-/// already-encoded byte pieces as borrowed slices. For a non-empty operation,
-/// FlowIO moves the carrier into retained operation state before calling
-/// [`WritevProjection::project_writev`], so slices may safely point into inline
-/// fields or owned allocations inside the carrier. The retained carrier and
-/// FlowIO-owned `iovec` scratch remain alive until the original write CQE
-/// retires, even if the future is dropped. Declared-empty projections are
-/// validated locally before retained state is allocated.
+/// Implement this for owned message values that expose already-encoded byte
+/// pieces as borrowed slices. For non-empty `writev_projected` and
+/// `writev_all_projected` operations, FlowIO moves the value into storage owned
+/// by the operation at a stable address before calling
+/// [`WritevProjection::project_writev`]. Slices may point into inline fields or
+/// owned allocations inside the value. The value and `iovec` array remain alive
+/// until FlowIO observes the write's completion, even if the future is dropped.
+///
+/// `try_writev_projected` borrows the value in place while projecting and
+/// making one nonblocking write. Its `iovec` array uses stack or reusable
+/// thread-local storage, with temporary heap storage during thread-local
+/// destruction or re-entry. Declared-empty projections are validated locally
+/// without allocating operation storage.
 ///
 /// `writev_count_and_len` must report the number of active non-empty pieces
 /// and the total byte length that `project_writev` will push. Empty pieces are
@@ -263,14 +281,15 @@ pub mod unix;
 /// empty projection pushes no non-empty piece and returns `Ok(())`;
 /// implementation errors propagate.
 ///
-/// This trait does not expose a borrowed-SQE API. Callers pass ownership of
-/// the carrier to the stream method and receive it back with the I/O result.
+/// Callers pass ownership of the source value to the stream method and receive
+/// it back with the I/O result. The asynchronous methods do not borrow the
+/// source value from the caller.
 ///
-/// This is a preferred fast-path API when a protocol already owns a compact
-/// message carrier with segmented byte fields: it copies pointer/length
-/// metadata, not message bytes. Use the contiguous stream `write` APIs for one
-/// contiguous byte range, and use non-`_all` projected writes when the caller
-/// can track partial progress explicitly.
+/// This is a preferred fast-path API when a protocol already owns a message
+/// value with segmented byte fields: it copies pointer/length metadata, not
+/// message bytes. Use the contiguous stream `write` APIs for one contiguous
+/// byte range, and use non-`_all` projected writes when the caller can track
+/// partial progress explicitly.
 ///
 /// # Example
 /// ```no_run
@@ -305,7 +324,7 @@ pub trait WritevProjection: 'static {
     /// Returns `(active_non_empty_piece_count, total_byte_len)`.
     fn writev_count_and_len(&self) -> (usize, usize);
 
-    /// Projects borrowed byte pieces from this retained carrier.
+    /// Projects borrowed byte pieces from this value.
     ///
     /// The lifetime on `pieces` ties every pushed slice to the borrow of
     /// `self`, preventing safe implementations from pushing temporary slices
@@ -316,12 +335,13 @@ pub trait WritevProjection: 'static {
 /// Sink used by [`WritevProjection`] implementations to expose write pieces.
 ///
 /// Values of this type are constructed only by FlowIO. Implementations push
-/// slices borrowed from the retained carrier; FlowIO stores only pointer/length
-/// metadata in retained scratch and never copies the slice bytes.
+/// slices borrowed from the source value; FlowIO stores only pointer/length
+/// metadata and never copies the slice bytes. Async writes keep this metadata
+/// until FlowIO observes the write's completion; immediate writes use it only
+/// during the nonblocking call.
 ///
-/// This type belongs to the projected vectored-write fast path and copies only
-/// slice metadata. Use it only inside [`WritevProjection::project_writev`];
-/// callers do not construct it directly.
+/// FlowIO provides this builder to [`WritevProjection::project_writev`] for the
+/// projected vectored-write fast path.
 ///
 /// # Example
 /// ```
@@ -346,7 +366,7 @@ pub trait WritevProjection: 'static {
 /// }
 /// ```
 pub struct WritevPieces<'a> {
-    /// FlowIO-owned retained scratch where projected slice metadata is written.
+    /// FlowIO-owned storage where projected slice metadata is written.
     iovecs: &'a mut [MaybeUninit<libc::iovec>],
     /// Number of initialized non-empty `iovec` entries.
     count: usize,
@@ -366,10 +386,10 @@ impl<'a> WritevPieces<'a> {
 
     /// Adds a non-empty byte piece to the projected write.
     ///
-    /// Empty slices are ignored, matching FlowIO's existing owned-chain
-    /// `writev` behavior. If the projection pushes more non-empty pieces than
-    /// were reported by `writev_count_and_len`, this returns
-    /// [`io::ErrorKind::InvalidInput`].
+    /// Empty slices are ignored, as in owned-chain `writev`.
+    /// Returns [`io::ErrorKind::InvalidInput`] if the projection pushes more
+    /// non-empty pieces than reported by
+    /// `writev_count_and_len`, or if their total byte length overflows `usize`.
     #[inline(always)]
     pub fn push(&mut self, bytes: &'a [u8]) -> io::Result<()> {
         if bytes.is_empty() {
@@ -454,8 +474,8 @@ pub(crate) fn invalid_input_kind() -> io::Error {
 /// Builds either FlowIO's production static-message `InvalidData` diagnostic
 /// or a message-free comparator selected at monomorphization time.
 ///
-/// `BARE` is used only by feature-gated diagnostic observers. Shipping paths
-/// instantiate `false`, preserving their exact cause text. Keeping the choice
+/// `BARE` is used only by feature-gated diagnostic observers. Production paths
+/// instantiate `false` and return the static cause message. Keeping the choice
 /// const-generic lets an observer reach the same validation branch without a
 /// runtime mode branch in that path.
 #[inline(always)]
@@ -469,7 +489,7 @@ pub(crate) fn invalid_data<const BARE: bool>(message: &'static str) -> io::Error
 
 /// Result of retiring one completed payload-owning operation.
 ///
-/// Rejection remains a distinct variant so ordinary completion sites cannot
+/// Rejection is a distinct variant so ordinary completion sites cannot
 /// accidentally interpret or publish a CQE observed from an invalid context.
 /// The variant itself encodes the fixed `NotConnected` response; retaining the
 /// CQE result lets the rich SCTP receive paths update record-recovery state
@@ -781,8 +801,8 @@ struct AcceptReadinessSlot {
     in_use: bool,
     /// Normal, one bare-`POLLERR` rearm consumed, or permanently terminal.
     readiness_state: AcceptReadinessState,
-    /// Preserves the listener handles' pre-core `!UnwindSafe` auto-trait
-    /// boundary without adding storage.
+    /// Makes the slot, and therefore the listener handles, `!UnwindSafe`
+    /// without adding storage.
     _unwind_boundary: PhantomData<&'static Cell<()>>,
 }
 
@@ -2034,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_take_preserves_previous_return_carrier_layout() {
+    fn completion_take_layout_matches_result_value_flag_tuple() {
         fn assert_layout<R, V>() {
             assert_eq!(
                 std::mem::size_of::<CompletionTake<R, V>>(),

@@ -559,8 +559,8 @@ fn pool_drop_cleans_up() {
     drop(buffers);
     assert_eq!(pool.live_slots_for_test(), 0);
 
-    // Explicit drop — now safe because slab tracking uses a singly-linked
-    // list with no self-referential sentinel.
+    // The pool acquired two slab pages above; dropping it must free both.
+    // Miri's leak check reports a page that teardown misses.
     drop(pool);
     println!("  Pool dropped: no leak");
 }
