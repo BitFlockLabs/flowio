@@ -587,11 +587,10 @@ unsafe fn release_shutdown_waiter(waiter: *mut TaskHeader, first_panic: &mut Opt
 /// ```
 #[derive(Clone, Copy)]
 pub struct ReactorConfig {
-    /// Number of entries requested for both the io_uring submission ring and
-    /// completion ring.
+    /// Number of submission-queue entries requested from io_uring.
     ///
-    /// This also caps the number of live FlowIO completion-state records.
-    /// Async operations that cannot reserve a completion-state slot return
+    /// This also caps the number of live FlowIO operation slots.
+    /// Async operations that cannot reserve an operation slot return
     /// [`std::io::ErrorKind::WouldBlock`] with their caller-owned payload.
     pub ring_entries: u32,
 }

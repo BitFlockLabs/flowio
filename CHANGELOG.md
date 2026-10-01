@@ -26,7 +26,7 @@ Alpha prereleases carry no compatibility guarantee.
   `checked_writable_len` and makes `writable_len()` saturate on overflow.
 - `IoBuffPoolConfig` implements `Clone`, `Copy`, `Debug`, `PartialEq`, and
   `Eq`.
-- `IoBuffReadWrite::initialized_writable_slice` provides an initialized
+- Unsafe `IoBuffReadWrite::initialized_writable_slice` provides an initialized
   writable prefix for userspace producers. `write_base_len` defaults to zero
   for overwrite-style buffers and reports the current payload length for
   `IoBuffMut` append reads.
@@ -38,9 +38,9 @@ Alpha prereleases carry no compatibility guarantee.
   `ReadvExactFuture`, `WriteFuture`, `WriteAllFuture`, `WritevFuture`,
   `WritevAllFuture`, `WritevProjectedFuture`, and `WritevAllProjectedFuture`
   so TCP/Unix callers can name these futures without boxing.
-- `flowio::net::tcp` and `flowio::net::sctp` export `AcceptFuture`,
-  `ConnectFuture`, and `ConnectTimeoutFuture`; TCP additionally exports
-  `OwnedConnectFuture` and `OwnedConnectTimeoutFuture`.
+- `flowio::net::tcp` and `flowio::net::sctp` document `AcceptFuture`,
+  `ConnectFuture`, and `ConnectTimeoutFuture` as supported public types; TCP
+  also documents `OwnedConnectFuture` and `OwnedConnectTimeoutFuture`.
 - `TcpStream`, `UnixStream`, and `SctpStream` add safe `from_owned_fd`
   constructors that consume an `OwnedFd`.
 - `TcpListener::is_terminal` and `SctpListener::is_terminal` report whether
@@ -71,6 +71,24 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking:** A zero-byte receive completion, including EOF and an empty
+  datagram, leaves a `Vec<u8>` buffer's length and contents unchanged instead
+  of truncating it to zero. Use the returned byte count, or clear the buffer
+  before each receive.
+- **Breaking (custom buffer implementations):** `IoBuffReadOnly` and
+  `IoBuffReadWrite` require stable readable ranges and writable bases while
+  FlowIO owns the buffer, initialized readable bytes, and ranges no larger
+  than `isize::MAX`. Positive ranges must be non-null and within one
+  allocation; empty windows may use null pointers. Audit `unsafe impl`s
+  against the trait documentation, including initialized-prefix guarantees
+  and `set_written_len(write_base_len() + n)` after positive progress only;
+  zero-byte completions do not call `set_written_len`.
+- **Breaking:** `resolve_host` returns `InvalidData` when its unique result
+  exceeds 64 socket addresses or `/etc/hosts` exceeds 4 MiB;
+  `DnsResolver::from_system` returns `InvalidData` for `/etc/resolv.conf`
+  larger than 64 KiB. Results are never truncated. Keep configuration files
+  within these limits and use another resolver for larger result sets.
+- Requires rustls 0.23.42 or newer.
 - **Breaking:** `UdpSocket::bind` no longer enables `SO_REUSEADDR`, keeping
   local endpoints exclusive even when the kernel assigns the port; a
   conflicting bind returns `EADDRINUSE`. Use `bind_reuse_port` with an
@@ -79,29 +97,19 @@ Alpha prereleases carry no compatibility guarantee.
   `SO_REUSEADDR`, so an occupied local endpoint returns `EADDRINUSE` during
   connect preparation. Use a distinct local endpoint for each live
   association, or port zero to let the kernel choose.
-- **Breaking:** TCP and Unix `try_read_append`, `read_exact_append`, and
-  `ReadExactAppendFuture` are removed. Use `try_read` or `read_exact` with
-  `IoBuffMut` to append, and `ReadExactFuture<'a, IoBuffMut, S>` when naming
-  the future type.
-- **Breaking:** Checked byte accessors remove all `u128`, `i128`, `f32`, and
-  `f64` operations and one-byte endian aliases from free functions, extension
-  traits, and cursors. Use unsuffixed `u8`/`i8` accessors and native,
-  little-endian, or big-endian 16/32/64-bit integer accessors; encode wider
-  integers and floats with their standard-library byte conversions.
-- **Breaking:** `PushError::value_mut` is removed. Save the reason with
-  `error()` and recover the value with `into_value()`, or use `into_parts()`,
-  before mutating a rejected value.
 - **Breaking:** `TcpStream`, `UnixStream`, and `UdpSocket` are explicitly
-  `!Send + !Sync`; keep each socket on its owner OS thread. An idle socket can
+  `!Send + !Sync` and no longer implement `RefUnwindSafe`. Keep each socket
+  on its owner OS thread, and review borrowed socket captures at `catch_unwind`
+  boundaries before using `AssertUnwindSafe`. An idle socket can
   move between FlowIO executors on that thread, but queued I/O stays bound to
   its originating executor until FlowIO observes completion.
 - **Breaking:** `UdpSocket::local_addr` returns `io::Result<SocketAddr>` and
   queries the live socket, including kernel-assigned ports and address changes
   after connect or reconnect. Callers must handle the result.
 - **Breaking:** Awaiting `JoinHandle<T>` returns `Result<T, JoinError>` so
-  cancelled tasks report an error rather than a task value. Handle
-  `JoinError::Cancelled` after executor shutdown or a task's `Future::poll`
-  panic; `Executor::run` re-raises the original panic.
+  a cancelled task's handle completes with `JoinError::Cancelled` instead of
+  staying pending. Handle cancellation after executor shutdown or a task's
+  `Future::poll` panic; `Executor::run` re-raises the original panic.
 - **Breaking:** TCP, Unix, and SCTP `from_raw_fd` constructors require an
   unsafe sole-ownership proof. Prefer `from_owned_fd`, which consumes
   `OwnedFd`.
@@ -119,8 +127,11 @@ Alpha prereleases carry no compatibility guarantee.
 - **Breaking:** Awaiting `timeout` or `timeout_at` yields
   `Result<F::Output, TimeoutError>`, with
   `TimeoutError::{Elapsed, Runtime(io::Error)}` replacing the unit `Elapsed`
-  error. Handle expiry separately from runtime failure; TCP and SCTP
-  connect-timeout helpers map only expiry to `TimedOut`.
+  error. Match `TimeoutError::Elapsed` (for example with `matches!`) separately
+  from runtime failure; the replacement does not implement `Clone`, `Copy`,
+  `Default`, `PartialEq`, `Eq`, `UnwindSafe`, or `RefUnwindSafe`. Review
+  retained errors at unwind boundaries. TCP and SCTP connect-timeout helpers
+  map only expiry to `TimedOut`.
 - **Breaking:** Upstream DNS requires an exact two-byte nonblocking kernel
   random value for each A and AAAA transaction ID before opening a socket,
   allowing at most three `EINTR` retries per ID. Handle short-read or
@@ -129,8 +140,9 @@ Alpha prereleases carry no compatibility guarantee.
 - **Breaking:** `SctpResetStreams` no longer supports struct literals; use
   `incoming`, `outgoing`, or `bidirectional` for listed streams, or
   `all_incoming`, `all_outgoing`, or `all_bidirectional` for all streams.
-  Public fields remain configurable, but listed requests must be nonempty and
-  all-stream requests must remain empty, or the operation returns
+  Include `..` in struct patterns. Public fields remain configurable, but
+  listed requests must be nonempty and all-stream requests must remain empty,
+  or the operation returns
   `InvalidInput` before a socket-option syscall.
 - **Breaking:** `SctpStream::peer_addr_params` accepts only the exact 152-byte
   legacy or 156-byte modern Linux response layout. Handle `InvalidData` for
@@ -145,7 +157,7 @@ Alpha prereleases carry no compatibility guarantee.
   20 bytes return `InvalidData`, and raw indication values are preserved.
 - **Breaking:** `SctpNotification::SendFailed` includes raw `flags: u16` from
   both Linux notification layouts, including unknown values. Field-exhaustive
-  patterns must bind `flags` or add `..`.
+  patterns must bind `flags` or add `..`; constructors must supply `flags`.
 - **Breaking:** UDP receive requests and SCTP receive windows of zero bytes
   return `InvalidInput` before consuming data or submitting I/O. Use a
   positive receive length even for an empty UDP datagram; a successful
@@ -157,10 +169,10 @@ Alpha prereleases carry no compatibility guarantee.
   completion. Allocation failure invokes the global allocation-error handler,
   normally aborting the process, and allocation or final deallocation may
   block in the allocator.
-- If executor shutdown abandons its ring with unfinished I/O, the affected
-  descriptors are kept until process exit to prevent descriptor reuse. This
-  retention is bounded by `ring_entries` per abandoned ring and accumulates
-  across abandoned rings.
+- If executor shutdown abandons its ring with unfinished I/O, those operations
+  stay pending and retain their descriptors, buffers, and kernel-visible
+  storage until process exit to prevent premature reuse. Descriptor retention
+  is bounded by `ring_entries` per abandoned ring and accumulates across rings.
 - **Breaking:** Upstream DNS work has a default five-second aggregate budget
   across address families, nameserver failover, and CNAME follow-up. Use
   `set_total_query_timeout` when a longer budget is needed; local resolution
@@ -171,7 +183,8 @@ Alpha prereleases carry no compatibility guarantee.
   allocator capacity cannot enlarge the configured raw-read bound.
 - SCTP message sends and receives copy less temporary data, and receive
   operations avoid parsing the same notification twice.
-- DNS parsing avoids allocating discarded Authority and Additional names.
+- DNS parsing avoids allocating discarded Authority and Additional names,
+  and their record counts no longer reserve unused address-result capacity.
   UDP header and question validation rejects malformed responses with the
   expected transaction ID without allocating an error.
 - **Breaking:** TCP and SCTP listeners become permanently unusable after
@@ -184,6 +197,8 @@ Alpha prereleases carry no compatibility guarantee.
   `InvalidInput` with the message "too many iovec segments for this
   operation". Match `io::ErrorKind` instead of the old display text; the
   active-segment check does not apply to a zero-length `readv_exact` request.
+  Oversized active-segment requests fail before operation-slot allocation, so
+  slot pressure cannot mask the input error as `WouldBlock`.
 - **Breaking:** SCTP `send_msg_vectored` and `recv_msg_vectored` reject chains
   with more than 1,024 active segments with `InvalidInput` and return the
   chain before submitting I/O. Coalesce buffers to fit that limit; empty
@@ -203,12 +218,49 @@ Alpha prereleases carry no compatibility guarantee.
   for these closes; if the queue is full or disconnected, FlowIO tries to
   disable linger before closing directly, which can still block if that fails.
 
+### Removed
+
+- **Breaking:** TCP and Unix `try_read_append`, `read_exact_append`, and
+  `ReadExactAppendFuture` are removed. Use `try_read` or `read_exact` with
+  `IoBuffMut` to append, and `ReadExactFuture<'a, IoBuffMut, S>` when naming
+  the future type.
+- **Breaking:** Checked byte accessors remove all `u128`, `i128`, `f32`, and
+  `f64` operations and one-byte endian aliases from free functions, extension
+  traits, and cursors. Use unsuffixed `u8`/`i8` accessors and native,
+  little-endian, or big-endian 16/32/64-bit integer accessors; encode wider
+  integers and floats with their standard-library byte conversions.
+- **Breaking:** `PushError::value_mut` is removed. Save the reason with
+  `error()` and recover the value with `into_value()`, or use `into_parts()`,
+  before mutating a rejected value.
+- **Breaking:** `flowio::runtime::timer::Elapsed` is removed. Use
+  `TimeoutError::Elapsed` and match expiry separately from runtime errors.
+
 ### Fixed
 
-- TCP, Unix, UDP, SCTP, and TLS reads preserve buffer contents when no data
-  arrives and append new bytes to `IoBuffMut`. Received bytes remain visible
-  after exact-read EOF or errors, including datagram truncation and metadata
-  errors.
+- Buffer and task reference-count overflow terminates the process instead of
+  wrapping and risking premature memory reclamation.
+- I/O submission returns `WouldBlock` when a full submission queue makes no
+  progress instead of spinning.
+- TCP/Unix vectored I/O and SCTP metadata vectored I/O reject overflowing
+  byte totals and inconsistent segment counts or lengths with `InvalidInput`
+  before kernel submission.
+- TCP and SCTP accepts rearm bare `POLLERR` once before returning `WouldBlock`;
+  descriptor-pressure errors preserve readiness for a direct retry.
+- TCP and SCTP connects reported as already connected (`EISCONN`) by the
+  kernel complete successfully instead of failing.
+- SCTP metadata receives accept `SCTP_RCVINFO` after other ancillary records,
+  such as socket timestamps, and return default receive-info fields when
+  receive-info is not requested, instead of `InvalidData`.
+- `SctpStream::local_addrs` decodes Linux's local-address reply correctly
+  instead of returning `InvalidData`. It and `peer_addrs` retry `ENOMEM` with
+  larger buffers up to 1,024 `sockaddr_storage` units.
+- `IoBuff::make_mut` preserves the consumed offset when copying a shared
+  buffer, keeping `payload_remaining()` consistent with the unique-owner path.
+- `Executor::run` returns `InvalidInput` when another run is active on the
+  same thread, preventing nested runs from replacing the active runtime.
+- TCP, Unix, UDP, SCTP, and TLS reads append new bytes to `IoBuffMut`.
+  Received bytes remain visible after exact-read EOF or errors, including
+  datagram truncation and metadata errors.
 - TCP and Unix zero-length reads and writes return `Ok(0)` after runtime
   validation without allocating or submitting I/O; a
   zero-length read does not indicate peer EOF. Projected writes also validate
@@ -221,11 +273,10 @@ Alpha prereleases carry no compatibility guarantee.
   held by vectored and projected I/O with more than 16 active segments.
 - `IoBuffMut::payload_extend_from_tailroom(0)` preserves active trailer bytes
   and the restriction on changing payload length while a trailer is present.
-- Unsafe buffer traits permit null pointers only for empty windows; positive
-  ranges must be non-null, aligned, and within one stable allocation, with
-  initialization matching the trait's access rules. TLS accepts empty custom
-  buffers with null pointers and initializes plaintext destinations before
-  constructing mutable byte slices.
+- TLS accepts empty custom buffers with null pointers and initializes
+  plaintext destinations before constructing mutable byte slices.
+- `IoBuffPool::new` rejects configurations that exceed Rust allocation-layout
+  limits with `IoBuffPoolConfigError::LayoutOverflow` before allocating a slab.
 - With `test-support`, `SlabAllocator` rejects acquisition before
   initialization and initializes its provider at most once.
 - UDP `send_to` rejects lengths outside io_uring's 32-bit limit before pointer
@@ -238,8 +289,12 @@ Alpha prereleases carry no compatibility guarantee.
   backlog and preserves listener ownership through shutdown.
 - SCTP metadata receives keep partial-delivery events enabled and consume
   identifiable partial-delivery abort notifications that the caller did not
-  request, resuming at the next intact record even after a dropped receive.
-  Changing the mask cannot disable this recovery.
+  request, including notifications split across receives or buffers, resuming
+  at the next intact record even after a dropped receive. Changing the mask
+  cannot disable this recovery; unrelated notification fragments do not end
+  the discarded data record. If shutdown abandons the
+  ring owning a dropped metadata receive, later metadata receives fail
+  permanently with `NotConnected`; use a new association.
 - SCTP notification decoding enforces each record's declared bounds and
   reports its kind, declared length, and required length when a known record
   is too short.
@@ -258,7 +313,8 @@ Alpha prereleases carry no compatibility guarantee.
 - `tls_server_end_point` rejects malformed certificate DER, including missing,
   reordered, extra, or trailing outer fields, noncanonical lengths, and an
   empty signature or nonzero unused-bit count. It checks structure, not the
-  signature's cryptographic validity.
+  signature's cryptographic validity. SHA-256/384/512-with-RSA identifiers
+  accept absent parameters alongside the explicit NULL form.
 - DNS parsing uses only the received datagram bytes, so stale buffer contents
   cannot complete a truncated response. Before applying a response code, it
   validates every declared record and matches any echoed question's name,
@@ -268,8 +324,8 @@ Alpha prereleases carry no compatibility guarantee.
 - DNS query names may have one trailing root dot and must fit 253 presentation
   bytes, 255 encoded bytes, and 63 bytes per label; invalid input is rejected
   before query allocation or I/O. CNAME data must consume its declared length
-  exactly, and A/AAAA data must have the required size in every section and
-  class.
+  exactly and cannot name the root; A/AAAA data must have the required size
+  in every section and class.
 - DNS resolves only Answer-section IN records; Authority and Additional
   records cannot supply an address or CNAME. For an active name without a
   matching-family address, multiple distinct CNAME targets return
@@ -288,14 +344,31 @@ Alpha prereleases carry no compatibility guarantee.
   errors and per-attempt expiry allow failover.
 - System DNS configuration retains the first eight unique valid nameservers;
   duplicates do not consume the limit and later unique entries are omitted.
-- Hosts-file parsing ignores invalid UTF-8 inside `#` comments and skips only
-  lines with invalid entry text.
+- Hosts-file and system nameserver parsing ignore invalid UTF-8 inside
+  comments and skip only lines with invalid entry text. Hosts files use `#`
+  comments; system nameserver files also accept `;` comments.
+- Hosts-file aliases match case-insensitively with or without one trailing
+  root dot.
+- Async transport operations and `Sleep` reject inactive executor contexts
+  or incompatible task wakers with `NotConnected`; submitted I/O returns the
+  error and buffer only after completion, while `Sleep` reclaims its armed
+  timer. Completion wakes waiters on their own executor, and temporary
+  same-executor cleanup polls keep already-submitted I/O pending.
 - Timeout wrappers reject inactive or foreign executors with
   `TimeoutError::Runtime(NotConnected)` before polling the wrapped future.
-- Timer scheduling keeps time monotonic after idle periods.
+- Timer scheduling measures each relative sleep from its own arm time, keeps
+  time monotonic after idle periods, and preserves deadlines across
+  timer-wheel wraps and cascades. Very large idle waits fit the kernel
+  timespec range instead of overflowing.
 - `Executor::run` preserves unfinished tasks after `WouldBlock` so a later run
   can resume them; shutdown cancels each remaining task once. Debug builds
   detect standard task wakers used outside their owner thread.
+- Runtime cleanup releases completed I/O resources even when internal
+  completion accounting reports an error.
+- Executor shutdown finishes task destruction before tearing down timers and
+  I/O or joining the socket-close worker, even when destructors drop another
+  executor or panic. Nested task destruction uses an iterative queue to
+  prevent stack exhaustion on long task-ownership chains.
 - TLS reads keep unfed ciphertext when records spanning socket reads reach
   rustls's plaintext or handshake-output limit, avoiding a spurious "received
   plaintext buffer full" failure and lost ciphertext. Bytes after an

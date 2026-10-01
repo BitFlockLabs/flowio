@@ -846,6 +846,15 @@ fn runtime_udp_send_paths_reject_oversize_iobuff_before_submission() {
 
 #[test]
 fn runtime_udp_send_to_zero_datagram_submits_and_delivers() {
+    assert_zero_datagram_submits_and_delivers(false);
+}
+
+#[test]
+fn runtime_udp_send_zero_datagram_submits_and_delivers() {
+    assert_zero_datagram_submits_and_delivers(true);
+}
+
+fn assert_zero_datagram_submits_and_delivers(connected: bool) {
     let mut socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .expect("failed to bind runtime UDP socket");
     let local_addr = socket.local_addr().expect("runtime local_addr failed");
@@ -854,14 +863,23 @@ fn runtime_udp_send_to_zero_datagram_submits_and_delivers() {
     let peer_addr = peer.local_addr().expect("peer local_addr failed");
     peer.set_read_timeout(Some(UDP_TEST_TIMEOUT))
         .expect("failed to bound peer receive");
+    if connected {
+        socket
+            .connect(peer_addr)
+            .expect("failed to connect UDP socket");
+    }
     let mut executor = Executor::new().expect("failed to construct runtime executor");
     let empty = Vec::with_capacity(1);
     let empty_ptr = empty.as_ptr();
     let empty_capacity = empty.capacity();
 
     let (empty, socket) = run_test_output(&mut executor, async move {
-        let (result, empty) = socket.send_to(empty, peer_addr).await;
-        assert_eq!(result.expect("zero-length send_to failed"), 0);
+        let (result, empty) = if connected {
+            socket.send(empty).await
+        } else {
+            socket.send_to(empty, peer_addr).await
+        };
+        assert_eq!(result.expect("zero-length UDP send failed"), 0);
         (empty, socket)
     });
 

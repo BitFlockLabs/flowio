@@ -280,7 +280,7 @@ fn poll_tcp_connect(slot: &mut ConnectSlot, cx: &mut Context<'_>) -> Poll<io::Re
 ///
 /// The stream is an owner-OS-thread value and is neither [`Send`] nor [`Sync`].
 /// An idle stream may be used by another FlowIO executor on that same thread;
-/// once FlowIO queues I/O for submission, its future and completion state stay
+/// once FlowIO queues I/O for submission, its future and operation slot stay
 /// bound to the originating executor until FlowIO observes the operation's own
 /// completion (see [`crate::net`] for exceptional ring abandonment).
 ///

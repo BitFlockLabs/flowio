@@ -3451,12 +3451,13 @@ impl SctpStream {
     /// responsible for nonblocking mode before any runtime I/O. Adoption makes
     /// no syscalls and does not configure socket options. Enable
     /// `SCTP_RECVRCVINFO` to receive ancillary fields; without receive-info,
-    /// message receives return default ancillary fields. For assisted recovery
-    /// after an oversized record, also subscribe to
+    /// message receives return default ancillary fields. Subscribe to
     /// `SCTP_PARTIAL_DELIVERY_EVENT`, or call
-    /// [`SctpStream::set_notification_mask`] after enabling receive-info so
-    /// FlowIO retains that subscription. Existing partial-delivery subscriptions
-    /// on an adopted descriptor remain caller-visible unless a later
+    /// [`SctpStream::set_notification_mask`] after enabling receive-info, so
+    /// metadata receives stop discarding a record's tail when Linux aborts its
+    /// partial delivery. Without that event, discarding continues to the next
+    /// end-of-record and can consume the next record. Partial-delivery
+    /// subscriptions on an adopted descriptor remain caller-visible unless a later
     /// [`SctpStream::set_notification_mask`] call changes that policy.
     ///
     /// # Example
@@ -3514,14 +3515,8 @@ impl SctpStream {
 
     /// Takes ownership of a bare SCTP socket descriptor and records its peer.
     ///
-    /// Adoption makes no syscalls. The caller must set nonblocking mode before
-    /// runtime I/O, enable `SCTP_RECVRCVINFO` for ancillary receive fields, and
-    /// subscribe to `SCTP_PARTIAL_DELIVERY_EVENT` for assisted discard recovery.
-    /// Without receive-info, message receives return default ancillary fields.
-    /// Calling [`SctpStream::set_notification_mask`] after enabling receive-info
-    /// retains the partial-delivery subscription. Existing subscriptions remain
-    /// caller-visible unless a later [`SctpStream::set_notification_mask`] call
-    /// changes that policy.
+    /// Adoption makes no syscalls. Socket configuration requirements and
+    /// notification behavior are the same as for [`SctpStream::from_owned_fd`].
     ///
     /// # Safety
     ///
@@ -3746,6 +3741,13 @@ impl SctpStream {
     /// per-message data fast path. Listed requests must contain at least one
     /// stream identifier; use an `all_*` constructor for all streams.
     ///
+    /// `Ok(())` means Linux queued the request. Subscribe to `stream_reset`
+    /// in [`SctpNotificationMask`] and receive the peer's result as
+    /// [`SctpNotification::StreamReset`]; check its DENIED (`0x0004`) and
+    /// FAILED (`0x0008`) flags. Linux allows one outstanding reconfiguration
+    /// request per association. Wait for its result before requesting another
+    /// reset or adding streams; an outstanding request causes `EINPROGRESS`.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidInput` when a listed request is empty, an explicit
@@ -3757,7 +3759,6 @@ impl SctpStream {
     /// # use flowio::net::sctp::{SctpResetStreams, SctpStream};
     /// # fn demo(stream: &SctpStream) -> std::io::Result<()> {
     /// stream.reset_streams(&SctpResetStreams::outgoing(&[1]))?;
-    /// stream.reset_streams(&SctpResetStreams::all_incoming())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -3785,6 +3786,13 @@ impl SctpStream {
     /// This requires SCTP association reconfiguration support and may be
     /// rejected by the kernel even when baseline SCTP messaging works. It is
     /// control-plane work, not the per-message data fast path.
+    ///
+    /// `Ok(())` means Linux queued the request. Subscribe to `stream_change`
+    /// in [`SctpNotificationMask`] and receive the peer's result as
+    /// [`SctpNotification::StreamChange`]; check its DENIED (`0x0004`) and
+    /// FAILED (`0x0008`) flags. Linux allows one outstanding reconfiguration
+    /// request per association. Wait for its result before adding more streams
+    /// or resetting streams; an outstanding request causes `EINPROGRESS`.
     ///
     /// # Example
     /// ```no_run

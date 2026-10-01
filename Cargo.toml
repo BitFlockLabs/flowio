@@ -12,8 +12,8 @@ exclude = ["fixtures/fuzzing/", "tests/", "public-api.txt"]
 repository = "https://github.com/BitFlockLabs/flowio"
 
 [features]
-# Dev-only: exposes internal parsers to the cargo-fuzz crate in `fuzz/` and,
-# with `test-support`, fixture-replay hooks to the integration tests.
+# Dev-only: exposes internal parsers to the cargo-fuzz crate in `fuzz/` and
+# fixture integration tests; with `test-support`, also fixture observation hooks.
 # Off by default; not part of the supported public API.
 fuzzing = []
 # Dev-only: re-exports internal hooks for integration tests and benchmark harnesses.

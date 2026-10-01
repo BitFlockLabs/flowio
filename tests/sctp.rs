@@ -608,10 +608,6 @@ fn bound_non_listening_sctp_endpoint_or_skip(test_name: &str) -> Option<(OwnedFd
     Some((fd, addr))
 }
 
-fn sctp_ipv6_bind_capability_unavailable(err: &std::io::Error) -> bool {
-    capability_unavailable(err)
-}
-
 fn raw_sctp_ipv6_loopback_or_skip(test_name: &str) -> bool {
     let Some(fd) = raw_sctp_socket_or_skip(test_name, libc::AF_INET6) else {
         return false;
@@ -640,7 +636,7 @@ fn raw_sctp_ipv6_loopback_or_skip(test_name: &str) -> bool {
     if err.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
         panic!("IPv6 loopback (::1) is unavailable for {test_name}: {err}");
     }
-    if sctp_ipv6_bind_capability_unavailable(&err) {
+    if capability_unavailable(&err) {
         require_sctp_capability(Some(&err)).expect("SCTP capability is required");
         return false;
     }
@@ -1592,40 +1588,10 @@ fn sctp_capability_policy_accepts_only_kernel_absence_and_permission_denial() {
 
 #[test]
 fn sctp_ipv6_bind_capability_policy_is_narrow() {
-    for errno in [
-        libc::EPROTONOSUPPORT,
-        libc::ESOCKTNOSUPPORT,
-        libc::EAFNOSUPPORT,
-        libc::EPFNOSUPPORT,
-        libc::EPERM,
-        libc::EACCES,
-    ] {
-        let err = std::io::Error::from_raw_os_error(errno);
-        assert!(
-            sctp_ipv6_bind_capability_unavailable(&err),
-            "accepted IPv6 SCTP bind errno {errno} was not classified unavailable"
-        );
-    }
-
-    for errno in [
-        libc::EADDRNOTAVAIL,
-        libc::EINVAL,
-        libc::ENOPROTOOPT,
-        libc::EOPNOTSUPP,
-        libc::EIO,
-    ] {
-        let err = std::io::Error::from_raw_os_error(errno);
-        assert!(
-            !sctp_ipv6_bind_capability_unavailable(&err),
-            "IPv6 SCTP bind errno {errno} should remain a failure"
-        );
-    }
-
+    let err = std::io::Error::from_raw_os_error(libc::EADDRNOTAVAIL);
     assert!(
-        !sctp_ipv6_bind_capability_unavailable(&std::io::Error::other(
-            "probe failed without an errno"
-        )),
-        "an IPv6 SCTP bind failure without an errno should remain visible"
+        !capability_unavailable(&err),
+        "missing IPv6 loopback must remain a failure, not an SCTP capability skip"
     );
 }
 
