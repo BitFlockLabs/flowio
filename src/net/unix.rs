@@ -4,8 +4,8 @@
 //!
 //! Preferred on the per-message fast path:
 //! - For steady-state stream I/O, [`UnixStream::read`] / [`UnixStream::write`]
-//!   perform one contiguous submission and return short reads or writes to the
-//!   caller.
+//!   return the first positive or terminal completion without looping on
+//!   partial progress. Reads resubmit no-progress `EAGAIN` internally.
 //! - Use vectored APIs only when data is already segmented. For one
 //!   contiguous payload, the contiguous APIs avoid building an `iovec` array.
 //! - For fixed-shape hot-path buffers, pair Unix stream I/O with
@@ -198,7 +198,9 @@ impl UnixStream {
     /// The descriptor is closed exactly once when the FlowIO stream is
     /// dropped. `OwnedFd` proves unique close ownership, but does not validate
     /// the socket type or configuration. Deadline-edge `try_*` methods require
-    /// the supplied stream socket to be nonblocking.
+    /// the supplied stream socket to be nonblocking. On an adopted non-socket
+    /// descriptor, `read`, `read_exact`, `readv` and `readv_exact` fail with
+    /// `ENOTSOCK` when they submit a receive.
     ///
     /// # Example
     /// ```no_run
@@ -230,7 +232,9 @@ impl UnixStream {
     /// Takes ownership of a bare Unix stream descriptor.
     ///
     /// The descriptor must refer to a valid stream socket. Deadline-edge
-    /// `try_*` methods additionally require it to be nonblocking.
+    /// `try_*` methods additionally require it to be nonblocking. On an adopted
+    /// non-socket descriptor, `read`, `read_exact`, `readv` and `readv_exact`
+    /// fail with `ENOTSOCK` when they submit a receive.
     ///
     /// # Safety
     ///

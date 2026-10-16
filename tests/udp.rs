@@ -6,7 +6,7 @@ use common::{
     poll_once_pending, run_test_output, set_positive_linger, wait_for_drop_count,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-use common::{SparseOversizedReadOnly, assert_oversized_send_rejected};
+use common::{SparseOversizedReadOnly, SparseReadWrite, assert_oversized_send_rejected};
 use flowio::net::udp::UdpSocket;
 use flowio::runtime::buffer::{
     IoBuffError, IoBuffMut as RealIoBuffMut, IoBuffReadOnly, IoBuffReadWrite,
@@ -782,6 +782,55 @@ fn runtime_udp_ipv6_connected_bidirectional_ping_pong() {
             .expect("bidirectional FlowIO IPv6 UDP exchange timed out");
         })
         .expect("FlowIO IPv6 UDP executor run failed");
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn runtime_udp_recv_u32_max_request_returns_sparse_owner() {
+    let (mut socket, peer, _) = connected_udp_pair();
+    configure_std_udp_peer_timeouts(&peer);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor.run(async move {
+        let drops = Rc::new(Cell::new(0));
+        let buffer = SparseReadWrite::new(&drops).expect(
+            "sparse mapping failed: process address space or host commit limit (vm.overcommit_memory=2)",
+        );
+        assert_eq!(buffer.writable_len(), u32::MAX as usize);
+        let address = buffer.mapping_base_addr();
+        assert_eq!(peer.send(b"recv").expect("peer send failed"), 4);
+        let (result, buffer) = timeout(UDP_TEST_TIMEOUT, socket.recv(buffer, u32::MAX as usize))
+            .await.expect("large-request UDP receive timed out");
+        assert_eq!(result.expect("large-request UDP receive failed"), 4);
+        assert_eq!(buffer.bytes(), b"recv");
+        assert_eq!(buffer.mapping_base_addr(), address);
+        assert_eq!(drops.get(), 0);
+        drop(buffer);
+        assert_eq!(drops.get(), 1);
+    }).expect("UDP receive executor failed");
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn runtime_udp_send_u32_max_request_reports_message_size_and_returns_sparse_owner() {
+    let (mut socket, peer, _) = connected_udp_pair();
+    peer.set_nonblocking(true)
+        .expect("set peer nonblocking failed");
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor.run(async move {
+        let mut buffer = SparseOversizedReadOnly::new().expect(
+            "sparse mapping failed: process address space or host commit limit (vm.overcommit_memory=2)",
+        );
+        buffer.truncate(u32::MAX as usize);
+        assert_eq!(buffer.len(), u32::MAX as usize);
+        let address = buffer.mapping_base_addr();
+        let (result, buffer) = timeout(UDP_TEST_TIMEOUT, socket.send(buffer))
+            .await.expect("large-request UDP send timed out");
+        assert_eq!(result.expect_err("oversized datagram was accepted").raw_os_error(), Some(libc::EMSGSIZE));
+        assert_eq!(buffer.mapping_base_addr(), address);
+        assert_eq!(buffer.len(), u32::MAX as usize);
+        assert_eq!(buffer.as_ptr_calls(), 1);
+        assert_eq!(peer.recv(&mut [0u8; 1]).expect_err("failed send emitted a datagram").kind(), io::ErrorKind::WouldBlock);
+    }).expect("UDP send executor failed");
 }
 
 #[test]

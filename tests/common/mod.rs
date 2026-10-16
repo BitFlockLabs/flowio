@@ -58,6 +58,91 @@ pub async fn poll_once_pending<F: Future>(future: F) {
     .await;
 }
 
+/// Runs the peer action after the receive returns Pending both before and after
+/// a completed ring operation. Its second poll may submit an exact-read retry.
+#[allow(dead_code)]
+pub async fn receive_after_pending<F: Future>(future: F, peer_action: impl FnOnce()) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    flowio::test_support::runtime::io::Nop::new()
+        .await
+        .expect("receive submission barrier failed");
+    poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    peer_action();
+    future.await
+}
+
+/// Checks a scalar receive's result, published bytes and exact buffer owner.
+#[allow(dead_code)]
+pub fn assert_read_returns_owner(
+    received: (io::Result<usize>, DropTrackedReadWrite),
+    expected: Result<usize, i32>,
+    bytes: &[u8],
+    address: *const u8,
+    drops: &Rc<Cell<usize>>,
+) -> DropTrackedReadWrite {
+    let (result, buffer) = received;
+    assert_eq!(
+        result.map_err(|error| error.raw_os_error()),
+        expected.map_err(Some)
+    );
+    assert_eq!(buffer.bytes(), bytes);
+    assert_eq!(buffer.bytes().as_ptr(), address);
+    assert_eq!(drops.get(), 0);
+    buffer
+}
+
+/// Exercises vectored receive readiness, appended prefixes and segment ownership.
+#[allow(unused_macros)]
+macro_rules! assert_vectored_receive_after_pending {
+    ($stream:ident, $peer:ident) => {{
+        let chain = $crate::common::make_read_chain([4, 4]);
+        let addresses = [
+            chain.get(0).unwrap().payload_bytes().as_ptr(),
+            chain.get(1).unwrap().payload_bytes().as_ptr(),
+        ];
+        let (result, chain) = $crate::common::receive_after_pending($stream.readv(chain), || {
+            $peer.write_all(b"hi").expect("peer partial write failed");
+        })
+        .await;
+        assert_eq!(result.expect("vectored receive failed"), 2);
+        assert_eq!(chain.get(0).unwrap().payload_bytes(), b"hi");
+        assert!(chain.get(1).unwrap().payload_bytes().is_empty());
+        for (index, address) in addresses.iter().enumerate() {
+            assert_eq!(chain.get(index).unwrap().payload_bytes().as_ptr(), *address);
+        }
+
+        let (result, chain) =
+            $crate::common::receive_after_pending($stream.readv_exact(chain, 5), || {
+                $peer.write_all(b"abcde").expect("peer exact write failed");
+            })
+            .await;
+        assert_eq!(result.expect("exact vectored receive failed"), 5);
+        assert_eq!(chain.get(0).unwrap().payload_bytes(), b"hiab");
+        assert_eq!(chain.get(1).unwrap().payload_bytes(), b"cde");
+        $peer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer shutdown failed");
+        let (result, chain) = $stream.readv(chain).await;
+        assert_eq!(result.expect("vectored EOF failed"), 0);
+        assert_eq!(chain.get(0).unwrap().payload_bytes(), b"hiab");
+        assert_eq!(chain.get(1).unwrap().payload_bytes(), b"cde");
+        for (index, address) in addresses.iter().enumerate() {
+            assert_eq!(chain.get(index).unwrap().payload_bytes().as_ptr(), *address);
+        }
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use assert_vectored_receive_after_pending;
+
 /// Returns whether one numeric descriptor currently names an open descriptor.
 ///
 /// This is used only by isolated child-process ownership regressions, where no
@@ -373,6 +458,11 @@ impl BoundedTcpStream {
     /// Shuts down part or all of the connected peer.
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         self.inner.shutdown(how)
+    }
+
+    /// Configures a reset when this peer closes.
+    pub fn force_reset_on_drop(&self) {
+        flowio::test_support::net::tls_test_peer::force_reset_on_drop(&self.inner);
     }
 
     /// Returns the peer stream's local address.
@@ -804,31 +894,23 @@ pub fn fill_try_send_buffer(
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 const SPARSE_OVERSIZED_READ_ONLY_LEN: usize = u32::MAX as usize + 1;
 
-/// Read-only sparse mapping larger than the io_uring 32-bit byte-count limit.
-///
-/// The mapping reserves virtual address space without reserving swap or
-/// populating physical pages. Oversized-send tests must reject it before
-/// consulting the pointer or submitting an SQE.
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-#[allow(dead_code)]
-pub struct SparseOversizedReadOnly {
+struct SparseMapping {
     base: std::ptr::NonNull<u8>,
-    as_ptr_calls: Cell<usize>,
+    len: usize,
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-#[allow(dead_code)]
-impl SparseOversizedReadOnly {
-    /// Reserves one valid initialized read-only mapping of exactly 2^32 bytes.
-    pub fn new() -> io::Result<Self> {
+impl SparseMapping {
+    fn new(len: usize, protection: libc::c_int) -> io::Result<Self> {
         let raw = unsafe {
             // SAFETY: this requests a new anonymous private mapping. No input
             // pointer or file descriptor is dereferenced, and success is
             // checked before the returned address is retained.
             libc::mmap(
                 std::ptr::null_mut(),
-                SPARSE_OVERSIZED_READ_ONLY_LEN,
-                libc::PROT_READ,
+                len,
+                protection,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,
@@ -841,15 +923,58 @@ impl SparseOversizedReadOnly {
         let Some(base) = std::ptr::NonNull::new(raw.cast::<u8>()) else {
             // SAFETY: `raw` names the successful mapping above and the exact
             // mapping length is unchanged.
-            let rc = unsafe { libc::munmap(raw, SPARSE_OVERSIZED_READ_ONLY_LEN) };
+            let rc = unsafe { libc::munmap(raw, len) };
             assert_eq!(rc, 0, "failed to unmap an unexpected null mapping");
             return Err(io::Error::other("mmap returned a null address"));
         };
 
+        Ok(Self { base, len })
+    }
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+impl Drop for SparseMapping {
+    fn drop(&mut self) {
+        // SAFETY: this value uniquely owns this mapping and its exact length.
+        let rc = unsafe { libc::munmap(self.base.as_ptr().cast::<libc::c_void>(), self.len) };
+        assert_eq!(
+            rc,
+            0,
+            "failed to release sparse test mapping: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// Read-only sparse mapping larger than the unsigned 32-bit request range.
+///
+/// The mapping reserves virtual address space without reserving swap or
+/// populating physical pages. Its default readable length is rejected before
+/// pointer access; a shorter prefix supports native large-request tests.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+pub struct SparseOversizedReadOnly {
+    mapping: SparseMapping,
+    readable_len: usize,
+    as_ptr_calls: Cell<usize>,
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+impl SparseOversizedReadOnly {
+    /// Reserves one valid initialized read-only mapping of exactly 2^32 bytes.
+    pub fn new() -> io::Result<Self> {
         Ok(Self {
-            base,
+            mapping: SparseMapping::new(SPARSE_OVERSIZED_READ_ONLY_LEN, libc::PROT_READ)?,
+            readable_len: SPARSE_OVERSIZED_READ_ONLY_LEN,
             as_ptr_calls: Cell::new(0),
         })
+    }
+
+    /// Restricts the readable prefix without changing the backing mapping.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.readable_len);
+        self.readable_len = len;
     }
 
     /// Returns how often a transport consulted this mapping's data pointer.
@@ -859,44 +984,79 @@ impl SparseOversizedReadOnly {
 
     /// Returns the stable mapping identity without counting a data-pointer use.
     pub fn mapping_base_addr(&self) -> usize {
-        self.base.as_ptr() as usize
+        self.mapping.base.as_ptr() as usize
     }
 }
 
 // SAFETY: successful anonymous mappings are zero-initialized and page-aligned.
-// This mapping is one non-null, immutable 2^32-byte range, which is below
-// `isize::MAX` on the gated 64-bit target. Its address remains stable across
-// moves and stays readable until the owning value unmaps it in `Drop`.
+// The readable prefix stays inside one non-null, immutable 2^32-byte mapping,
+// below `isize::MAX` on the gated 64-bit target. Its address remains stable
+// across moves and stays readable until the owning value unmaps it in `Drop`.
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 unsafe impl IoBuffReadOnly for SparseOversizedReadOnly {
     fn as_ptr(&self) -> *const u8 {
         self.as_ptr_calls
             .set(self.as_ptr_calls.get().saturating_add(1));
-        self.base.as_ptr()
+        self.mapping.base.as_ptr()
     }
 
     fn len(&self) -> usize {
-        SPARSE_OVERSIZED_READ_ONLY_LEN
+        self.readable_len
+    }
+}
+
+/// Sparse writable ownership for one native receive at the u32 request bound.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+pub struct SparseReadWrite {
+    mapping: SparseMapping,
+    written: usize,
+    drops: Rc<Cell<usize>>,
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+#[allow(dead_code)]
+impl SparseReadWrite {
+    pub fn new(drops: &Rc<Cell<usize>>) -> io::Result<Self> {
+        Ok(Self {
+            mapping: SparseMapping::new(u32::MAX as usize, libc::PROT_READ | libc::PROT_WRITE)?,
+            written: 0,
+            drops: Rc::clone(drops),
+        })
+    }
+
+    pub fn mapping_base_addr(&self) -> usize {
+        self.mapping.base.as_ptr() as usize
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: only completed, initialized kernel output is published here.
+        unsafe { std::slice::from_raw_parts(self.mapping.base.as_ptr(), self.written) }
+    }
+}
+
+// SAFETY: the mapping owns one stable writable range below isize::MAX. Moves
+// keep its base unchanged, and publication exposes only initialized bytes.
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+unsafe impl IoBuffReadWrite for SparseReadWrite {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.mapping.base.as_ptr()
+    }
+
+    fn writable_len(&self) -> usize {
+        self.mapping.len
+    }
+
+    unsafe fn set_written_len(&mut self, len: usize) {
+        assert!(len <= self.mapping.len);
+        self.written = len;
     }
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
-impl Drop for SparseOversizedReadOnly {
+impl Drop for SparseReadWrite {
     fn drop(&mut self) {
-        // SAFETY: this value uniquely owns the successful mapping at `base`,
-        // and Drop supplies the exact original length once.
-        let rc = unsafe {
-            libc::munmap(
-                self.base.as_ptr().cast::<libc::c_void>(),
-                SPARSE_OVERSIZED_READ_ONLY_LEN,
-            )
-        };
-        assert_eq!(
-            rc,
-            0,
-            "failed to release sparse oversized test mapping: {}",
-            io::Error::last_os_error()
-        );
+        self.drops.set(self.drops.get() + 1);
     }
 }
 
@@ -999,6 +1159,11 @@ impl DropTrackedReadWrite {
     #[allow(dead_code)]
     pub fn zeroed(len: usize, drops: &Rc<Cell<usize>>) -> Self {
         Self::new(vec![0; len], drops)
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -1538,7 +1703,7 @@ macro_rules! assert_empty_projected_async_cases {
 #[allow(unused_imports)]
 pub(crate) use assert_empty_projected_async_cases;
 
-/// Exercises the shared TCP/Unix one-shot empty read/write policy.
+/// Exercises the shared TCP/Unix empty read, exact-read and write policy.
 #[allow(unused_macros)]
 macro_rules! assert_empty_stream_io_cases {
     ($stream:ident) => {{
@@ -1548,6 +1713,12 @@ macro_rules! assert_empty_stream_io_cases {
         let read_capacity = read_buffer.capacity();
         let (result, read_buffer) = $stream.read(read_buffer, 0).await;
         assert_eq!(result.expect("empty stream read failed"), 0);
+        assert_eq!(read_buffer, b"HEAD");
+        assert_eq!(read_buffer.as_ptr(), read_ptr);
+        assert_eq!(read_buffer.capacity(), read_capacity);
+
+        let (result, read_buffer) = $stream.read_exact(read_buffer, 0).await;
+        assert_eq!(result.expect("empty exact stream read failed"), 0);
         assert_eq!(read_buffer, b"HEAD");
         assert_eq!(read_buffer.as_ptr(), read_ptr);
         assert_eq!(read_buffer.capacity(), read_capacity);

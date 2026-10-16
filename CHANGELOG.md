@@ -237,6 +237,17 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- TCP and Unix `write`, `write_all`, `writev` and `writev_all`, and UDP and SCTP
+  `recv`, no longer fail with `InvalidInput` for requests of 2 GiB or more on
+  kernels that reject larger socket request lengths; the `_all` writes continue
+  from each completed count. UDP and SCTP `send` of 2 GiB or more report the
+  kernel's message-size error instead.
+- TCP and Unix `read`, `read_exact`, `readv` and `readv_exact`, and TLS
+  handshakes and reads wait for data instead of returning `WouldBlock` on
+  Linux 5.11 through 5.14.6. If another read consumes the available data
+  first, these reads also wait again instead of returning `WouldBlock` on
+  kernels without io_uring's poll retry limit: mainline before 6.3, 5.15.y
+  before 5.15.99, 6.1.y before 6.1.18 and 6.2.y before 6.2.3.
 - Buffer and task reference-count overflow terminates the process instead of
   wrapping and risking premature memory reclamation.
 - I/O submission returns `WouldBlock` when a full submission queue makes no
@@ -279,7 +290,7 @@ Alpha prereleases carry no compatibility guarantee.
   limits with `IoBuffPoolConfigError::LayoutOverflow` before allocating a slab.
 - With `test-support`, `SlabAllocator` rejects acquisition before
   initialization and initializes its provider at most once.
-- UDP `send_to` rejects lengths outside io_uring's 32-bit limit before pointer
+- UDP `send_to` rejects lengths above `u32::MAX` before pointer
   access, allocation, or submission and returns the caller's buffer.
   Metadata-free `recv_msg` and `recv_from` no longer reject complete payloads
   because discarded ancillary data was truncated.

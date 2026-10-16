@@ -2,15 +2,15 @@ mod common;
 
 use common::{
     BoundedTcpListener, BoundedTcpPeer, BoundedTcpStream, DYNAMIC_PROJECTED_PIECES,
-    DropTrackedProjected17, EmptyProjected, OVERSIZED_VECTORED_IOVECS,
+    DropTrackedProjected17, DropTrackedReadWrite, EmptyProjected, OVERSIZED_VECTORED_IOVECS,
     OVERSIZED_VECTORED_TEST_STACK_BYTES, ProjectedSourceWitness, TestIoBuffMut as IoBuffMut,
     TestProjected, TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
-    assert_op_allocation_fault_preserved, assert_vectored_overlimit, connect_bounded_tcp_peer,
-    fill_try_send_buffer, ipv6_loopback_capability_unavailable, lowest_available_fd,
-    make_oversized_read_chain, make_oversized_write_chain, make_payload_chain, make_read_chain,
-    make_read_only_chain, oversized_read_chain_endpoints, oversized_write_chain_endpoints,
-    poll_once_pending, raw_fd_is_open, run_test, run_test_output, set_positive_linger,
-    spawn_bounded_tcp_peer,
+    assert_op_allocation_fault_preserved, assert_read_returns_owner, assert_vectored_overlimit,
+    connect_bounded_tcp_peer, fill_try_send_buffer, ipv6_loopback_capability_unavailable,
+    lowest_available_fd, make_oversized_read_chain, make_oversized_write_chain, make_payload_chain,
+    make_read_chain, make_read_only_chain, oversized_read_chain_endpoints,
+    oversized_write_chain_endpoints, poll_once_pending, raw_fd_is_open, receive_after_pending,
+    run_test, run_test_output, set_positive_linger, spawn_bounded_tcp_peer,
 };
 use flowio::net::tcp::{TcpConnector, TcpListener, TcpStream};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
@@ -1137,7 +1137,7 @@ fn runtime_tcp_empty_read_write_complete_without_submission() {
         assert_eq!(stats.retained_pooled_allocs, 0);
         assert_eq!(stats.retained_heap_fallbacks, 0);
         assert_eq!(
-            stats.poll_context_extractions, 2,
+            stats.poll_context_extractions, 3,
             "each local completion must still validate its FlowIO context"
         );
     }
@@ -1941,6 +1941,65 @@ fn runtime_tcp_write_all_read_exact_large_payload() {
 }
 
 #[test]
+fn runtime_tcp_scalar_reads_wait_for_data_and_return_owner() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_tcp_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        let drops = Rc::new(Cell::new(0));
+        let buffer = DropTrackedReadWrite::zeroed(4, &drops);
+        let address = buffer.bytes().as_ptr();
+
+        let (result, buffer) = receive_after_pending(stream.read(buffer, 4), || {
+            peer.write_all(b"hi").expect("peer partial write failed");
+        })
+        .await;
+        let buffer = assert_read_returns_owner((result, buffer), Ok(2), b"hi", address, &drops);
+
+        let (result, buffer) = receive_after_pending(stream.read_exact(buffer, 4), || {
+            peer.write_all(b"done").expect("peer exact write failed");
+        })
+        .await;
+        let buffer = assert_read_returns_owner((result, buffer), Ok(4), b"done", address, &drops);
+
+        peer.shutdown(Shutdown::Write)
+            .expect("peer shutdown failed");
+        let (result, buffer) = stream.read(buffer, 4).await;
+        let buffer = assert_read_returns_owner((result, buffer), Ok(0), b"done", address, &drops);
+        drop(buffer);
+        assert_eq!(drops.get(), 1);
+    });
+}
+
+#[test]
+fn runtime_tcp_vectored_reads_wait_for_data_and_return_owners() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_tcp_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        common::assert_vectored_receive_after_pending!(stream, peer);
+    });
+}
+
+#[test]
+fn runtime_tcp_scalar_read_reset_preserves_owner() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_tcp_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        peer.force_reset_on_drop();
+        let drops = Rc::new(Cell::new(0));
+        let buffer = DropTrackedReadWrite::new(b"seed".to_vec(), &drops);
+        let address = buffer.bytes().as_ptr();
+        let received = receive_after_pending(stream.read(buffer, 4), || drop(peer)).await;
+        let buffer =
+            assert_read_returns_owner(received, Err(libc::ECONNRESET), b"seed", address, &drops);
+        drop(buffer);
+        assert_eq!(drops.get(), 1);
+    });
+}
+
+#[test]
 fn runtime_tcp_read_exact_eof() {
     let mut executor = Executor::new().expect("failed to construct runtime executor");
 
@@ -1960,10 +2019,12 @@ fn runtime_tcp_read_exact_eof() {
 
             let mut recv = IoBuffMut::new(0, 8, 0);
             recv.payload_append(b"HEAD").unwrap();
+            let address = recv.payload_bytes().as_ptr();
             let (res, buf) = stream.read_exact(recv, 4).await;
             let err = res.expect_err("should fail with UnexpectedEof");
             assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
             assert_eq!(buf.payload_bytes(), b"HEADhi");
+            assert_eq!(buf.payload_bytes().as_ptr(), address);
         })
         .expect("executor run failed");
 

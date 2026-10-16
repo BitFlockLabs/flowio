@@ -9,8 +9,8 @@
 //!
 //! Preferred on the per-message fast path:
 //! - For steady-state stream I/O, [`TcpStream::read`] / [`TcpStream::write`]
-//!   perform one contiguous submission and return short reads or writes to the
-//!   caller.
+//!   return the first positive or terminal completion without looping on
+//!   partial progress. Reads resubmit no-progress `EAGAIN` internally.
 //! - For timeout-edge callers whose phase deadline has already reached
 //!   `Duration::ZERO`, the `try_*` methods attempt one nonblocking syscall on
 //!   the existing socket and return immediately with the rental buffer.
@@ -318,7 +318,9 @@ impl TcpStream {
     /// dropped. `OwnedFd` proves unique close ownership, but does not validate
     /// the socket type or configuration. The descriptor must refer to a valid
     /// connected TCP stream and must be nonblocking when using the `try_*`
-    /// deadline-edge APIs.
+    /// deadline-edge APIs. On an adopted non-socket descriptor, `read`,
+    /// `read_exact`, `readv` and `readv_exact` fail with `ENOTSOCK` when they
+    /// submit a receive.
     ///
     /// # Example
     /// ```no_run
@@ -354,7 +356,9 @@ impl TcpStream {
     ///
     /// FlowIO-created TCP sockets are nonblocking. Callers that pass an
     /// external descriptor must preserve that invariant; the `try_*`
-    /// deadline-edge APIs rely on the fd already being nonblocking.
+    /// deadline-edge APIs rely on the fd already being nonblocking. On an
+    /// adopted non-socket descriptor, `read`, `read_exact`, `readv`
+    /// and `readv_exact` fail with `ENOTSOCK` when they submit a receive.
     ///
     /// # Safety
     ///

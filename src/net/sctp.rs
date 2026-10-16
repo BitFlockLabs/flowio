@@ -218,7 +218,9 @@ use super::{
     map_connect_timeout, set_reuse_addr, set_reuse_port, set_sock_opt, socket_addr_from_c,
     socket_addr_to_c, socket_domain, write_msghdr,
 };
-use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
+use crate::net::send_sqe::{
+    build_recv_entry, build_recvmsg_entry, build_send_entry, build_sendmsg_entry,
+};
 use crate::runtime::buffer::bytes::{
     BufferRangeError, read_i32_at, read_u16_at, read_u16_be_at, read_u32_at,
 };
@@ -239,7 +241,6 @@ use crate::runtime::retained::{
 use crate::runtime::task::release_task;
 use crate::runtime::timer::{Timeout, timeout};
 use crate::utils::disarm_unwind_guard;
-use io_uring::{opcode, types};
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
@@ -253,6 +254,8 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+
+const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
 
 /// Kernel-facing notification-subscription layout used with SCTP socket
 /// options on Linux.
@@ -3997,12 +4000,14 @@ impl SctpStream {
     /// metadata receive resynchronization. If a metadata receive is discarding
     /// a record tail, or a dropped `recv_msg` / `recv_msg_vectored` is still
     /// attached to the stream, this method rejects the request without changing
-    /// that state or submitting another receive.
+    /// that state or submitting another receive. Each receive submits at most
+    /// `i32::MAX` bytes, even when the validated request is larger. A receive
+    /// returns the actual byte count without requesting another message.
     ///
     /// # Errors
-    /// Returns `InvalidInput` if `len` is zero, exceeds
+    /// Returns `InvalidInput` if `len` is zero, exceeds `u32::MAX` or
     /// `buffer.writable_len()`, or metadata-receive recovery is pending. Length
-    /// validation takes precedence over the pending-recovery check; all three
+    /// validation takes precedence over the pending-recovery check; these
     /// cases return the buffer after owner-context validation and before
     /// operation allocation, buffer-pointer access, or submission. Kernel
     /// receive errors are returned as `io::Error` values from the completed
@@ -4038,10 +4043,15 @@ impl SctpStream {
     /// Starts one connected data send on the fast path.
     ///
     /// Per-message metadata comes from the socket's default send info, if any.
+    /// One send submits a prefix of at most `i32::MAX` bytes as one message.
+    /// A message larger than the socket's send buffer fails with `EMSGSIZE`.
+    /// A short successful result means the peer receives only that prefix as
+    /// one complete message. A later send is a separate message, not a
+    /// continuation of the returned remainder.
     ///
     /// # Errors
     /// Returns `InvalidInput` if the buffer has no readable bytes or its length
-    /// exceeds the kernel send-count width.
+    /// exceeds `u32::MAX`.
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> DataSendFuture<'_, B> {
@@ -4120,10 +4130,13 @@ impl SctpStream {
     /// This is the explicit-metadata send path. If the metadata is stable for
     /// the association, install it once with [`SctpStream::set_default_send_info`]
     /// and prefer [`SctpStream::send`] on the data fast path.
+    /// A message larger than the socket's send buffer fails with `EMSGSIZE`.
+    /// A short successful result means the peer receives only that prefix as
+    /// one complete message; a later send creates a separate message.
     ///
     /// # Errors
     /// Returns `InvalidInput` if the buffer has no readable bytes or its length
-    /// exceeds the kernel send-count width.
+    /// exceeds `u32::MAX`.
     ///
     /// See [`SctpStream`] for in-flight drop ownership.
     pub fn send_msg<B: IoBuffReadOnly>(
@@ -4212,6 +4225,9 @@ impl SctpStream {
     /// zero-readable chains are rejected without submitting kernel I/O. Use
     /// this when both segmentation and explicit SCTP metadata matter. For a
     /// single contiguous data-only send, prefer [`SctpStream::send`].
+    /// A message larger than the socket's send buffer fails with `EMSGSIZE`.
+    /// A short successful result means the peer receives only that prefix as
+    /// one complete message; a later send creates a separate message.
     ///
     /// # Errors
     /// Returns `InvalidInput` if the chain has no readable bytes, has more than
@@ -5468,7 +5484,7 @@ pub struct DataRecvFuture<'a, B: IoBuffReadWrite> {
     buffer: Option<B>,
     /// Logical buffer length captured before the receive writable window formed.
     write_base_len: usize,
-    /// Maximum bytes requested from the kernel.
+    /// Validated receive request, clamped to `i32::MAX` on submission.
     len: u32,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
@@ -5535,9 +5551,7 @@ impl<B: IoBuffReadWrite> Future for DataRecvFuture<'_, B> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_mut_ptr();
-                        Ok(opcode::Recv::new(types::Fd(fd), ptr, this.len)
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_recv_entry(fd, ptr, this.len, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -5625,10 +5639,13 @@ impl<B: IoBuffReadOnly> Future for DataSendFuture<'_, B> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        let entry = build_send_entry(fd, ptr, this.len, state_ptr as u64);
-                        #[cfg(test)]
-                        tests::observe_data_send_entry(&entry);
-                        Ok(entry)
+                        Ok(build_send_entry(
+                            fd,
+                            ptr,
+                            this.len,
+                            SEND_FLAGS,
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -5809,11 +5826,11 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                     &mut this.state_ptr,
                     payload,
                     |fd, payload| {
-                        Ok(
-                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
-                                .build()
-                                .user_data(state_ptr as u64),
-                        )
+                        Ok(build_recvmsg_entry(
+                            fd,
+                            payload.msghdr.as_mut_ptr(),
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -5924,6 +5941,7 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                         Ok(build_sendmsg_entry(
                             fd,
                             payload.msghdr.as_ptr(),
+                            SEND_FLAGS as u32,
                             state_ptr as u64,
                         ))
                     },
@@ -6152,11 +6170,11 @@ impl<const N: usize> Future for RecvVectoredFuture<'_, N> {
                     &mut this.state_ptr,
                     payload,
                     |fd, payload| {
-                        Ok(
-                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
-                                .build()
-                                .user_data(state_ptr as u64),
-                        )
+                        Ok(build_recvmsg_entry(
+                            fd,
+                            payload.msghdr.as_mut_ptr(),
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -6290,6 +6308,7 @@ impl<const N: usize> Future for SendVectoredFuture<'_, N> {
                         Ok(build_sendmsg_entry(
                             fd,
                             payload.msghdr.as_ptr(),
+                            SEND_FLAGS as u32,
                             state_ptr as u64,
                         ))
                     },
@@ -8488,6 +8507,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use io_uring::opcode;
 
     #[cfg(not(miri))]
     #[test]
@@ -8507,7 +8527,7 @@ mod tests {
             drop(connector);
         });
     }
-    use crate::net::send_sqe::test_support::sqe_prefix;
+    use crate::net::send_sqe::test_support::{SocketEntryCapture, sqe_prefix};
     use crate::runtime::buffer::IoBuffMut;
     use crate::runtime::executor::with_ringless_poll_context_for_test;
     use crate::runtime::task::{TaskHeader, TaskVTable};
@@ -11624,57 +11644,30 @@ mod tests {
     }
 
     #[test]
-    fn sctp_data_send_entry_uses_send_with_nosignal() {
-        let bytes = [1u8, 2, 3, 4];
-        let entry = build_send_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
-        let sqe = sqe_prefix(&entry);
+    fn sctp_data_send_caller_preserves_nosignal() {
+        use crate::net::send_sqe::test_support::{
+            ExpectedScalarEntry, assert_rejected_scalar_submission, next_operation_user_data,
+        };
 
-        assert_eq!(sqe.opcode, opcode::Send::CODE);
-        assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
-        assert_eq!(sqe.user_data, 99);
-    }
-
-    thread_local! {
-        static DATA_SEND_ENTRY: std::cell::RefCell<Option<Option<io_uring::squeue::Entry>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn observe_data_send_entry(entry: &io_uring::squeue::Entry) {
-        DATA_SEND_ENTRY.with(|observed| {
-            if let Some(slot) = observed.borrow_mut().as_mut() {
-                assert!(slot.is_none(), "scalar SCTP send built more than one entry");
-                *slot = Some(entry.clone());
-            }
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut stream = ringless_sctp_stream();
+            let fd = stream.fd.raw_fd();
+            let buffer = vec![1u8, 2, 3, 4];
+            let original = buffer.as_ptr();
+            let mut future = stream.send(buffer);
+            let expected = ExpectedScalarEntry {
+                opcode: opcode::Send::CODE,
+                fd,
+                addr: original,
+                owner_addr: original,
+                len: 4,
+                msg_flags: libc::MSG_NOSIGNAL as u32,
+                user_data: next_operation_user_data(owner),
+            };
+            let returned =
+                assert_rejected_scalar_submission(cx, &mut future, expected, &[1, 2, 3, 4]);
+            assert_eq!(returned.as_ptr(), original);
         });
-    }
-
-    struct DataSendEntryCapture {
-        previous: Option<Option<io_uring::squeue::Entry>>,
-    }
-
-    impl DataSendEntryCapture {
-        fn new() -> Self {
-            Self {
-                previous: DATA_SEND_ENTRY.with(|observed| observed.replace(Some(None))),
-            }
-        }
-
-        fn take(&self) -> io_uring::squeue::Entry {
-            DATA_SEND_ENTRY.with(|observed| {
-                observed
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("scalar SCTP send observation is not active")
-                    .take()
-                    .expect("scalar SCTP send did not build an entry")
-            })
-        }
-    }
-
-    impl Drop for DataSendEntryCapture {
-        fn drop(&mut self) {
-            DATA_SEND_ENTRY.with(|observed| observed.replace(self.previous.take()));
-        }
     }
 
     #[test]
@@ -11704,7 +11697,7 @@ mod tests {
             let mut stream = ringless_sctp_stream();
             let expected_fd = stream.fd.raw_fd();
             let mut send = stream.send(buffer);
-            let capture = DataSendEntryCapture::new();
+            let capture = SocketEntryCapture::new();
             test_hooks::fail_next_raw_sqe_submit();
             let Poll::Ready((result, returned)) = Pin::new(&mut send).poll(cx) else {
                 panic!("scalar SCTP send did not return its rejected submission");
@@ -11749,23 +11742,152 @@ mod tests {
     }
 
     #[test]
-    fn sctp_metadata_send_entry_uses_sendmsg_with_nosignal() {
-        let msg = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: std::ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
+    fn sctp_data_callers_clamp_scalar_requests_and_return_original_owners() {
+        use crate::net::send_sqe::test_support::{
+            ExpectedScalarEntry, ScalarTestFuture, assert_rejected_scalar_submission,
         };
-        let entry = build_sendmsg_entry(7, &msg, 99);
-        let sqe = sqe_prefix(&entry);
 
-        assert_eq!(sqe.opcode, opcode::SendMsg::CODE);
-        assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
-        assert_eq!(sqe.addr, (&msg as *const libc::msghdr) as u64);
-        assert_eq!(sqe.user_data, 99);
+        for receive in [false, true] {
+            for requested in [i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+                with_ringless_poll_context_for_test(1, |owner, cx| {
+                    let reactor = owner.reactor_ptr();
+                    let state = unsafe { (&mut *reactor).alloc_op() };
+                    assert!(!state.is_null());
+                    unsafe { (&mut *reactor).free_op(state) };
+                    let mut stream = ringless_sctp_stream();
+                    let fd = stream.fd.raw_fd();
+                    let buffer = b"abcdefgh".to_vec();
+                    let original = buffer.as_ptr();
+                    // The validated length is synthetic; the forced submission
+                    // failure prevents the kernel from touching this small owner.
+                    let mut future: ScalarTestFuture<'_> = if receive {
+                        let mut future = stream.recv(buffer, 8);
+                        future.len = requested;
+                        Box::pin(future)
+                    } else {
+                        let mut future = stream.send(buffer);
+                        future.len = requested;
+                        Box::pin(future)
+                    };
+                    let returned = assert_rejected_scalar_submission(
+                        cx,
+                        &mut future,
+                        ExpectedScalarEntry {
+                            opcode: if receive {
+                                opcode::Recv::CODE
+                            } else {
+                                opcode::Send::CODE
+                            },
+                            fd,
+                            addr: original,
+                            owner_addr: original,
+                            len: requested.min(i32::MAX as u32),
+                            msg_flags: if receive {
+                                0
+                            } else {
+                                libc::MSG_NOSIGNAL as u32
+                            },
+                            user_data: state as u64,
+                        },
+                        b"abcdefgh",
+                    );
+                    drop(returned);
+                    assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                    assert_eq!(owner.inflight_op_count_for_test(), 0);
+                });
+            }
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn sctp_data_short_send_returns_actual_count_without_sending_remainder() {
+        use crate::runtime::op::completion_retirement_test_support::stage_payload;
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut stream = ringless_sctp_stream();
+            let buffer = b"abcdefgh".to_vec();
+            let original = buffer.as_ptr();
+            let mut future = stream.send(buffer);
+            future.len = u32::MAX;
+            let payload = RetainedDataSendPayload {
+                buffer: future.buffer.take().expect("send owner missing"),
+            };
+            // A short completion must finish this one message without a second
+            // submission, even when the requested prefix was larger.
+            unsafe { stage_payload(owner, &mut future.state_ptr, payload, 2, true) };
+            test_hooks::fail_next_raw_sqe_submit();
+            let Poll::Ready((result, returned)) = Pin::new(&mut future).poll(cx) else {
+                panic!("short SCTP send did not finish its message");
+            };
+            assert_eq!(result.expect("short SCTP send failed"), 2);
+            assert_eq!(returned.as_ptr(), original);
+            assert_eq!(returned, b"abcdefgh");
+            assert!(future.state_ptr.is_null());
+            assert!(future.buffer.is_none());
+            assert!(Pin::new(&mut future).poll(cx).is_pending());
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 1);
+            assert!(test_hooks::take_raw_sqe_submit_failure().is_some());
+            assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
+    }
+
+    #[test]
+    fn sctp_metadata_send_caller_retains_header_and_nosignal() {
+        use crate::net::send_sqe::test_support::{
+            assert_rejected_message_submission, next_message_entry,
+        };
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut stream = ringless_sctp_stream();
+            let expected = next_message_entry::<RetainedSctpSendPayload<Vec<u8>>>(
+                owner,
+                std::mem::offset_of!(RetainedSctpSendPayload<Vec<u8>>, msghdr),
+                stream.fd.raw_fd(),
+                libc::MSG_NOSIGNAL as u32,
+            );
+            let buffer = b"abcdefgh".to_vec();
+            let original = buffer.as_ptr();
+            let mut future = stream.send_msg(buffer, SctpSendInfo::default());
+            let returned = assert_rejected_message_submission(cx, &mut future, expected);
+            assert_eq!(returned.as_ptr(), original);
+            assert_eq!(returned, b"abcdefgh");
+            assert!(future.state_ptr.is_null());
+            assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
+    }
+
+    #[test]
+    fn sctp_vectored_metadata_send_caller_retains_header_and_nosignal() {
+        use crate::net::send_sqe::test_support::{
+            assert_rejected_message_submission, next_message_entry,
+        };
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut stream = ringless_sctp_stream();
+            let (chain, originals) = sctp_send_shape_drift_chain();
+            let expected = next_message_entry::<RetainedSctpSendVectoredPayload<2>>(
+                owner,
+                std::mem::offset_of!(RetainedSctpSendVectoredPayload<2>, msghdr),
+                stream.fd.raw_fd(),
+                libc::MSG_NOSIGNAL as u32,
+            );
+            let mut future = stream.send_msg_vectored(chain, SctpSendInfo::default());
+            let returned = assert_rejected_message_submission(cx, &mut future, expected);
+            for (index, bytes) in [b"abc".as_slice(), b"defgh".as_slice()]
+                .into_iter()
+                .enumerate()
+            {
+                let segment = returned.get(index).expect("returned segment missing");
+                assert_eq!(segment.as_ptr() as usize, originals[index]);
+                assert_eq!(segment.payload_bytes(), bytes);
+            }
+            assert!(future.state_ptr.is_null());
+            assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        });
     }
 
     fn expected_sctp_reset_encoding(

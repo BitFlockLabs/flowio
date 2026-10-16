@@ -1,15 +1,16 @@
 mod common;
 
 use common::{
-    InitializationTrackedReadWrite, TestIoBuffMut as IoBuffMut, TestProjected,
-    TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
-    assert_poll_after_ready_parks, fill_try_send_buffer, make_payload_chain, make_read_chain,
-    make_read_only_chain, poll_once_pending, run_test, set_positive_linger,
+    DropTrackedReadWrite, InitializationTrackedReadWrite, TestIoBuffMut as IoBuffMut,
+    TestProjected, TryCountMismatchedProjected, TryMismatchedProjected, TryOversizedProjected,
+    assert_poll_after_ready_parks, assert_read_returns_owner, fill_try_send_buffer,
+    make_payload_chain, make_read_chain, make_read_only_chain, poll_once_pending,
+    receive_after_pending, run_test, set_positive_linger,
 };
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use common::{
     OVERSIZED_VECTORED_IOVECS, OVERSIZED_VECTORED_TEST_STACK_BYTES, SparseOversizedReadOnly,
-    assert_op_allocation_fault_preserved, assert_oversized_send_rejected,
+    SparseReadWrite, assert_op_allocation_fault_preserved, assert_oversized_send_rejected,
     assert_oversized_try_send_rejected, assert_vectored_overlimit, make_oversized_read_chain,
     make_oversized_write_chain, oversized_read_chain_endpoints, oversized_write_chain_endpoints,
     run_test_output,
@@ -303,6 +304,161 @@ fn runtime_unix_kernel_read_skips_userspace_initialization() {
 }
 
 #[test]
+fn runtime_unix_scalar_reads_wait_for_data_and_return_owner() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_unix_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        let drops = Rc::new(Cell::new(0));
+        let buffer = DropTrackedReadWrite::zeroed(4, &drops);
+        let address = buffer.bytes().as_ptr();
+
+        let (result, buffer) = receive_after_pending(stream.read(buffer, 4), || {
+            peer.write_all(b"hi").expect("peer partial write failed");
+        })
+        .await;
+        let buffer = assert_read_returns_owner((result, buffer), Ok(2), b"hi", address, &drops);
+
+        let (result, buffer) = receive_after_pending(stream.read_exact(buffer, 4), || {
+            peer.write_all(b"done").expect("peer exact write failed");
+        })
+        .await;
+        let buffer = assert_read_returns_owner((result, buffer), Ok(4), b"done", address, &drops);
+
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("peer shutdown failed");
+        let (result, buffer) = stream.read(buffer, 4).await;
+        let buffer = assert_read_returns_owner((result, buffer), Ok(0), b"done", address, &drops);
+        drop(buffer);
+        assert_eq!(drops.get(), 1);
+    });
+}
+
+#[test]
+fn runtime_unix_vectored_reads_wait_for_data_and_return_owners() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_unix_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        common::assert_vectored_receive_after_pending!(stream, peer);
+    });
+}
+
+#[test]
+fn runtime_unix_scalar_read_reset_preserves_owner() {
+    run_test(async move {
+        let (mut stream, peer) = connected_try_unix_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        let (result, _) = stream.try_write(b"unread".to_vec());
+        assert_eq!(result.expect("queue unread peer data failed"), 6);
+        let drops = Rc::new(Cell::new(0));
+        let buffer = DropTrackedReadWrite::new(b"seed".to_vec(), &drops);
+        let address = buffer.bytes().as_ptr();
+        let received = receive_after_pending(stream.read(buffer, 4), || drop(peer)).await;
+        let buffer =
+            assert_read_returns_owner(received, Err(libc::ECONNRESET), b"seed", address, &drops);
+        drop(buffer);
+        assert_eq!(drops.get(), 1);
+    });
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn runtime_unix_read_u32_max_request_returns_sparse_owner() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_unix_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        let drops = Rc::new(Cell::new(0));
+        let buffer = SparseReadWrite::new(&drops).expect(
+            "sparse mapping failed: process address space or host commit limit (vm.overcommit_memory=2)",
+        );
+        assert_eq!(
+            flowio::runtime::buffer::IoBuffReadWrite::writable_len(&buffer),
+            u32::MAX as usize
+        );
+        let address = buffer.mapping_base_addr();
+        let (result, buffer) =
+            receive_after_pending(stream.read(buffer, u32::MAX as usize), || {
+                peer.write_all(b"recv").expect("peer write failed");
+                peer.shutdown(std::net::Shutdown::Write)
+                    .expect("peer shutdown failed");
+            })
+            .await;
+        assert_eq!(result.expect("large-request receive failed"), 4);
+        assert_eq!(buffer.bytes(), b"recv");
+        assert_eq!(buffer.mapping_base_addr(), address);
+        assert_eq!(drops.get(), 0);
+
+        let (result, buffer) = stream.read(buffer, u32::MAX as usize).await;
+        assert_eq!(result.expect("large-request EOF receive failed"), 0);
+        assert_eq!(buffer.bytes(), b"recv");
+        assert_eq!(buffer.mapping_base_addr(), address);
+        assert_eq!(drops.get(), 0);
+
+        let (mut stream, mut peer) = connected_try_unix_stream();
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        let (result, buffer) =
+            receive_after_pending(stream.read_exact(buffer, u32::MAX as usize), || {
+                peer.write_all(b"tail").expect("peer write failed");
+                peer.shutdown(std::net::Shutdown::Write)
+                    .expect("peer shutdown failed");
+            })
+            .await;
+        assert_eq!(
+            result
+                .expect_err("large exact receive did not report EOF")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(buffer.bytes(), b"tail");
+        assert_eq!(buffer.mapping_base_addr(), address);
+        assert_eq!(drops.get(), 0);
+        drop(buffer);
+        assert_eq!(drops.get(), 1);
+    });
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn runtime_unix_write_u32_max_request_returns_sparse_owner() {
+    run_test(async move {
+        let (mut stream, mut peer) = connected_try_unix_stream();
+        stream
+            .set_send_buffer_size(4096)
+            .expect("set send buffer failed");
+        peer.set_nonblocking(true)
+            .expect("set peer nonblocking failed");
+        let mut buffer = SparseOversizedReadOnly::new().expect(
+            "sparse mapping failed: process address space or host commit limit (vm.overcommit_memory=2)",
+        );
+        buffer.truncate(u32::MAX as usize);
+        assert_eq!(
+            flowio::runtime::buffer::IoBuffReadOnly::len(&buffer),
+            u32::MAX as usize
+        );
+        let address = buffer.mapping_base_addr();
+        let (result, buffer) =
+            flowio::runtime::timer::timeout(Duration::from_secs(2), stream.write(buffer))
+                .await
+                .expect("large-request Unix write timed out");
+        let written = result.expect("large-request Unix write failed");
+        assert!(written > 0 && written <= 0x7fff_f000);
+        assert_eq!(buffer.mapping_base_addr(), address);
+        assert_eq!(
+            flowio::runtime::buffer::IoBuffReadOnly::len(&buffer),
+            u32::MAX as usize
+        );
+        assert_eq!(buffer.as_ptr_calls(), 1);
+        let mut byte = [1u8];
+        assert_eq!(peer.read(&mut byte).expect("peer read failed"), 1);
+        assert_eq!(byte, [0]);
+    });
+}
+
+#[test]
 fn runtime_unix_try_read_rejects_invalid_len() {
     let (mut stream, _peer) = connected_try_unix_stream();
     let mut recv = IoBuffMut::new(0, 4, 0);
@@ -543,7 +699,7 @@ fn runtime_unix_empty_read_write_complete_without_submission() {
         assert_eq!(stats.retained_pooled_allocs, 0);
         assert_eq!(stats.retained_heap_fallbacks, 0);
         assert_eq!(
-            stats.poll_context_extractions, 2,
+            stats.poll_context_extractions, 3,
             "each local completion must still validate its FlowIO context"
         );
     }
@@ -667,10 +823,12 @@ fn runtime_unix_read_exact_eof() {
 
         let mut recv = IoBuffMut::new(0, 8, 0);
         recv.payload_append(b"HEAD").unwrap();
+        let address = recv.payload_bytes().as_ptr();
         let (res, buf) = client.read_exact(recv, 4).await;
         let err = res.expect_err("should fail with UnexpectedEof");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert_eq!(buf.payload_bytes(), b"HEADhi");
+        assert_eq!(buf.payload_bytes().as_ptr(), address);
 
         let (mut client, mut server) = UnixStream::pair().expect("second socketpair failed");
         Executor::spawn(async move {
@@ -680,10 +838,13 @@ fn runtime_unix_read_exact_eof() {
         })
         .expect("second server spawn failed");
 
-        let (res, buf) = client.read_exact(b"HEAD".to_vec(), 4).await;
+        let recv = b"HEAD".to_vec();
+        let address = recv.as_ptr();
+        let (res, buf) = client.read_exact(recv, 4).await;
         let err = res.expect_err("base-zero exact read should report partial EOF");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert_eq!(buf, b"hi", "positive base-zero progress should overwrite");
+        assert_eq!(buf.as_ptr(), address);
     });
 }
 

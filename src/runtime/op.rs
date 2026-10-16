@@ -541,6 +541,7 @@ impl CompletionState {
     ///
     /// The caller must request the exact concrete payload type that was
     /// attached to this completion state.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) unsafe fn retained_payload<T: 'static>(&self) -> &T {
         debug_assert!(

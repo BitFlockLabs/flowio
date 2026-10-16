@@ -1,20 +1,21 @@
 //! Shared io_uring futures for byte-stream transports and FlowIO's TLS wrapper.
 //!
-//! These futures use `IORING_OP_READ` for reads and `IORING_OP_SEND` /
-//! `IORING_OP_SENDMSG` with `MSG_NOSIGNAL` for writes, then handle partial
-//! completion internally for the `_all` / `_exact` variants.  The stream type
+//! Scalar reads use `IORING_OP_RECV` without flags; writes use `IORING_OP_SEND` /
+//! `IORING_OP_SENDMSG` with `MSG_NOSIGNAL`. The `_all` / `_exact` variants
+//! handle partial completions internally. The stream type
 //! parameter `S` is carried only in `PhantomData` to borrow the parent stream
 //! for the duration of the operation.
 //!
 //! Vectored operations materialize `iovec` arrays into scratch storage.
-//! Partial progress advances that scratch in place, and the retry path can
-//! downgrade to `IORING_OP_READ` / `IORING_OP_SEND` when only one segment
-//! remains.
+//! Partial progress advances that scratch in place. One remaining segment
+//! uses `IORING_OP_RECV` for reads up to `i32::MAX` bytes or `IORING_OP_SEND`
+//! for write windows up to `u32::MAX`, submitting at most `i32::MAX` bytes.
+//! Other vectored reads use `IORING_OP_RECVMSG`.
 //!
 //! `CompletionState` is allocated from the reactor's pool for each active
-//! operation. Simple futures free it when their one submission retires; retry
-//! futures reset the same slot for sequential resubmissions after each CQE has
-//! been consumed.
+//! operation. A stream receive resubmits a no-progress EAGAIN completion with
+//! the same slot and payload. Exact/all futures also reuse their slot for
+//! partial progress; every resubmission follows the previous target CQE.
 //!
 //! If a future is dropped while its SQE is still in flight, the state is
 //! marked orphaned and an `ASYNC_CANCEL` SQE is submitted; the CQE path then
@@ -28,7 +29,9 @@
 //! If a future is dropped after completion but before polling its result, the
 //! completed state is freed immediately from `Drop`.
 
-use crate::net::send_sqe::{build_send_entry, build_sendmsg_entry};
+use crate::net::send_sqe::{
+    build_recv_entry, build_recvmsg_entry, build_send_entry, build_sendmsg_entry,
+};
 use crate::net::{
     CompletionTake, MsgHdrInit, complete_read_with_progress, completion_cqe_result,
     finish_completed_payload_take, finish_completed_take, write_msghdr,
@@ -56,7 +59,7 @@ use crate::runtime::retained::{
     with_raw_retained_slot,
 };
 use crate::runtime::task::TaskHeader;
-use io_uring::{opcode, squeue, types};
+use io_uring::squeue;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io;
@@ -67,6 +70,8 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::slice;
 use std::task::{Context, Poll};
+
+const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
 
 macro_rules! impl_stream_rw {
     ($stream:ident, $stream_path:literal) => {
@@ -212,8 +217,9 @@ macro_rules! impl_stream_rw {
         /// EOF.
         ///
         /// Preferred on the stream fast path when the caller tracks framing:
-        /// this performs one contiguous submission and returns short reads
-        /// directly.
+        /// this returns the first positive or terminal completion without
+        /// looping on partial progress. A no-progress EAGAIN completion is
+        /// resubmitted internally.
         pub fn read<B: IoBuffReadWrite>(
             &mut self,
             buffer: B,
@@ -232,7 +238,8 @@ macro_rules! impl_stream_rw {
         ///
         /// Preferred on the stream fast path when the caller tracks progress:
         /// this performs one contiguous submission and returns a short write
-        /// directly.
+        /// directly. Each submission requests at most `i32::MAX` bytes;
+        /// [`write_all`](Self::write_all) advances by the actual completion count.
         pub fn write<B: IoBuffReadOnly>(
             &mut self,
             buffer: B,
@@ -282,6 +289,8 @@ macro_rules! impl_stream_rw {
         ///
         /// The chain is consumed and returned alongside the result (rental
         /// pattern). The total number of bytes read is returned in `Ok`.
+        /// A no-progress EAGAIN completion is resubmitted internally;
+        /// partial progress is returned without another receive.
         ///
         /// Use this when the receive path is already naturally segmented. For a
         /// single contiguous destination buffer, prefer [`Self::read`] to avoid
@@ -404,7 +413,7 @@ macro_rules! impl_stream_rw {
         /// # Errors
         ///
         /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds the chain's
-        /// writable capacity or the `io_uring` 32-bit byte-count limit, the
+        /// writable capacity or the public `u32::MAX` request limit, the
         /// chain's total writable length overflows `usize`, a nonzero `len`
         /// targets a chain with more than 1024 non-empty writable segments, or
         /// the chain's writable segment count or byte total changes before
@@ -656,6 +665,59 @@ unsafe fn reset_existing_retry_state(state: &mut CompletionState, waiter: *mut T
     unsafe { state.register_waiter(waiter) };
 }
 
+/// Resubmits only a completed `-EAGAIN` receive, retaining its owner and lease.
+/// Other states and completion results are left to the caller. Context
+/// rejection returns `NotConnected`; a failed submission returns its error.
+/// Both failures return the retained owner without another receive.
+///
+/// # Safety
+///
+/// `fd_state` must own the operation with retained payload type `T`. `build`
+/// must use the supplied descriptor and only retained kernel-visible storage.
+/// `extract` must move or drop every owned payload field before reclamation.
+#[inline(always)]
+unsafe fn retry_completed_stream_read<T: 'static, R>(
+    cx: &mut Context<'_>,
+    fd_state: &mut RuntimeFdOpState<'_>,
+    build: impl FnOnce(RawFd, &mut T, u64) -> squeue::Entry,
+    extract: impl Fn(*mut T) -> R + Copy,
+) -> Option<Poll<(io::Result<usize>, R)>> {
+    let state_ptr = fd_state.state_ptr();
+    if state_ptr.is_null()
+        || !unsafe { (*state_ptr).is_completed() }
+        || unsafe { (*state_ptr).result } != -libc::EAGAIN
+    {
+        return None;
+    }
+
+    let pctx =
+        match unsafe { retry_poll_ctx_or_rejected_payload_with::<T, R>(cx, fd_state, extract) } {
+            Ok(pctx) => pctx,
+            Err(owner) => {
+                return Some(Poll::Ready((
+                    Err(io::Error::from(io::ErrorKind::NotConnected)),
+                    owner,
+                )));
+            }
+        };
+
+    if let Err(error) = unsafe {
+        submit_resubmitted_fd_sqe(&pctx, fd_state, |fd| {
+            let payload = (*state_ptr).retained_payload_mut::<T>();
+            let entry = build(fd, payload, state_ptr as u64);
+            // The completed state stays reclaimable if a buffer callback
+            // unwinds during SQE construction or header initialization.
+            reset_existing_retry_state(&mut *state_ptr, pctx.owner_task());
+            Ok(entry)
+        })
+    } {
+        let owner =
+            unsafe { take_retained_payload_with_and_free_state::<T, R>(&pctx, fd_state, extract) };
+        return Some(Poll::Ready((Err(error), owner)));
+    }
+    Some(Poll::Pending)
+}
+
 use super::{WritevPieces, WritevProjection, invalid_input, invalid_input_kind, opt_ref, opt_take};
 
 /// Returns an uninitialized inline `iovec` scratch array.
@@ -900,6 +962,9 @@ struct RetainedReadvPayload<const N: usize> {
     buffer: IoBuffVecMut<N>,
     /// Kernel-facing `iovec` array pointing into `buffer` segments.
     scratch: RetainedIovecScratch,
+    /// Kernel-facing header, initialized in retained storage for each RECVMSG.
+    /// Single-iovec RECV submissions never read this field.
+    msg: MaybeUninit<libc::msghdr>,
 }
 
 struct RetainedWritevPayload<C> {
@@ -961,6 +1026,7 @@ unsafe fn emplace_retained_readv_payload<const N: usize>(
             let mut writing = slot.begin_writing();
             let dst = writing.as_mut_ptr();
             scratch_init.initialize_at(std::ptr::addr_of_mut!((*dst).scratch));
+            std::ptr::addr_of_mut!((*dst).msg).write(MaybeUninit::uninit());
             std::ptr::copy_nonoverlapping(source, std::ptr::addr_of_mut!((*dst).buffer), 1);
             std::ptr::write(buffer, None);
             writing.finish()
@@ -1095,42 +1161,36 @@ unsafe fn take_writev_completion_from_retained<C>(
 #[inline(always)]
 /// Builds the next read-style SQE from the current vectored scratch window.
 ///
-/// When only one segment remains and its length fits in `u32`, this downgrades
-/// to `IORING_OP_READ` to avoid an unnecessary `readv`.
+/// One active segment within the signed byte-count limit uses `IORING_OP_RECV`.
+/// Larger single segments and multiple segments use `IORING_OP_RECVMSG`.
 fn build_read_vectored_entry(
     fd: RawFd,
     iovecs: &[MaybeUninit<libc::iovec>],
     skip: usize,
     count: usize,
+    msg: &mut MaybeUninit<libc::msghdr>,
     user_data: u64,
 ) -> squeue::Entry {
     debug_assert!(count > 0, "readv submission requires at least one iovec");
 
     if count == 1 {
         let iov = unsafe { iovec_slice_ref(iovecs, skip) };
-        if let Ok(len) = u32::try_from(iov.iov_len) {
-            return opcode::Read::new(types::Fd(fd), iov.iov_base as *mut u8, len)
-                .build()
-                .user_data(user_data);
+        if iov.iov_len <= i32::MAX as usize {
+            return build_recv_entry(fd, iov.iov_base as *mut u8, iov.iov_len as u32, user_data);
         }
     }
 
-    opcode::Readv::new(
-        types::Fd(fd),
-        unsafe { iovec_slice_ptr(iovecs, skip) },
-        count as u32,
-    )
-    .build()
-    .user_data(user_data)
+    let msg = prepare_message_header(msg, iovecs, skip, count);
+    build_recvmsg_entry(fd, msg, user_data)
 }
 
 #[inline(always)]
-fn prepare_sendmsg_header(
+fn prepare_message_header(
     msg: &mut MaybeUninit<libc::msghdr>,
     iovecs: &[MaybeUninit<libc::iovec>],
     skip: usize,
     count: usize,
-) -> *const libc::msghdr {
+) -> *mut libc::msghdr {
     write_msghdr(
         msg,
         MsgHdrInit {
@@ -1142,14 +1202,14 @@ fn prepare_sendmsg_header(
             controllen: 0,
         },
     );
-    msg.as_ptr()
+    msg.as_mut_ptr()
 }
 
 #[inline(always)]
 /// Builds the next write-style SQE from the current vectored scratch window.
 ///
-/// When only one segment remains and its length fits in `u32`, this downgrades
-/// to `IORING_OP_SEND` to avoid an unnecessary `sendmsg`.
+/// One remaining segment whose length fits in `u32` uses `IORING_OP_SEND`,
+/// submitting at most `i32::MAX` bytes. Larger or multiple segments use SENDMSG.
 fn build_write_vectored_entry(
     fd: RawFd,
     iovecs: &[MaybeUninit<libc::iovec>],
@@ -1163,12 +1223,12 @@ fn build_write_vectored_entry(
     if count == 1 {
         let iov = unsafe { iovec_slice_ref(iovecs, skip) };
         if let Ok(len) = u32::try_from(iov.iov_len) {
-            return build_send_entry(fd, iov.iov_base as *const u8, len, user_data);
+            return build_send_entry(fd, iov.iov_base as *const u8, len, SEND_FLAGS, user_data);
         }
     }
 
-    let msg = prepare_sendmsg_header(msg, iovecs, skip, count);
-    build_sendmsg_entry(fd, msg, user_data)
+    let msg = prepare_message_header(msg, iovecs, skip, count);
+    build_sendmsg_entry(fd, msg, SEND_FLAGS as u32, user_data)
 }
 
 /// Advance past `bytes` consumed/filled bytes in an iovec array by mutating
@@ -1444,14 +1504,7 @@ pub(crate) fn try_write_once<B: IoBuffReadOnly>(fd: RawFd, buffer: B) -> (io::Re
         return (Ok(0), buffer);
     }
 
-    let result = unsafe {
-        libc::send(
-            fd,
-            buffer.as_ptr() as *const libc::c_void,
-            len,
-            libc::MSG_NOSIGNAL,
-        )
-    };
+    let result = unsafe { libc::send(fd, buffer.as_ptr() as *const libc::c_void, len, SEND_FLAGS) };
     (one_shot_syscall_result(result), buffer)
 }
 
@@ -1498,7 +1551,7 @@ fn try_writev_projected_with_scratch<T: WritevProjection>(
         msg_flags: 0,
     };
 
-    let result = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+    let result = unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) };
     one_shot_syscall_result(result)
 }
 
@@ -1664,7 +1717,9 @@ fn submit_initial_projected_writev<T: WritevProjection>(
 // ReadFuture
 // ---------------------------------------------------------------------------
 
-/// Single read into a caller-provided buffer (rental pattern).
+/// Reads into a caller-provided buffer and returns the first positive or
+/// terminal completion (rental pattern). A no-progress EAGAIN completion is
+/// resubmitted internally.
 ///
 /// A zero-length request completes locally with `Ok(0)` and returns the
 /// buffer unchanged. That request-scoped result is not an EOF observation.
@@ -1675,7 +1730,7 @@ pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
     buffer: Option<B>,
     /// Stream descriptor read from by this future.
     fd: RawFd,
-    /// Maximum bytes requested from the kernel.
+    /// Validated caller request, clamped to i32::MAX at submission.
     len: u32,
     /// Logical length immediately before the submitted writable region.
     write_base_len: usize,
@@ -1732,6 +1787,19 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
             return complete_empty_stream_io(cx, buffer);
         }
 
+        if let Some(retry) = unsafe {
+            retry_completed_stream_read::<RetainedReadPayload<B>, _>(
+                cx,
+                &mut this.state_ptr,
+                |fd, payload, user_data| {
+                    build_recv_entry(fd, payload.buffer.as_mut_ptr(), this.len, user_data)
+                },
+                |payload| std::ptr::read(std::ptr::addr_of!((*payload).buffer)),
+            )
+        } {
+            return retry;
+        }
+
         if let Some(completion) = unsafe {
             take_completed_result_and_payload::<RetainedReadPayload<B>>(cx, &mut this.state_ptr)
         } {
@@ -1774,9 +1842,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadFuture<'_, B, S> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_mut_ptr();
-                        Ok(opcode::Read::new(types::Fd(fd), ptr, this.len)
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_recv_entry(fd, ptr, this.len, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -1812,7 +1878,7 @@ pub struct WriteFuture<'a, B: IoBuffReadOnly, S> {
     buffer: Option<B>,
     /// Stream descriptor written by this future.
     fd: RawFd,
-    /// Validated byte count submitted to the kernel.
+    /// Validated request length, clamped to `i32::MAX` on submission.
     len: u32,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
@@ -1900,7 +1966,13 @@ impl<B: IoBuffReadOnly, S> Future for WriteFuture<'_, B, S> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(build_send_entry(fd, ptr, this.len, state_ptr as u64))
+                        Ok(build_send_entry(
+                            fd,
+                            ptr,
+                            this.len,
+                            SEND_FLAGS,
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -2093,7 +2165,13 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
                         this.base_ptr = payload.buffer.as_ptr();
                         let ptr = this.base_ptr;
                         let remaining = this.total - this.offset;
-                        Ok(build_send_entry(fd, ptr, remaining, state_ptr as u64))
+                        Ok(build_send_entry(
+                            fd,
+                            ptr,
+                            remaining,
+                            SEND_FLAGS,
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -2110,7 +2188,13 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
 
         unsafe {
             if let Err(e) = submit_resubmitted_fd_sqe(&pctx, &this.state_ptr, |fd| {
-                Ok(build_send_entry(fd, ptr, remaining, state_ptr as u64))
+                Ok(build_send_entry(
+                    fd,
+                    ptr,
+                    remaining,
+                    SEND_FLAGS,
+                    state_ptr as u64,
+                ))
             }) {
                 let payload = take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
                     &pctx,
@@ -2134,7 +2218,8 @@ impl<B: IoBuffReadOnly, S> Drop for WriteAllFuture<'_, B, S> {
 // ReadExactFuture
 // ---------------------------------------------------------------------------
 
-/// Reads exactly the requested number of bytes, re-submitting on partial reads.
+/// Reads exactly the requested number of bytes, re-submitting on partial reads
+/// and no-progress EAGAIN completions.
 ///
 /// Returns `UnexpectedEof` if the peer closes before that many bytes arrive. On
 /// error the buffer reflects the bytes received so far. Like
@@ -2258,6 +2343,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
         // completion slot once the previous CQE has been fully consumed.
         if !this.state_ptr.state_ptr().is_null() {
             match classify_retry_cqe_result(unsafe { (*this.state_ptr.state_ptr()).result }) {
+                RetryCqeResult::KernelError(libc::EAGAIN) => {}
                 RetryCqeResult::KernelError(errno) => {
                     let payload = unsafe {
                         take_retained_payload_and_free_state::<RetainedReadPayload<B>>(
@@ -2342,9 +2428,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
                         this.base_ptr = payload.buffer.as_mut_ptr();
                         let ptr = this.base_ptr.add(this.filled as usize);
                         let remaining = this.target - this.filled;
-                        Ok(opcode::Read::new(types::Fd(fd), ptr, remaining)
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_recv_entry(fd, ptr, remaining, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready(complete_read_with_progress(
@@ -2366,9 +2450,7 @@ impl<B: IoBuffReadWrite, S> Future for ReadExactFuture<'_, B, S> {
 
         unsafe {
             if let Err(e) = submit_resubmitted_fd_sqe(&pctx, &this.state_ptr, |fd| {
-                Ok(opcode::Read::new(types::Fd(fd), ptr, remaining)
-                    .build()
-                    .user_data(state_ptr as u64))
+                Ok(build_recv_entry(fd, ptr, remaining, state_ptr as u64))
             }) {
                 let payload = take_retained_payload_and_free_state::<RetainedReadPayload<B>>(
                     &pctx,
@@ -2398,8 +2480,11 @@ impl<B: IoBuffReadWrite, S> Drop for ReadExactFuture<'_, B, S> {
 // ---------------------------------------------------------------------------
 
 /// Scatter-read into a vectored buffer chain (rental pattern).
+///
+/// Returns the first positive or terminal completion without looping on partial
+/// progress. A no-progress EAGAIN completion is resubmitted internally.
 pub struct ReadvFuture<'a, const N: usize, S> {
-    /// Completion state for the submitted readv/read SQE, if any.
+    /// Completion state for the submitted RECV or RECVMSG SQE, if any.
     state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned mutable segment chain returned on completion.
     buffer: Option<IoBuffVecMut<N>>,
@@ -2452,6 +2537,26 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
         let this = unsafe { self.get_unchecked_mut() };
         this.state_ptr
             .debug_assert_matches_raw_fd(this.fd, FdStateDiagnostic::Stream);
+
+        if let Some(retry) = unsafe {
+            retry_completed_stream_read::<RetainedReadvPayload<N>, _>(
+                cx,
+                &mut this.state_ptr,
+                |fd, payload, user_data| {
+                    build_read_vectored_entry(
+                        fd,
+                        retained_iovecs(&payload.scratch),
+                        0,
+                        this.iov_count,
+                        &mut payload.msg,
+                        user_data,
+                    )
+                },
+                |payload| take_readv_buffer_from_retained(payload),
+            )
+        } {
+            return retry;
+        }
 
         if let Some(completion) = unsafe {
             take_completed_result_and_payload_with::<RetainedReadvPayload<N>, _>(
@@ -2552,6 +2657,7 @@ impl<const N: usize, S> Future for ReadvFuture<'_, N, S> {
                             retained_iovecs(&payload.scratch),
                             0,
                             actual_shape.0,
+                            &mut payload.msg,
                             state_ptr as u64,
                         ))
                     },
@@ -3316,8 +3422,9 @@ impl<T: WritevProjection, S> Drop for WritevAllProjectedFuture<'_, T, S> {
 // ---------------------------------------------------------------------------
 
 /// Scatter-read exactly the requested number of bytes into a vectored buffer
-/// chain, re-submitting on partial reads with the same `iovec` array. Returns
-/// `UnexpectedEof` if the peer closes before that many bytes arrive.
+/// chain, re-submitting on partial reads and no-progress EAGAIN completions
+/// with the same `iovec` array. Returns `UnexpectedEof` if the peer closes
+/// before that many bytes arrive.
 pub struct ReadvExactFuture<'a, const N: usize, S> {
     /// Completion state reused across sequential retry submissions.
     state_ptr: RuntimeFdOpState<'a>,
@@ -3466,6 +3573,7 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
         if !this.state_ptr.state_ptr().is_null() {
             let state_ptr = this.state_ptr.state_ptr();
             match classify_retry_cqe_result(unsafe { (*state_ptr).result }) {
+                RetryCqeResult::KernelError(libc::EAGAIN) => {}
                 RetryCqeResult::KernelError(errno) => {
                     let mut buffer = unsafe {
                         take_retained_payload_with_and_free_state::<RetainedReadvPayload<N>, _>(
@@ -3572,6 +3680,7 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
                             retained_iovecs(&payload.scratch),
                             this.skip,
                             this.window_iov_count,
+                            &mut payload.msg,
                             state_ptr as u64,
                         ))
                     },
@@ -3591,13 +3700,14 @@ impl<const N: usize, S> Future for ReadvExactFuture<'_, N, S> {
 
         unsafe {
             if let Err(e) = submit_resubmitted_fd_sqe(&pctx, &this.state_ptr, |fd| {
-                let payload = (*state_ptr).retained_payload::<RetainedReadvPayload<N>>();
+                let payload = (*state_ptr).retained_payload_mut::<RetainedReadvPayload<N>>();
                 let remaining_iovs = this.window_iov_count - this.skip;
                 Ok(build_read_vectored_entry(
                     fd,
                     retained_iovecs(&payload.scratch),
                     this.skip,
                     remaining_iovs,
+                    &mut payload.msg,
                     state_ptr as u64,
                 ))
             }) {
@@ -3633,6 +3743,7 @@ mod tests {
     #[cfg(not(miri))]
     use crate::runtime::reactor::ReactorConfig;
     use crate::runtime::task::release_task;
+    use io_uring::opcode;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -3653,6 +3764,18 @@ mod tests {
         })
     }
 
+    fn sentinel_message_header() -> MaybeUninit<libc::msghdr> {
+        MaybeUninit::new(libc::msghdr {
+            msg_name: NonNull::<u8>::dangling().as_ptr().cast(),
+            msg_namelen: 17,
+            msg_iov: NonNull::<libc::iovec>::dangling().as_ptr(),
+            msg_iovlen: 19,
+            msg_control: NonNull::<u8>::dangling().as_ptr().cast(),
+            msg_controllen: 23,
+            msg_flags: libc::MSG_TRUNC,
+        })
+    }
+
     fn assert_message_free_invalid_input(result: io::Result<()>) {
         let err = result.expect_err("shape should be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -3660,6 +3783,1405 @@ mod tests {
             err.get_ref().is_none(),
             "try-path shape errors must remain message-free"
         );
+    }
+
+    #[cfg(not(miri))]
+    mod socket_receive_submission_tests {
+        use super::*;
+        use crate::net::unix::UnixStream;
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        fn fixture() -> (UnixStream, IoBuffMut, *const u8) {
+            let mut fds = [-1; 2];
+            // SAFETY: the array has room for both descriptors returned by pipe2.
+            assert_eq!(
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+                0,
+                "pipe creation failed: {}",
+                io::Error::last_os_error()
+            );
+            // SAFETY: successful pipe2 transfers two distinct fresh descriptors.
+            let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            std::fs::File::from(writer)
+                .write_all(b"pipe")
+                .expect("pipe data could not be queued");
+            let mut buffer = IoBuffMut::new(2, 16, 0).expect("buffer allocation failed");
+            buffer.payload_append(b"pre").expect("prefix did not fit");
+            let original = buffer.as_ptr();
+            (UnixStream::from_owned_fd(reader), buffer, original)
+        }
+
+        fn run(future: impl Future<Output = ()> + 'static) {
+            Executor::new()
+                .expect("executor creation failed")
+                .run(future)
+                .expect("receive test executor failed");
+        }
+
+        fn assert_pipe_rejection(
+            result: io::Result<usize>,
+            buffer: &IoBuffMut,
+            original: *const u8,
+            prefix: &[u8],
+        ) {
+            assert_eq!(
+                result
+                    .expect_err("socket receive accepted a pipe")
+                    .raw_os_error(),
+                Some(libc::ENOTSOCK)
+            );
+            assert_eq!(
+                buffer.as_ptr(),
+                original,
+                "receive replaced the buffer owner"
+            );
+            assert_eq!(
+                buffer.payload_bytes(),
+                prefix,
+                "receive lost initialized bytes"
+            );
+        }
+
+        struct ResetReadBuffer {
+            bytes: Vec<u8>,
+            drops: Rc<Cell<usize>>,
+        }
+
+        // SAFETY: the Vec owns stable writable capacity across moves; the
+        // receive completion initializes every byte before publishing it.
+        unsafe impl IoBuffReadWrite for ResetReadBuffer {
+            fn as_mut_ptr(&mut self) -> *mut u8 {
+                self.bytes.as_mut_ptr()
+            }
+
+            fn writable_len(&self) -> usize {
+                self.bytes.capacity()
+            }
+
+            unsafe fn set_written_len(&mut self, len: usize) {
+                unsafe { IoBuffReadWrite::set_written_len(&mut self.bytes, len) };
+            }
+        }
+
+        impl Drop for ResetReadBuffer {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        async fn assert_exact_reset_after_progress<S, P>(
+            mut future: ReadExactFuture<'_, ResetReadBuffer, S>,
+            peer: P,
+        ) {
+            let buffer = future.buffer.as_ref().expect("read buffer missing");
+            let original = buffer.bytes.as_ptr();
+            let drops = Rc::clone(&buffer.drops);
+            std::future::poll_fn(|cx| {
+                assert!(Pin::new(&mut future).poll(cx).is_pending());
+                match future.filled {
+                    0 | 1 => Poll::Pending,
+                    2 => Poll::Ready(()),
+                    count => panic!("unexpected exact-read prefix length: {count}"),
+                }
+            })
+            .await;
+            assert_eq!(drops.get(), 0);
+            drop(peer);
+
+            let (result, buffer) = future.await;
+            assert_eq!(
+                result
+                    .expect_err("peer reset was not reported")
+                    .raw_os_error(),
+                Some(libc::ECONNRESET)
+            );
+            assert_eq!(buffer.bytes, b"hi");
+            assert_eq!(buffer.bytes.as_ptr(), original);
+            assert_eq!(drops.get(), 0);
+            drop(buffer);
+            assert_eq!(drops.get(), 1);
+        }
+
+        #[test]
+        fn unix_exact_read_reset_preserves_consumed_prefix_and_owner() {
+            run(async {
+                let (socket, mut peer) =
+                    std::os::unix::net::UnixStream::pair().expect("Unix socket pair failed");
+                socket
+                    .set_nonblocking(true)
+                    .expect("set receive nonblocking failed");
+                peer.set_nonblocking(true)
+                    .expect("set peer nonblocking failed");
+                let mut stream = UnixStream::from_owned_fd(socket.into());
+                let (result, _) = stream.try_write(b"unread".to_vec());
+                assert_eq!(result.expect("queue unread peer data failed"), 6);
+                peer.write_all(b"hi").expect("peer prefix write failed");
+                let buffer = ResetReadBuffer {
+                    bytes: b"seed".to_vec(),
+                    drops: Rc::new(Cell::new(0)),
+                };
+                assert_exact_reset_after_progress(stream.read_exact(buffer, 4), peer).await;
+            });
+        }
+
+        #[test]
+        #[cfg(feature = "test-support")]
+        fn tcp_exact_read_reset_preserves_consumed_prefix_and_owner() {
+            run(async {
+                let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .expect("TCP bind failed");
+                let mut peer = std::net::TcpStream::connect(
+                    listener.local_addr().expect("TCP address missing"),
+                )
+                .expect("TCP peer connect failed");
+                let (socket, _) = listener.accept().expect("TCP accept failed");
+                socket
+                    .set_nonblocking(true)
+                    .expect("set receive nonblocking failed");
+                peer.set_nonblocking(true)
+                    .expect("set peer nonblocking failed");
+                crate::net::tls_test_peer::force_reset_on_drop(&peer);
+                let mut stream = crate::net::tcp::TcpStream::from_owned_fd(socket.into());
+                peer.write_all(b"hi").expect("peer prefix write failed");
+                let buffer = ResetReadBuffer {
+                    bytes: b"seed".to_vec(),
+                    drops: Rc::new(Cell::new(0)),
+                };
+                assert_exact_reset_after_progress(stream.read_exact(buffer, 4), peer).await;
+            });
+        }
+
+        // SAFETY: the payload owns its buffer and any positive result counts only
+        // initialized bytes. The state is unsubmitted on this executor's reactor.
+        unsafe fn publish_completed_result<T: 'static>(
+            pctx: &PollCtx,
+            fd_state: &mut RuntimeFdOpState<'_>,
+            payload: RetainedPayload<T>,
+            result: i32,
+        ) {
+            let state = unsafe { (&mut *pctx.reactor()).alloc_op() };
+            assert!(!state.is_null(), "operation allocation failed");
+            unsafe {
+                (*state).attach_retained_payload(payload);
+                (*state).attach_fd_lease(fd_state.take_initial_lease());
+                (*state).result = result;
+                (*state).set_completed();
+                // No SQE refers to this completed state; the next poll submits
+                // the retry with the same retained owner and descriptor lease.
+                fd_state.publish_submitted_state(state);
+            }
+        }
+
+        fn assert_pending_receive<F: Future + Unpin>(
+            _pctx: &PollCtx,
+            cx: &mut Context<'_>,
+            future: &mut F,
+            _submissions: usize,
+        ) {
+            #[cfg(debug_assertions)]
+            let before = unsafe { (*_pctx.runtime_state()).stats.sqe_submits };
+            assert!(Pin::new(future).poll(cx).is_pending());
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                unsafe { (*_pctx.runtime_state()).stats.sqe_submits },
+                before + _submissions,
+                "receive poll submitted an unexpected number of SQEs"
+            );
+        }
+
+        #[test]
+        fn read_initial_rejects_pipe_and_returns_owner() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let (result, buffer) = stream.read(buffer, 4).await;
+                assert_pipe_rejection(result, &buffer, original, b"pre");
+            });
+        }
+
+        #[test]
+        fn read_eagain_resubmission_rejects_pipe_and_returns_owner() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let mut future = stream.read(buffer, 4);
+                std::future::poll_fn(|cx| {
+                    let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                    let payload = RetainedReadPayload {
+                        buffer: future.buffer.take().expect("read buffer missing"),
+                    };
+                    // SAFETY: no SQE refers to this completed state; the next
+                    // poll submits the receive against the adopted pipe.
+                    unsafe {
+                        let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                        publish_completed_result(
+                            &pctx,
+                            &mut future.state_ptr,
+                            retained,
+                            -libc::EAGAIN,
+                        );
+                    }
+                    assert_pending_receive(&pctx, cx, &mut future, 1);
+                    Poll::Ready(())
+                })
+                .await;
+                let (result, buffer) = future.await;
+                assert_pipe_rejection(result, &buffer, original, b"pre");
+            });
+        }
+
+        #[test]
+        fn read_exact_initial_rejects_pipe_and_returns_owner() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let (result, buffer) = stream.read_exact(buffer, 4).await;
+                assert_pipe_rejection(result, &buffer, original, b"pre");
+            });
+        }
+
+        #[test]
+        fn read_exact_retry_rejects_pipe_and_preserves_progress() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let mut future = stream.read_exact(buffer, 4);
+                std::future::poll_fn(|cx| {
+                    let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                    let mut payload = RetainedReadPayload {
+                        buffer: future.buffer.take().expect("read buffer missing"),
+                    };
+                    future.base_ptr = payload.buffer.as_mut_ptr();
+                    // SAFETY: the writable region has at least four bytes. This
+                    // byte models one consumed CQE before the real retry SQE.
+                    unsafe {
+                        future.base_ptr.write(b'x');
+                        let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                        publish_completed_result(&pctx, &mut future.state_ptr, retained, 1);
+                    }
+                    assert!(Pin::new(&mut future).poll(cx).is_pending());
+                    assert_eq!(future.filled, 1);
+                    Poll::Ready(())
+                })
+                .await;
+                let (result, buffer) = future.await;
+                assert_pipe_rejection(result, &buffer, original, b"prex");
+            });
+        }
+
+        #[test]
+        fn readv_single_initial_rejects_pipe_and_returns_owner() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let (result, chain) = stream.readv(IoBuffVecMut::from_array([buffer])).await;
+                assert_pipe_rejection(
+                    result,
+                    chain.get(0).expect("segment missing"),
+                    original,
+                    b"pre",
+                );
+            });
+        }
+
+        #[test]
+        fn readv_exact_single_initial_rejects_pipe_and_returns_owner() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let (result, chain) = stream
+                    .readv_exact(IoBuffVecMut::from_array([buffer]), 4)
+                    .await;
+                assert_pipe_rejection(
+                    result,
+                    chain.get(0).expect("segment missing"),
+                    original,
+                    b"pre",
+                );
+            });
+        }
+
+        #[test]
+        fn readv_exact_single_retry_rejects_pipe_and_preserves_progress() {
+            run(async {
+                let (mut stream, buffer, original) = fixture();
+                let mut future = stream.readv_exact(IoBuffVecMut::from_array([buffer]), 4);
+                std::future::poll_fn(|cx| {
+                    let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                    let pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
+                    let scratch = unsafe { (*pool.as_ptr()).alloc_iovec_scratch(1) }
+                        .expect("iovec scratch allocation failed");
+                    let mut payload = RetainedReadvPayload {
+                        buffer: future.buffer.take().expect("readv buffer missing"),
+                        scratch,
+                        msg: sentinel_message_header(),
+                    };
+                    assert_eq!(
+                        payload
+                            .buffer
+                            .fill_read_iovecs_and_writable_len(
+                                payload.scratch.as_uninit_slice_mut()
+                            )
+                            .expect("readv shape invalid"),
+                        (future.iov_count, future.writable)
+                    );
+                    // SAFETY: the initialized iovec describes the buffer's
+                    // writable region. No operation has been submitted yet.
+                    unsafe {
+                        future.window_iov_count = clamp_iovecs_to_read_limit(
+                            retained_iovecs_mut(&mut payload.scratch, future.iov_count),
+                            0,
+                            4,
+                        );
+                        let iov = iovec_slice_ref(retained_iovecs(&payload.scratch), 0);
+                        (iov.iov_base as *mut u8).write(b'x');
+                        let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                        publish_completed_result(&pctx, &mut future.state_ptr, retained, 1);
+                    }
+                    assert!(Pin::new(&mut future).poll(cx).is_pending());
+                    assert_eq!(future.filled, 1);
+                    assert_eq!(future.skip, 0);
+                    Poll::Ready(())
+                })
+                .await;
+                let (result, chain) = future.await;
+                assert_pipe_rejection(
+                    result,
+                    chain.get(0).expect("segment missing"),
+                    original,
+                    b"prex",
+                );
+            });
+        }
+
+        fn socket_fixture() -> (RuntimeFd, std::os::unix::net::UnixStream) {
+            let (socket, peer) =
+                std::os::unix::net::UnixStream::pair().expect("Unix socket pair failed");
+            socket
+                .set_nonblocking(true)
+                .expect("set nonblocking failed");
+            (RuntimeFd::from_external_owned(socket.into()), peer)
+        }
+
+        // SAFETY: the state owns a payload of T and no submitted operation has
+        // access to its completion metadata during this synchronous poll.
+        unsafe fn retry_identity<T: 'static>(
+            fd_state: &RuntimeFdOpState<'_>,
+        ) -> (*mut CompletionState, *const T, *const ()) {
+            let state = fd_state.state_ptr();
+            assert!(!state.is_null(), "receive lost its completion state");
+            unsafe {
+                assert!((*state).has_fd_lease(), "receive lost its descriptor lease");
+                (
+                    state,
+                    (*state).retained_payload::<T>() as *const T,
+                    (*state).fd_lease_core_ptr().as_ptr().cast(),
+                )
+            }
+        }
+
+        fn eagain_scalar_buffer() -> ResetReadBuffer {
+            ResetReadBuffer {
+                bytes: b"seed".to_vec(),
+                drops: Rc::new(Cell::new(0)),
+            }
+        }
+
+        #[test]
+        fn read_eagain_retains_owner_and_lease_until_data_or_eof() {
+            run(async {
+                for data in [false, true] {
+                    let (fd, mut peer) = socket_fixture();
+                    let weak = fd.weak_for_test();
+                    let buffer = eagain_scalar_buffer();
+                    let original = buffer.bytes.as_ptr();
+                    let drops = Rc::clone(&buffer.drops);
+                    let mut future =
+                        ReadFuture::<_, ()>::new(fd.lease().into_op_state(), buffer, 4);
+                    drop(fd);
+                    std::future::poll_fn(|cx| {
+                        let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                        let payload = RetainedReadPayload {
+                            buffer: future.buffer.take().expect("read buffer missing"),
+                        };
+                        // SAFETY: this is an unsubmitted state on the current reactor.
+                        unsafe {
+                            let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                            publish_completed_result(
+                                &pctx,
+                                &mut future.state_ptr,
+                                retained,
+                                -libc::EAGAIN,
+                            );
+                            let before = retry_identity::<RetainedReadPayload<ResetReadBuffer>>(
+                                &future.state_ptr,
+                            );
+                            for submissions in [1, 0] {
+                                assert_pending_receive(&pctx, cx, &mut future, submissions);
+                                assert_eq!(
+                                    retry_identity::<RetainedReadPayload<ResetReadBuffer>>(
+                                        &future.state_ptr
+                                    ),
+                                    before
+                                );
+                                assert!(!(*before.0).is_completed());
+                                assert_eq!(
+                                    (*before.0)
+                                        .retained_payload::<RetainedReadPayload<ResetReadBuffer>>()
+                                        .buffer
+                                        .bytes,
+                                    b"seed"
+                                );
+                                assert_eq!(weak.strong_count(), 1);
+                                assert_eq!(drops.get(), 0);
+                            }
+                        }
+                        Poll::Ready(())
+                    })
+                    .await;
+                    if data {
+                        peer.write_all(b"x").expect("peer write failed");
+                    }
+                    peer.shutdown(std::net::Shutdown::Write)
+                        .expect("peer shutdown failed");
+                    let (result, buffer) = future.await;
+                    assert_eq!(
+                        result.expect("receive after EAGAIN failed"),
+                        usize::from(data)
+                    );
+                    assert_eq!(
+                        buffer.bytes.as_slice(),
+                        if data {
+                            b"x".as_slice()
+                        } else {
+                            b"seed".as_slice()
+                        }
+                    );
+                    assert_eq!(buffer.bytes.as_ptr(), original);
+                    assert_eq!(weak.strong_count(), 0);
+                    assert_eq!(drops.get(), 0);
+                    drop(buffer);
+                    assert_eq!(drops.get(), 1);
+                }
+            });
+        }
+
+        #[test]
+        fn read_exact_eagain_preserves_prior_prefix_until_data_or_eof() {
+            run(async {
+                for prior in [0, 1] {
+                    for data in [false, true] {
+                        let (fd, mut peer) = socket_fixture();
+                        let weak = fd.weak_for_test();
+                        let buffer = eagain_scalar_buffer();
+                        let original = buffer.bytes.as_ptr();
+                        let drops = Rc::clone(&buffer.drops);
+                        let mut future =
+                            ReadExactFuture::<_, ()>::new(fd.lease().into_op_state(), buffer, 4);
+                        drop(fd);
+                        std::future::poll_fn(|cx| {
+                            let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                            let mut payload = RetainedReadPayload {
+                                buffer: future.buffer.take().expect("read buffer missing"),
+                            };
+                            future.base_ptr = payload.buffer.as_mut_ptr();
+                            future.filled = prior;
+                            // SAFETY: the writable window contains four bytes and no
+                            // kernel operation uses it while prior progress is planted.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    b"abcd".as_ptr(),
+                                    future.base_ptr,
+                                    prior as usize,
+                                );
+                                let retained =
+                                    (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                                publish_completed_result(
+                                    &pctx,
+                                    &mut future.state_ptr,
+                                    retained,
+                                    -libc::EAGAIN,
+                                );
+                                let before = retry_identity::<RetainedReadPayload<ResetReadBuffer>>(
+                                    &future.state_ptr,
+                                );
+                                for submissions in [1, 0] {
+                                    assert_pending_receive(&pctx, cx, &mut future, submissions);
+                                    assert_eq!(future.filled, prior);
+                                    assert_eq!(
+                                        retry_identity::<RetainedReadPayload<ResetReadBuffer>>(
+                                            &future.state_ptr
+                                        ),
+                                        before
+                                    );
+                                    assert!(!(*before.0).is_completed());
+                                    assert_eq!(weak.strong_count(), 1);
+                                    assert_eq!(drops.get(), 0);
+                                }
+                            }
+                            Poll::Ready(())
+                        })
+                        .await;
+                        if data {
+                            peer.write_all(&b"abcd"[prior as usize..])
+                                .expect("peer write failed");
+                        }
+                        peer.shutdown(std::net::Shutdown::Write)
+                            .expect("peer shutdown failed");
+                        let (result, buffer) = future.await;
+                        if data {
+                            assert_eq!(result.expect("exact receive after EAGAIN failed"), 4);
+                        } else {
+                            assert_eq!(
+                                result.expect_err("partial EOF accepted").kind(),
+                                io::ErrorKind::UnexpectedEof
+                            );
+                        }
+                        assert_eq!(
+                            buffer.bytes.as_slice(),
+                            if !data && prior == 0 {
+                                b"seed".as_slice()
+                            } else {
+                                &b"abcd"[..if data { 4 } else { prior as usize }]
+                            }
+                        );
+                        assert_eq!(buffer.bytes.as_ptr(), original);
+                        assert_eq!(weak.strong_count(), 0);
+                        assert_eq!(drops.get(), 0);
+                        drop(buffer);
+                        assert_eq!(drops.get(), 1);
+                    }
+                }
+            });
+        }
+
+        fn eagain_chain(active: usize) -> IoBuffVecMut<2> {
+            assert!((1..=2).contains(&active));
+            let mut first = IoBuffMut::new(2, if active == 1 { 7 } else { 5 }, 0)
+                .expect("first segment allocation failed");
+            first.payload_append(b"pre").expect("first prefix failed");
+            let mut second = IoBuffMut::new(1, if active == 1 { 1 } else { 3 }, 0)
+                .expect("second segment allocation failed");
+            second.payload_append(b"q").expect("second prefix failed");
+            IoBuffVecMut::from_array([first, second])
+        }
+
+        fn chain_pointers(chain: &IoBuffVecMut<2>) -> [*const u8; 2] {
+            std::array::from_fn(|index| chain.get(index).expect("segment missing").as_ptr())
+        }
+
+        fn assert_chain_prefix(
+            chain: &IoBuffVecMut<2>,
+            original: [*const u8; 2],
+            active: usize,
+            data: &[u8],
+        ) {
+            assert_eq!(chain_pointers(chain), original);
+            let first_count = data.len().min(if active == 1 { 4 } else { 2 });
+            assert_eq!(
+                chain.get(0).expect("first segment missing").payload_bytes(),
+                [b"pre".as_slice(), &data[..first_count]].concat()
+            );
+            assert_eq!(
+                chain
+                    .get(1)
+                    .expect("second segment missing")
+                    .payload_bytes(),
+                [b"q".as_slice(), &data[first_count..]].concat()
+            );
+        }
+
+        fn readv_payload(pctx: &PollCtx, mut buffer: IoBuffVecMut<2>) -> RetainedReadvPayload<2> {
+            let (count, writable) = buffer
+                .checked_read_iovec_count_and_writable_len()
+                .expect("readv shape invalid");
+            let pool = unsafe { Reactor::retained_payload_pool_ptr(pctx.reactor()) };
+            let mut scratch = unsafe { (*pool.as_ptr()).alloc_iovec_scratch(count) }
+                .expect("iovec scratch allocation failed");
+            assert_eq!(
+                buffer
+                    .fill_read_iovecs_and_writable_len(scratch.as_uninit_slice_mut())
+                    .expect("readv materialization failed"),
+                (count, writable)
+            );
+            RetainedReadvPayload {
+                buffer,
+                scratch,
+                msg: sentinel_message_header(),
+            }
+        }
+
+        // SAFETY: every scratch entry is initialized and points to its retained
+        // buffer's writable window; no submitted operation accesses it.
+        unsafe fn write_vector_prefix(payload: &mut RetainedReadvPayload<2>, count: usize) {
+            let mut copied = 0;
+            for iov in unsafe { retained_iovecs_mut(&mut payload.scratch, 2) } {
+                let take = (count - copied).min(iov.iov_len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        b"abcd".as_ptr().add(copied),
+                        iov.iov_base.cast(),
+                        take,
+                    )
+                };
+                copied += take;
+                if copied == count {
+                    break;
+                }
+            }
+            assert_eq!(copied, count);
+        }
+
+        #[test]
+        fn readv_eagain_retains_owner_and_lease_for_both_opcodes() {
+            run(async {
+                for active in [1, 2] {
+                    for data in [false, true] {
+                        let (fd, mut peer) = socket_fixture();
+                        let weak = fd.weak_for_test();
+                        let chain = eagain_chain(active);
+                        let original = chain_pointers(&chain);
+                        let mut future =
+                            ReadvFuture::<2, ()>::new(fd.lease().into_op_state(), chain);
+                        drop(fd);
+                        std::future::poll_fn(|cx| {
+                            let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                            let payload = readv_payload(
+                                &pctx,
+                                future.buffer.take().expect("readv buffer missing"),
+                            );
+                            // SAFETY: this is an unsubmitted state on the current reactor.
+                            unsafe {
+                                let retained =
+                                    (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                                publish_completed_result(
+                                    &pctx,
+                                    &mut future.state_ptr,
+                                    retained,
+                                    -libc::EAGAIN,
+                                );
+                                let before =
+                                    retry_identity::<RetainedReadvPayload<2>>(&future.state_ptr);
+                                for submissions in [1, 0] {
+                                    assert_pending_receive(&pctx, cx, &mut future, submissions);
+                                    assert_eq!(
+                                        retry_identity::<RetainedReadvPayload<2>>(
+                                            &future.state_ptr
+                                        ),
+                                        before
+                                    );
+                                    assert!(!(*before.0).is_completed());
+                                    assert_chain_prefix(
+                                        &(*before.0)
+                                            .retained_payload::<RetainedReadvPayload<2>>()
+                                            .buffer,
+                                        original,
+                                        active,
+                                        b"",
+                                    );
+                                    assert_eq!(weak.strong_count(), 1);
+                                }
+                            }
+                            Poll::Ready(())
+                        })
+                        .await;
+                        if data {
+                            peer.write_all(b"a").expect("peer write failed");
+                        }
+                        peer.shutdown(std::net::Shutdown::Write)
+                            .expect("peer shutdown failed");
+                        let (result, chain) = future.await;
+                        assert_eq!(
+                            result.expect("vectored receive after EAGAIN failed"),
+                            usize::from(data)
+                        );
+                        assert_chain_prefix(
+                            &chain,
+                            original,
+                            active,
+                            if data {
+                                b"a".as_slice()
+                            } else {
+                                b"".as_slice()
+                            },
+                        );
+                        assert_eq!(weak.strong_count(), 0);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn readv_exact_eagain_preserves_progress_and_remaining_window() {
+            run(async {
+                for active in [1, 2] {
+                    for prior in [0, 1, 2] {
+                        for data in [false, true] {
+                            let (fd, mut peer) = socket_fixture();
+                            let weak = fd.weak_for_test();
+                            let chain = eagain_chain(active);
+                            let original = chain_pointers(&chain);
+                            let mut future = ReadvExactFuture::<2, ()>::new(
+                                fd.lease().into_op_state(),
+                                chain,
+                                4,
+                            );
+                            drop(fd);
+                            std::future::poll_fn(|cx| {
+                                let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                                let mut payload = readv_payload(
+                                    &pctx,
+                                    future.buffer.take().expect("readv buffer missing"),
+                                );
+                                // SAFETY: the active iovecs cover exactly four writable
+                                // bytes. Prior progress is initialized before publication.
+                                unsafe {
+                                    future.window_iov_count = clamp_iovecs_to_read_limit(
+                                        retained_iovecs_mut(&mut payload.scratch, active),
+                                        0,
+                                        4,
+                                    );
+                                    if prior != 0 {
+                                        // A single active entry has enough capacity for
+                                        // the entire prefix; the second entry is unused.
+                                        let first =
+                                            iovec_slice_ref(retained_iovecs(&payload.scratch), 0);
+                                        std::ptr::copy_nonoverlapping(
+                                            b"abcd".as_ptr(),
+                                            first.iov_base.cast(),
+                                            prior,
+                                        );
+                                    }
+                                    advance_iovecs_in_place(
+                                        retained_iovecs_mut(&mut payload.scratch, active),
+                                        &mut future.skip,
+                                        prior,
+                                    );
+                                    future.filled = prior;
+                                    let retained =
+                                        (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                                    publish_completed_result(
+                                        &pctx,
+                                        &mut future.state_ptr,
+                                        retained,
+                                        -libc::EAGAIN,
+                                    );
+                                    let before = retry_identity::<RetainedReadvPayload<2>>(
+                                        &future.state_ptr,
+                                    );
+                                    let skip = future.skip;
+                                    for submissions in [1, 0] {
+                                        assert_pending_receive(&pctx, cx, &mut future, submissions);
+                                        assert_eq!((future.filled, future.skip), (prior, skip));
+                                        assert_eq!(
+                                            retry_identity::<RetainedReadvPayload<2>>(
+                                                &future.state_ptr
+                                            ),
+                                            before
+                                        );
+                                        assert!(!(*before.0).is_completed());
+                                        assert_eq!(weak.strong_count(), 1);
+                                    }
+                                }
+                                Poll::Ready(())
+                            })
+                            .await;
+                            if data {
+                                peer.write_all(&b"abcd"[prior..])
+                                    .expect("peer write failed");
+                            }
+                            peer.shutdown(std::net::Shutdown::Write)
+                                .expect("peer shutdown failed");
+                            let (result, chain) = future.await;
+                            if data {
+                                assert_eq!(
+                                    result.expect("vectored exact receive after EAGAIN failed"),
+                                    4
+                                );
+                            } else {
+                                assert_eq!(
+                                    result.expect_err("partial EOF accepted").kind(),
+                                    io::ErrorKind::UnexpectedEof
+                                );
+                            }
+                            assert_chain_prefix(
+                                &chain,
+                                original,
+                                active,
+                                &b"abcd"[..if data { 4 } else { prior }],
+                            );
+                            assert_eq!(weak.strong_count(), 0);
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn readv_multi_initial_rejects_pipe_and_returns_owners() {
+            run(async {
+                let (mut stream, _, _) = fixture();
+                let chain = eagain_chain(2);
+                let original = chain_pointers(&chain);
+                let (result, chain) = stream.readv(chain).await;
+                assert_eq!(
+                    result.expect_err("RECVMSG accepted a pipe").raw_os_error(),
+                    Some(libc::ENOTSOCK)
+                );
+                assert_chain_prefix(&chain, original, 2, b"");
+            });
+        }
+
+        #[test]
+        fn readv_eagain_resubmission_rejects_pipe_for_both_opcodes() {
+            run(async {
+                for active in [1, 2] {
+                    let (mut stream, _, _) = fixture();
+                    let chain = eagain_chain(active);
+                    let original = chain_pointers(&chain);
+                    let mut future = stream.readv(chain);
+                    std::future::poll_fn(|cx| {
+                        let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                        let payload = readv_payload(
+                            &pctx,
+                            future.buffer.take().expect("readv buffer missing"),
+                        );
+                        // SAFETY: no SQE refers to this completed state; the
+                        // real resubmission must use RECV or RECVMSG on the pipe.
+                        unsafe {
+                            let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                            publish_completed_result(
+                                &pctx,
+                                &mut future.state_ptr,
+                                retained,
+                                -libc::EAGAIN,
+                            );
+                        }
+                        assert_pending_receive(&pctx, cx, &mut future, 1);
+                        Poll::Ready(())
+                    })
+                    .await;
+                    let (result, chain) = future.await;
+                    assert_eq!(
+                        result
+                            .expect_err("socket receive retry accepted a pipe")
+                            .raw_os_error(),
+                        Some(libc::ENOTSOCK)
+                    );
+                    assert_chain_prefix(&chain, original, active, b"");
+                }
+            });
+        }
+
+        #[test]
+        fn readv_exact_multi_initial_rejects_pipe_and_returns_owners() {
+            run(async {
+                let (mut stream, _, _) = fixture();
+                let chain = eagain_chain(2);
+                let original = chain_pointers(&chain);
+                let (result, chain) = stream.readv_exact(chain, 4).await;
+                assert_eq!(
+                    result.expect_err("RECVMSG accepted a pipe").raw_os_error(),
+                    Some(libc::ENOTSOCK)
+                );
+                assert_chain_prefix(&chain, original, 2, b"");
+            });
+        }
+
+        #[test]
+        fn readv_exact_retry_rejects_pipe_before_and_after_single_window_transition() {
+            run(async {
+                for prior in [1, 2] {
+                    let (mut stream, _, _) = fixture();
+                    let chain = eagain_chain(2);
+                    let original = chain_pointers(&chain);
+                    let mut future = stream.readv_exact(chain, 4);
+                    std::future::poll_fn(|cx| {
+                        let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                        let mut payload = readv_payload(
+                            &pctx,
+                            future.buffer.take().expect("readv buffer missing"),
+                        );
+                        // SAFETY: the planted positive completion describes exactly
+                        // the initialized prefix in the unsubmitted writable window.
+                        unsafe {
+                            future.window_iov_count = clamp_iovecs_to_read_limit(
+                                retained_iovecs_mut(&mut payload.scratch, 2),
+                                0,
+                                4,
+                            );
+                            write_vector_prefix(&mut payload, prior);
+                            let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                            publish_completed_result(
+                                &pctx,
+                                &mut future.state_ptr,
+                                retained,
+                                prior as i32,
+                            );
+                        }
+                        assert!(Pin::new(&mut future).poll(cx).is_pending());
+                        assert_eq!(future.filled, prior);
+                        assert_eq!(future.skip, usize::from(prior == 2));
+                        Poll::Ready(())
+                    })
+                    .await;
+                    let (result, chain) = future.await;
+                    assert_eq!(
+                        result
+                            .expect_err("socket receive retry accepted a pipe")
+                            .raw_os_error(),
+                        Some(libc::ENOTSOCK)
+                    );
+                    assert_chain_prefix(&chain, original, 2, &b"abcd"[..prior]);
+                }
+            });
+        }
+
+        struct PanicReadBuffer {
+            inner: ResetReadBuffer,
+            pointer_calls: usize,
+        }
+
+        // SAFETY: the inner Vec owns stable writable capacity; the second
+        // pointer request unwinds before returning a pointer or changing it.
+        unsafe impl IoBuffReadWrite for PanicReadBuffer {
+            fn as_mut_ptr(&mut self) -> *mut u8 {
+                self.pointer_calls += 1;
+                assert_eq!(self.pointer_calls, 1, "receive retry pointer panic");
+                self.inner.as_mut_ptr()
+            }
+
+            fn writable_len(&self) -> usize {
+                self.inner.writable_len()
+            }
+
+            unsafe fn set_written_len(&mut self, len: usize) {
+                unsafe { self.inner.set_written_len(len) };
+            }
+        }
+
+        #[test]
+        fn read_eagain_pointer_panic_reclaims_completed_owner_and_lease() {
+            run(async {
+                let (fd, _peer) = socket_fixture();
+                let weak = fd.weak_for_test();
+                let buffer = PanicReadBuffer {
+                    inner: eagain_scalar_buffer(),
+                    pointer_calls: 0,
+                };
+                let drops = Rc::clone(&buffer.inner.drops);
+                let mut future = ReadFuture::<_, ()>::new(fd.lease().into_op_state(), buffer, 4);
+                let (reactor, before_ops) = std::future::poll_fn(|cx| {
+                    let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                    let before_ops = unsafe { (&*pctx.reactor()).live_op_count() };
+                    let mut payload = RetainedReadPayload {
+                        buffer: future.buffer.take().expect("read buffer missing"),
+                    };
+                    let _ = payload.buffer.as_mut_ptr();
+                    // SAFETY: the planted state is completed and no SQE refers
+                    // to it. The second pointer callback unwinds before reset.
+                    unsafe {
+                        let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                        publish_completed_result(
+                            &pctx,
+                            &mut future.state_ptr,
+                            retained,
+                            -libc::EAGAIN,
+                        );
+                        let state = future.state_ptr.state_ptr();
+                        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = Pin::new(&mut future).poll(cx);
+                        }));
+                        let panic = unwind.expect_err("retry pointer callback did not unwind");
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .expect("assertion panic message missing");
+                        assert!(message.contains("receive retry pointer panic"));
+                        assert_eq!(future.state_ptr.state_ptr(), state);
+                        assert!((*state).is_completed());
+                        assert_eq!(weak.strong_count(), 2);
+                        assert_eq!(drops.get(), 0);
+                    }
+                    Poll::Ready((pctx.reactor(), before_ops))
+                })
+                .await;
+                drop(future);
+                assert_eq!(drops.get(), 1);
+                assert_eq!(unsafe { (&*reactor).live_op_count() }, before_ops);
+                assert_eq!(weak.strong_count(), 1);
+                drop(fd);
+                assert_eq!(weak.strong_count(), 0);
+                assert_eq!(drops.get(), 1);
+            });
+        }
+
+        #[test]
+        fn cancelled_read_eagain_keeps_owner_until_original_completion_retires() {
+            let drops = Rc::new(Cell::new(0));
+            let after = Rc::clone(&drops);
+            run(async move {
+                let (fd, peer) = socket_fixture();
+                let weak = fd.weak_for_test();
+                let buffer = ResetReadBuffer {
+                    bytes: b"seed".to_vec(),
+                    drops: Rc::clone(&drops),
+                };
+                let mut future = ReadFuture::<_, ()>::new(fd.lease().into_op_state(), buffer, 4);
+                drop(fd);
+                std::future::poll_fn(|cx| {
+                    let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                    let payload = RetainedReadPayload {
+                        buffer: future.buffer.take().expect("read buffer missing"),
+                    };
+                    // SAFETY: the completed state is unsubmitted; the next poll
+                    // starts the real operation whose target owns the buffer.
+                    unsafe {
+                        let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                        publish_completed_result(
+                            &pctx,
+                            &mut future.state_ptr,
+                            retained,
+                            -libc::EAGAIN,
+                        );
+                    }
+                    assert_pending_receive(&pctx, cx, &mut future, 1);
+                    Poll::Ready(())
+                })
+                .await;
+                drop(future);
+                assert_eq!(
+                    drops.get(),
+                    0,
+                    "cancel freed a buffer before its target completion"
+                );
+                assert_eq!(weak.strong_count(), 1);
+                drop(peer);
+            });
+            assert_eq!(
+                after.get(),
+                1,
+                "executor shutdown did not retire the cancelled receive owner"
+            );
+        }
+
+        fn poll_rejected_context<F: Future + Unpin>(
+            foreign: bool,
+            future: &mut F,
+        ) -> Poll<F::Output> {
+            if foreign {
+                with_ringless_poll_context_for_test(1, |_owner, cx| Pin::new(future).poll(cx))
+            } else {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                Pin::new(future).poll(&mut cx)
+            }
+        }
+
+        #[test]
+        fn read_eagain_rejected_context_reclaims_origin_and_returns_owner() {
+            for foreign in [false, true] {
+                let (origin, mut future, original, drops, weak) =
+                    with_ringless_poll_context_for_test(1, |owner, cx| {
+                        let pctx = poll_ctx_from_waker(cx).expect("origin context missing");
+                        let fd = RuntimeFd::from_fresh_raw_fd(RuntimeFd::INVALID);
+                        let weak = fd.weak_for_test();
+                        let buffer = eagain_scalar_buffer();
+                        let original = buffer.bytes.as_ptr();
+                        let drops = Rc::clone(&buffer.drops);
+                        let mut future =
+                            ReadFuture::<_, ()>::new(fd.lease().into_op_state(), buffer, 4);
+                        drop(fd);
+                        let payload = RetainedReadPayload {
+                            buffer: future.buffer.take().expect("read owner missing"),
+                        };
+                        // SAFETY: no operation is submitted; the completed target
+                        // retains its origin and buffer until the rejecting poll.
+                        unsafe {
+                            let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                            publish_completed_result(
+                                &pctx,
+                                &mut future.state_ptr,
+                                retained,
+                                -libc::EAGAIN,
+                            );
+                        }
+                        (Rc::clone(owner), future, original, drops, weak)
+                    });
+                let Poll::Ready((result, buffer)) = poll_rejected_context(foreign, &mut future)
+                else {
+                    panic!("rejected read context attempted resubmission");
+                };
+                assert_eq!(
+                    result.expect_err("invalid context accepted").kind(),
+                    io::ErrorKind::NotConnected
+                );
+                assert_eq!(buffer.bytes.as_ptr(), original);
+                assert_eq!(buffer.bytes, b"seed");
+                assert!(future.state_ptr.state_ptr().is_null());
+                assert_eq!(weak.strong_count(), 0);
+                assert_eq!(drops.get(), 0);
+                assert_eq!(unsafe { (&*origin.reactor_ptr()).live_op_count() }, 0);
+                drop(future);
+                assert_eq!(drops.get(), 0);
+                drop(buffer);
+                assert_eq!(drops.get(), 1);
+            }
+        }
+
+        #[test]
+        fn readv_eagain_rejected_context_reclaims_origin_and_returns_owners() {
+            for foreign in [false, true] {
+                let (origin, mut future, original, weak) =
+                    with_ringless_poll_context_for_test(1, |owner, cx| {
+                        let pctx = poll_ctx_from_waker(cx).expect("origin context missing");
+                        let fd = RuntimeFd::from_fresh_raw_fd(RuntimeFd::INVALID);
+                        let weak = fd.weak_for_test();
+                        let chain = eagain_chain(2);
+                        let original = chain_pointers(&chain);
+                        let mut future =
+                            ReadvFuture::<2, ()>::new(fd.lease().into_op_state(), chain);
+                        drop(fd);
+                        let payload = readv_payload(
+                            &pctx,
+                            future.buffer.take().expect("readv owners missing"),
+                        );
+                        // SAFETY: the retained chain belongs to this origin and
+                        // no SQE refers to this planted completed target.
+                        unsafe {
+                            let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                            publish_completed_result(
+                                &pctx,
+                                &mut future.state_ptr,
+                                retained,
+                                -libc::EAGAIN,
+                            );
+                        }
+                        (Rc::clone(owner), future, original, weak)
+                    });
+                let Poll::Ready((result, chain)) = poll_rejected_context(foreign, &mut future)
+                else {
+                    panic!("rejected readv context attempted resubmission");
+                };
+                assert_eq!(
+                    result.expect_err("invalid context accepted").kind(),
+                    io::ErrorKind::NotConnected
+                );
+                assert_chain_prefix(&chain, original, 2, b"");
+                assert!(future.state_ptr.state_ptr().is_null());
+                assert_eq!(weak.strong_count(), 0);
+                assert_eq!(unsafe { (&*origin.reactor_ptr()).live_op_count() }, 0);
+                let stats = unsafe { (&*origin.reactor_ptr()).retained_payload_stats() };
+                assert_eq!(stats.pooled_allocs, 1);
+                assert_eq!(stats.pooled_frees, 1);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn assert_retained_readv_class<const N: usize, const CLASS: usize>() {
+        assert_eq!(std::mem::size_of::<RetainedReadvPayload<N>>(), 40 * N + 352);
+        assert_eq!(std::mem::align_of::<RetainedReadvPayload<N>>(), 8);
+        let mut pool = RetainedPayloadPool::new().expect("retained pool creation failed");
+        if CLASS != 0 {
+            let warm = pool.alloc([0u8; CLASS]);
+            // SAFETY: this payload belongs to pool and has no external references.
+            unsafe { warm.drop_and_free(&mut pool) };
+        }
+        let before = pool.stats();
+        for extract in [false, true] {
+            let mut chain = IoBuffVecMut::<N>::new();
+            let original = if N == 0 {
+                std::ptr::null()
+            } else {
+                let segment = IoBuffMut::new(0, 4, 0).expect("segment allocation failed");
+                let original = segment.as_ptr();
+                chain.push(segment).expect("segment did not fit");
+                original
+            };
+            let mut buffer = Some(chain);
+            let scratch = pool
+                .alloc_iovec_scratch_init(usize::from(N != 0))
+                .expect("scratch allocation failed");
+            // SAFETY: the scratch count equals the chain's active count; the
+            // handle is consumed below through the same live pool.
+            let payload = unsafe {
+                emplace_retained_readv_payload(NonNull::from(&mut pool), &mut buffer, scratch)
+            };
+            assert!(buffer.is_none());
+            // The unsubmitted payload's message header remains uninitialized.
+            if extract {
+                let returned = unsafe {
+                    payload.take_with(&mut pool, |ptr| take_readv_buffer_from_retained(ptr))
+                };
+                assert_eq!(returned.segments(), usize::from(N != 0));
+                if N != 0 {
+                    assert_eq!(returned.get(0).expect("segment missing").as_ptr(), original);
+                }
+                drop(returned);
+            } else {
+                unsafe { payload.drop_and_free(&mut pool) };
+            }
+        }
+        let delta = pool.stats().saturating_delta_since(before);
+        if CLASS == 0 {
+            assert_eq!(delta.heap_fallbacks, 2, "N={N}");
+            assert_eq!(delta.heap_frees, 2, "N={N}");
+            assert_eq!(delta.pooled_allocs, 0, "N={N}");
+            assert_eq!(delta.pooled_frees, 0, "N={N}");
+        } else {
+            assert_eq!(delta.pooled_allocs, 2, "N={N}");
+            assert_eq!(delta.pooled_frees, 2, "N={N}");
+            assert_eq!(delta.pooled_reuses, 2, "N={N}, expected class {CLASS}");
+            assert_eq!(delta.heap_fallbacks, 0, "N={N}");
+            assert_eq!(delta.heap_frees, 0, "N={N}");
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn retained_readv_payload_class_boundaries_and_releases() {
+        macro_rules! check {
+            ($($capacity:literal => $class:literal),+ $(,)?) => {
+                $(assert_retained_readv_class::<$capacity, $class>();)+
+            };
+        }
+        check!(
+            0 => 512, 1 => 512, 2 => 512, 3 => 512, 4 => 512,
+            5 => 1024, 6 => 1024, 8 => 1024, 16 => 1024,
+            17 => 2048, 18 => 2048, 19 => 2048, 42 => 2048,
+            43 => 4096, 44 => 4096, 93 => 4096,
+            94 => 8192, 95 => 8192, 96 => 8192, 196 => 8192,
+            197 => 16384, 198 => 16384, 400 => 16384,
+            401 => 32768, 402 => 32768, 403 => 32768, 810 => 32768,
+            811 => 65536, 812 => 65536, 1629 => 65536,
+            1630 => 0, 1631 => 0, 1632 => 0,
+        );
+    }
+
+    #[test]
+    fn stream_read_vectored_reinitializes_every_message_header_field() {
+        let bytes = [0u8; 4];
+        let mut iovecs = [
+            initialized_iovec(bytes.as_ptr(), 1),
+            initialized_iovec(bytes.as_ptr(), 2),
+            initialized_iovec(bytes.as_ptr(), 4),
+        ];
+        let mut msg = sentinel_message_header();
+        for (skip, count, last_len) in [(0, 3, 4), (1, 2, 4), (2, 1, i32::MAX as usize + 1)] {
+            // No operation is submitted; only the encoded window is inspected.
+            iovecs[2] = initialized_iovec(bytes.as_ptr(), last_len);
+            let entry = build_read_vectored_entry(7, &iovecs, skip, count, &mut msg, 99);
+            let sqe = sqe_prefix(&entry);
+            // SAFETY: each RECVMSG branch initializes every header field.
+            let header = unsafe { msg.assume_init_mut() };
+            assert_eq!(sqe.opcode, opcode::RecvMsg::CODE);
+            assert_eq!(sqe.addr, (header as *mut libc::msghdr) as u64);
+            assert_eq!(
+                header.msg_iov,
+                std::ptr::addr_of!(iovecs[skip]) as *mut libc::iovec
+            );
+            assert_eq!(header.msg_iovlen, count);
+            assert!(header.msg_name.is_null());
+            assert_eq!(header.msg_namelen, 0);
+            assert!(header.msg_control.is_null());
+            assert_eq!(header.msg_controllen, 0);
+            assert_eq!(header.msg_flags, 0);
+            // Completed receives may modify output fields. No operation uses
+            // these sentinel values before the next builder resets the header.
+            msg = sentinel_message_header();
+        }
+    }
+
+    #[test]
+    fn retained_readv_message_header_stays_at_final_address_after_future_moves() {
+        use crate::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut buffers = IoBuffPool::new(IoBuffPoolConfig {
+                headroom: 0,
+                payload: 1,
+                tailroom: 0,
+                objs_per_slab: 2,
+            })
+            .expect("buffer pool creation failed");
+            buffers.init();
+            let chain = IoBuffVecMut::from_array(std::array::from_fn::<_, 2, _>(|_| {
+                buffers.alloc().expect("buffer allocation failed")
+            }));
+            let originals = [
+                chain.get(0).expect("first segment missing").as_ptr(),
+                chain.get(1).expect("second segment missing").as_ptr(),
+            ];
+            let mut future = ReadvFuture::<2, ()>::new(invalid_fd_capability(), chain);
+            let reactor = owner.reactor_ptr();
+            let pool = unsafe { Reactor::retained_payload_pool_ptr(reactor) };
+            let scratch = unsafe { (&mut *pool.as_ptr()).alloc_iovec_scratch_init(2) }
+                .expect("scratch allocation failed");
+            let mut retained =
+                unsafe { emplace_retained_readv_payload(pool, &mut future.buffer, scratch) };
+            let payload_address = retained.as_ptr();
+            let entry = unsafe {
+                let payload = retained.as_mut();
+                assert_eq!(
+                    payload
+                        .buffer
+                        .fill_read_iovecs_and_writable_len(payload.scratch.as_uninit_slice_mut())
+                        .expect("iovec construction failed"),
+                    (2, 2)
+                );
+                build_read_vectored_entry(
+                    future.fd,
+                    retained_iovecs(&payload.scratch),
+                    0,
+                    2,
+                    &mut payload.msg,
+                    99,
+                )
+            };
+            let header_address = unsafe { std::ptr::addr_of!((*payload_address).msg) };
+            assert_eq!(sqe_prefix(&entry).addr, header_address as u64);
+            let state = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!state.is_null());
+            unsafe {
+                (*state).attach_retained_payload(retained);
+                (*state).attach_fd_lease(future.state_ptr.take_initial_lease());
+                future.state_ptr.publish_submitted_state(state);
+            }
+            let mut moved = Box::new(future);
+            assert_eq!(moved.state_ptr.state_ptr(), state);
+            assert_eq!(buffers.live_slots_for_test(), 2);
+            unsafe {
+                let payload = (*state).retained_payload::<RetainedReadvPayload<2>>();
+                assert_eq!(payload as *const _, payload_address.cast_const());
+                assert_eq!(std::ptr::addr_of!(payload.msg), header_address);
+                let header = payload.msg.assume_init_ref();
+                assert_eq!(
+                    header.msg_iov,
+                    payload.scratch.as_uninit_slice().as_ptr() as *mut _
+                );
+                assert_eq!(header.msg_iovlen, 2);
+                for (index, original) in originals.iter().enumerate() {
+                    let iovec = &*header.msg_iov.add(index);
+                    assert_eq!(iovec.iov_base.cast_const(), (*original).cast());
+                    iovec.iov_base.cast::<u8>().write(b'a' + index as u8);
+                }
+                (*state).result = 2;
+                (*state).set_completed();
+            }
+            let Poll::Ready((result, returned)) = Pin::new(moved.as_mut()).poll(cx) else {
+                panic!("completed moved receive remained pending");
+            };
+            assert_eq!(result.expect("completed receive failed"), 2);
+            for (index, original) in originals.iter().enumerate() {
+                let segment = returned.get(index).expect("returned segment missing");
+                assert_eq!(segment.as_ptr(), *original);
+                assert_eq!(segment.payload_bytes(), &[b'a' + index as u8]);
+            }
+            assert_eq!(buffers.live_slots_for_test(), 2);
+            drop(moved);
+            assert_eq!(buffers.live_slots_for_test(), 2);
+            drop(returned);
+            assert_eq!(buffers.live_slots_for_test(), 0);
+            assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+            let stats = unsafe { (&*reactor).retained_payload_stats() };
+            assert_eq!(stats.pooled_allocs, 1);
+            assert_eq!(stats.pooled_frees, 1);
+        });
     }
 
     #[test]
@@ -6196,13 +7718,258 @@ mod tests {
     }
 
     #[test]
-    fn stream_write_entry_uses_send_with_nosignal() {
+    fn scalar_write_callers_clamp_initial_submissions_without_replacing_owners() {
+        use crate::net::send_sqe::test_support::{
+            ExpectedScalarEntry, ScalarTestFuture, assert_rejected_scalar_submission,
+        };
+
+        for all in [false, true] {
+            for requested in [i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+                with_ringless_poll_context_for_test(1, |owner, cx| {
+                    let reactor = owner.reactor_ptr();
+                    let state = unsafe { (&mut *reactor).alloc_op() };
+                    assert!(!state.is_null());
+                    unsafe { (&mut *reactor).free_op(state) };
+                    let buffer = b"abcdefgh".to_vec();
+                    let original = buffer.as_ptr();
+                    // Only encoded lengths are synthetic. Submission fails before
+                    // any kernel can access beyond this real buffer.
+                    let mut future: ScalarTestFuture<'_> = if all {
+                        let mut future =
+                            WriteAllFuture::<_, ()>::new(invalid_fd_capability(), buffer);
+                        future.total = requested;
+                        Box::pin(future)
+                    } else {
+                        let mut future = WriteFuture::<_, ()>::new(invalid_fd_capability(), buffer);
+                        future.len = requested;
+                        Box::pin(future)
+                    };
+                    let returned = assert_rejected_scalar_submission(
+                        cx,
+                        &mut future,
+                        ExpectedScalarEntry {
+                            opcode: opcode::Send::CODE,
+                            fd: RuntimeFd::INVALID,
+                            addr: original,
+                            owner_addr: original,
+                            len: requested.min(i32::MAX as u32),
+                            msg_flags: libc::MSG_NOSIGNAL as u32,
+                            user_data: state as u64,
+                        },
+                        b"abcdefgh",
+                    );
+                    drop(returned);
+                    assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                    assert_eq!(owner.inflight_op_count_for_test(), 0);
+                });
+            }
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn scalar_write_all_retry_clamps_remaining_request_after_progress() {
+        use crate::net::send_sqe::test_support::{
+            ExpectedScalarEntry, assert_rejected_scalar_submission,
+        };
+        use crate::runtime::op::completion_retirement_test_support::stage_payload;
+
+        for total in [i32::MAX as u32 + 1, i32::MAX as u32 + 2, u32::MAX] {
+            with_ringless_poll_context_for_test(1, |owner, cx| {
+                let buffer = b"abcdefgh".to_vec();
+                let original = buffer.as_ptr();
+                let mut future = WriteAllFuture::<_, ()>::new(invalid_fd_capability(), buffer);
+                future.total = total;
+                future.base_ptr = original;
+                let payload = RetainedWritePayload {
+                    buffer: future.buffer.take().expect("write owner missing"),
+                };
+                // The completed request consumed one real byte. Its next SQE
+                // fails before the synthetic remaining length reaches a kernel.
+                let saved =
+                    unsafe { stage_payload(owner, &mut future.state_ptr, payload, 1, true) };
+                let returned = assert_rejected_scalar_submission(
+                    cx,
+                    &mut future,
+                    ExpectedScalarEntry {
+                        opcode: opcode::Send::CODE,
+                        fd: RuntimeFd::INVALID,
+                        addr: unsafe { original.add(1) },
+                        owner_addr: original,
+                        len: (total - 1).min(i32::MAX as u32),
+                        msg_flags: libc::MSG_NOSIGNAL as u32,
+                        user_data: saved.state as u64,
+                    },
+                    b"abcdefgh",
+                );
+                assert_eq!(future.offset, 1);
+                assert_eq!(future.total, total);
+                drop(returned);
+                assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+                assert_eq!(owner.inflight_op_count_for_test(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn stream_write_vectored_single_window_clamps_send_and_keeps_larger_sendmsg() {
         let bytes = [1u8, 2, 3, 4];
-        let entry = build_send_entry(7, bytes.as_ptr(), bytes.len() as u32, 99);
+        for len in [
+            i32::MAX as usize,
+            i32::MAX as usize + 1,
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+        ] {
+            // No operation is submitted; the artificial length is inspected only.
+            let iovecs = [
+                initialized_iovec(bytes.as_ptr(), 1),
+                initialized_iovec(bytes.as_ptr(), len),
+            ];
+            let mut msg = sentinel_message_header();
+            let entry = build_write_vectored_entry(7, &iovecs, 1, 1, &mut msg, 99);
+            let sqe = sqe_prefix(&entry);
+            assert_eq!(sqe.fd, 7);
+            assert_eq!(sqe.flags, 0);
+            assert_eq!(sqe.ioprio, 0);
+            assert_eq!(sqe.off_or_addr2, 0);
+            assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
+            assert_eq!(sqe.user_data, 99);
+            let header = unsafe { msg.assume_init_ref() };
+            if len <= u32::MAX as usize {
+                assert_eq!(sqe.opcode, opcode::Send::CODE);
+                assert_eq!(sqe.addr, bytes.as_ptr() as u64);
+                assert_eq!(sqe.len, len.min(i32::MAX as usize) as u32);
+                let sentinel = unsafe { sentinel_message_header().assume_init() };
+                assert_eq!(header.msg_name, sentinel.msg_name);
+                assert_eq!(header.msg_namelen, sentinel.msg_namelen);
+                assert_eq!(header.msg_iov, sentinel.msg_iov);
+                assert_eq!(header.msg_iovlen, sentinel.msg_iovlen);
+                assert_eq!(header.msg_control, sentinel.msg_control);
+                assert_eq!(header.msg_controllen, sentinel.msg_controllen);
+                assert_eq!(header.msg_flags, sentinel.msg_flags);
+            } else {
+                assert_eq!(sqe.opcode, opcode::SendMsg::CODE);
+                assert_eq!(sqe.addr, msg.as_ptr() as u64);
+                assert_eq!(sqe.len, 1);
+                assert_eq!(
+                    header.msg_iov,
+                    std::ptr::addr_of!(iovecs[1]).cast_mut().cast()
+                );
+                assert_eq!(header.msg_iovlen, 1);
+                assert_eq!(unsafe { (*header.msg_iov).iov_len }, len);
+                assert!(header.msg_name.is_null());
+                assert_eq!(header.msg_namelen, 0);
+                assert!(header.msg_control.is_null());
+                assert_eq!(header.msg_controllen, 0);
+                assert_eq!(header.msg_flags, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn stream_write_caller_submits_send_with_nosignal() {
+        use crate::net::send_sqe::test_support::{
+            ExpectedScalarEntry, assert_rejected_scalar_submission, next_operation_user_data,
+        };
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let buffer = vec![1u8, 2, 3, 4];
+            let original = buffer.as_ptr();
+            let mut future = WriteFuture::<_, ()>::new(invalid_fd_capability(), buffer);
+            let expected = ExpectedScalarEntry {
+                opcode: opcode::Send::CODE,
+                fd: RuntimeFd::INVALID,
+                addr: original,
+                owner_addr: original,
+                len: 4,
+                msg_flags: libc::MSG_NOSIGNAL as u32,
+                user_data: next_operation_user_data(owner),
+            };
+            let returned =
+                assert_rejected_scalar_submission(cx, &mut future, expected, &[1, 2, 3, 4]);
+            assert_eq!(returned.as_ptr(), original);
+        });
+    }
+
+    #[test]
+    fn stream_read_vectored_single_entry_uses_recv_with_zero_flags() {
+        let mut bytes = [0u8; 4];
+        let iovecs = [
+            initialized_iovec(bytes.as_ptr(), 1),
+            initialized_iovec(bytes.as_mut_ptr(), bytes.len()),
+        ];
+        let mut msg = MaybeUninit::uninit();
+        let entry = build_read_vectored_entry(7, &iovecs, 1, 1, &mut msg, 99);
         let sqe = sqe_prefix(&entry);
 
-        assert_eq!(sqe.opcode, opcode::Send::CODE);
-        assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
+        assert_eq!(sqe.opcode, opcode::Recv::CODE);
+        assert_eq!(sqe.flags, 0);
+        assert_eq!(sqe.ioprio, 0);
+        assert_eq!(sqe.fd, 7);
+        assert_eq!(sqe.off_or_addr2, 0);
+        assert_eq!(sqe.addr, bytes.as_ptr() as u64);
+        assert_eq!(sqe.len, bytes.len() as u32);
+        assert_eq!(sqe.msg_flags, 0);
+        assert_eq!(sqe.user_data, 99);
+    }
+
+    #[test]
+    fn stream_read_vectored_single_entry_respects_signed_length_boundary() {
+        let byte = 0u8;
+        for len in [i32::MAX as usize, i32::MAX as usize + 1, u32::MAX as usize] {
+            // Only SQE fields are inspected; no operation accesses this range.
+            let iovecs = [initialized_iovec(&byte, len)];
+            let mut msg = MaybeUninit::uninit();
+            let entry = build_read_vectored_entry(7, &iovecs, 0, 1, &mut msg, 99);
+            let sqe = sqe_prefix(&entry);
+            if len <= i32::MAX as usize {
+                assert_eq!(sqe.opcode, opcode::Recv::CODE);
+                assert_eq!(sqe.addr, std::ptr::addr_of!(byte) as u64);
+                assert_eq!(sqe.len, len as u32);
+            } else {
+                assert_eq!(sqe.opcode, opcode::RecvMsg::CODE);
+                assert_eq!(sqe.addr, msg.as_ptr() as u64);
+                assert_eq!(sqe.len, 1);
+                let header = unsafe { msg.assume_init_ref() };
+                assert_eq!(header.msg_iov, iovecs.as_ptr().cast_mut().cast());
+                assert_eq!(header.msg_iovlen, 1);
+                assert_eq!(unsafe { (*header.msg_iov).iov_len }, len);
+            }
+            assert_eq!(sqe.fd, 7);
+            assert_eq!(sqe.flags, 0);
+            assert_eq!(sqe.ioprio, 0);
+            assert_eq!(sqe.off_or_addr2, 0);
+            assert_eq!(sqe.msg_flags, 0);
+            assert_eq!(sqe.user_data, 99);
+        }
+    }
+
+    #[test]
+    fn stream_read_vectored_multi_entry_uses_recvmsg_window() {
+        let bytes = [0u8; 4];
+        let iovecs = [
+            initialized_iovec(bytes.as_ptr(), 1),
+            initialized_iovec(bytes.as_ptr(), 2),
+            initialized_iovec(bytes.as_ptr(), 4),
+        ];
+        let mut msg = MaybeUninit::uninit();
+        let entry = build_read_vectored_entry(7, &iovecs, 1, 2, &mut msg, 99);
+        let sqe = sqe_prefix(&entry);
+
+        assert_eq!(sqe.opcode, opcode::RecvMsg::CODE);
+        assert_eq!(sqe.flags, 0);
+        assert_eq!(sqe.ioprio, 0);
+        assert_eq!(sqe.off_or_addr2, 0);
+        assert_eq!(sqe.fd, 7);
+        assert_eq!(sqe.addr, msg.as_ptr() as u64);
+        assert_eq!(sqe.len, 1);
+        let header = unsafe { msg.assume_init_ref() };
+        assert_eq!(
+            header.msg_iov,
+            std::ptr::addr_of!(iovecs[1]).cast_mut().cast()
+        );
+        assert_eq!(header.msg_iovlen, 2);
+        assert_eq!(sqe.msg_flags, 0);
         assert_eq!(sqe.user_data, 99);
     }
 

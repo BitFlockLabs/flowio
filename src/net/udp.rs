@@ -91,13 +91,15 @@ use super::{
     socket_addr_to_c, socket_domain, write_msghdr,
 };
 use crate::net::complete_read_with_progress;
+use crate::net::send_sqe::{
+    build_recv_entry, build_recvmsg_entry, build_send_entry, build_sendmsg_entry,
+};
 use crate::runtime::buffer::{IoBuffReadOnly, IoBuffReadWrite};
 use crate::runtime::executor::{
     drop_fd_op_state_unchecked, poll_ctx_from_waker, prepare_unsubmitted_op,
     refresh_op_waiter_from_waker, submit_retained_fd_sqe, validate_local_io_result,
 };
 use crate::runtime::fd::{FdStateDiagnostic, RuntimeFd, RuntimeFdOpState};
-use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -106,6 +108,8 @@ use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+const SEND_FLAGS: i32 = 0;
 
 /// Datagram socket with generic buffer support.
 ///
@@ -341,6 +345,9 @@ impl UdpSocket {
     /// [`io::ErrorKind::InvalidInput`] and the unchanged buffer after runtime
     /// context validation, before operation allocation or submission. It does
     /// not consume a datagram. A positive request can receive an empty datagram.
+    /// Requests up to `u32::MAX` bytes are accepted when
+    /// `buffer.writable_len()` covers the request. One receive submits at most
+    /// `i32::MAX` bytes. It does not split a datagram into multiple receives.
     pub fn recv<B: IoBuffReadWrite>(&mut self, buffer: B, len: usize) -> RecvFuture<'_, B> {
         let write_base_len = buffer.write_base_len();
         let mut input_error = None;
@@ -401,10 +408,12 @@ impl UdpSocket {
     /// Starts one connected send from the provided buffer.
     ///
     /// This omits per-datagram destination handling on a connected socket.
-    /// After owner-context validation, a source longer than the io_uring
-    /// 32-bit byte-count limit returns [`io::ErrorKind::InvalidInput`] before
-    /// pointer access or submission. An empty source is submitted as a
-    /// zero-length datagram.
+    /// After owner-context validation, a source longer than `u32::MAX` bytes
+    /// returns [`io::ErrorKind::InvalidInput`] before pointer access or
+    /// submission. The submitted prefix is at most `i32::MAX` bytes, and
+    /// datagram size limits can reject it with `EMSGSIZE`. A successful send
+    /// transmits the entire submitted datagram; it does not return a partial
+    /// datagram. An empty source is submitted as a zero-length datagram.
     pub fn send<B: IoBuffReadOnly>(&mut self, buffer: B) -> SendFuture<'_, B> {
         let mut input_error = None;
         let len = match checked_send_len(buffer.len()) {
@@ -463,7 +472,7 @@ impl UdpSocket {
     /// Starts one unconnected send to the provided destination.
     ///
     /// Use this instead of [`UdpSocket::send`] when the destination varies per
-    /// datagram. A source longer than the io_uring 32-bit byte-count limit is
+    /// datagram. A source longer than `u32::MAX` bytes is
     /// rejected before submission; an empty source remains a legal datagram
     /// and is submitted to the kernel.
     pub fn send_to<B: IoBuffReadOnly>(
@@ -758,7 +767,7 @@ pub struct RecvFuture<'a, B: IoBuffReadWrite> {
     fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
-    /// Maximum datagram bytes requested from the kernel.
+    /// Validated caller request, capped at `i32::MAX` when building the SQE.
     len: u32,
     /// Logical payload length captured for relative publication.
     write_base_len: usize,
@@ -829,9 +838,7 @@ impl<B: IoBuffReadWrite> Future for RecvFuture<'_, B> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_mut_ptr();
-                        Ok(opcode::Recv::new(types::Fd(fd), ptr, this.len)
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_recv_entry(fd, ptr, this.len, state_ptr as u64))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -945,11 +952,11 @@ impl<B: IoBuffReadWrite> Future for RecvMsgFuture<'_, B> {
                     |fd, payload| {
                         initialize_retained_recv_msg_payload(payload, this.len);
 
-                        Ok(
-                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
-                                .build()
-                                .user_data(state_ptr as u64),
-                        )
+                        Ok(build_recvmsg_entry(
+                            fd,
+                            payload.msghdr.as_mut_ptr(),
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -984,7 +991,7 @@ pub struct SendFuture<'a, B: IoBuffReadOnly> {
     fd_state: RuntimeFdOpState<'a>,
     /// Caller-owned send buffer returned on completion.
     buffer: Option<B>,
-    /// Validated datagram byte count submitted to the kernel.
+    /// Validated datagram byte count, clamped to the signed SQE limit on submission.
     len: u32,
     /// Deferred validation error returned before any SQE submission.
     input_error: Option<io::Error>,
@@ -1046,9 +1053,13 @@ impl<B: IoBuffReadOnly> Future for SendFuture<'_, B> {
                     payload,
                     |fd, payload| {
                         let ptr = payload.buffer.as_ptr();
-                        Ok(opcode::Send::new(types::Fd(fd), ptr, this.len)
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_send_entry(
+                            fd,
+                            ptr,
+                            this.len,
+                            SEND_FLAGS,
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -1169,11 +1180,11 @@ impl<B: IoBuffReadWrite> Future for RecvFromFuture<'_, B> {
                     |fd, payload| {
                         initialize_retained_recv_from_payload(payload, this.len);
 
-                        Ok(
-                            opcode::RecvMsg::new(types::Fd(fd), payload.msghdr.as_mut_ptr())
-                                .build()
-                                .user_data(state_ptr as u64),
-                        )
+                        Ok(build_recvmsg_entry(
+                            fd,
+                            payload.msghdr.as_mut_ptr(),
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -1279,9 +1290,12 @@ impl<B: IoBuffReadOnly> Future for SendToFuture<'_, B> {
                     |fd, payload| {
                         initialize_retained_send_to_payload(payload, destination, len);
 
-                        Ok(opcode::SendMsg::new(types::Fd(fd), payload.msghdr.as_ptr())
-                            .build()
-                            .user_data(state_ptr as u64))
+                        Ok(build_sendmsg_entry(
+                            fd,
+                            payload.msghdr.as_ptr(),
+                            SEND_FLAGS as u32,
+                            state_ptr as u64,
+                        ))
                     },
                 ) {
                     return Poll::Ready((Err(e), payload.buffer));
@@ -1337,7 +1351,167 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    use crate::net::send_sqe::test_support::{
+        ExpectedScalarEntry, assert_rejected_scalar_submission,
+    };
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    use crate::runtime::executor::with_ringless_poll_context_for_test;
     use crate::runtime::op::CompletionState;
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    use crate::runtime::op::completion_retirement_test_support::stage_payload;
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    use crate::runtime::test_hooks;
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    use io_uring::opcode;
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    fn ringless_udp_socket() -> UdpSocket {
+        UdpSocket {
+            fd: RuntimeFd::from_fresh_raw_fd(-7),
+            peer_addr: None,
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn udp_scalar_callers_clamp_signed_lengths_and_submit_empty_sends() {
+        for sending in [false, true] {
+            for requested in [0, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+                if !sending && requested == 0 {
+                    continue;
+                }
+                with_ringless_poll_context_for_test(1, |owner, cx| {
+                    let reactor = owner.reactor_ptr();
+                    let expected_state = unsafe { (&mut *reactor).alloc_op() };
+                    assert!(!expected_state.is_null());
+                    // The operation pool reuses this slot on the next allocation.
+                    unsafe { (&mut *reactor).free_op(expected_state) };
+                    let mut socket = ringless_udp_socket();
+                    let expected_bytes: &[u8] = if requested == 0 { b"" } else { b"seed" };
+                    let buffer = expected_bytes.to_vec();
+                    let original = buffer.as_ptr();
+                    let expected = ExpectedScalarEntry {
+                        opcode: if sending {
+                            opcode::Send::CODE
+                        } else {
+                            opcode::Recv::CODE
+                        },
+                        fd: socket.fd.raw_fd(),
+                        addr: original,
+                        owner_addr: original,
+                        len: if requested == 0 { 0 } else { i32::MAX as u32 },
+                        msg_flags: 0,
+                        user_data: expected_state as u64,
+                    };
+                    // The ringless reactor rejects every entry before kernel access.
+                    // Synthetic request lengths test encoding with a valid small owner.
+                    let returned = if sending {
+                        let mut future = socket.send(buffer);
+                        future.len = requested;
+                        let returned = assert_rejected_scalar_submission(
+                            cx,
+                            &mut future,
+                            expected,
+                            expected_bytes,
+                        );
+                        assert!(future.fd_state.state_ptr().is_null());
+                        assert!(future.buffer.is_none());
+                        returned
+                    } else {
+                        let mut future = socket.recv(buffer, expected_bytes.len());
+                        future.len = requested;
+                        let returned = assert_rejected_scalar_submission(
+                            cx,
+                            &mut future,
+                            expected,
+                            expected_bytes,
+                        );
+                        assert!(future.fd_state.state_ptr().is_null());
+                        assert!(future.buffer.is_none());
+                        returned
+                    };
+                    assert_eq!(returned.as_ptr(), original);
+                    assert_eq!(socket.fd.strong_count_for_test(), 1);
+                    assert_eq!(unsafe { (&*reactor).live_op_count() }, 0);
+                    assert_eq!(owner.inflight_op_count_for_test(), 0);
+                    let stats = unsafe { (&*reactor).retained_payload_stats() };
+                    assert_eq!((stats.pooled_allocs, stats.pooled_frees), (1, 1));
+                    assert_eq!(stats.heap_fallbacks, 0);
+                });
+            }
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn udp_short_send_completion_returns_owner_without_sending_remainder() {
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut socket = ringless_udp_socket();
+            let buffer = b"seed".to_vec();
+            let original = buffer.as_ptr();
+            let mut future = socket.send(buffer);
+            let payload = RetainedSendPayload {
+                buffer: future.buffer.take().expect("send owner missing"),
+            };
+            // SAFETY: the completed ringless operation owns four initialized bytes;
+            // its two-byte result describes a prefix without any kernel reference.
+            unsafe { stage_payload(owner, &mut future.fd_state, payload, 2, true) };
+            test_hooks::fail_next_raw_sqe_submit();
+            let Poll::Ready((result, returned)) = Pin::new(&mut future).poll(cx) else {
+                panic!("short UDP send completion did not return its owner");
+            };
+            assert_eq!(result.expect("short send was rejected"), 2);
+            assert_eq!(returned.as_ptr(), original);
+            assert_eq!(returned, b"seed");
+            assert!(future.fd_state.state_ptr().is_null());
+            assert!(future.buffer.is_none());
+            assert!(Pin::new(&mut future).poll(cx).is_pending());
+            assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 1);
+            assert!(test_hooks::take_raw_sqe_submit_failure().is_some());
+            drop(future);
+            assert_eq!(socket.fd.strong_count_for_test(), 1);
+            assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            let stats = unsafe { (&*owner.reactor_ptr()).retained_payload_stats() };
+            assert_eq!((stats.pooled_allocs, stats.pooled_frees), (1, 1));
+            assert_eq!(stats.heap_fallbacks, 0);
+        });
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn udp_send_to_caller_submits_sendmsg_with_zero_flags_and_retained_header() {
+        use crate::net::send_sqe::test_support::{
+            assert_rejected_message_submission, next_message_entry,
+        };
+
+        with_ringless_poll_context_for_test(1, |owner, cx| {
+            let mut socket = ringless_udp_socket();
+            let expected = next_message_entry::<RetainedSendToPayload<Vec<u8>>>(
+                owner,
+                std::mem::offset_of!(RetainedSendToPayload<Vec<u8>>, msghdr),
+                socket.fd.raw_fd(),
+                0,
+            );
+            let buffer = b"datagram".to_vec();
+            let original = buffer.as_ptr();
+            let destination = SocketAddr::from(([127, 0, 0, 1], 9001));
+            let mut future = socket.send_to(buffer, destination);
+            let returned = assert_rejected_message_submission(cx, &mut future, expected);
+            assert_eq!(returned.as_ptr(), original);
+            assert_eq!(returned, b"datagram");
+            assert!(future.fd_state.state_ptr().is_null());
+            assert!(future.buffer.is_none());
+            drop(future);
+            assert_eq!(socket.fd.strong_count_for_test(), 1);
+            assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+            assert_eq!(owner.inflight_op_count_for_test(), 0);
+            let stats = unsafe { (&*owner.reactor_ptr()).retained_payload_stats() };
+            assert_eq!((stats.pooled_allocs, stats.pooled_frees), (2, 2));
+            assert_eq!(stats.heap_fallbacks, 0);
+        });
+    }
 
     #[test]
     fn terminal_fd_state_keeps_udp_send_future_fused() {

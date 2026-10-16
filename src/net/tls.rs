@@ -1211,9 +1211,9 @@ impl TlsClientStream {
             let mut buffer = self.take_write_tls_buffer()?;
             buffer.clear();
 
-            // The shared raw write future accepts a u32 byte count. Keep the
-            // configured scratch size as an upper bound while never consuming
-            // more ciphertext from rustls than one submission can represent.
+            // The write-all future accepts up to u32::MAX bytes and advances
+            // by each completion's actual count across bounded submissions.
+            // Drain no more than that request limit or the configured scratch size.
             let chunk_limit = self.transport_write_buffer_size.min(u32::MAX as usize);
             let written =
                 match drain_tls_write_scratch(&mut self.connection, &mut buffer, chunk_limit) {
@@ -1918,7 +1918,7 @@ mod tests {
         tls_transport_eof_result, tls_unfed_read_slice, tls_userspace_destination,
         tls_write_progress_result,
     };
-    #[cfg(all(debug_assertions, feature = "test-support", not(miri)))]
+    #[cfg(all(feature = "test-support", not(miri)))]
     use crate::net::tls_test_peer;
     use crate::runtime::buffer::{IoBuffError, IoBuffMut, IoBuffReadWrite};
     #[cfg(not(miri))]
@@ -1967,6 +1967,9 @@ mod tests {
         )
         .expect("std connect failed");
         let (peer, _) = listener.accept().expect("std accept failed");
+        client
+            .set_nonblocking(true)
+            .expect("client nonblocking setup failed");
         let mut tls = TlsClientStream::new(
             TcpStream::from_owned_fd(client.into()),
             client_config,
@@ -2060,6 +2063,111 @@ mod tests {
             assert!(written > 0, "server TLS record write made no progress");
         }
         record
+    }
+
+    #[cfg(not(miri))]
+    async fn assert_tls_read_pending<F: Future>(mut read: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(
+                read.as_mut().poll(cx).is_pending(),
+                "TLS read completed before the peer supplied data or closed"
+            );
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn tls_read_before_data_returns_original_buffer() {
+        let (mut tls, mut server, peer) = handshaken_tls_connections(128);
+        let wire = server_application_record(&mut server, b"pong");
+        peer.set_nonblocking(true)
+            .expect("peer nonblocking setup failed");
+        let mut peer = TcpStream::from_owned_fd(peer.into());
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run(async move {
+                let buffer = Vec::with_capacity(32);
+                let allocation = buffer.as_ptr();
+                let capacity = buffer.capacity();
+                let mut read = Box::pin(tls.read(buffer, 4));
+                assert_tls_read_pending(read.as_mut()).await;
+                crate::runtime::io::Nop::new()
+                    .await
+                    .expect("read submission turn failed");
+                assert_tls_read_pending(read.as_mut()).await;
+
+                let (result, _) = peer.write_all(wire).await;
+                result.expect("peer TLS record write failed");
+                let (result, buffer) = read.await;
+                assert_eq!(result.expect("TLS read failed"), 4);
+                assert_eq!(buffer, b"pong");
+                assert_eq!(buffer.as_ptr(), allocation);
+                assert_eq!(buffer.capacity(), capacity);
+            })
+            .expect("executor run failed");
+    }
+
+    #[cfg(all(feature = "test-support", not(miri)))]
+    fn assert_tls_read_exact_peer_close_preserves_prefix(reset: bool) {
+        let (mut tls, mut server, peer) = handshaken_tls_connections(128);
+        let wire = server_application_record(&mut server, b"pre");
+        if reset {
+            tls_test_peer::force_reset_on_drop(&peer);
+        }
+        peer.set_nonblocking(true)
+            .expect("peer nonblocking setup failed");
+        let mut peer = TcpStream::from_owned_fd(peer.into());
+        let mut executor = Executor::new().expect("executor construction failed");
+        executor
+            .run(async move {
+                let buffer = Vec::with_capacity(32);
+                let allocation = buffer.as_ptr();
+                let capacity = buffer.capacity();
+                let mut read = Box::pin(tls.read_exact(buffer, 6));
+                assert_tls_read_pending(read.as_mut()).await;
+
+                let (result, _) = peer.write_all(wire).await;
+                result.expect("peer TLS record write failed");
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        read.as_mut().poll(cx).is_pending(),
+                        "TLS exact read completed before the peer closed"
+                    );
+                    if read.as_ref().get_ref().filled == 3 {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                drop(peer);
+
+                let (result, buffer) = read.await;
+                let err = result.expect_err("partial TLS exact read accepted peer close");
+                if reset {
+                    assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+                } else {
+                    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+                }
+                assert_eq!(buffer, b"pre");
+                assert_eq!(buffer.as_ptr(), allocation);
+                assert_eq!(buffer.capacity(), capacity);
+            })
+            .expect("executor run failed");
+    }
+
+    #[test]
+    #[cfg(all(feature = "test-support", not(miri)))]
+    fn tls_read_exact_reset_returns_partial_original_buffer() {
+        assert_tls_read_exact_peer_close_preserves_prefix(true);
+    }
+
+    #[test]
+    #[cfg(all(feature = "test-support", not(miri)))]
+    fn tls_read_exact_raw_eof_returns_partial_original_buffer() {
+        assert_tls_read_exact_peer_close_preserves_prefix(false);
     }
 
     #[test]

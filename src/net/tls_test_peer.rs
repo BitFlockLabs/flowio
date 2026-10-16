@@ -1,4 +1,4 @@
-//! Blocking standard-library peer helpers for TLS cancellation tests.
+//! Standard-library TCP peer helpers for TLS cancellation and stream reset tests.
 
 use std::io::{self, Read};
 use std::net::TcpStream;

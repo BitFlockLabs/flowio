@@ -5417,6 +5417,15 @@ fn runtime_cancel_readv_mid_flight() {
 /// checked out until the original CQE retires.
 #[test]
 fn runtime_drop_polled_readv_cleans_up_after_original_cqe() {
+    assert_drop_polled_readv_cleans_up_after_original_cqe::<2>();
+}
+
+#[test]
+fn runtime_drop_polled_single_segment_readv_cleans_up_after_original_cqe() {
+    assert_drop_polled_readv_cleans_up_after_original_cqe::<1>();
+}
+
+fn assert_drop_polled_readv_cleans_up_after_original_cqe<const N: usize>() {
     let mut executor = new_executor();
 
     executor
@@ -5426,15 +5435,14 @@ fn runtime_drop_polled_readv_cleans_up_after_original_cqe() {
                 headroom: 0,
                 payload: 4096,
                 tailroom: 0,
-                objs_per_slab: 2,
+                objs_per_slab: N,
             })
             .expect("pool config invalid");
             pool.init();
-            let recv = IoBuffVecMut::<2>::from_array([
-                pool.alloc().expect("first pool alloc failed"),
-                pool.alloc().expect("second pool alloc failed"),
-            ]);
-            assert_eq!(pool.live_slots_for_test(), 2);
+            let recv = IoBuffVecMut::<N>::from_array(std::array::from_fn(|_| {
+                pool.alloc().expect("read segment pool alloc failed")
+            }));
+            assert_eq!(pool.live_slots_for_test(), N);
 
             let mut readv = Box::pin(reader.readv(recv));
             std::future::poll_fn(|cx| match Future::poll(readv.as_mut(), cx) {
@@ -5446,7 +5454,7 @@ fn runtime_drop_polled_readv_cleans_up_after_original_cqe() {
             drop(readv);
             assert_eq!(
                 pool.live_slots_for_test(),
-                2,
+                N,
                 "readv buffers were released before the original CQE retired"
             );
 
@@ -5469,6 +5477,15 @@ fn runtime_drop_polled_readv_cleans_up_after_original_cqe() {
 /// CQE retires after peer release.
 #[test]
 fn runtime_cancel_readv_exact_mid_flight() {
+    assert_cancel_readv_exact_mid_flight::<2>();
+}
+
+#[test]
+fn runtime_cancel_single_segment_readv_exact_mid_flight() {
+    assert_cancel_readv_exact_mid_flight::<1>();
+}
+
+fn assert_cancel_readv_exact_mid_flight<const N: usize>() {
     let mut executor = new_executor();
 
     executor
@@ -5479,21 +5496,20 @@ fn runtime_cancel_readv_exact_mid_flight() {
                 headroom: 0,
                 payload: 512 * 1024,
                 tailroom: 0,
-                objs_per_slab: 2,
+                objs_per_slab: N,
             })
             .expect("pool config invalid");
             pool.init();
 
             sleep(Duration::from_millis(1)).await.unwrap();
 
-            let recv = IoBuffVecMut::<2>::from_array([
-                pool.alloc().expect("first pool alloc failed"),
-                pool.alloc().expect("second pool alloc failed"),
-            ]);
-            assert_eq!(pool.live_slots_for_test(), 2);
+            let recv = IoBuffVecMut::<N>::from_array(std::array::from_fn(|_| {
+                pool.alloc().expect("read segment pool alloc failed")
+            }));
+            assert_eq!(pool.live_slots_for_test(), N);
 
             let result = timeout(Duration::from_millis(50), async {
-                let (res, _chain) = reader.readv_exact(recv, 1024 * 1024).await;
+                let (res, _chain) = reader.readv_exact(recv, N * 512 * 1024).await;
                 res
             })
             .await;
@@ -5504,7 +5520,7 @@ fn runtime_cancel_readv_exact_mid_flight() {
             );
             assert_eq!(
                 pool.live_slots_for_test(),
-                2,
+                N,
                 "readv_exact buffers were released before the original CQE retired"
             );
 

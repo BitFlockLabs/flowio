@@ -116,8 +116,9 @@
 //! # Fast-Path Guidance
 //!
 //! Preferred on the per-message fast path:
-//! - On stream transports, `read` / `write` and `readv` / `writev` perform one
-//!   submission and expose partial progress to the caller.
+//! - On stream transports, `read` / `write` and `readv` / `writev` expose the
+//!   first positive or terminal completion without looping on partial progress.
+//!   Reads resubmit a no-progress EAGAIN completion internally.
 //! - For fixed-peer UDP, prefer [`udp::UdpSocket::connect`] plus `send` /
 //!   `recv` because that avoids per-datagram destination handling.
 //! - Use vectored APIs only when payloads are already segmented. For one
@@ -590,8 +591,8 @@ fn completion_cqe_result(result: i32) -> io::Result<usize> {
     }
 }
 
-/// Validates a caller-supplied read length against the writable capacity that
-/// the buffer actually exposes to the kernel.
+/// Validates a read request against writable capacity and the unsigned 32-bit
+/// request range. Scalar SQE encoding applies its signed prefix bound later.
 pub(crate) fn checked_read_len(requested: usize, writable: usize) -> io::Result<u32> {
     if requested > writable {
         return Err(invalid_input(READ_LEN_EXCEEDS_WRITABLE));
@@ -649,8 +650,8 @@ pub(crate) unsafe fn complete_read_with_progress<B: IoBuffReadWrite, T>(
     }
 }
 
-/// Validates a contiguous send length against io_uring opcodes that accept a
-/// 32-bit byte count.
+/// Validates a contiguous send against the unsigned 32-bit request range.
+/// Scalar SQE encoding applies its signed prefix bound later.
 pub(crate) fn checked_send_len(requested: usize) -> io::Result<u32> {
     match send_len_u32(requested) {
         Some(len) => Ok(len),
@@ -3216,13 +3217,40 @@ mod tests {
     }
 
     #[test]
+    fn checked_lengths_preserve_unsigned_requests_before_sqe_encoding() {
+        for requested in [
+            0,
+            1,
+            i32::MAX as usize,
+            i32::MAX as usize + 1,
+            u32::MAX as usize,
+        ] {
+            assert_eq!(
+                checked_read_len(requested, requested).expect("in-capacity request rejected"),
+                requested as u32,
+            );
+            assert_eq!(
+                checked_send_len(requested).expect("accepted send request rejected"),
+                requested as u32,
+            );
+            assert_eq!(send_len_u32(requested), Some(requested as u32));
+            if requested != 0 {
+                let error = checked_read_len(requested, requested - 1)
+                    .expect_err("receive request exceeded writable capacity");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(error.to_string(), READ_LEN_EXCEEDS_WRITABLE);
+            }
+        }
+    }
+
+    #[test]
     fn checked_lengths_reject_u32_overflow_with_static_message() {
         let oversized = u32::MAX as usize + 1;
 
         assert_eq!(
             send_len_u32(u32::MAX as usize),
             Some(u32::MAX),
-            "the exact io_uring byte-count limit should remain valid"
+            "the unsigned 32-bit request limit remains valid before SQE encoding"
         );
         assert_eq!(
             send_len_u32(oversized),
