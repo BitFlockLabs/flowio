@@ -42,6 +42,64 @@ fn connected_try_unix_stream() -> (UnixStream, std::os::unix::net::UnixStream) {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+fn runtime_unix_try_writes_return_epipe_without_sigpipe() {
+    const CHILD_ENV: &str = "FLOWIO_UNIX_TRY_WRITES_SIGPIPE_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        common::run_exact_test_child_with_watchdog(
+            "runtime_unix_try_writes_return_epipe_without_sigpipe",
+            CHILD_ENV,
+            Duration::from_secs(30),
+        );
+        return;
+    }
+
+    unsafe {
+        assert_ne!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_ERR);
+        let mut signals: libc::sigset_t = std::mem::zeroed();
+        assert_eq!(libc::sigemptyset(&mut signals), 0);
+        assert_eq!(libc::sigaddset(&mut signals, libc::SIGPIPE), 0);
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()),
+            0
+        );
+    }
+    let (mut stream, peer) = connected_try_unix_stream();
+    drop(peer);
+
+    let drops = Rc::new(Cell::new(0));
+    let buffer = common::DropTrackedReadOnly::new(b"scalar".to_vec(), &drops);
+    let original = buffer.bytes().as_ptr();
+    let (result, buffer) = stream.try_write(buffer);
+    assert_eq!(
+        result
+            .expect_err("closed peer accepted write")
+            .raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    assert_eq!(buffer.bytes().as_ptr(), original);
+    assert_eq!(buffer.bytes(), b"scalar");
+    assert_eq!(drops.get(), 0);
+    drop(buffer);
+    assert_eq!(drops.get(), 1);
+
+    let (source, witness) = common::DropTrackedProjected17::new(b'v');
+    let (result, source) = stream.try_writev_projected(source);
+    assert_eq!(
+        result
+            .expect_err("closed peer accepted projected write")
+            .raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    assert!(source.has_identity(&witness));
+    assert_eq!(source.bytes(), &[b'v'; common::DYNAMIC_PROJECTED_PIECES]);
+    assert_eq!(witness.projection_calls(), 1);
+    assert_eq!(witness.drops(), 0);
+    drop(source);
+    assert_eq!(witness.drops(), 1);
+}
+
+#[test]
 fn runtime_retry_initial_submissions_extract_poll_context_once() {
     let mut executor = Executor::new().expect("failed to construct executor");
 
@@ -371,9 +429,8 @@ fn runtime_unix_read_u32_max_request_returns_sparse_owner() {
         peer.set_nonblocking(true)
             .expect("set peer nonblocking failed");
         let drops = Rc::new(Cell::new(0));
-        let buffer = SparseReadWrite::new(&drops).expect(
-            "sparse mapping failed: process address space or host commit limit (vm.overcommit_memory=2)",
-        );
+        let buffer = SparseReadWrite::new(&drops)
+            .expect("sparse map: process address space / host commit (vm.overcommit_memory=2)");
         assert_eq!(
             flowio::runtime::buffer::IoBuffReadWrite::writable_len(&buffer),
             u32::MAX as usize
@@ -431,9 +488,8 @@ fn runtime_unix_write_u32_max_request_returns_sparse_owner() {
             .expect("set send buffer failed");
         peer.set_nonblocking(true)
             .expect("set peer nonblocking failed");
-        let mut buffer = SparseOversizedReadOnly::new().expect(
-            "sparse mapping failed: process address space or host commit limit (vm.overcommit_memory=2)",
-        );
+        let mut buffer = SparseOversizedReadOnly::new()
+            .expect("sparse map: process address space / host commit (vm.overcommit_memory=2)");
         buffer.truncate(u32::MAX as usize);
         assert_eq!(
             flowio::runtime::buffer::IoBuffReadOnly::len(&buffer),

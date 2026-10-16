@@ -1077,10 +1077,7 @@ fn assert_oversized_send_owner_uninspected(buffer: &SparseOversizedReadOnly) {
 pub fn assert_oversized_send_rejected(result: io::Result<usize>, buffer: &SparseOversizedReadOnly) {
     let err = result.expect_err("oversized send should fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "length exceeds io_uring u32 byte-count limit"
-    );
+    assert_eq!(err.to_string(), "length exceeds u32::MAX request limit");
     assert_oversized_send_owner_uninspected(buffer);
 }
 

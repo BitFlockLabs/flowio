@@ -9,7 +9,8 @@ fn clamp_socket_io_len(len: u32) -> u32 {
     len.min(i32::MAX as u32)
 }
 
-/// Builds a positive-length receive SQE without message flags.
+/// Builds a positive-length receive SQE without message flags, capped at
+/// `i32::MAX` bytes.
 #[inline(always)]
 pub(crate) fn build_recv_entry(fd: RawFd, ptr: *mut u8, len: u32, user_data: u64) -> squeue::Entry {
     debug_assert!(len > 0, "socket receives require a nonzero byte count");
@@ -33,7 +34,8 @@ pub(crate) fn build_recvmsg_entry(
         .user_data(user_data)
 }
 
-/// Builds a single-buffer send SQE with the transport's message flags.
+/// Builds a single-buffer send SQE with the transport's message flags, capped at
+/// `i32::MAX` bytes.
 #[inline(always)]
 pub(crate) fn build_send_entry(
     fd: RawFd,
@@ -167,6 +169,28 @@ pub(crate) mod test_support {
         }
     }
 
+    fn poll_rejected_submission<F, B>(
+        cx: &mut Context<'_>,
+        future: &mut F,
+        kind: &str,
+    ) -> (SocketEntryCapture, B)
+    where
+        F: Future<Output = (io::Result<usize>, B)> + Unpin,
+    {
+        let capture = SocketEntryCapture::new();
+        test_hooks::fail_next_raw_sqe_submit();
+        let Poll::Ready((result, owner)) = Pin::new(&mut *future).poll(cx) else {
+            panic!("rejected {kind} submission did not return its owner");
+        };
+        let error = match result {
+            Err(error) => error,
+            Ok(value) => panic!("injected {kind} submission succeeded: {value:?}"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
+        (capture, owner)
+    }
+
     /// Checks a message-send caller against independently predicted retained storage.
     pub(crate) fn assert_rejected_message_submission<F, B>(
         cx: &mut Context<'_>,
@@ -176,18 +200,7 @@ pub(crate) mod test_support {
     where
         F: Future<Output = (io::Result<usize>, B)> + Unpin,
     {
-        let capture = SocketEntryCapture::new();
-        test_hooks::fail_next_raw_sqe_submit();
-        let Poll::Ready((result, owner)) = Pin::new(&mut *future).poll(cx) else {
-            panic!("rejected message submission did not return its owner");
-        };
-        assert_eq!(
-            result
-                .expect_err("injected message submission succeeded")
-                .kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
+        let (capture, owner) = poll_rejected_submission(cx, future, "message");
         assert!(Pin::new(&mut *future).poll(cx).is_pending());
         let entry = capture.take();
         assert_entry_fields(
@@ -227,18 +240,7 @@ pub(crate) mod test_support {
     where
         F: Future<Output = (io::Result<usize>, Vec<u8>)> + Unpin,
     {
-        let capture = SocketEntryCapture::new();
-        test_hooks::fail_next_raw_sqe_submit();
-        let Poll::Ready((result, owner)) = Pin::new(&mut *future).poll(cx) else {
-            panic!("rejected scalar submission did not return its owner");
-        };
-        assert_eq!(
-            result
-                .expect_err("injected scalar submission succeeded")
-                .kind(),
-            io::ErrorKind::WouldBlock,
-        );
-        assert_eq!(test_hooks::raw_sqe_submit_failures_remaining(), 0);
+        let (capture, owner) = poll_rejected_submission(cx, future, "scalar");
         assert_eq!(owner.as_ptr(), expected.owner_addr);
         assert_eq!(owner, expected_bytes);
         assert!(Pin::new(&mut *future).poll(cx).is_pending());

@@ -255,6 +255,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+// Return send errors without delivering SIGPIPE.
 const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
 
 /// Kernel-facing notification-subscription layout used with SCTP socket
@@ -4001,7 +4002,7 @@ impl SctpStream {
     /// a record tail, or a dropped `recv_msg` / `recv_msg_vectored` is still
     /// attached to the stream, this method rejects the request without changing
     /// that state or submitting another receive. Each receive submits at most
-    /// `i32::MAX` bytes, even when the validated request is larger. A receive
+    /// `i32::MAX` bytes, even when the requested length is larger. A receive
     /// returns the actual byte count without requesting another message.
     ///
     /// # Errors
@@ -11672,17 +11673,11 @@ mod tests {
 
     #[test]
     fn sctp_data_send_caller_submits_send_with_nosignal_and_own_state() {
+        use crate::net::send_sqe::test_support::next_operation_user_data;
+
         with_ringless_poll_context_for_test(1, |owner, cx| {
             let reactor = owner.reactor_ptr();
-            let expected_state = unsafe { (&mut *reactor).alloc_op() };
-            assert!(
-                !expected_state.is_null(),
-                "send fixture state allocation failed"
-            );
-            // The pool reuses the most recently freed slot. No operation is
-            // allocated between this release and the send's first poll, so
-            // the expected correlation value is independent of the SQE.
-            unsafe { (&mut *reactor).free_op(expected_state) };
+            let expected_user_data = next_operation_user_data(owner);
 
             let pointer_calls = Rc::new(Cell::new(0));
             let drops = Rc::new(Cell::new(0));
@@ -11708,7 +11703,7 @@ mod tests {
 
             assert_eq!(sqe.opcode, opcode::Send::CODE);
             assert_eq!(sqe.msg_flags, libc::MSG_NOSIGNAL as u32);
-            assert_eq!(sqe.user_data, expected_state as u64);
+            assert_eq!(sqe.user_data, expected_user_data);
             assert_eq!(sqe.fd, expected_fd);
             assert_eq!(sqe.addr, expected_addr as u64);
             assert_eq!(sqe.len, expected_len as u32);
@@ -11736,7 +11731,7 @@ mod tests {
             assert_eq!(stats.pooled_frees, 1);
             assert_eq!(stats.heap_fallbacks, 0);
             let reused = unsafe { (&mut *reactor).alloc_op() };
-            assert_eq!(reused, expected_state);
+            assert_eq!(reused as u64, expected_user_data);
             unsafe { (&mut *reactor).free_op(reused) };
         });
     }
@@ -11745,15 +11740,14 @@ mod tests {
     fn sctp_data_callers_clamp_scalar_requests_and_return_original_owners() {
         use crate::net::send_sqe::test_support::{
             ExpectedScalarEntry, ScalarTestFuture, assert_rejected_scalar_submission,
+            next_operation_user_data,
         };
 
         for receive in [false, true] {
             for requested in [i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
                 with_ringless_poll_context_for_test(1, |owner, cx| {
                     let reactor = owner.reactor_ptr();
-                    let state = unsafe { (&mut *reactor).alloc_op() };
-                    assert!(!state.is_null());
-                    unsafe { (&mut *reactor).free_op(state) };
+                    let expected_user_data = next_operation_user_data(owner);
                     let mut stream = ringless_sctp_stream();
                     let fd = stream.fd.raw_fd();
                     let buffer = b"abcdefgh".to_vec();
@@ -11787,7 +11781,7 @@ mod tests {
                             } else {
                                 libc::MSG_NOSIGNAL as u32
                             },
-                            user_data: state as u64,
+                            user_data: expected_user_data,
                         },
                         b"abcdefgh",
                     );

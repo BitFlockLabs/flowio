@@ -458,7 +458,7 @@ pub(crate) unsafe fn opt_mut<T>(opt: &mut Option<T>) -> &mut T {
 }
 
 const READ_LEN_EXCEEDS_WRITABLE: &str = "length exceeds writable buffer capacity";
-const LEN_EXCEEDS_U32: &str = "length exceeds io_uring u32 byte-count limit";
+const LEN_EXCEEDS_U32: &str = "length exceeds u32::MAX request limit";
 const READ_PROGRESS_EXCEEDS_WRITABLE: &str = "read completion exceeds writable buffer capacity";
 const READ_PUBLICATION_OVERFLOW: &str = "read publication length overflow";
 

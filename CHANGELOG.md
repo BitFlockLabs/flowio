@@ -237,11 +237,13 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
-- TCP and Unix `write`, `write_all`, `writev` and `writev_all`, and UDP and SCTP
-  `recv`, no longer fail with `InvalidInput` for requests of 2 GiB or more on
-  kernels that reject larger socket request lengths; the `_all` writes continue
-  from each completed count. UDP and SCTP `send` of 2 GiB or more report the
-  kernel's message-size error instead.
+- TCP and Unix `write` and `write_all`, and UDP/SCTP `recv`, no longer fail
+  with `InvalidInput` for requests from 2 GiB through `u32::MAX` bytes on
+  kernels that reject larger socket operation lengths; this also covers
+  `writev`, `writev_all`, `writev_projected` and `writev_all_projected` when
+  one segment in that range remains, and `_all` writes continue from each
+  completed count. UDP `send` in that range reports `EMSGSIZE`, while SCTP
+  `send` may send a short complete message or report `EMSGSIZE`.
 - TCP and Unix `read`, `read_exact`, `readv` and `readv_exact`, and TLS
   handshakes and reads wait for data instead of returning `WouldBlock` on
   Linux 5.11 through 5.14.6. If another read consumes the available data
@@ -290,8 +292,8 @@ Alpha prereleases carry no compatibility guarantee.
   limits with `IoBuffPoolConfigError::LayoutOverflow` before allocating a slab.
 - With `test-support`, `SlabAllocator` rejects acquisition before
   initialization and initializes its provider at most once.
-- UDP `send_to` rejects lengths above `u32::MAX` before pointer
-  access, allocation, or submission and returns the caller's buffer.
+- UDP `send_to` rejects lengths above `u32::MAX` before pointer access,
+  allocation, or submission and returns the caller's buffer.
   Metadata-free `recv_msg` and `recv_from` no longer reject complete payloads
   because discarded ancillary data was truncated.
 - Fixed-size socket-option getters return `InvalidData` for unexpected kernel

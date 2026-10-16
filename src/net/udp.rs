@@ -109,6 +109,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+// Datagram sends do not generate SIGPIPE.
 const SEND_FLAGS: i32 = 0;
 
 /// Datagram socket with generic buffer support.
@@ -1353,7 +1354,7 @@ mod tests {
     use super::*;
     #[cfg(any(debug_assertions, feature = "test-support"))]
     use crate::net::send_sqe::test_support::{
-        ExpectedScalarEntry, assert_rejected_scalar_submission,
+        ExpectedScalarEntry, assert_rejected_scalar_submission, next_operation_user_data,
     };
     #[cfg(any(debug_assertions, feature = "test-support"))]
     use crate::runtime::executor::with_ringless_poll_context_for_test;
@@ -1383,10 +1384,7 @@ mod tests {
                 }
                 with_ringless_poll_context_for_test(1, |owner, cx| {
                     let reactor = owner.reactor_ptr();
-                    let expected_state = unsafe { (&mut *reactor).alloc_op() };
-                    assert!(!expected_state.is_null());
-                    // The operation pool reuses this slot on the next allocation.
-                    unsafe { (&mut *reactor).free_op(expected_state) };
+                    let expected_user_data = next_operation_user_data(owner);
                     let mut socket = ringless_udp_socket();
                     let expected_bytes: &[u8] = if requested == 0 { b"" } else { b"seed" };
                     let buffer = expected_bytes.to_vec();
@@ -1402,7 +1400,7 @@ mod tests {
                         owner_addr: original,
                         len: if requested == 0 { 0 } else { i32::MAX as u32 },
                         msg_flags: 0,
-                        user_data: expected_state as u64,
+                        user_data: expected_user_data,
                     };
                     // The ringless reactor rejects every entry before kernel access.
                     // Synthetic request lengths test encoding with a valid small owner.

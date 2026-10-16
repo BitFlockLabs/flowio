@@ -71,6 +71,7 @@ use std::ptr::NonNull;
 use std::slice;
 use std::task::{Context, Poll};
 
+// Return send errors without delivering SIGPIPE.
 const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL;
 
 macro_rules! impl_stream_rw {
@@ -413,8 +414,8 @@ macro_rules! impl_stream_rw {
         /// # Errors
         ///
         /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds the chain's
-        /// writable capacity or the public `u32::MAX` request limit, the
-        /// chain's total writable length overflows `usize`, a nonzero `len`
+        /// writable capacity or `u32::MAX`, the chain's total writable length
+        /// overflows `usize`, a nonzero `len`
         /// targets a chain with more than 1024 non-empty writable segments, or
         /// the chain's writable segment count or byte total changes before
         /// submission. The overflow, segment-count, and shape failures return
@@ -7721,15 +7722,14 @@ mod tests {
     fn scalar_write_callers_clamp_initial_submissions_without_replacing_owners() {
         use crate::net::send_sqe::test_support::{
             ExpectedScalarEntry, ScalarTestFuture, assert_rejected_scalar_submission,
+            next_operation_user_data,
         };
 
         for all in [false, true] {
             for requested in [i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
                 with_ringless_poll_context_for_test(1, |owner, cx| {
                     let reactor = owner.reactor_ptr();
-                    let state = unsafe { (&mut *reactor).alloc_op() };
-                    assert!(!state.is_null());
-                    unsafe { (&mut *reactor).free_op(state) };
+                    let expected_user_data = next_operation_user_data(owner);
                     let buffer = b"abcdefgh".to_vec();
                     let original = buffer.as_ptr();
                     // Only encoded lengths are synthetic. Submission fails before
@@ -7754,7 +7754,7 @@ mod tests {
                             owner_addr: original,
                             len: requested.min(i32::MAX as u32),
                             msg_flags: libc::MSG_NOSIGNAL as u32,
-                            user_data: state as u64,
+                            user_data: expected_user_data,
                         },
                         b"abcdefgh",
                     );
