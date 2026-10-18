@@ -5,6 +5,7 @@
 //! unreachable pressure and kernel-error paths deterministic without changing
 //! production behavior when no hook is armed.
 
+use crate::runtime::reactor::RequiredRingFeature;
 use std::cell::Cell;
 use std::io;
 thread_local! {
@@ -17,7 +18,9 @@ thread_local! {
     static FAIL_RING_WAIT_ERRNO: Cell<i32> = const { Cell::new(0) };
     #[cfg(debug_assertions)]
     static FAIL_IOBUFF_POOL_SLAB_ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static FAIL_REACTOR_EXT_ARG_PROBES: Cell<usize> = const { Cell::new(0) };
+    static FAIL_REACTOR_FEATURE_PROBES: Cell<[usize; RequiredRingFeature::SendMsgZc as usize + 1]> =
+        const { Cell::new([0; RequiredRingFeature::SendMsgZc as usize + 1]) };
+    static FAIL_PROBE_REGISTRATION_ERRNO: Cell<i32> = const { Cell::new(0) };
     static FORCE_REACTOR_SHUTDOWN_FALLBACKS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -76,12 +79,27 @@ pub(crate) fn fail_next_iobuff_pool_slab_alloc() {
     FAIL_IOBUFF_POOL_SLAB_ALLOCS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
 
-/// Makes the next reactor feature validation report missing
-/// `IORING_ENTER_EXT_ARG` support.
+/// Makes the next reactor validation report the specified capability missing.
 #[doc(hidden)]
 #[cfg(all(test, not(miri)))]
-pub(crate) fn fail_next_reactor_ext_arg_probe() {
-    FAIL_REACTOR_EXT_ARG_PROBES.with(|fails| fails.set(fails.get().saturating_add(1)));
+pub(crate) fn fail_next_reactor_feature_probe(feature: RequiredRingFeature) {
+    FAIL_REACTOR_FEATURE_PROBES.with(|fails| {
+        let mut counts = fails.get();
+        counts[feature as usize] = counts[feature as usize].saturating_add(1);
+        fails.set(counts);
+    });
+}
+
+/// Makes the next opcode-probe registration fail with the specified errno.
+#[cfg(all(test, not(miri)))]
+pub(crate) fn fail_next_probe_registration_errno(errno: i32) {
+    FAIL_PROBE_REGISTRATION_ERRNO.with(|stored| stored.set(errno));
+}
+
+#[inline(always)]
+pub(crate) fn take_probe_registration_failure() -> Option<io::Error> {
+    let errno = FAIL_PROBE_REGISTRATION_ERRNO.with(|stored| stored.replace(0));
+    (errno != 0).then(|| io::Error::from_raw_os_error(errno))
 }
 
 /// Makes the next reactor shutdown skip its ordinary bounded drain and enter
@@ -200,13 +218,14 @@ pub(crate) fn take_iobuff_pool_slab_alloc_failure() -> bool {
 }
 
 #[inline(always)]
-pub(crate) fn take_reactor_ext_arg_probe_failure() -> bool {
-    FAIL_REACTOR_EXT_ARG_PROBES.with(|fails| {
-        let remaining = fails.get();
-        if remaining == 0 {
+pub(crate) fn take_reactor_feature_probe_failure(feature: RequiredRingFeature) -> bool {
+    FAIL_REACTOR_FEATURE_PROBES.with(|fails| {
+        let mut counts = fails.get();
+        if counts[feature as usize] == 0 {
             false
         } else {
-            fails.set(remaining - 1);
+            counts[feature as usize] -= 1;
+            fails.set(counts);
             true
         }
     })

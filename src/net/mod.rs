@@ -678,18 +678,6 @@ fn map_connect_timeout<T>(result: Result<io::Result<T>, TimeoutError>) -> io::Re
     }
 }
 
-/// Interpret a connect CQE result code. `io_uring` may re-issue an async
-/// `connect(2)` once the socket is writable; if the connection already
-/// completed, that retry returns `EISCONN`, which means the connection is
-/// established, not an error. A real connect failure returns its own errno
-/// (e.g. `ECONNREFUSED`), never `EISCONN`.
-fn connect_cqe_result(result: i32) -> io::Result<()> {
-    if result >= 0 || result == -libc::EISCONN {
-        return Ok(());
-    }
-    Err(io::Error::from_raw_os_error(-result))
-}
-
 /// Builds the one-shot readiness notification used by TCP and SCTP accept.
 ///
 /// The CQE reports only readiness; it never owns an accepted descriptor.
@@ -1706,7 +1694,8 @@ impl<C> ConnectSubmissionSlot<C> {
                 self.state_ptr = std::ptr::null_mut();
                 self.in_use = false;
 
-                let (result, payload) = completion.into_io_result(connect_cqe_result);
+                let (result, payload) =
+                    completion.into_io_result(|r| completion_cqe_result(r).map(drop));
                 return Poll::Ready(match result {
                     Ok(()) => finish_connected(payload.into_fd(), &self.completion_data),
                     Err(err) => Err(err),
@@ -2210,16 +2199,6 @@ mod tests {
         ] {
             assert_eq!(err.raw_os_error(), Some(libc::EBADF));
         }
-    }
-
-    #[test]
-    fn connect_cqe_result_treats_eisconn_as_established() {
-        connect_cqe_result(0).expect("zero connect CQE should succeed");
-        connect_cqe_result(-libc::EISCONN).expect("EISCONN connect CQE should mean established");
-
-        let err = connect_cqe_result(-libc::ECONNREFUSED)
-            .expect_err("real connect failure should retain its errno");
-        assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
     }
 
     #[cfg(not(miri))]

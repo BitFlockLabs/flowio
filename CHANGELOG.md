@@ -71,6 +71,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
+- **Breaking (error text):** Socket reads and sends longer than `u32::MAX`
+  bytes report `InvalidInput` with the message
+  "length exceeds u32::MAX request limit". Match `io::ErrorKind` instead of the
+  display text.
 - **Breaking:** A zero-byte receive completion, including EOF and an empty
   datagram, leaves a `Vec<u8>` buffer's length and contents unchanged instead
   of truncating it to zero. Use the returned byte count, or clear the buffer
@@ -144,10 +148,6 @@ Alpha prereleases carry no compatibility guarantee.
   listed requests must be nonempty and all-stream requests must remain empty,
   or the operation returns
   `InvalidInput` before a socket-option syscall.
-- **Breaking:** `SctpStream::peer_addr_params` accepts only the exact 152-byte
-  legacy or 156-byte modern Linux response layout. Handle `InvalidData` for
-  intermediate or other unsupported lengths instead of reading a partial
-  result.
 - **Breaking:** SCTP `send`, `send_msg`, and `send_msg_vectored` reject empty
   buffers with `InvalidInput` and return the buffer. Skip the send when there
   are no readable bytes, including for vectored sends.
@@ -162,8 +162,9 @@ Alpha prereleases carry no compatibility guarantee.
   return `InvalidInput` before consuming data or submitting I/O. Use a
   positive receive length even for an empty UDP datagram; a successful
   zero-byte data-only SCTP receive denotes peer EOF.
-- FlowIO supports x86-64 Linux 5.11 or newer; other architectures are outside
-  the support and validation contract.
+- **Breaking (platform):** FlowIO requires x86-64 Linux 6.1 or newer;
+  executor construction returns `Unsupported` when required kernel capabilities
+  are absent. Upgrade hosts running older kernels to Linux 6.1 or newer.
 - Socket construction and adoption allocate one reference-counted descriptor
   record; submitted I/O keeps the descriptor alive until FlowIO observes
   completion. Allocation failure invokes the global allocation-error handler,
@@ -259,8 +260,6 @@ Alpha prereleases carry no compatibility guarantee.
   before kernel submission.
 - TCP and SCTP accepts rearm bare `POLLERR` once before returning `WouldBlock`;
   descriptor-pressure errors preserve readiness for a direct retry.
-- TCP and SCTP connects reported as already connected (`EISCONN`) by the
-  kernel complete successfully instead of failing.
 - SCTP metadata receives accept `SCTP_RCVINFO` after other ancillary records,
   such as socket timestamps, and return default receive-info fields when
   receive-info is not requested, instead of `InvalidData`.

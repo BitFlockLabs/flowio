@@ -2638,8 +2638,9 @@ impl Executor {
     /// fast-path primitive.
     ///
     /// # Errors
-    /// Returns `Unsupported` when the running Linux kernel does not provide
-    /// the `IORING_ENTER_EXT_ARG` feature required for timed `io_uring` waits.
+    /// Requires x86-64 Linux 6.1 or newer. Returns `Unsupported` when the ring
+    /// lacks `IORING_ENTER_EXT_ARG`, `IORING_FEAT_NATIVE_WORKERS` or
+    /// `IORING_OP_SENDMSG_ZC`. Opcode-probe syscall errors are returned unchanged.
     /// Returns `InvalidInput` when the kernel rejects
     /// `config.reactor.ring_entries`, including zero or a value above its
     /// ring-size limit. Other `io_uring` setup errors are returned unchanged.

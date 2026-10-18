@@ -13,10 +13,12 @@ It is not recommended for production yet.
 
 ## Install
 
-Requires x86-64 Linux 5.11 or newer and Rust 1.88 or newer. Executor construction
-returns `Unsupported` if the kernel lacks `IORING_ENTER_EXT_ARG`, which timed
-waits require. Other CPU architectures are not supported or validated, and the
-crate does not build or run on non-Linux targets.
+Requires x86-64 Linux 6.1 or newer and Rust 1.88 or newer. Executor
+construction returns `Unsupported` if the kernel lacks `IORING_ENTER_EXT_ARG`,
+`IORING_FEAT_NATIVE_WORKERS` or `IORING_OP_SENDMSG_ZC` support. An error from the
+kernel's operation probe is returned unchanged. Other CPU architectures are
+not supported or validated, and the crate does not build or run on non-Linux
+targets.
 
 ```toml
 [dependencies]

@@ -3,7 +3,7 @@
 //! # Compatibility
 //!
 //! This implementation targets the x86-64 Linux SCTP socket API and FlowIO's
-//! crate-wide x86-64 Linux 5.11-or-newer runtime floor.
+//! crate-wide x86-64 Linux 6.1-or-newer runtime floor.
 //!
 //! Baseline one-to-one SCTP operations are expected to work on supported x86-64
 //! Linux kernels where SCTP is enabled:
@@ -13,9 +13,7 @@
 //! - [`SctpStream::send_msg`]
 //! - [`SctpStream::recv_msg`]
 //!
-//! FlowIO uses the 14-byte `SCTP_EVENTS` subscription layout available since
-//! Linux 5.5. That predates the x86-64 Linux 5.11 runtime floor, so FlowIO does
-//! not fall back to the legacy 13-byte subscription layout.
+//! FlowIO uses the 14-byte `SCTP_EVENTS` subscription layout.
 //!
 //! More advanced SCTP controls and introspection depend on kernel support and
 //! runtime policy for the specific socket option involved. These methods may
@@ -1428,12 +1426,6 @@ impl SctpPaddrParamsFields {
             dscp: self.dscp,
         })
     }
-
-    fn requires_modern_sockopt(&self) -> bool {
-        self.ipv6_flow_label != 0
-            || self.dscp != 0
-            || (self.flags & (SPP_IPV6_FLOWLABEL | SPP_DSCP)) != 0
-    }
 }
 
 #[repr(C)]
@@ -1742,56 +1734,6 @@ impl SctpStatusRaw {
     }
 }
 
-#[repr(C, packed)]
-/// Legacy Linux `sctp_paddrparams` layout without flow-label or DSCP fields.
-struct SctpPaddrParamsRawLegacy {
-    /// Association selected by the parameter request.
-    assoc_id: libc::sctp_assoc_t,
-    /// Specific peer path, or an all-zero family for association-wide values.
-    address: libc::sockaddr_storage,
-    /// Heartbeat interval in milliseconds.
-    heartbeat_interval_ms: u32,
-    /// Maximum retransmissions before the selected path is considered failed.
-    path_max_retransmits: u16,
-    /// Configured path MTU in bytes.
-    path_mtu: u32,
-    /// Delayed-SACK interval in milliseconds.
-    sack_delay_ms: u32,
-    /// Legacy `SPP_*` option-selection and behavior bits.
-    flags: u32,
-}
-
-const SCTP_PADDR_PARAMS_LEGACY_OPT_LEN: usize =
-    align_sockopt_len(std::mem::size_of::<SctpPaddrParamsRawLegacy>());
-
-impl SctpPaddrParamsRawLegacy {
-    fn from_fields(fields: SctpPaddrParamsFields) -> Self {
-        Self {
-            assoc_id: fields.assoc_id,
-            address: fields.address,
-            heartbeat_interval_ms: fields.heartbeat_interval_ms,
-            path_max_retransmits: fields.path_max_retransmits,
-            path_mtu: fields.path_mtu,
-            sack_delay_ms: fields.sack_delay_ms,
-            flags: fields.flags,
-        }
-    }
-
-    fn to_fields(&self) -> SctpPaddrParamsFields {
-        SctpPaddrParamsFields {
-            assoc_id: read_unaligned_field!(self, assoc_id),
-            address: read_unaligned_field!(self, address),
-            heartbeat_interval_ms: read_unaligned_field!(self, heartbeat_interval_ms),
-            path_max_retransmits: read_unaligned_field!(self, path_max_retransmits),
-            path_mtu: read_unaligned_field!(self, path_mtu),
-            sack_delay_ms: read_unaligned_field!(self, sack_delay_ms),
-            flags: read_unaligned_field!(self, flags),
-            ipv6_flow_label: 0,
-            dscp: 0,
-        }
-    }
-}
-
 fn decode_peer_addr_params_sockopt(
     buffer: &[u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN],
     optlen: usize,
@@ -1801,17 +1743,11 @@ fn decode_peer_addr_params_sockopt(
         return raw.to_fields().to_public();
     }
 
-    if optlen == SCTP_PADDR_PARAMS_LEGACY_OPT_LEN {
-        let raw =
-            unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const SctpPaddrParamsRawLegacy) };
-        return raw.to_fields().to_public();
-    }
-
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "unexpected SCTP_PEER_ADDR_PARAMS length {} (expected {} or {})",
-            optlen, SCTP_PADDR_PARAMS_RAW_OPT_LEN, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN
+            "unexpected SCTP_PEER_ADDR_PARAMS length {} (expected 156)",
+            optlen
         ),
     ))
 }
@@ -3823,8 +3759,8 @@ impl SctpStream {
     /// Reads `SCTP_PEER_ADDR_PARAMS` for the whole association or for one specific path.
     ///
     /// On supported x86-64 Linux, the kernel response must use exactly the
-    /// 152-byte legacy or 156-byte modern rounded socket-option length. Any
-    /// other response length is returned as [`io::ErrorKind::InvalidData`].
+    /// 156-byte rounded socket-option length. Any other response length is
+    /// returned as [`io::ErrorKind::InvalidData`].
     ///
     /// This is path/association status-control work, not the per-message data
     /// fast path.
@@ -4421,17 +4357,6 @@ const _: () = {
     assert!(std::mem::offset_of!(SctpPaddrParamsRaw, ipv6_flow_label) == 150);
     assert!(std::mem::offset_of!(SctpPaddrParamsRaw, dscp) == 154);
     assert!(SCTP_PADDR_PARAMS_RAW_OPT_LEN == 156);
-
-    assert!(std::mem::size_of::<SctpPaddrParamsRawLegacy>() == 150);
-    assert!(std::mem::align_of::<SctpPaddrParamsRawLegacy>() == 1);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, assoc_id) == 0);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, address) == 4);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, heartbeat_interval_ms) == 132);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, path_max_retransmits) == 136);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, path_mtu) == 138);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, sack_delay_ms) == 142);
-    assert!(std::mem::offset_of!(SctpPaddrParamsRawLegacy, flags) == 146);
-    assert!(SCTP_PADDR_PARAMS_LEGACY_OPT_LEN == 152);
 
     assert!(SOCKET_TIMESTAMP_CONTROL_LEN == 32);
     assert!(SOCKET_TIMESTAMPING_CONTROL_LEN == 64);
@@ -6612,15 +6537,9 @@ fn paddr_params_bytes<T, const N: usize>(raw: &T) -> [u8; N] {
 
 fn apply_peer_addr_params_raw(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()> {
     let fields = SctpPaddrParamsFields::from_public(params);
-    if fields.requires_modern_sockopt() {
-        let raw = SctpPaddrParamsRaw::from_fields(fields);
-        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
-        set_sctp_sock_opt_bytes(fd, libc::SCTP_PEER_ADDR_PARAMS, &bytes)
-    } else {
-        let raw = SctpPaddrParamsRawLegacy::from_fields(fields);
-        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN>(&raw);
-        set_sctp_sock_opt_bytes(fd, libc::SCTP_PEER_ADDR_PARAMS, &bytes)
-    }
+    let raw = SctpPaddrParamsRaw::from_fields(fields);
+    let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
+    set_sctp_sock_opt_bytes(fd, libc::SCTP_PEER_ADDR_PARAMS, &bytes)
 }
 
 fn apply_default_peer_addr_params(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()> {
@@ -15874,7 +15793,6 @@ mod tests {
             ..SctpPeerAddrParams::for_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)))
         };
         let fields = SctpPaddrParamsFields::from_public(params);
-        assert!(fields.requires_modern_sockopt());
 
         let raw = SctpPaddrParamsRaw::from_fields(fields);
         let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
@@ -15885,7 +15803,7 @@ mod tests {
     }
 
     #[test]
-    fn paddr_params_legacy_sockopt_round_trips_common_fields() {
+    fn paddr_params_sockopt_preserves_common_field_bytes() {
         let params = SctpPeerAddrParams {
             assoc_id: 23,
             heartbeat_interval_ms: 15_000,
@@ -15896,14 +15814,17 @@ mod tests {
             ..SctpPeerAddrParams::for_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 3869)))
         };
         let fields = SctpPaddrParamsFields::from_public(params);
-        assert!(!fields.requires_modern_sockopt());
-
-        let raw = SctpPaddrParamsRawLegacy::from_fields(fields);
-        let legacy_bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN>(&raw);
-        let mut bytes = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
-        bytes[..legacy_bytes.len()].copy_from_slice(&legacy_bytes);
-        let decoded = decode_peer_addr_params_sockopt(&bytes, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN)
-            .expect("legacy paddr params should decode");
+        let raw = SctpPaddrParamsRaw::from_fields(fields);
+        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
+        let mut expected = [0u8; 150];
+        expected[..12].copy_from_slice(&[23, 0, 0, 0, 2, 0, 0x0f, 0x1d, 127, 0, 0, 1]);
+        expected[132..].copy_from_slice(&[
+            0x98, 0x3a, 0, 0, 3, 0, 0xb0, 4, 0, 0, 0x78, 0, 0, 0, 9, 0, 0, 0,
+        ]);
+        assert_eq!(bytes[..150], expected);
+        assert_eq!(bytes[150..], [0; 6]);
+        let decoded = decode_peer_addr_params_sockopt(&bytes, 156)
+            .expect("156-byte peer parameters should decode");
 
         assert_eq!(decoded, params);
         assert_eq!(decoded.ipv6_flow_label, 0);
@@ -15916,10 +15837,7 @@ mod tests {
 
         for optlen in (0..=157).chain(std::iter::once(usize::MAX)) {
             let result = decode_peer_addr_params_sockopt(&buffer, optlen);
-            if matches!(
-                optlen,
-                SCTP_PADDR_PARAMS_LEGACY_OPT_LEN | SCTP_PADDR_PARAMS_RAW_OPT_LEN
-            ) {
+            if optlen == 156 {
                 result.expect("exact supported peer-parameter length should decode");
                 continue;
             }
@@ -15929,41 +15847,11 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "unexpected SCTP_PEER_ADDR_PARAMS length {} (expected {} or {})",
-                    optlen, SCTP_PADDR_PARAMS_RAW_OPT_LEN, SCTP_PADDR_PARAMS_LEGACY_OPT_LEN
+                    "unexpected SCTP_PEER_ADDR_PARAMS length {} (expected 156)",
+                    optlen
                 )
             );
         }
-    }
-
-    #[test]
-    fn paddr_params_extended_fields_force_modern_sockopt() {
-        let common = SctpPeerAddrParams {
-            flags: SctpPeerAddrParams::HEARTBEAT_ENABLE,
-            ..SctpPeerAddrParams::association_default()
-        };
-        assert!(!SctpPaddrParamsFields::from_public(common).requires_modern_sockopt());
-
-        let by_flow_label = SctpPeerAddrParams {
-            ipv6_flow_label: 1,
-            ..common
-        };
-        assert!(SctpPaddrParamsFields::from_public(by_flow_label).requires_modern_sockopt());
-
-        let by_dscp = SctpPeerAddrParams { dscp: 1, ..common };
-        assert!(SctpPaddrParamsFields::from_public(by_dscp).requires_modern_sockopt());
-
-        let by_flow_flag = SctpPeerAddrParams {
-            flags: SctpPeerAddrParams::IPV6_FLOWLABEL,
-            ..common
-        };
-        assert!(SctpPaddrParamsFields::from_public(by_flow_flag).requires_modern_sockopt());
-
-        let by_dscp_flag = SctpPeerAddrParams {
-            flags: SctpPeerAddrParams::DSCP,
-            ..common
-        };
-        assert!(SctpPaddrParamsFields::from_public(by_dscp_flag).requires_modern_sockopt());
     }
 
     #[test]

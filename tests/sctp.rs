@@ -1774,7 +1774,7 @@ fn sctp_connect_slot_drop_cached_state_closes_socket_fd() {
 
 #[test]
 fn sctp_peer_addr_params_rejects_exact_length_neighbors() {
-    for optlen in [149, 150, 151, 153, 154, 155, 157] {
+    for optlen in [149, 150, 151, 152, 153, 154, 155, 157] {
         test_peer_addr_params_rejects_optlen(optlen).unwrap();
     }
 }

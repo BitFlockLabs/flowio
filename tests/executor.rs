@@ -2882,32 +2882,6 @@ fn runtime_write_ring_submit_eintr_is_absorbed() {
     );
 }
 
-#[cfg(any(debug_assertions, feature = "test-support"))]
-#[test]
-fn runtime_write_ring_submit_ebusy_is_absorbed() {
-    let mut executor = new_executor();
-
-    executor
-        .run(async move {
-            let (mut writer, _reader) = UnixStream::pair().expect("socketpair failed");
-            let drops = Rc::new(Cell::new(0));
-            let tracked = DropTrackedReadOnly::new(b"ebusy".to_vec(), &drops);
-
-            test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-            let (res, returned) = writer.write(tracked).await;
-            assert_eq!(res.expect("EBUSY should be absorbed"), 5);
-            assert_eq!(drops.get(), 0, "payload dropped before caller return");
-            drop(returned);
-            assert_eq!(drops.get(), 1, "returned payload dropped exactly once");
-        })
-        .expect("executor run failed");
-    assert_eq!(
-        test_hooks::ring_submit_failures_remaining(),
-        0,
-        "ring-submit EBUSY hook was not consumed"
-    );
-}
-
 #[test]
 fn runtime_op_pool_capacity_returns_would_block_and_payload() {
     let mut executor = Executor::new_with_config(ExecutorConfig {

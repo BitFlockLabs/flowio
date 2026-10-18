@@ -19,7 +19,7 @@ use crate::runtime::task::{TaskHeader, release_task};
 use crate::utils::disarm_unwind_guard;
 use crate::utils::memory::provider::BasicMemoryProvider;
 use crate::utils::memory::provider_owned_pool::ProviderOwnedPool;
-use io_uring::{IoUring, opcode, types};
+use io_uring::{IoUring, Probe, opcode, types};
 use std::collections::VecDeque;
 use std::io;
 use std::mem::ManuallyDrop;
@@ -127,25 +127,66 @@ mod kernel_timespec_tests {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum RequiredRingFeature {
+    ExtArg,
+    NativeWorkers,
+    SendMsgZc,
+}
+
 #[inline]
-fn missing_ext_arg_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "FlowIO requires Linux kernel 5.11 or newer with IORING_ENTER_EXT_ARG support",
+fn require_ring_feature(feature: RequiredRingFeature, supported: bool) -> io::Result<()> {
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    let supported =
+        !crate::runtime::test_hooks::take_reactor_feature_probe_failure(feature) && supported;
+
+    if !supported {
+        let name = match feature {
+            RequiredRingFeature::ExtArg => "IORING_ENTER_EXT_ARG",
+            RequiredRingFeature::NativeWorkers => "IORING_FEAT_NATIVE_WORKERS",
+            RequiredRingFeature::SendMsgZc => "IORING_OP_SENDMSG_ZC",
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("FlowIO requires Linux 6.1 or newer with {name} support"),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn require_probe_opcodes(supported: impl Fn(u8) -> bool) -> io::Result<()> {
+    require_ring_feature(
+        RequiredRingFeature::SendMsgZc,
+        supported(opcode::SendMsgZc::CODE),
     )
 }
 
 #[inline]
-fn validate_required_ring_features(ring: &IoUring) -> io::Result<()> {
+fn register_required_probe(ring: &IoUring, probe: &mut Probe) -> io::Result<()> {
     #[cfg(any(debug_assertions, feature = "test-support"))]
-    if crate::runtime::test_hooks::take_reactor_ext_arg_probe_failure() {
-        return Err(missing_ext_arg_error());
+    if let Some(err) = crate::runtime::test_hooks::take_probe_registration_failure() {
+        return Err(err);
     }
+    ring.submitter().register_probe(probe)
+}
 
-    if !ring.params().is_feature_ext_arg() {
-        return Err(missing_ext_arg_error());
-    }
-    Ok(())
+#[inline]
+fn validate_required_ring_features(ring: &IoUring) -> io::Result<()> {
+    // Feature checks precede registration so unsupported kernels report the
+    // missing capability; reactor_setup_checks_features_before_probe_registration
+    // protects this order.
+    require_ring_feature(
+        RequiredRingFeature::ExtArg,
+        ring.params().is_feature_ext_arg(),
+    )?;
+    require_ring_feature(
+        RequiredRingFeature::NativeWorkers,
+        ring.params().is_feature_native_workers(),
+    )?;
+    let mut probe = Probe::new();
+    register_required_probe(ring, &mut probe)?;
+    require_probe_opcodes(|op| probe.is_supported(op))
 }
 
 #[inline(always)]
@@ -571,10 +612,11 @@ unsafe fn release_shutdown_waiter(waiter: *mut TaskHeader, first_panic: &mut Opt
 /// type. Choose the ring size before creating the executor and keep the
 /// executor alive for steady-state work.
 ///
-/// FlowIO's timed reactor waits require Linux kernel 5.11 or newer with
-/// `IORING_ENTER_EXT_ARG` support. Executor construction reports
-/// [`std::io::ErrorKind::Unsupported`] when the running kernel lacks that
-/// feature.
+/// FlowIO requires x86-64 Linux 6.1 or newer. Executor construction checks
+/// `IORING_ENTER_EXT_ARG`, `IORING_FEAT_NATIVE_WORKERS` and
+/// `IORING_OP_SENDMSG_ZC` on the executor's ring, reporting
+/// [`std::io::ErrorKind::Unsupported`] when a capability is missing.
+/// Errors from registering the opcode probe are returned unchanged.
 ///
 /// # Example
 /// ```no_run
@@ -1170,16 +1212,7 @@ impl Reactor {
     }
 
     #[inline(always)]
-    fn refresh_completion_queue_view_after_submit_busy(&mut self) {
-        if let Some(ring) = self.ring.as_mut() {
-            let mut cq = ring.completion();
-            cq.sync();
-        }
-    }
-
-    #[inline(always)]
     fn submit_ring_for_sqe_capacity(&mut self) -> io::Result<()> {
-        let mut retried_after_busy = false;
         loop {
             match self.submit_ring() {
                 Ok(submitted) => {
@@ -1192,13 +1225,6 @@ impl Reactor {
                     }
                 }
                 Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
-                Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
-                    if retried_after_busy {
-                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                    }
-                    retried_after_busy = true;
-                    self.refresh_completion_queue_view_after_submit_busy();
-                }
                 Err(err) => return Err(err),
             }
         }
@@ -1504,9 +1530,6 @@ impl Reactor {
                 Ok(0) => return Ok(ReactorSubmitStatus::Busy),
                 Ok(_) => {}
                 Err(err) if is_raw_os_error(&err, libc::EINTR) => continue,
-                Err(err) if is_raw_os_error(&err, libc::EBUSY) => {
-                    return Ok(ReactorSubmitStatus::Busy);
-                }
                 Err(err) => return Err(err),
             }
         }
@@ -5751,11 +5774,14 @@ mod tests {
         reactor
             .submit_close_sqe(owner, 0)
             .expect("queue close failed");
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EIO);
 
         assert_eq!(
-            reactor.flush_sqes().expect("flush status failed"),
-            ReactorSubmitStatus::Busy
+            reactor
+                .flush_sqes()
+                .expect_err("injected submission error was ignored")
+                .raw_os_error(),
+            Some(libc::EIO)
         );
         assert_eq!(reactor.queued_head, 0);
         assert_eq!(reactor.next_sequence, 1);
@@ -5797,38 +5823,6 @@ mod tests {
             ReactorSubmitStatus::Ready
         );
         assert!(reactor.pending_closes.is_empty());
-        assert!(raw_fd_is_closed(raw));
-    }
-
-    #[cfg(any(debug_assertions, feature = "test-support"))]
-    #[test]
-    fn initially_full_close_persistent_ebusy_returns_owner_without_marker() {
-        let mut reactor =
-            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
-        reactor.init();
-        reactor
-            .submit_sqe(nop_sqe(1))
-            .expect("first nop submit failed");
-        reactor
-            .submit_sqe(nop_sqe(2))
-            .expect("second nop submit failed");
-        let before_head = reactor.queued_head;
-        let before_sequence = reactor.next_sequence;
-        let (raw, owner) = distinctive_owner();
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-
-        let (err, returned) = reactor
-            .submit_close_sqe(owner, 41)
-            .expect_err("persistent full-queue pressure should return ownership");
-
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(returned.as_raw_fd(), raw);
-        assert!(!raw_fd_is_closed(raw));
-        assert_eq!(reactor.queued_head, before_head);
-        assert_eq!(reactor.next_sequence, before_sequence);
-        assert!(reactor.pending_closes.is_empty());
-        drop(returned);
         assert!(raw_fd_is_closed(raw));
     }
 
@@ -6029,77 +6023,6 @@ mod tests {
         assert_eq!(reactor.next_sequence, 0);
         assert_eq!(reactor.queued_sqe_count(), 1);
         assert!(reactor.has_queued_sqes());
-    }
-
-    #[cfg(any(debug_assertions, feature = "test-support"))]
-    #[test]
-    fn submit_sqe_full_queue_transient_ebusy_retries_and_pushes() {
-        let mut reactor =
-            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
-        reactor.init();
-
-        reactor
-            .submit_sqe(nop_sqe(1))
-            .expect("first nop submit failed");
-        reactor
-            .submit_sqe(nop_sqe(2))
-            .expect("second nop submit failed");
-
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-        reactor
-            .submit_sqe(nop_sqe(3))
-            .expect("transient EBUSY should be retried");
-        assert_eq!(
-            crate::runtime::test_hooks::ring_submit_failures_remaining(),
-            0,
-            "full-queue EBUSY hook was not consumed"
-        );
-        assert!(
-            reactor.has_queued_sqes(),
-            "third NOP should remain pending after transient submit pressure"
-        );
-    }
-
-    #[cfg(any(debug_assertions, feature = "test-support"))]
-    #[test]
-    fn submit_sqe_full_queue_persistent_ebusy_returns_would_block() {
-        let mut reactor =
-            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
-        reactor.init();
-
-        reactor
-            .submit_sqe(nop_sqe(1))
-            .expect("first nop submit failed");
-        reactor
-            .submit_sqe(nop_sqe(2))
-            .expect("second nop submit failed");
-
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-        let err = reactor
-            .submit_sqe(nop_sqe(3))
-            .expect_err("persistent EBUSY should surface as pressure");
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(
-            reactor.has_queued_sqes(),
-            "existing queued SQEs should remain pending after pressure"
-        );
-    }
-
-    #[cfg(any(debug_assertions, feature = "test-support"))]
-    #[test]
-    fn flush_sqes_reports_busy_on_submit_ebusy() {
-        let mut reactor =
-            Reactor::new_with_config(ReactorConfig { ring_entries: 2 }).expect("reactor failed");
-        reactor.init();
-
-        reactor.submit_sqe(nop_sqe(1)).expect("nop submit failed");
-
-        crate::runtime::test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-        let status = reactor
-            .flush_sqes()
-            .expect("flush should not fail on EBUSY");
-        assert_eq!(status, ReactorSubmitStatus::Busy);
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]
@@ -6600,18 +6523,96 @@ mod tests {
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]
-    #[test]
-    fn reactor_setup_rejects_missing_ext_arg_support() {
-        crate::runtime::test_hooks::fail_next_reactor_ext_arg_probe();
+    fn assert_missing_ring_feature(feature: RequiredRingFeature, name: &str) {
+        crate::runtime::test_hooks::fail_next_reactor_feature_probe(feature);
         let err = match Reactor::new_with_config(ReactorConfig { ring_entries: 8 }) {
-            Ok(_) => panic!("reactor setup should fail without EXT_ARG support"),
+            Ok(_) => panic!("reactor setup should fail without {name} support"),
             Err(err) => err,
         };
 
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            err.to_string().contains("Linux kernel 5.11"),
-            "error should name the minimum kernel requirement: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!("FlowIO requires Linux 6.1 or newer with {name} support")
         );
+        Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+            .expect("feature failure injection must be consumed once");
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn reactor_setup_rejects_missing_ext_arg_support() {
+        assert_missing_ring_feature(RequiredRingFeature::ExtArg, "IORING_ENTER_EXT_ARG");
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn reactor_setup_rejects_missing_native_workers_support() {
+        assert_missing_ring_feature(
+            RequiredRingFeature::NativeWorkers,
+            "IORING_FEAT_NATIVE_WORKERS",
+        );
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn reactor_setup_rejects_missing_sendmsg_zc_support() {
+        assert_missing_ring_feature(RequiredRingFeature::SendMsgZc, "IORING_OP_SENDMSG_ZC");
+    }
+
+    #[test]
+    fn required_probe_opcodes_reject_pre_6_1_support() {
+        type OpcodeSupport = fn(u8) -> bool;
+        let cases: [(OpcodeSupport, bool); 3] = [
+            (|op| op != 48, false),
+            (|op| op <= 47, false),
+            (|_| true, true),
+        ];
+        for (supported, accepted) in cases {
+            let result = require_probe_opcodes(supported);
+            if accepted {
+                result.expect("supported opcode was rejected");
+            } else {
+                let err = result.expect_err("missing SENDMSG_ZC was accepted");
+                assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+                assert_eq!(
+                    err.to_string(),
+                    "FlowIO requires Linux 6.1 or newer with IORING_OP_SENDMSG_ZC support"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn reactor_setup_preserves_probe_registration_error() {
+        crate::runtime::test_hooks::fail_next_probe_registration_errno(libc::EIO);
+        let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+            .err()
+            .expect("probe registration failure was ignored");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+            .expect("probe failure must be consumed once");
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn reactor_setup_checks_features_before_probe_registration() {
+        crate::runtime::test_hooks::fail_next_reactor_feature_probe(RequiredRingFeature::ExtArg);
+        crate::runtime::test_hooks::fail_next_probe_registration_errno(libc::EIO);
+        let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+            .err()
+            .expect("missing EXT_ARG was accepted");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            err.to_string(),
+            "FlowIO requires Linux 6.1 or newer with IORING_ENTER_EXT_ARG support"
+        );
+        let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+            .err()
+            .expect("probe failure was consumed before the feature check");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+            .expect("probe failure must be consumed once");
     }
 }

@@ -54,6 +54,8 @@ fn runtime_unix_try_writes_return_epipe_without_sigpipe() {
         return;
     }
 
+    // Test binaries start with SIGPIPE ignored; restore its default action
+    // so an unsuppressed signal terminates the child.
     unsafe {
         assert_ne!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_ERR);
         let mut signals: libc::sigset_t = std::mem::zeroed();

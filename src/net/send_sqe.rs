@@ -124,6 +124,8 @@ pub(crate) mod test_support {
     }
 
     /// Predicts the next operation slot before the future allocates it.
+    /// The pool reuses the most recently freed slot; no other slot may be
+    /// allocated before the future's first poll.
     pub(crate) fn next_operation_user_data(
         owner: &std::rc::Rc<crate::runtime::executor::ExecutorOwner>,
     ) -> u64 {

@@ -7,12 +7,12 @@
 //!
 //! # Platform
 //!
-//! The supported platform is x86-64 Linux 5.11 or newer. Timed waits require
-//! `IORING_ENTER_EXT_ARG`; executor construction returns
-//! [`std::io::ErrorKind::Unsupported`] when the kernel lacks that feature.
-//! `IORING_OP_CLOSE` is available from Linux 5.6, and the 14-byte SCTP event
-//! subscription layout is available from Linux 5.5. Both fit this runtime
-//! floor; the SCTP transport does not use the older 13-byte layout.
+//! The supported platform is x86-64 Linux 6.1 or newer. Executor construction
+//! requires `IORING_ENTER_EXT_ARG`, `IORING_FEAT_NATIVE_WORKERS` and
+//! `IORING_OP_SENDMSG_ZC`, returning [`std::io::ErrorKind::Unsupported`] when
+//! a capability is missing. The opcode probe runs on the executor's ring.
+//! Descriptor teardown uses `IORING_OP_CLOSE`. SCTP event subscriptions use
+//! the 14-byte layout.
 //!
 //! # Ownership and cancellation
 //!

@@ -415,12 +415,12 @@ macro_rules! impl_stream_rw {
         ///
         /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds the chain's
         /// writable capacity or `u32::MAX`, the chain's total writable length
-        /// overflows `usize`, a nonzero `len`
-        /// targets a chain with more than 1024 non-empty writable segments, or
-        /// the chain's writable segment count or byte total changes before
-        /// submission. The overflow, segment-count, and shape failures return
-        /// the chain without submitting kernel I/O. A zero `len` is valid even
-        /// when the chain has no writable segments.
+        /// overflows `usize`, a nonzero `len` targets a chain with more than
+        /// 1024 non-empty writable segments, or the chain's writable segment
+        /// count or byte total changes before submission. The overflow,
+        /// segment-count, and shape failures return the chain without submitting
+        /// kernel I/O. A zero `len` is valid even when the chain has no writable
+        /// segments.
         pub fn readv_exact<const N: usize>(
             &mut self,
             buffer: IoBuffVecMut<N>,

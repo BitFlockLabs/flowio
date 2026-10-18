@@ -1707,13 +1707,12 @@ fn runtime_tcp_unsubmitted_readiness_retains_listener_fd_until_ring_safe() {
 
             // Keep the full one-entry SQ userspace-only when listener teardown
             // tries to queue cancellation.
-            test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
-            test_hooks::fail_next_ring_submit_errno(libc::EBUSY);
+            test_hooks::fail_next_ring_submit_errno(libc::EIO);
             drop(listener);
             assert_eq!(
                 test_hooks::ring_submit_failures_remaining(),
                 0,
-                "listener teardown did not consume both injected submit failures"
+                "listener teardown did not consume one injected submit failure"
             );
 
             let flags = unsafe { libc::fcntl(listener_fd, libc::F_GETFD) };
