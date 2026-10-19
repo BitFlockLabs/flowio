@@ -7834,9 +7834,8 @@ pub(crate) mod test_support {
         pub recv_buffer_size: usize,
         /// Effective one-to-one `SCTP_DEFAULT_SNDINFO` metadata.
         pub default_send_info: SctpSendInfo,
-        /// Linux `SO_BUF_LOCK` bitmask (`SOCK_SNDBUF_LOCK` and
-        /// `SOCK_RCVBUF_LOCK`) when the running kernel exposes it.
-        pub buffer_locks: Option<libc::c_int>,
+        /// Linux `SO_BUF_LOCK` bitmask (`SOCK_SNDBUF_LOCK` and `SOCK_RCVBUF_LOCK`).
+        pub buffer_locks: libc::c_int,
     }
 
     /// Feature-gated snapshot of the stream-owned dropped-receive lifecycle.
@@ -8047,11 +8046,7 @@ pub(crate) mod test_support {
     pub fn test_sctp_socket_options(fd: RawFd) -> io::Result<SctpSocketOptionSnapshot> {
         let (notifications, recv_rcvinfo) = test_sctp_socket_receive_options(fd)?;
         let nodelay: libc::c_int = get_sock_opt(fd, libc::IPPROTO_SCTP, libc::SCTP_NODELAY)?;
-        let buffer_locks = match get_sock_opt(fd, libc::SOL_SOCKET, libc::SO_BUF_LOCK) {
-            Ok(value) => Some(value),
-            Err(err) if err.raw_os_error() == Some(libc::ENOPROTOOPT) => None,
-            Err(err) => return Err(err),
-        };
+        let buffer_locks = get_sock_opt(fd, libc::SOL_SOCKET, libc::SO_BUF_LOCK)?;
 
         // `sctp_sndinfo` does not implement Default, and snd_assoc_id is an
         // input selector for getsockopt. Query the one-to-one default with

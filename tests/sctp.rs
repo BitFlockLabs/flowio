@@ -2892,15 +2892,11 @@ fn runtime_sctp_accept_inherits_listener_socket_options_and_preserves_buffer_loc
         exposed_listener_options.default_send_info,
         expected_send_info
     );
-    if let Some(buffer_locks) = exposed_listener_options.buffer_locks {
-        assert_eq!(buffer_locks & 0b11, 0b11);
-        assert_ne!(
-            exposed_listener_options.buffer_locks,
-            default_options.buffer_locks
-        );
-    } else {
-        assert_eq!(default_options.buffer_locks, None);
-    }
+    assert_eq!(exposed_listener_options.buffer_locks & 0b11, 0b11);
+    assert_ne!(
+        exposed_listener_options.buffer_locks,
+        default_options.buffer_locks
+    );
     assert_ne!(
         exposed_listener_options.notifications,
         default_options.notifications
