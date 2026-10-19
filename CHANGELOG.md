@@ -71,10 +71,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Changed
 
-- **Breaking (error text):** Socket reads and sends longer than `u32::MAX`
-  bytes report `InvalidInput` with the message
-  "length exceeds u32::MAX request limit". Match `io::ErrorKind` instead of the
-  display text.
+- **Breaking (error text):** The `InvalidInput` message for requests above
+  `u32::MAX` bytes is now "length exceeds u32::MAX request limit" in TCP and
+  Unix `try_read`, `read`, `read_exact`, `readv_exact`, `write` and `write_all`;
+  UDP `recv`, `recv_msg`, `recv_from`, `send` and `send_to`; SCTP `recv`,
+  `recv_msg`, `send` and `send_msg`; and TLS `read` and `read_exact`.
+  Match `io::ErrorKind` instead of the display text.
 - **Breaking:** A zero-byte receive completion, including EOF and an empty
   datagram, leaves a `Vec<u8>` buffer's length and contents unchanged instead
   of truncating it to zero. Use the returned byte count, or clear the buffer
@@ -246,11 +248,8 @@ Alpha prereleases carry no compatibility guarantee.
   completed count. UDP `send` in that range reports `EMSGSIZE`, while SCTP
   `send` may send a short complete message or report `EMSGSIZE`.
 - TCP and Unix `read`, `read_exact`, `readv` and `readv_exact`, and TLS
-  handshakes and reads wait for data instead of returning `WouldBlock` on
-  Linux 5.11 through 5.14.6. If another read consumes the available data
-  first, these reads also wait again instead of returning `WouldBlock` on
-  kernels without io_uring's poll retry limit: mainline before 6.3, 5.15.y
-  before 5.15.99, 6.1.y before 6.1.18 and 6.2.y before 6.2.3.
+  handshakes and reads wait for data again instead of returning `WouldBlock`
+  when another read consumes the available data first.
 - Buffer and task reference-count overflow terminates the process instead of
   wrapping and risking premature memory reclamation.
 - I/O submission returns `WouldBlock` when a full submission queue makes no
