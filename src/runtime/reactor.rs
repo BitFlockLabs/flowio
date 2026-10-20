@@ -724,6 +724,14 @@ impl DeferredCloseDrainGuard {
             runtime_state,
         }
     }
+
+    #[cold]
+    #[inline(never)]
+    fn drain(&mut self) {
+        run_cleanup_preserving_panic(|| unsafe {
+            Reactor::drain_deferred_closes_unchecked(self.reactor, self.runtime_state);
+        });
+    }
 }
 
 impl Drop for DeferredCloseDrainGuard {
@@ -733,9 +741,7 @@ impl Drop for DeferredCloseDrainGuard {
         if unsafe { (*deferred).is_empty() } {
             return;
         }
-        run_cleanup_preserving_panic(|| unsafe {
-            Reactor::drain_deferred_closes_unchecked(self.reactor, self.runtime_state);
-        });
+        self.drain();
     }
 }
 
@@ -1234,6 +1240,8 @@ impl Reactor {
         unsafe { self.pending_cancels.push_back(ptr) };
     }
 
+    #[cold]
+    #[inline(never)]
     fn retry_pending_cancels(&mut self) {
         // Capture one pass's work budget before retrying. Failed submissions
         // append at the tail and are not attempted again until the next pass.
@@ -1524,7 +1532,9 @@ impl Reactor {
     #[inline(always)]
     /// Flushes any queued SQEs to the kernel submission queue.
     pub fn flush_sqes(&mut self) -> io::Result<ReactorSubmitStatus> {
-        self.retry_pending_cancels();
+        if self.has_pending_cancels() {
+            self.retry_pending_cancels();
+        }
         while self.has_queued_sqes() {
             match self.submit_ring() {
                 Ok(0) => return Ok(ReactorSubmitStatus::Busy),
@@ -5743,6 +5753,43 @@ mod tests {
         close_fd_if_open(third_raw);
     }
 
+    #[test]
+    fn close_ledger_without_pending_closes_preserves_submission_accounting() {
+        let mut reactor =
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 }).expect("reactor failed");
+        reactor.init();
+        assert!(reactor.pending_closes.is_empty());
+
+        reactor.queued_head = 100;
+        reactor.next_sequence = 104;
+        reactor.retire_submitted(4).expect("full retirement failed");
+        assert_eq!((reactor.queued_head, reactor.next_sequence), (0, 0));
+
+        reactor.queued_head = 100;
+        reactor.next_sequence = 104;
+        reactor
+            .retire_submitted(2)
+            .expect("partial retirement failed");
+        assert_eq!((reactor.queued_head, reactor.next_sequence), (102, 104));
+        let error = reactor
+            .retire_submitted(3)
+            .expect_err("over-reported submissions must fail");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "io_uring reported more submissions than FlowIO queued"
+        );
+        assert_eq!((reactor.queued_head, reactor.next_sequence), (104, 104));
+
+        reactor.queued_head = u64::MAX - 1;
+        reactor.next_sequence = 2;
+        reactor
+            .retire_submitted(4)
+            .expect("wrapped retirement failed");
+        assert_eq!((reactor.queued_head, reactor.next_sequence), (0, 0));
+        assert!(reactor.pending_closes.is_empty());
+    }
+
     #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn failed_close_push_returns_the_identical_owner_without_a_marker() {
@@ -6062,6 +6109,10 @@ mod tests {
         let status = reactor
             .wait_for_events(Some(Duration::from_millis(1)))
             .expect("wait_for_events should report busy wait pressure");
+        assert_eq!(
+            crate::runtime::test_hooks::ring_wait_failures_remaining(),
+            0
+        );
         assert_eq!(status, ReactorSubmitStatus::Busy);
         assert!(
             !reactor.has_queued_sqes(),
@@ -6512,6 +6563,10 @@ mod tests {
 
         crate::runtime::test_hooks::fail_next_raw_sqe_submit();
         let status = reactor.flush_sqes().expect("cancel retry flush failed");
+        assert_eq!(
+            crate::runtime::test_hooks::raw_sqe_submit_failures_remaining(),
+            0
+        );
 
         assert_eq!(status, ReactorSubmitStatus::Busy);
         assert_eq!(reactor.pending_cancels.len(), 1);

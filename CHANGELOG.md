@@ -243,7 +243,6 @@ Alpha prereleases carry no compatibility guarantee.
 - `SctpPeerAddrParams::dscp` documentation now describes the DS-field byte
   that Linux applies: pass the DSCP codepoint shifted left by two (184 for
   EF); passing the bare codepoint, such as 46, sets a different DSCP.
-
 - TCP and Unix `write` and `write_all`, and UDP/SCTP `recv`, no longer fail
   with `InvalidInput` for requests from 2 GiB through `u32::MAX` bytes on
   kernels that reject larger socket operation lengths; this also covers

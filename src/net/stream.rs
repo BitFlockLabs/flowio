@@ -1729,7 +1729,9 @@ pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
     state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned destination buffer returned on completion.
     buffer: Option<B>,
-    /// Stream descriptor read from by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Validated caller request, clamped to i32::MAX at submission.
     len: u32,
@@ -1743,7 +1745,7 @@ pub struct ReadFuture<'a, B: IoBuffReadWrite, S> {
 
 impl<'a, B: IoBuffReadWrite, S> ReadFuture<'a, B, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: B, len: usize) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let len = match super::checked_read_len(len, buffer.writable_len()) {
@@ -1877,7 +1879,9 @@ pub struct WriteFuture<'a, B: IoBuffReadOnly, S> {
     state_ptr: RuntimeFdOpState<'a>,
     /// Caller-owned source buffer returned on completion.
     buffer: Option<B>,
-    /// Stream descriptor written by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Validated request length, clamped to `i32::MAX` on submission.
     len: u32,
@@ -1889,7 +1893,7 @@ pub struct WriteFuture<'a, B: IoBuffReadOnly, S> {
 
 impl<'a, B: IoBuffReadOnly, S> WriteFuture<'a, B, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: B) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let mut input_error = None;
         let len = match super::checked_send_len(buffer.len()) {
             Ok(len) => len,
@@ -2012,7 +2016,9 @@ pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
     /// Stable base pointer into the retained buffer, captured once after the
     /// buffer has been moved into operation state.
     base_ptr: *const u8,
-    /// Stream descriptor written by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Bytes already confirmed written by completed submissions.
     offset: u32,
@@ -2026,7 +2032,7 @@ pub struct WriteAllFuture<'a, B: IoBuffReadOnly, S> {
 
 impl<'a, B: IoBuffReadOnly, S> WriteAllFuture<'a, B, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: B) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let mut input_error = None;
         let total = match super::checked_send_len(buffer.len()) {
             Ok(total) => total,
@@ -2234,7 +2240,9 @@ pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
     buffer: Option<B>,
     /// Stable base pointer into the retained buffer's writable region.
     base_ptr: *mut u8,
-    /// Stream descriptor read from by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Exact byte count required before the future can succeed.
     target: u32,
@@ -2250,7 +2258,7 @@ pub struct ReadExactFuture<'a, B: IoBuffReadWrite, S> {
 
 impl<'a, B: IoBuffReadWrite, S> ReadExactFuture<'a, B, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: B, len: usize) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let write_base_len = buffer.write_base_len();
         let mut input_error = None;
         let target = match super::checked_read_len(len, buffer.writable_len()) {
@@ -2495,7 +2503,9 @@ pub struct ReadvFuture<'a, const N: usize, S> {
     /// reads complete before submission and debug checks do not re-walk the
     /// caller-owned chain.
     writable: usize,
-    /// Stream descriptor read from by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Exact deferred error classified by the single sizing pass, if any.
     deferred_error: DeferredReadvError,
@@ -2505,7 +2515,7 @@ pub struct ReadvFuture<'a, const N: usize, S> {
 
 impl<'a, const N: usize, S> ReadvFuture<'a, N, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: IoBuffVecMut<N>) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let (iov_count, writable, deferred_error) =
             match buffer.checked_read_iovec_count_and_writable_len() {
                 Some((iov_count, writable)) => (
@@ -2695,7 +2705,9 @@ pub struct WritevFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     iov_count: usize,
     /// Total initialized bytes available across all segments.
     total: usize,
-    /// Stream descriptor written by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
@@ -2703,7 +2715,7 @@ pub struct WritevFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
 
 impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevFuture<'a, C, N, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: C) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         Self {
             state_ptr: fd_state,
             buffer: Some(buffer),
@@ -2840,7 +2852,9 @@ pub struct WritevAllFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     buffer: Option<C>,
     /// Number of non-empty source segments to materialize into iovec scratch.
     iov_count: usize,
-    /// Stream descriptor written by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Total bytes that must be written before completion.
     total: usize,
@@ -2850,7 +2864,7 @@ pub struct WritevAllFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
 
 impl<'a, C: WriteBufferChain<N>, const N: usize, S> WritevAllFuture<'a, C, N, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, buffer: C) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         Self {
             state_ptr: fd_state,
             buffer: Some(buffer),
@@ -3117,7 +3131,9 @@ pub struct WritevProjectedFuture<'a, T: WritevProjection, S> {
     total: usize,
     /// Input-shape validation result computed once at construction.
     input_error: Option<io::Error>,
-    /// Stream descriptor written by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Borrows the parent stream for the future lifetime.
     _marker: PhantomData<&'a mut S>,
@@ -3125,7 +3141,7 @@ pub struct WritevProjectedFuture<'a, T: WritevProjection, S> {
 
 impl<'a, T: WritevProjection, S> WritevProjectedFuture<'a, T, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, source: T) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let (iov_count, total) = source.writev_count_and_len();
         let input_error = validate_projected_count_and_len(iov_count, total).err();
         Self {
@@ -3220,7 +3236,9 @@ pub struct WritevAllProjectedFuture<'a, T: WritevProjection, S> {
     source: Option<T>,
     /// Number of non-empty projected pieces reported by the source.
     iov_count: usize,
-    /// Stream descriptor written by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Total projected byte length that must be written before completion.
     total: usize,
@@ -3230,7 +3248,7 @@ pub struct WritevAllProjectedFuture<'a, T: WritevProjection, S> {
 
 impl<'a, T: WritevProjection, S> WritevAllProjectedFuture<'a, T, S> {
     pub(crate) fn new(fd_state: RuntimeFdOpState<'a>, source: T) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let (iov_count, total) = source.writev_count_and_len();
         Self {
             state_ptr: fd_state,
@@ -3437,7 +3455,9 @@ pub struct ReadvExactFuture<'a, const N: usize, S> {
     /// target validation and debug checks without re-walking the caller-owned
     /// chain.
     writable: usize,
-    /// Stream descriptor read from by this future.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Exact byte count required before the future can succeed.
     target: usize,
@@ -3464,7 +3484,7 @@ impl<'a, const N: usize, S> ReadvExactFuture<'a, N, S> {
         buffer: IoBuffVecMut<N>,
         target: usize,
     ) -> Self {
-        let fd = fd_state.raw_fd();
+        let fd = fd_state.debug_raw_fd();
         let (iov_count, writable, mut input_error) =
             match buffer.checked_read_iovec_count_and_writable_len() {
                 Some((iov_count, writable)) => (iov_count, writable, None),

@@ -468,6 +468,18 @@ impl<'a> RuntimeFdOpState<'a> {
         }
     }
 
+    const CHECK_RAW_FD: bool = cfg!(debug_assertions);
+
+    /// Returns the descriptor for debug checks, or `RuntimeFd::INVALID` in release builds.
+    #[inline(always)]
+    pub(crate) fn debug_raw_fd(&self) -> RawFd {
+        if Self::CHECK_RAW_FD {
+            self.raw_fd()
+        } else {
+            RuntimeFd::INVALID
+        }
+    }
+
     /// Checks a saved descriptor against this state when debug assertions are enabled.
     ///
     /// A negative state descriptor permits any saved descriptor value.
@@ -475,7 +487,7 @@ impl<'a> RuntimeFdOpState<'a> {
     #[track_caller]
     pub(crate) fn debug_assert_matches_raw_fd(&self, fd: RawFd, diagnostic: FdStateDiagnostic) {
         let state_fd = self.raw_fd();
-        if cfg!(debug_assertions) && !(state_fd < 0 || fd == state_fd) {
+        if Self::CHECK_RAW_FD && !(state_fd < 0 || fd == state_fd) {
             match diagnostic {
                 FdStateDiagnostic::Stream => {
                     panic!("stream future raw descriptor and typed operation state diverged")

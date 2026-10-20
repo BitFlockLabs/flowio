@@ -3501,6 +3501,15 @@ pub(crate) unsafe fn drop_op_ptr_unchecked(ptr: &mut *mut crate::runtime::op::Co
 /// of [`drop_op_ptr_unchecked`].
 #[inline(always)]
 pub(crate) unsafe fn drop_fd_op_state_unchecked(fd_state: &mut RuntimeFdOpState<'_>) {
+    if fd_state.is_null() {
+        return;
+    }
+    unsafe { drop_published_fd_op_state_unchecked(fd_state) };
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn drop_published_fd_op_state_unchecked(fd_state: &mut RuntimeFdOpState<'_>) {
     let mut state_ptr = fd_state.take_state_ptr();
     unsafe { drop_op_ptr_unchecked(&mut state_ptr) };
 }

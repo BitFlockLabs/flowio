@@ -3957,7 +3957,7 @@ impl SctpStream {
             input_error = Some(invalid_input_kind());
         }
         let state_ptr = self.fd.op_state();
-        let fd = state_ptr.raw_fd();
+        let fd = state_ptr.debug_raw_fd();
         DataRecvFuture {
             fd,
             state_ptr,
@@ -3993,7 +3993,7 @@ impl SctpStream {
             }
         };
         let state_ptr = self.fd.op_state();
-        let fd = state_ptr.raw_fd();
+        let fd = state_ptr.debug_raw_fd();
         DataSendFuture {
             fd,
             state_ptr,
@@ -4041,7 +4041,7 @@ impl SctpStream {
             }
         };
         let state_ptr = self.fd.op_state();
-        let fd = state_ptr.raw_fd();
+        let fd = state_ptr.debug_raw_fd();
         RecvFuture {
             fd,
             state_ptr,
@@ -4082,7 +4082,7 @@ impl SctpStream {
             }
         };
         let state_ptr = self.fd.op_state();
-        let fd = state_ptr.raw_fd();
+        let fd = state_ptr.debug_raw_fd();
         SendFuture {
             fd,
             state_ptr,
@@ -4134,7 +4134,7 @@ impl SctpStream {
                 None => (0, 0, true),
             };
         let state_ptr = self.fd.op_state();
-        let fd = state_ptr.raw_fd();
+        let fd = state_ptr.debug_raw_fd();
         RecvVectoredFuture {
             fd,
             state_ptr,
@@ -4176,7 +4176,7 @@ impl SctpStream {
                 None => (0, 0, true),
             };
         let state_ptr = self.fd.op_state();
-        let fd = state_ptr.raw_fd();
+        let fd = state_ptr.debug_raw_fd();
         SendVectoredFuture {
             fd,
             state_ptr,
@@ -5394,7 +5394,9 @@ unsafe fn prepare_unsubmitted_sctp_state(
 
 #[doc(hidden)]
 pub struct DataRecvFuture<'a, B: IoBuffReadWrite> {
-    /// SCTP association socket descriptor used for this data-only receive.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Completion state for the submitted receive operation.
     state_ptr: RuntimeFdOpState<'a>,
@@ -5492,7 +5494,9 @@ impl<B: IoBuffReadWrite> Drop for DataRecvFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct DataSendFuture<'a, B: IoBuffReadOnly> {
-    /// SCTP association socket descriptor used for this data-only send.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Completion state for the submitted send operation.
     state_ptr: RuntimeFdOpState<'a>,
@@ -5586,7 +5590,9 @@ impl<B: IoBuffReadOnly> Drop for DataSendFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct RecvFuture<'a, B: IoBuffReadWrite> {
-    /// SCTP association socket descriptor used for this recvmsg path.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Completion state for the submitted receive operation.
     state_ptr: RuntimeFdOpState<'a>,
@@ -5785,7 +5791,9 @@ impl<B: IoBuffReadWrite> Drop for RecvFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct SendFuture<'a, B: IoBuffReadOnly> {
-    /// SCTP association socket descriptor used for this sendmsg path.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Completion state for the submitted send operation.
     state_ptr: RuntimeFdOpState<'a>,
@@ -5888,7 +5896,9 @@ impl<B: IoBuffReadOnly> Drop for SendFuture<'_, B> {
 
 #[doc(hidden)]
 pub struct RecvVectoredFuture<'a, const N: usize> {
-    /// SCTP association socket descriptor used for this vectored recvmsg path.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Completion state for the submitted receive operation.
     state_ptr: RuntimeFdOpState<'a>,
@@ -6133,7 +6143,9 @@ impl<const N: usize> Drop for RecvVectoredFuture<'_, N> {
 
 #[doc(hidden)]
 pub struct SendVectoredFuture<'a, const N: usize> {
-    /// SCTP association socket descriptor used for this vectored sendmsg path.
+    /// Descriptor captured for debug-build checks against `state_ptr`.
+    /// Release builds store `RuntimeFd::INVALID`; SQE construction derives the
+    /// live descriptor from `state_ptr`.
     fd: RawFd,
     /// Completion state for the submitted send operation.
     state_ptr: RuntimeFdOpState<'a>,
