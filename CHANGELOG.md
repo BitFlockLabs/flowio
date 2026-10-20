@@ -240,6 +240,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- `SctpPeerAddrParams::dscp` documentation now describes the DS-field byte
+  that Linux applies: pass the DSCP codepoint shifted left by two (184 for
+  EF); passing the bare codepoint, such as 46, sets a different DSCP.
+
 - TCP and Unix `write` and `write_all`, and UDP/SCTP `recv`, no longer fail
   with `InvalidInput` for requests from 2 GiB through `u32::MAX` bytes on
   kernels that reject larger socket operation lengths; this also covers
@@ -250,6 +254,8 @@ Alpha prereleases carry no compatibility guarantee.
 - TCP and Unix `read`, `read_exact`, `readv` and `readv_exact`, and TLS
   handshakes and reads wait for data again instead of returning `WouldBlock`
   when another read consumes the available data first.
+  The early `WouldBlock` was most frequent on Linux 6.1.y before 6.1.18 and
+  6.2.y before 6.2.3.
 - Buffer and task reference-count overflow terminates the process instead of
   wrapping and risking premature memory reclamation.
 - I/O submission returns `WouldBlock` when a full submission queue makes no

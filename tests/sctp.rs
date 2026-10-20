@@ -4362,6 +4362,47 @@ fn runtime_sctp_vectored_empty_chain_semantics() {
 }
 
 #[test]
+fn runtime_sctp_peer_addr_params_round_trips_dscp_byte() {
+    let config = SctpSocketConfig::data(SctpInitConfig::diameter_default());
+    let Some(listener) = bind_sctp_listener_or_skip(
+        "runtime_sctp_peer_addr_params_round_trips_dscp_byte",
+        config,
+    ) else {
+        return;
+    };
+    let address = listener.local_addr();
+    let connector = SctpConnector::with_config(config);
+    let mut executor = Executor::new().expect("failed to construct executor");
+    executor
+        .run(async move {
+            let (client, server) = timeout(
+                Duration::from_secs(1),
+                accepted_sctp_pair(listener, connector, address),
+            )
+            .await
+            .expect("SCTP pair setup timed out");
+            client
+                .set_peer_addr_params(SctpPeerAddrParams {
+                    flags: SctpPeerAddrParams::DSCP,
+                    dscp: 184,
+                    ..SctpPeerAddrParams::for_address(address)
+                })
+                .expect("setting the SCTP peer DS-field byte failed");
+            let observed = client
+                .peer_addr_params(Some(address))
+                .expect("reading the SCTP peer DS-field byte failed");
+            assert_eq!(observed.address, Some(address));
+            assert_eq!(
+                observed.flags & SctpPeerAddrParams::DSCP,
+                SctpPeerAddrParams::DSCP
+            );
+            assert_eq!(observed.dscp, 184);
+            drop(server);
+        })
+        .expect("executor run failed");
+}
+
+#[test]
 fn runtime_sctp_default_peer_addr_params_rejects_specific_address() {
     use std::net::{Ipv4Addr, SocketAddr};
 

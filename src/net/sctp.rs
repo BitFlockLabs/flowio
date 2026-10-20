@@ -475,7 +475,9 @@ pub struct SctpPeerAddrParams {
     pub flags: u32,
     /// IPv6 flow label to apply when [`SctpPeerAddrParams::IPV6_FLOWLABEL`] is set.
     pub ipv6_flow_label: u32,
-    /// DSCP value to apply when [`SctpPeerAddrParams::DSCP`] is set.
+    /// DS-field byte to apply when [`SctpPeerAddrParams::DSCP`] is set: the DSCP
+    /// codepoint shifted left by two bits (184 for EF). Linux ignores the two
+    /// low bits.
     pub dscp: u8,
 }
 
@@ -741,7 +743,7 @@ impl SctpPeerAddrParams {
     pub const HEARTBEAT_TIME_IS_ZERO: u32 = SPP_HB_TIME_IS_ZERO;
     /// Applies the IPv6 flow label value.
     pub const IPV6_FLOWLABEL: u32 = SPP_IPV6_FLOWLABEL;
-    /// Applies the DSCP value.
+    /// Applies the DS-field byte in [`SctpPeerAddrParams::dscp`].
     pub const DSCP: u32 = SPP_DSCP;
 
     /// Returns an empty association-wide parameter block.
@@ -1347,7 +1349,7 @@ struct SctpSetPeerPrimRaw {
 }
 
 #[repr(C, packed)]
-/// Modern Linux `sctp_paddrparams` socket-option layout.
+/// Linux `sctp_paddrparams` layout: 155 packed bytes, 156-byte option length.
 struct SctpPaddrParamsRaw {
     /// Association selected by the parameter request.
     assoc_id: libc::sctp_assoc_t,
@@ -1365,7 +1367,7 @@ struct SctpPaddrParamsRaw {
     flags: u32,
     /// IPv6 flow label selected by `SPP_IPV6_FLOWLABEL`.
     ipv6_flow_label: u32,
-    /// DSCP value selected by `SPP_DSCP`.
+    /// DS-field byte selected by `SPP_DSCP`.
     dscp: u8,
 }
 
@@ -1394,7 +1396,7 @@ struct SctpPaddrParamsFields {
     flags: u32,
     /// IPv6 flow label selected by `SPP_IPV6_FLOWLABEL`.
     ipv6_flow_label: u32,
-    /// DSCP value selected by `SPP_DSCP`.
+    /// DS-field byte selected by `SPP_DSCP`.
     dscp: u8,
 }
 
@@ -3765,20 +3767,10 @@ impl SctpStream {
     /// This is path/association status-control work, not the per-message data
     /// fast path.
     pub fn peer_addr_params(&self, address: Option<SocketAddr>) -> io::Result<SctpPeerAddrParams> {
-        let mut buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
-        let request = SctpPaddrParamsRaw::from_fields(SctpPaddrParamsFields::from_public(
-            SctpPeerAddrParams {
-                address,
-                ..SctpPeerAddrParams::association_default()
-            },
-        ));
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &request as *const SctpPaddrParamsRaw as *const u8,
-                buffer.as_mut_ptr(),
-                std::mem::size_of::<SctpPaddrParamsRaw>(),
-            );
-        }
+        let mut buffer = peer_addr_params_sockopt_bytes(SctpPeerAddrParams {
+            address,
+            ..SctpPeerAddrParams::association_default()
+        });
         let mut optlen = buffer.len() as libc::socklen_t;
         let rc = unsafe {
             libc::getsockopt(
@@ -6520,25 +6512,23 @@ fn set_sctp_sock_opt_bytes(fd: RawFd, name: libc::c_int, value: &[u8]) -> io::Re
     Ok(())
 }
 
-fn paddr_params_bytes<T, const N: usize>(raw: &T) -> [u8; N] {
-    const {
-        assert!(std::mem::size_of::<T>() <= N);
-    }
-    let mut buffer = [0u8; N];
+fn peer_addr_params_sockopt_bytes(
+    params: SctpPeerAddrParams,
+) -> [u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN] {
+    let raw = SctpPaddrParamsRaw::from_fields(SctpPaddrParamsFields::from_public(params));
+    let mut buffer = [0u8; SCTP_PADDR_PARAMS_RAW_OPT_LEN];
     unsafe {
         std::ptr::copy_nonoverlapping(
-            raw as *const T as *const u8,
+            &raw as *const SctpPaddrParamsRaw as *const u8,
             buffer.as_mut_ptr(),
-            std::mem::size_of::<T>(),
+            std::mem::size_of::<SctpPaddrParamsRaw>(),
         );
     }
     buffer
 }
 
 fn apply_peer_addr_params_raw(fd: RawFd, params: SctpPeerAddrParams) -> io::Result<()> {
-    let fields = SctpPaddrParamsFields::from_public(params);
-    let raw = SctpPaddrParamsRaw::from_fields(fields);
-    let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
+    let bytes = peer_addr_params_sockopt_bytes(params);
     set_sctp_sock_opt_bytes(fd, libc::SCTP_PEER_ADDR_PARAMS, &bytes)
 }
 
@@ -15773,7 +15763,7 @@ mod tests {
     }
 
     #[test]
-    fn paddr_params_modern_sockopt_round_trips_extended_fields() {
+    fn paddr_params_sockopt_round_trips_extended_fields() {
         let params = SctpPeerAddrParams {
             assoc_id: 17,
             heartbeat_interval_ms: 30_000,
@@ -15784,15 +15774,14 @@ mod tests {
                 | SctpPeerAddrParams::IPV6_FLOWLABEL
                 | SctpPeerAddrParams::DSCP,
             ipv6_flow_label: 0xabcde,
-            dscp: 46,
+            dscp: 184,
             ..SctpPeerAddrParams::for_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 3868)))
         };
-        let fields = SctpPaddrParamsFields::from_public(params);
-
-        let raw = SctpPaddrParamsRaw::from_fields(fields);
-        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
+        let bytes = peer_addr_params_sockopt_bytes(params);
+        assert_eq!(bytes[154], 184);
+        assert_eq!(bytes[155], 0);
         let decoded = decode_peer_addr_params_sockopt(&bytes, SCTP_PADDR_PARAMS_RAW_OPT_LEN)
-            .expect("modern paddr params should decode");
+            .expect("156-byte peer parameters should decode");
 
         assert_eq!(decoded, params);
     }
@@ -15808,9 +15797,7 @@ mod tests {
             flags: SctpPeerAddrParams::HEARTBEAT_ENABLE | SctpPeerAddrParams::PMTUD_ENABLE,
             ..SctpPeerAddrParams::for_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 3869)))
         };
-        let fields = SctpPaddrParamsFields::from_public(params);
-        let raw = SctpPaddrParamsRaw::from_fields(fields);
-        let bytes = paddr_params_bytes::<_, SCTP_PADDR_PARAMS_RAW_OPT_LEN>(&raw);
+        let bytes = peer_addr_params_sockopt_bytes(params);
         let mut expected = [0u8; 150];
         expected[..12].copy_from_slice(&[23, 0, 0, 0, 2, 0, 0x0f, 0x1d, 127, 0, 0, 1]);
         expected[132..].copy_from_slice(&[

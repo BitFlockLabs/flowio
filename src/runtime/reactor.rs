@@ -6595,24 +6595,50 @@ mod tests {
             .expect("probe failure must be consumed once");
     }
 
+    #[test]
+    fn reactor_setup_preserves_restricted_probe_registration_error() {
+        let ring = IoUring::builder()
+            .setup_r_disabled()
+            .build(8)
+            .expect("disabled ring setup failed");
+        let mut restrictions = [io_uring::register::Restriction::register_op(0)];
+        ring.submitter()
+            .register_restrictions(&mut restrictions)
+            .expect("ring restrictions failed");
+        ring.submitter()
+            .register_enable_rings()
+            .expect("enabling restricted ring failed");
+        let err = validate_required_ring_features(&ring)
+            .expect_err("restricted probe registration was accepted");
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+    }
+
     #[cfg(any(debug_assertions, feature = "test-support"))]
     #[test]
     fn reactor_setup_checks_features_before_probe_registration() {
-        crate::runtime::test_hooks::fail_next_reactor_feature_probe(RequiredRingFeature::ExtArg);
-        crate::runtime::test_hooks::fail_next_probe_registration_errno(libc::EIO);
-        let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
-            .err()
-            .expect("missing EXT_ARG was accepted");
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(
-            err.to_string(),
-            "FlowIO requires Linux 6.1 or newer with IORING_ENTER_EXT_ARG support"
-        );
-        let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
-            .err()
-            .expect("probe failure was consumed before the feature check");
-        assert_eq!(err.raw_os_error(), Some(libc::EIO));
-        Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
-            .expect("probe failure must be consumed once");
+        for (feature, name) in [
+            (RequiredRingFeature::ExtArg, "IORING_ENTER_EXT_ARG"),
+            (
+                RequiredRingFeature::NativeWorkers,
+                "IORING_FEAT_NATIVE_WORKERS",
+            ),
+        ] {
+            crate::runtime::test_hooks::fail_next_reactor_feature_probe(feature);
+            crate::runtime::test_hooks::fail_next_probe_registration_errno(libc::EIO);
+            let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+                .err()
+                .expect("missing feature was accepted");
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(
+                err.to_string(),
+                format!("FlowIO requires Linux 6.1 or newer with {name} support")
+            );
+            let err = Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+                .err()
+                .expect("probe failure was consumed before the feature check");
+            assert_eq!(err.raw_os_error(), Some(libc::EIO));
+            Reactor::new_with_config(ReactorConfig { ring_entries: 8 })
+                .expect("probe failure must be consumed once");
+        }
     }
 }

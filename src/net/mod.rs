@@ -581,7 +581,7 @@ unsafe fn finish_completed_payload_take<T: 'static>(
     }
 }
 
-/// Maps the ordinary byte-count CQE shape used by transport data operations.
+/// Maps negative CQE results to OS errors; returns nonnegative completion values.
 #[inline(always)]
 fn completion_cqe_result(result: i32) -> io::Result<usize> {
     if result < 0 {
@@ -2269,6 +2269,7 @@ mod tests {
                     false,
                     Expected::OsError(libc::ECONNREFUSED),
                 ),
+                (-libc::EISCONN, false, Expected::OsError(libc::EISCONN)),
                 (0, true, Expected::ContextRejected),
             ] {
                 let state_ptr = unsafe { (&mut *reactor).alloc_op() };
