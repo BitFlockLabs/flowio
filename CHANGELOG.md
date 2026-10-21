@@ -240,6 +240,10 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- TCP and Unix `writev_all` and `writev_all_projected` wait for send-buffer
+  space and continue one segment at a time instead of returning `WouldBlock`
+  after part of the chain was sent, for example after the peer half-closes
+  the connection.
 - `SctpPeerAddrParams::dscp` documentation now describes the DS-field byte
   that Linux applies: pass the DSCP codepoint shifted left by two (184 for
   EF); passing the bare codepoint, such as 46, sets a different DSCP.

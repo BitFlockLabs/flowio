@@ -3277,6 +3277,9 @@ where
 /// - Do not use [`SctpStream::recv`] when EOR, truncation detection, receive
 ///   metadata, or notifications are part of the protocol contract.
 ///
+/// Message operations can also return the kernel's `WouldBlock`; see
+/// [error semantics](crate::net#error-semantics).
+///
 /// # Metadata receive semantics
 ///
 /// [`SctpStream::recv_msg`] and [`SctpStream::recv_msg_vectored`] return

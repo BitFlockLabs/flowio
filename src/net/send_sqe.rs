@@ -115,6 +115,13 @@ pub(crate) mod test_support {
                     .expect("socket operation did not build an entry")
             })
         }
+
+        pub(crate) fn assert_empty(&self) {
+            SOCKET_ENTRY.with(|entry| {
+                let captured = entry.borrow();
+                assert!(captured.as_ref().expect("capture missing").is_none());
+            });
+        }
     }
 
     impl Drop for SocketEntryCapture {
@@ -242,9 +249,22 @@ pub(crate) mod test_support {
     where
         F: Future<Output = (io::Result<usize>, Vec<u8>)> + Unpin,
     {
-        let (capture, owner) = poll_rejected_submission(cx, future, "scalar");
+        let owner = assert_rejected_scalar_owner(cx, future, &expected);
         assert_eq!(owner.as_ptr(), expected.owner_addr);
         assert_eq!(owner, expected_bytes);
+        owner
+    }
+
+    /// Inspects a rejected scalar submission without restricting its owner type.
+    pub(crate) fn assert_rejected_scalar_owner<F, B>(
+        cx: &mut Context<'_>,
+        future: &mut F,
+        expected: &ExpectedScalarEntry,
+    ) -> B
+    where
+        F: Future<Output = (io::Result<usize>, B)> + Unpin,
+    {
+        let (capture, owner) = poll_rejected_submission(cx, future, "scalar");
         assert!(Pin::new(&mut *future).poll(cx).is_pending());
         let entry = capture.take();
         assert_entry_fields(
@@ -259,7 +279,7 @@ pub(crate) mod test_support {
         owner
     }
 
-    fn assert_entry_fields(
+    pub(crate) fn assert_entry_fields(
         entry: &squeue::Entry,
         opcode: u8,
         fd: i32,

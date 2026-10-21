@@ -222,6 +222,8 @@ macro_rules! define_runtime_stats {
             pub writev_scratch_alloc_failures: usize,
             /// Partial vectored-write completions that advanced the operation's
             /// iovec array before resubmitting the remaining write window.
+            /// After a switch to single-buffer sends, a send that completes its whole
+            /// segment also counts when more segments remain.
             #[cfg(debug_assertions)]
             pub writev_partial_continuations: usize,
             /// Descriptor owners transferred to the executor's bounded close
@@ -328,6 +330,8 @@ pub struct RuntimeDiagnosticCounters {
     pub writev_scratch_slab_allocs: usize,
     /// Partial vectored writes that advanced retained iovec metadata before
     /// submitting the remaining write window.
+    /// After a switch to single-buffer sends, a send that completes its whole
+    /// segment also counts when more segments remain.
     pub writev_partial_continuations: usize,
 }
 

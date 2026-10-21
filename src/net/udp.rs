@@ -114,6 +114,9 @@ const SEND_FLAGS: i32 = 0;
 
 /// Datagram socket with generic buffer support.
 ///
+/// Message operations can also return the kernel's `WouldBlock`; see
+/// [error semantics](crate::net#error-semantics).
+///
 /// On the fast path, keep the socket open and connected to a default peer if
 /// that peer is stable. Avoid rebuilding sockets or using `send_to` /
 /// `recv_from` in that case; connected `send` / `recv` is the intended

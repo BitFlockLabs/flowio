@@ -3014,3 +3014,88 @@ mod bind_setup_support;
 fn runtime_tcp_bind_setup_failures_recover_exact_descriptors() {
     bind_setup_support::tcp();
 }
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_tcp_writev_all_after_peer_half_close_waits_and_sends_once() {
+    const NAME: &str = "runtime_tcp_writev_all_after_peer_half_close_waits_and_sends_once";
+    const CHILD: &str = "FLOWIO_TCP_WRITEV_ALL_FALLBACK_CHILD";
+    const FORM: &str = "FLOWIO_WRITEV_ALL_FORM";
+    let selected = std::env::var(FORM).ok();
+    assert!(matches!(
+        selected.as_deref(),
+        None | Some("chain" | "projected")
+    ));
+    if std::env::var_os(CHILD).is_none() {
+        for form in ["chain", "projected"] {
+            if selected.as_deref().is_none_or(|s| s == form) {
+                common::run_exact_test_child_with_watchdog_env(
+                    NAME,
+                    CHILD,
+                    Duration::from_secs(120),
+                    &[(FORM, form)],
+                );
+            }
+        }
+        return;
+    }
+    let projected = selected.expect("child form missing") == "projected";
+    static SEGMENTS: [&[u8]; 3] = [
+        &[0xA1; 4 * 1024 * 1024],
+        &[0xB2; 4 * 1024 * 1024],
+        &[0xC3; 4 * 1024 * 1024],
+    ];
+    run_test(async move {
+        let mut listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).expect("bind");
+        let addr = listener.local_addr();
+        let receive_capacity = Rc::new(Cell::new(0));
+        let peer_capacity = receive_capacity.clone();
+        let reader = Executor::spawn(async move {
+            let mut peer = TcpStream::connect(addr)
+                .expect("connect setup")
+                .await
+                .expect("connect");
+            peer.set_recv_buffer_size(256 * 1024)
+                .expect("set receive buffer");
+            let capacity = peer.recv_buffer_size().expect("get receive buffer");
+            assert!(capacity >= 256 * 1024);
+            peer_capacity.set(capacity);
+            let result = peer.write_all(b"request".to_vec()).await.0;
+            assert_eq!(result.expect("request write"), 7);
+            peer.shutdown(Shutdown::Write).expect("peer half-close");
+            sleep(Duration::from_millis(200)).await.expect("peer delay");
+            for segment in SEGMENTS {
+                let (result, bytes) = peer.read_exact(vec![0; segment.len()], segment.len()).await;
+                assert_eq!(result.expect("read segment"), segment.len());
+                assert_eq!(bytes, segment);
+            }
+            assert_eq!(peer.read(vec![0; 1], 1).await.0.expect("peer EOF"), 0);
+        })
+        .expect("spawn peer");
+        let (mut writer, _) = listener.accept().await.expect("accept");
+        writer
+            .set_send_buffer_size(256 * 1024)
+            .expect("set send buffer");
+        let capacity = writer.send_buffer_size().expect("get send buffer");
+        assert!(capacity >= 256 * 1024);
+        let (result, request) = writer.read_exact(vec![0; 7], 7).await;
+        assert_eq!(result.expect("read request"), 7);
+        assert_eq!(request, b"request");
+        assert_eq!(writer.read(vec![0; 1], 1).await.0.expect("request EOF"), 0);
+        assert!(
+            SEGMENTS
+                .iter()
+                .all(|segment| segment.len() > capacity + receive_capacity.get())
+        );
+        let result = if projected {
+            let source = TestProjected::new(SEGMENTS);
+            writer.writev_all_projected(source).await.0
+        } else {
+            writer.writev_all(make_read_only_chain(SEGMENTS)).await.0
+        };
+        assert_eq!(result.expect("writev_all failed"), 3 * 4 * 1024 * 1024);
+        writer.shutdown(Shutdown::Write).expect("writer EOF");
+        reader.await.expect("peer task failed");
+    });
+}

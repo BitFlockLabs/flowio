@@ -100,6 +100,27 @@
 //! readiness takes the ordinary one-shot rearm. Other `accept4` errors
 //! propagate unchanged.
 //!
+//! Message-based operations can also return the kernel's
+//! [`io::ErrorKind::WouldBlock`] after the socket reported readiness: UDP
+//! `recv_msg`, `recv_from` and `send_to`; SCTP `recv_msg`,
+//! `recv_msg_vectored`, `send_msg` and `send_msg_vectored`; and TCP/Unix
+//! `writev` and `writev_projected` with more than one non-empty segment or one
+//! segment of 4 GiB or more. This can happen on every supported kernel, for
+//! example when the send buffer is full while the receive side is shut down by
+//! [`Shutdown::Read`](std::net::Shutdown::Read) or by the peer's half-close,
+//! or while unread urgent data is pending, and when an unconnected UDP socket
+//! receives datagrams with invalid checksums. Such an operation sent or
+//! consumed nothing and returns its owner unchanged; repeating it can return
+//! the same error until the condition clears, so apply bounded backoff.
+//! Complete-buffer writes (`write_all`, `writev_all` and
+//! `writev_all_projected`) do not report progress when they fail: after any
+//! error, including `WouldBlock`, part of the buffer may already have been
+//! sent, and repeating the call can send that part again.
+//! Socket send timeouts (`SO_SNDTIMEO`) do not bound FlowIO writes: a write
+//! can wait for send-buffer space without a time limit, and it can also end
+//! with `WouldBlock` when that timeout passes without progress. Use
+//! cancellation or a FlowIO timeout to bound a call.
+//!
 //! [`io::ErrorKind::NotConnected`] also reports an invalid runtime poll
 //! context: transport futures must be polled inside the FlowIO executor that
 //! submitted them. An unsubmitted rental operation returns the buffer

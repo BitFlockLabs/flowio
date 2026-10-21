@@ -19,10 +19,14 @@ use flowio::net::unix::UnixStream;
 use flowio::runtime::buffer::iobuffvec::IoBuffVecMut;
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::executor::Executor;
+#[cfg(not(miri))]
+use flowio::runtime::timer::{TimeoutError, sleep, timeout};
 #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
 use flowio::test_support::runtime::{io::Nop, test_hooks};
 use std::cell::Cell;
 use std::io::{self, Read, Write};
+#[cfg(not(miri))]
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::task::Poll;
@@ -2006,3 +2010,184 @@ fn runtime_unix_readv_exact_eof_distributes_partial_data() {
         assert_eq!(chain.get(1).expect("seg1").payload_bytes(), b"lo");
     });
 }
+
+#[cfg(not(miri))]
+fn run_unix_writev_all_forms(name: &str, run: impl FnOnce(bool)) {
+    const CHILD: &str = "FLOWIO_UNIX_WRITEV_ALL_FALLBACK_CHILD";
+    const FORM: &str = "FLOWIO_WRITEV_ALL_FORM";
+    let selected = std::env::var(FORM).ok();
+    assert!(matches!(
+        selected.as_deref(),
+        None | Some("chain" | "projected")
+    ));
+    if std::env::var_os(CHILD).is_none() {
+        for form in ["chain", "projected"] {
+            if selected.as_deref().is_none_or(|s| s == form) {
+                common::run_exact_test_child_with_watchdog_env(
+                    name,
+                    CHILD,
+                    Duration::from_secs(30),
+                    &[(FORM, form)],
+                );
+            }
+        }
+        return;
+    }
+    run(selected.expect("child form missing") == "projected");
+}
+
+#[cfg(not(miri))]
+fn unix_writev_all_after_shutdown(projected: bool, peer_half_close: bool) {
+    static SEGMENTS: [&[u8]; 3] = [&[0xA1; 65536], &[0xB2; 65536], &[0xC3; 65536]];
+    run_test(async move {
+        let (mut writer, mut peer) = UnixStream::pair().expect("socketpair failed");
+        writer.set_send_buffer_size(4096).expect("set send buffer");
+        let capacity = writer.send_buffer_size().expect("get send buffer");
+        assert!(SEGMENTS.iter().all(|segment| segment.len() > capacity));
+        if !peer_half_close {
+            writer.shutdown(Shutdown::Read).expect("shutdown read");
+        }
+        let reader = Executor::spawn(async move {
+            if peer_half_close {
+                let result = peer.write_all(b"request".to_vec()).await.0;
+                assert_eq!(result.expect("request write"), 7);
+                peer.shutdown(Shutdown::Write).expect("peer half-close");
+            }
+            sleep(Duration::from_millis(200)).await.expect("peer delay");
+            for segment in SEGMENTS {
+                let (result, bytes) = peer.read_exact(vec![0; segment.len()], segment.len()).await;
+                assert_eq!(result.expect("read segment"), segment.len());
+                assert_eq!(bytes, segment);
+            }
+            assert_eq!(peer.read(vec![0; 1], 1).await.0.expect("peer EOF"), 0);
+        })
+        .expect("spawn peer");
+        if peer_half_close {
+            let (result, request) = writer.read_exact(vec![0; 7], 7).await;
+            assert_eq!(result.expect("read request"), 7);
+            assert_eq!(request, b"request");
+            assert_eq!(writer.read(vec![0; 1], 1).await.0.expect("request EOF"), 0);
+        }
+        let result = if projected {
+            let source = TestProjected::new(SEGMENTS);
+            writer.writev_all_projected(source).await.0
+        } else {
+            writer.writev_all(make_read_only_chain(SEGMENTS)).await.0
+        };
+        assert_eq!(result.expect("writev_all failed"), 3 * 65536);
+        writer.shutdown(Shutdown::Write).expect("writer EOF");
+        reader.await.expect("peer task failed");
+    });
+}
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_unix_writev_all_after_read_shutdown_waits_and_sends_once() {
+    run_unix_writev_all_forms(
+        "runtime_unix_writev_all_after_read_shutdown_waits_and_sends_once",
+        |form| {
+            unix_writev_all_after_shutdown(form, false);
+        },
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_unix_writev_all_after_peer_half_close_waits_and_sends_once() {
+    run_unix_writev_all_forms(
+        "runtime_unix_writev_all_after_peer_half_close_waits_and_sends_once",
+        |form| {
+            unix_writev_all_after_shutdown(form, true);
+        },
+    );
+}
+
+#[cfg(not(miri))]
+async fn cancel_waiting_scalar_send<B>(
+    future: impl std::future::Future<Output = (io::Result<usize>, B)>,
+    drops: impl Fn() -> usize,
+    expected_drops: usize,
+    peer: UnixStream,
+) {
+    let mut future = Box::pin(future);
+    let mut first_poll = true;
+    // Only the first send's completion can wake this task before the timer is armed.
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready((result, _)) = future.as_mut().poll(cx) {
+            panic!("send completed before scalar fallback cancellation: {result:?}");
+        }
+        if first_poll {
+            first_poll = false;
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    let result = timeout(Duration::from_millis(50), future).await;
+    assert!(matches!(result, Err(TimeoutError::Elapsed)));
+    assert_eq!(drops(), 0, "send owner dropped before target completion");
+    drop(peer);
+    for _ in 0..100 {
+        if drops() == expected_drops {
+            break;
+        }
+        sleep(Duration::from_millis(5))
+            .await
+            .expect("completion wait");
+    }
+    assert_eq!(drops(), expected_drops, "completion drop count");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn runtime_unix_writev_all_fallback_cancel_keeps_owner_until_completion() {
+    run_unix_writev_all_forms(
+        "runtime_unix_writev_all_fallback_cancel_keeps_owner_until_completion",
+        unix_cancel_scalar_fallback,
+    );
+}
+
+#[cfg(not(miri))]
+fn unix_cancel_scalar_fallback(projected: bool) {
+    use flowio::runtime::buffer::iobuffvec::IoBuffReadOnlyVec;
+    let mut executor = Executor::new().expect("executor");
+    executor
+        .run(async move {
+            let (mut writer, peer) = UnixStream::pair().expect("socketpair");
+            writer.set_send_buffer_size(4096).expect("set send buffer");
+            fill_try_send_buffer(|buffer| writer.try_write(buffer));
+            writer.shutdown(Shutdown::Read).expect("shutdown read");
+            if projected {
+                let (source, witness) = common::DropTrackedProjected17::new(b'p');
+                cancel_waiting_scalar_send(
+                    writer.writev_all_projected(source),
+                    || witness.drops(),
+                    1,
+                    peer,
+                )
+                .await;
+                assert_eq!(witness.projection_calls(), 1);
+            } else {
+                let drops = Rc::new(Cell::new(0));
+                let pieces = [0xA1, 0xB2, 0xC3]
+                    .map(|byte| common::DropTrackedReadOnly::new(vec![byte; 65536], &drops));
+                let chain = IoBuffReadOnlyVec::from_array(pieces);
+                cancel_waiting_scalar_send(writer.writev_all(chain), || drops.get(), 3, peer).await;
+            }
+        })
+        .expect("executor run");
+    #[cfg(debug_assertions)]
+    {
+        let stats = executor.last_stats();
+        let submits = stats.sqe_submits - stats.close_ring_submissions;
+        assert_eq!(submits, 2, "initial SENDMSG and fallback SEND");
+    }
+    let snapshot = executor.test_quiescence();
+    runtime_longevity_support::assert_quiescent(snapshot, "cancelled scalar fallback");
+}
+
+#[cfg(not(miri))]
+#[allow(dead_code)]
+#[path = "common/runtime_longevity.rs"]
+mod runtime_longevity_support;
