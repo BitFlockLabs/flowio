@@ -40,10 +40,14 @@
 //! [`unix::UnixStream`] and owns the submitted rental buffer, chain, or
 //! projection source until completion. It must be polled on the executor owner
 //! thread and, after submission, in its originating executor. Dropping an
-//! in-flight operation is nonblocking: FlowIO keeps any kernel-visible payload
-//! alive until it observes the operation's own completion. Racing read bytes
-//! can be discarded after cancellation, so framed protocols should treat read
-//! cancellation as terminal unless they provide stronger recovery semantics.
+//! in-flight operation does not itself wait for the operation: FlowIO keeps any
+//! kernel-visible payload alive until it observes the operation's own
+//! completion. If the drop releases the last reference to a finished task whose
+//! output owns an executor, that executor shuts down synchronously (see
+//! [ownership and cancellation](crate::runtime#ownership-and-cancellation)).
+//! Racing read bytes can be discarded after cancellation, so framed protocols
+//! should treat read cancellation as terminal unless they provide stronger
+//! recovery semantics.
 //!
 //! The operation fields and constructors are private, their layouts are not
 //! stable, and the futures are neither `Send` nor `Sync`. The implementation

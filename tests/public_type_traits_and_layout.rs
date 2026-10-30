@@ -38,9 +38,9 @@ use flowio::runtime::buffer::IoBuffMut;
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVec};
 #[cfg(not(miri))]
 use flowio::runtime::executor::{Executor, TrySpawnError};
-use flowio::runtime::executor::{ExecutorConfig, JoinError};
+use flowio::runtime::executor::{ExecutorConfig, JoinError, JoinHandle};
 use flowio::runtime::reactor::ReactorConfig;
-use flowio::runtime::timer::TimeoutError;
+use flowio::runtime::timer::{Sleep, Timeout, TimeoutError};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 #[cfg(not(miri))]
 use std::future::Future;
@@ -145,6 +145,21 @@ assert_local_unwind_boundary!(
     TlsFlushFuture<'static>,
     TlsShutdownFuture<'static>,
 );
+
+// Timer, join-handle and connection-setup futures are also bound to their
+// owner thread. `Ready<()>` and `()` are `Send` and `Sync`, so these checks
+// bind locality to the FlowIO type, not its parameter.
+assert_not_impl_any!(Sleep: Send, Sync);
+assert_not_impl_any!(Timeout<std::future::Ready<()>>: Send, Sync);
+assert_not_impl_any!(JoinHandle<()>: Send, Sync);
+assert_not_impl_any!(TcpAcceptFuture<'static>: Send, Sync);
+assert_not_impl_any!(TcpConnectFuture<'static>: Send, Sync);
+assert_not_impl_any!(TcpConnectTimeoutFuture<'static>: Send, Sync);
+assert_not_impl_any!(OwnedConnectFuture: Send, Sync);
+assert_not_impl_any!(OwnedConnectTimeoutFuture: Send, Sync);
+assert_not_impl_any!(SctpAcceptFuture<'static>: Send, Sync);
+assert_not_impl_any!(SctpConnectFuture<'static>: Send, Sync);
+assert_not_impl_any!(SctpConnectTimeoutFuture<'static>: Send, Sync);
 
 // These configuration and error values are runtime-independent and can cross
 // threads even though the handles above cannot.

@@ -127,10 +127,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 /// reads and writes rather than reconstructing it around each operation.
 ///
 /// The stream is an owner-OS-thread value and is neither [`Send`] nor [`Sync`].
-/// An idle stream may be used by another FlowIO executor on that same thread;
-/// once FlowIO queues I/O for submission, its future and operation slot stay
-/// bound to the originating executor until FlowIO observes the operation's own
-/// completion (see [`crate::net`] for exceptional ring abandonment).
+/// An idle stream may be used by another FlowIO executor on that same thread.
+/// Once FlowIO queues I/O for submission, its future stays bound to the
+/// originating executor until the future returns its result or is dropped,
+/// even after FlowIO observes the operation's own completion. If the future is
+/// dropped while the operation is in flight, its operation slot stays in use
+/// in that executor until FlowIO observes that completion (see [`crate::net`]
+/// for exceptional ring abandonment).
 ///
 /// # Example
 /// ```no_run

@@ -3329,7 +3329,11 @@ where
 /// in-flight [`SctpStream::recv_msg`] or [`SctpStream::recv_msg_vectored`]
 /// stays attached to the stream, which holds at most one such receive, until
 /// the next valid metadata receive consumes its completion or the stream is
-/// dropped. While such a dropped receive is attached (pending, completed, or
+/// dropped. That receive keeps the stream bound to the executor that submitted
+/// it, so using or dropping the stream in another executor's run is not
+/// supported while the receive is attached (see
+/// [`Executor::run`](crate::runtime::executor::Executor::run)).
+/// While such a dropped receive is attached (pending, completed, or
 /// stranded on an abandoned `io_uring`), or while a metadata receive is
 /// discarding the tail of an oversized record, [`SctpStream::recv`] returns
 /// [`io::ErrorKind::InvalidInput`] without allocating or submitting a receive,

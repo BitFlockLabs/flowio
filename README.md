@@ -185,6 +185,10 @@ and the [SCTP module](https://docs.rs/flowio/latest/flowio/net/sctp/index.html).
 
 - Runtime execution is single-threaded; its state and task wakers are not
   cross-thread APIs.
+- I/O futures and timers belong to the executor that started them. Moving one
+  to another executor on the same thread, including dropping it there, is not
+  supported; see
+  [`Executor::run`](https://docs.rs/flowio/latest/flowio/runtime/executor/struct.Executor.html#method.run).
 - Task and timer storage has no configurable total slab cap. Sleep allocation
   failures return `io::Error`; timeout wrappers use `TimeoutError::Runtime`.
 - Socket setup allocates, and positive socket linger can delay shutdown.

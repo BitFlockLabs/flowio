@@ -367,7 +367,7 @@ pub struct RuntimeQuiescence {
     pub timers_pending: bool,
     /// Completion states still checked out from the operation pool.
     pub live_ops: usize,
-    /// Orphaned operations waiting for another cancel submission attempt.
+    /// Operations awaiting an `ASYNC_CANCEL` submission attempt.
     pub pending_cancels: usize,
     /// Userspace SQEs not yet consumed by the kernel.
     pub queued_sqes: u64,
@@ -2907,7 +2907,16 @@ impl Executor {
     /// shutdown; an executor cannot be restarted after shutdown.
     /// Futures submitted or armed by one executor must remain on that executor;
     /// polling them outside an active run or through another executor's task
-    /// waker also returns [`io::ErrorKind::NotConnected`].
+    /// waker also returns [`io::ErrorKind::NotConnected`]. Dropping them inside
+    /// another executor's run is not supported either. Such a drop remains
+    /// memory-safe, but an in-flight operation can still complete, and it
+    /// keeps its buffer and descriptor at least until the submitting executor
+    /// runs again or is dropped.
+    /// If such a drop releases the last reference to a finished task whose
+    /// output owns an executor, for example the one that submitted or armed the
+    /// future, that executor shuts down inside the other run and can delay it
+    /// (see
+    /// [ownership and cancellation](crate::runtime#ownership-and-cancellation)).
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] if live runtime work remains but
     /// there are no ready tasks, in-flight I/O operations, or timers that can
@@ -3414,12 +3423,19 @@ impl Drop for Executor {
 }
 
 /// Cancel an in-flight operation from a future's `Drop` impl.
-/// Marks the `CompletionState` as orphaned and submits `ASYNC_CANCEL`.
-/// Reclaims through the completion state's recorded origin owner.
+/// Routes the cancellation to the reactor of the completion state's
+/// recorded origin owner, which queues `ASYNC_CANCEL` or a cancel-retry
+/// entry before releasing the waiter. The origin reclaims the state when
+/// it observes the target completion, which can happen inside that release
+/// if the release shuts the origin down; if a shutdown abandons the ring
+/// first, the state stays allocated until process exit. The owner pin held
+/// here keeps the origin reactor allocated through the release.
 ///
 /// # Safety
 ///
-/// `ptr` must point to a live, submitted completion state.
+/// `ptr` must point to a live, submitted, incomplete completion state that
+/// is not ring-abandoned, shutdown-owned or queued for cancel retry, and
+/// this must run on its origin reactor's owner thread.
 unsafe fn cancel_op_unchecked(ptr: *mut crate::runtime::op::CompletionState) {
     let Some(owner) = (unsafe { (*ptr).clone_owner() }) else {
         return;
@@ -4261,7 +4277,9 @@ where
                 let jt = &mut *(slot.data.as_mut_ptr() as *mut JoinTask<F>);
                 // Drop only the future. The result and join_waker must survive
                 // for the JoinHandle to consume. They are cleaned up in destroy
-                // when the last reference (executor or JoinHandle) is released.
+                // when the last task reference is released; besides the
+                // executor and JoinHandle, an operation or timer waiter or a
+                // waker clone can hold one.
                 drop_join_future_in_place(std::ptr::addr_of_mut!(jt.future));
             },
             cancel: |ptr| unsafe {

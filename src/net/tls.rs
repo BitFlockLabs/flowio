@@ -474,7 +474,11 @@ pub struct TlsClientOptions {
 /// not discard already-started raw transport work. Any in-flight TLS record
 /// read/write remains owned by the stream and will be resumed or retired by the
 /// next TLS operation. This keeps TLS record handling correct without adding a
-/// TLS-specific background thread.
+/// TLS-specific background thread. A staged raw read or write, in flight or
+/// completed but not yet consumed by a TLS operation, keeps the stream bound to
+/// the executor that submitted it, so using or dropping the stream in another
+/// executor's run is not supported while the stream holds one (see
+/// [`Executor::run`](crate::runtime::executor::Executor::run)).
 ///
 /// Every live TLS future poll validates that its waker belongs to the active
 /// FlowIO executor before it completes locally or touches rustls or staged raw

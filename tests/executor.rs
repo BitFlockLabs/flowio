@@ -6,9 +6,13 @@ use common::{
 };
 use flowio::net::unix::UnixStream;
 use flowio::net::{WritevPieces, WritevProjection};
+#[cfg(any(debug_assertions, feature = "test-support"))]
+use flowio::runtime::buffer::IoBuffReadWrite;
 use flowio::runtime::buffer::iobuffvec::{IoBuffReadOnlyVec, IoBuffVecMut};
 use flowio::runtime::buffer::pool::{IoBuffPool, IoBuffPoolConfig};
 use flowio::runtime::buffer::{IoBuffMut, IoBuffReadOnly};
+#[cfg(any(debug_assertions, feature = "test-support"))]
+use flowio::runtime::executor::RuntimeQuiescence;
 use flowio::runtime::executor::RuntimeStats;
 use flowio::runtime::executor::{Executor, ExecutorConfig, JoinError, JoinHandle, TrySpawnError};
 use flowio::runtime::reactor::ReactorConfig;
@@ -36,6 +40,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[allow(dead_code)]
+#[path = "common/runtime_longevity.rs"]
+mod runtime_longevity_support;
+
 const COMPLETION_DRAIN_REENTRANCY_CHILD_ENV: &str = "FLOWIO_COMPLETION_DRAIN_REENTRANCY_CHILD";
 const COMPLETION_DRAIN_REENTRANCY_CHILD_TEST: &str =
     "runtime_real_completion_drain_preserves_reentrant_operation_ownership";
@@ -50,6 +59,12 @@ const ABANDONED_READ_PAYLOAD_CHILD_TEST: &str =
 const ABANDONED_ESCAPED_READ_CHILD_ENV: &str = "FLOWIO_ABANDONED_ESCAPED_READ_CHILD";
 const ABANDONED_ESCAPED_READ_CHILD_TEST: &str =
     "runtime_executor_drop_fallback_keeps_escaped_read_pending";
+const CANCEL_UNWIND_CHILD_ENV: &str = "FLOWIO_CANCEL_UNWIND_CHILD";
+const CANCEL_UNWIND_CHILD_TEST: &str =
+    "runtime_dropped_read_unwinds_when_final_waiter_drops_executor";
+const FOREIGN_DRAIN_CANCEL_CHILD_ENV: &str = "FLOWIO_FOREIGN_DRAIN_CANCEL_CHILD";
+const FOREIGN_DRAIN_CANCEL_CHILD_TEST: &str =
+    "runtime_foreign_completion_drain_drop_reclaims_read_whose_final_waiter_owns_executor";
 
 fn new_executor() -> Executor {
     Executor::new().expect("failed to construct runtime executor")
@@ -2479,6 +2494,636 @@ fn runtime_executor_drop_fallback_keeps_escaped_read_pending() {
         "future drop did not retain the exact unresolved descriptor"
     );
     drop(writer);
+
+    // A final waiter release that tears the origin down through forced ring
+    // abandonment must find the cancel-retry entry already linked.
+    let mut origin =
+        stage_read_whose_waiter_owns_origin(OriginRelease::Drop, OriginRunExit::InjectedWaitError);
+    let origin_identity = fd_identity(origin.reader_fd).expect("origin reader fstat failed");
+    let read = origin.take_read();
+    test_hooks::fail_next_sqe_submit();
+    test_hooks::force_next_reactor_shutdown_fallback();
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        1,
+        "forced abandonment: fallback was not armed exactly once"
+    );
+    drop(read);
+    assert_cancel_published_at_release(&origin, "forced abandonment", (0, 1));
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "forced abandonment: origin teardown did not consume the fallback"
+    );
+    assert_eq!(
+        origin.buffer_drops.get(),
+        0,
+        "forced abandonment: ring-abandoned read payload was released"
+    );
+    assert_eq!(
+        fd_identity(origin.reader_fd).expect("forced abandonment: origin reader descriptor closed"),
+        origin_identity,
+        "forced abandonment: ring abandonment did not retain the read's descriptor"
+    );
+    drop(origin);
+}
+
+/// Read future retained outside the executor that submitted it.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+type StagedRead = Pin<Box<dyn Future<Output = (io::Result<usize>, DropTrackedReadWrite)>>>;
+
+/// What a completed task output does with the origin executor when cancelling
+/// the staged future releases that task's final reference.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+enum OriginRelease {
+    /// Drops the executor, so its teardown runs inside the waiter release.
+    Drop,
+    /// Drops the executor, then panics with `OriginReleasePanic`.
+    DropThenPanic,
+    /// Moves the executor into this slot instead of dropping it.
+    Keep(Rc<RefCell<Option<Executor>>>),
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[derive(Debug)]
+struct OriginReleasePanic;
+
+/// How the origin run ends while its staged future is still submitted or armed.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OriginRunExit {
+    /// An injected ring-wait error makes `run` return `Err(EIO)`.
+    InjectedWaitError,
+    /// A later root poll panics, and `run` propagates that panic.
+    TaskPanic,
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[derive(Debug)]
+struct OriginRunPanic;
+
+/// Origin ownership and staged-payload drops sampled inside the final release.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[derive(Clone, Copy)]
+struct ReleaseSnapshot {
+    origin: RuntimeQuiescence,
+    buffer_drops: usize,
+}
+
+/// Spawned-task output that owns the origin executor after its run returns.
+/// Apart from the `DropThenPanic` payload, its destructor only records values
+/// and then drops or keeps the executor.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+struct OriginExecutorHolder {
+    executor: Rc<RefCell<Option<Executor>>>,
+    buffer_drops: Rc<Cell<usize>>,
+    at_release: Rc<Cell<Option<ReleaseSnapshot>>>,
+    releases: Rc<Cell<usize>>,
+    release: OriginRelease,
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+impl Drop for OriginExecutorHolder {
+    fn drop(&mut self) {
+        self.releases.set(self.releases.get() + 1);
+        let Some(executor) = self.executor.borrow_mut().take() else {
+            return;
+        };
+        self.at_release.set(Some(ReleaseSnapshot {
+            origin: executor.test_quiescence(),
+            buffer_drops: self.buffer_drops.get(),
+        }));
+        match &self.release {
+            OriginRelease::Drop => drop(executor),
+            OriginRelease::DropThenPanic => {
+                drop(executor);
+                std::panic::panic_any(OriginReleasePanic);
+            }
+            OriginRelease::Keep(slot) => *slot.borrow_mut() = Some(executor),
+        }
+    }
+}
+
+/// Origin state after its run ended with one submitted read whose only waiter
+/// is a completed task that owns the executor.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+struct StagedOrigin {
+    read: Option<StagedRead>,
+    writer: UnixStream,
+    reader_fd: RawFd,
+    buffer_drops: Rc<Cell<usize>>,
+    at_release: Rc<Cell<Option<ReleaseSnapshot>>>,
+    releases: Rc<Cell<usize>>,
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+impl StagedOrigin {
+    fn take_read(&mut self) -> StagedRead {
+        self.read.take().expect("staged origin read already taken")
+    }
+
+    /// Writes one byte to the origin reader's peer, so the read's target CQE
+    /// can retire during a later origin drain.
+    fn send_peer_byte(&mut self) {
+        let (sent, _) = self.writer.try_write(b"x".to_vec());
+        assert_eq!(
+            sent.expect("origin peer byte send failed"),
+            1,
+            "origin peer byte was not sent"
+        );
+    }
+}
+
+/// Future left submitted or armed by a staged origin run, with the release
+/// record of the task output that owns the origin executor.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+struct WaiterOwnedOrigin<F> {
+    future: F,
+    at_release: Rc<Cell<Option<ReleaseSnapshot>>>,
+    releases: Rc<Cell<usize>>,
+}
+
+/// Runs `executor` until it ends with `future` submitted or armed and a
+/// completed spawned task as its only waiter, then moves the executor into
+/// that task's output. `check` inspects the origin state after the run ends,
+/// and `what` names the future in assertion messages.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+fn stage_waiter_owning_origin<F: Future + Unpin + 'static>(
+    mut executor: Executor,
+    future: F,
+    what: &'static str,
+    buffer_drops: &Rc<Cell<usize>>,
+    release: OriginRelease,
+    exit: OriginRunExit,
+    check: impl FnOnce(&RuntimeQuiescence),
+) -> WaiterOwnedOrigin<F> {
+    let staged = Rc::new(RefCell::new(Some(future)));
+    let executor_slot = Rc::new(RefCell::new(None));
+    let at_release = Rc::new(Cell::new(None));
+    let releases = Rc::new(Cell::new(0usize));
+    let holder = OriginExecutorHolder {
+        executor: Rc::clone(&executor_slot),
+        buffer_drops: Rc::clone(buffer_drops),
+        at_release: Rc::clone(&at_release),
+        releases: Rc::clone(&releases),
+        release,
+    };
+    let staged_for_waiter = Rc::clone(&staged);
+    let origin_run = async move {
+        let waiter = Executor::spawn(async move {
+            poll_fn(|cx| {
+                let mut slot = staged_for_waiter.borrow_mut();
+                let future = slot
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("staged origin {what} missing"));
+                assert!(
+                    Pin::new(future).poll(cx).is_pending(),
+                    "staged origin {what} completed before its run ended"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            if exit == OriginRunExit::InjectedWaitError {
+                test_hooks::fail_next_ring_wait_errno(libc::EIO);
+            }
+            holder
+        })
+        .unwrap_or_else(|err| panic!("spawn origin {what} waiter: {err:?}"));
+        drop(waiter);
+        if exit == OriginRunExit::TaskPanic {
+            // The timer resumes the root in a later pass, after any SQE the
+            // waiter queued has been submitted.
+            sleep(Duration::from_millis(1))
+                .await
+                .expect("origin run-ending sleep failed");
+            std::panic::panic_any(OriginRunPanic);
+        }
+    };
+    match exit {
+        OriginRunExit::InjectedWaitError => {
+            let err = executor
+                .run(origin_run)
+                .expect_err("injected wait error should end the origin run");
+            assert_eq!(err.raw_os_error(), Some(libc::EIO));
+            assert_eq!(test_hooks::ring_wait_failures_remaining(), 0);
+        }
+        OriginRunExit::TaskPanic => {
+            let payload =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(origin_run)))
+                    .expect_err("origin task panic should end the origin run");
+            assert!(
+                payload.is::<OriginRunPanic>(),
+                "origin run ended with a different panic"
+            );
+        }
+    }
+    let before = executor.test_quiescence();
+    check(&before);
+    assert!(
+        !before.task_registry_empty,
+        "origin {what} waiter was released before cancellation"
+    );
+    assert_eq!(
+        releases.get(),
+        0,
+        "origin {what} waiter output dropped before cancellation"
+    );
+    *executor_slot.borrow_mut() = Some(executor);
+    let future = staged
+        .borrow_mut()
+        .take()
+        .unwrap_or_else(|| panic!("staged origin {what} missing"));
+    WaiterOwnedOrigin {
+        future,
+        at_release,
+        releases,
+    }
+}
+
+/// Runs a fresh executor until it ends with one submitted read whose only
+/// waiter is a completed spawned task, then moves the executor into that
+/// task's output. The read is the only operation the executor has allocated,
+/// so its operation pool has no free slot until the read retires.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+fn stage_read_whose_waiter_owns_origin(
+    release: OriginRelease,
+    exit: OriginRunExit,
+) -> StagedOrigin {
+    let executor = new_executor();
+    let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+    let reader_fd = reader.as_raw_fd();
+    let buffer_drops = Rc::new(Cell::new(0usize));
+    let read_drops = Rc::clone(&buffer_drops);
+    let read: StagedRead = Box::pin(async move {
+        reader
+            .read(DropTrackedReadWrite::zeroed(64, &read_drops), 64)
+            .await
+    });
+    let staged = stage_waiter_owning_origin(
+        executor,
+        read,
+        "read",
+        &buffer_drops,
+        release,
+        exit,
+        |before| {
+            assert_eq!(
+                (
+                    before.live_tasks,
+                    before.live_ops,
+                    before.inflight_ops,
+                    before.queued_sqes,
+                    before.pending_cancels,
+                    before.operation_slab_pages,
+                    before.retained_pooled_allocs + before.retained_heap_allocs,
+                    before.storage_abandoned,
+                ),
+                (0, 1, 1, 0, 0, 1, 1, false),
+                "origin run did not end with the waiter-owned read as its only operation"
+            );
+            assert_eq!(
+                buffer_drops.get(),
+                0,
+                "origin read buffer dropped before cancellation"
+            );
+        },
+    );
+    StagedOrigin {
+        read: Some(staged.future),
+        writer,
+        reader_fd,
+        buffer_drops,
+        at_release: staged.at_release,
+        releases: staged.releases,
+    }
+}
+
+/// Checks the origin snapshot taken while the read's cancellation released
+/// its final waiter.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+fn assert_cancel_published_at_release(origin: &StagedOrigin, phase: &str, expected: (u64, usize)) {
+    assert_eq!(
+        origin.releases.get(),
+        1,
+        "{phase}: final waiter output was not dropped exactly once"
+    );
+    let snapshot = origin
+        .at_release
+        .get()
+        .expect("final waiter output did not observe the origin executor");
+    let at_release = snapshot.origin;
+    assert_eq!(
+        (at_release.queued_sqes, at_release.pending_cancels),
+        expected,
+        "{phase}: cancellation was not published before the final waiter release"
+    );
+    assert_eq!(
+        (at_release.live_ops, at_release.inflight_ops),
+        (1, 1),
+        "{phase}: cancelled read left the origin registry before its waiter release"
+    );
+    assert_eq!(
+        at_release.retained_pooled_allocs + at_release.retained_heap_allocs,
+        at_release.retained_pooled_frees + at_release.retained_heap_frees + 1,
+        "{phase}: cancelled read payload was released before its waiter release"
+    );
+    assert_eq!(
+        snapshot.buffer_drops, 0,
+        "{phase}: read buffer dropped before its waiter release"
+    );
+    assert!(
+        !at_release.storage_abandoned,
+        "{phase}: origin storage was abandoned before the waiter release"
+    );
+}
+
+/// Writable buffer that drops a staged origin read when it is dropped. A
+/// foreign executor drops it inside its completion drain when the orphaned
+/// foreign read that carries it retires.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+struct OriginReadDropBuffer {
+    bytes: DropTrackedReadWrite,
+    read: Option<StagedRead>,
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+impl Drop for OriginReadDropBuffer {
+    fn drop(&mut self) {
+        drop(self.read.take());
+    }
+}
+
+// SAFETY: the three required methods forward to `DropTrackedReadWrite`, which
+// implements only those methods and upholds the trait contract, so the
+// provided methods behave as they do for it; the staged read does not affect
+// the writable range.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+unsafe impl IoBuffReadWrite for OriginReadDropBuffer {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    fn writable_len(&self) -> usize {
+        self.bytes.writable_len()
+    }
+
+    unsafe fn set_written_len(&mut self, len: usize) {
+        unsafe { self.bytes.set_written_len(len) };
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_dropped_read_publishes_cancel_before_final_waiter_release() {
+    for (phase, fail_cancel_submit, expected) in [
+        ("submission queue", false, (1, 0)),
+        ("retry queue", true, (0, 1)),
+    ] {
+        let kept = Rc::new(RefCell::new(None));
+        let mut origin = stage_read_whose_waiter_owns_origin(
+            OriginRelease::Keep(Rc::clone(&kept)),
+            OriginRunExit::InjectedWaitError,
+        );
+        let read = origin.take_read();
+        if fail_cancel_submit {
+            test_hooks::fail_next_sqe_submit();
+        }
+        drop(read);
+        assert_cancel_published_at_release(&origin, phase, expected);
+        let mut executor = kept
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| panic!("{phase}: final waiter output did not keep the executor"));
+        let after = executor.test_quiescence();
+        assert_eq!(
+            (
+                after.live_ops,
+                after.inflight_ops,
+                after.queued_sqes,
+                after.pending_cancels
+            ),
+            (1, 1, expected.0, expected.1),
+            "{phase}: published cancellation did not outlast the waiter release"
+        );
+        origin.send_peer_byte();
+        executor
+            .run(async {})
+            .unwrap_or_else(|err| panic!("{phase}: origin drain run failed: {err}"));
+        assert_eq!(
+            origin.buffer_drops.get(),
+            1,
+            "{phase}: cancelled read payload was not released once"
+        );
+        runtime_longevity_support::assert_quiescent(executor.test_quiescence(), phase);
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_dropped_read_reclaims_when_final_waiter_drops_executor() {
+    let mut origin =
+        stage_read_whose_waiter_owns_origin(OriginRelease::Drop, OriginRunExit::InjectedWaitError);
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "reclaim: a shutdown fallback was already armed"
+    );
+    origin.send_peer_byte();
+    drop(origin.take_read());
+    assert_cancel_published_at_release(&origin, "reclaim", (1, 0));
+    assert_eq!(
+        origin.buffer_drops.get(),
+        1,
+        "reclaim: target retirement did not release the read payload once"
+    );
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_dropped_read_reclaims_after_task_panic_ends_origin_run() {
+    let mut origin =
+        stage_read_whose_waiter_owns_origin(OriginRelease::Drop, OriginRunExit::TaskPanic);
+    origin.send_peer_byte();
+    drop(origin.take_read());
+    assert_cancel_published_at_release(&origin, "reclaim after task panic", (1, 0));
+    assert_eq!(
+        origin.buffer_drops.get(),
+        1,
+        "reclaim after task panic: target retirement did not release the read payload once"
+    );
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_dropped_read_unwinds_when_final_waiter_drops_executor() {
+    if std::env::var_os(CANCEL_UNWIND_CHILD_ENV).is_none() {
+        // Uncaptured child output keeps every panic report, including an
+        // abort's, in one ordered stderr stream; this test prints nothing to
+        // stdout, so the pass line stays intact.
+        common::run_exact_test_child_with_watchdog_env(
+            CANCEL_UNWIND_CHILD_TEST,
+            CANCEL_UNWIND_CHILD_ENV,
+            Duration::from_secs(120),
+            &[("RUST_TEST_NOCAPTURE", "1")],
+        );
+        return;
+    }
+
+    let mut origin = stage_read_whose_waiter_owns_origin(
+        OriginRelease::DropThenPanic,
+        OriginRunExit::InjectedWaitError,
+    );
+    origin.send_peer_byte();
+    let read = origin.take_read();
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(read)))
+        .expect_err("unwinding release: final waiter output did not panic");
+    assert!(
+        payload.is::<OriginReleasePanic>(),
+        "unwinding release: a different panic escaped the read drop"
+    );
+    assert_cancel_published_at_release(&origin, "unwinding release", (1, 0));
+    assert_eq!(
+        origin.buffer_drops.get(),
+        1,
+        "unwinding release: target retirement did not release the read payload once"
+    );
+}
+
+/// Another executor's task drops a submitted read. The run contract does not
+/// support this use; the test checks that it stays memory-safe.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_foreign_task_drop_cancels_read_whose_final_waiter_owns_executor() {
+    let mut origin =
+        stage_read_whose_waiter_owns_origin(OriginRelease::Drop, OriginRunExit::InjectedWaitError);
+    assert_eq!(
+        test_hooks::reactor_shutdown_fallbacks_remaining(),
+        0,
+        "foreign task poll: a shutdown fallback was already armed"
+    );
+    let read = origin.take_read();
+    let mut foreign = new_executor();
+    foreign
+        .run(async move {
+            drop(read);
+        })
+        .expect("foreign task poll: foreign run failed");
+    assert_cancel_published_at_release(&origin, "foreign task poll", (1, 0));
+    assert_eq!(
+        origin.buffer_drops.get(),
+        1,
+        "foreign task poll: the published cancel did not retire the read"
+    );
+    runtime_longevity_support::assert_quiescent(foreign.test_quiescence(), "foreign task poll");
+    foreign
+        .run(async {})
+        .expect("foreign task poll: foreign executor did not run again");
+}
+
+/// A destructor in another executor's completion drain drops a submitted read.
+/// The run contract does not support this use; the test checks that it stays
+/// memory-safe.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_foreign_completion_drain_drop_reclaims_read_whose_final_waiter_owns_executor() {
+    if std::env::var_os(FOREIGN_DRAIN_CANCEL_CHILD_ENV).is_none() {
+        run_exact_test_child_with_watchdog(
+            FOREIGN_DRAIN_CANCEL_CHILD_TEST,
+            FOREIGN_DRAIN_CANCEL_CHILD_ENV,
+            Duration::from_secs(8),
+        );
+        return;
+    }
+
+    let mut origin =
+        stage_read_whose_waiter_owns_origin(OriginRelease::Drop, OriginRunExit::InjectedWaitError);
+    origin.send_peer_byte();
+    let carrier_drops = Rc::new(Cell::new(0usize));
+    let carrier = OriginReadDropBuffer {
+        bytes: DropTrackedReadWrite::zeroed(1, &carrier_drops),
+        read: Some(origin.take_read()),
+    };
+    let (mut carrier_reader, mut carrier_writer) =
+        UnixStream::pair().expect("carrier socketpair failed");
+    let (sent, _) = carrier_writer.try_write(b"y".to_vec());
+    assert_eq!(
+        sent.expect("carrier peer byte send failed"),
+        1,
+        "carrier peer byte was not sent"
+    );
+    let mut foreign = new_executor();
+    foreign
+        .run(async move {
+            poll_once_pending(carrier_reader.read(carrier, 1)).await;
+        })
+        .expect("foreign completion drain: foreign run failed");
+    assert_eq!(
+        carrier_drops.get(),
+        1,
+        "foreign completion drain: carrier payload was not released once"
+    );
+    assert_cancel_published_at_release(&origin, "foreign completion drain", (0, 1));
+    assert_eq!(
+        origin.buffer_drops.get(),
+        1,
+        "foreign completion drain: origin read payload was not released once"
+    );
+    runtime_longevity_support::assert_quiescent(
+        foreign.test_quiescence(),
+        "foreign completion drain",
+    );
+    drop(carrier_writer);
+}
+
+/// Another executor's task drops an armed sleep. The run contract does not
+/// support this use; the test checks that it stays memory-safe.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn runtime_foreign_task_drop_reclaims_sleep_whose_final_waiter_owns_executor() {
+    let no_payload_drops = Rc::new(Cell::new(0usize));
+    let staged = stage_waiter_owning_origin(
+        new_executor(),
+        sleep(Duration::from_secs(60)),
+        "sleep",
+        &no_payload_drops,
+        OriginRelease::Drop,
+        OriginRunExit::InjectedWaitError,
+        |before| {
+            assert_eq!(
+                (
+                    before.live_tasks,
+                    before.live_ops,
+                    before.inflight_ops,
+                    before.timers_pending,
+                ),
+                (0, 0, 0, true),
+                "origin run did not end with the waiter-owned sleep as its only work"
+            );
+        },
+    );
+    let timer = staged.future;
+    let mut foreign = new_executor();
+    foreign
+        .run(async move {
+            drop(timer);
+        })
+        .expect("foreign sleep drop: foreign run failed");
+    assert_eq!(
+        staged.releases.get(),
+        1,
+        "foreign sleep drop: final waiter output was not dropped exactly once"
+    );
+    let snapshot = staged.at_release.get().unwrap_or_else(|| {
+        panic!("foreign sleep drop: final waiter output did not observe the origin executor")
+    });
+    assert!(
+        !snapshot.origin.timers_pending,
+        "foreign sleep drop: the sleep stayed armed through its waiter release"
+    );
+    runtime_longevity_support::assert_quiescent(foreign.test_quiescence(), "foreign sleep drop");
+    foreign
+        .run(async {})
+        .expect("foreign sleep drop: foreign executor did not run again");
 }
 
 #[cfg(debug_assertions)]

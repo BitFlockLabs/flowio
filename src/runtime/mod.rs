@@ -23,12 +23,25 @@
 //!
 //! Once FlowIO queues an I/O request or arms a timer, its future must be polled
 //! by that executor. Polling outside an active run or through another
-//! executor returns [`std::io::ErrorKind::NotConnected`]. An unsubmitted
+//! executor returns [`std::io::ErrorKind::NotConnected`]. Dropping that future
+//! inside another executor's run is not supported either; the drop stays
+//! memory-safe, as [`executor::Executor::run`] describes. An unsubmitted
 //! rental operation returns its buffer immediately; a submitted operation
 //! retains it until FlowIO observes the operation's completion, then returns
 //! it with the error. Dropping an in-flight read can discard bytes from a
 //! racing completion. Treat read cancellation as a protocol boundary unless
 //! the protocol has its own recovery path.
+//!
+//! Dropping an armed timer, or a future or stream that holds an in-flight I/O
+//! operation, does not itself wait for the timer or the operation, but it
+//! releases any reference that the timer or operation still holds to the task
+//! that last polled it. If that is the last reference to a finished task whose
+//! output owns an [`executor::Executor`], that executor shuts down
+//! synchronously, inside the drop or, when the drop itself runs while FlowIO is
+//! cleaning up tasks, before that cleanup ends. Its bounded shutdown drain can
+//! wait for its in-flight operations, including the dropped operation if that
+//! executor submitted it, and a queued positive-linger close can delay that
+//! shutdown further (see [socket closing](crate::runtime#socket-closing)).
 //!
 //! If bounded shutdown abandons a ring before observing an operation's
 //! completion, the future cannot safely return its buffer and remains pending.

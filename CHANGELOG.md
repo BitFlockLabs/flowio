@@ -106,9 +106,9 @@ Alpha prereleases carry no compatibility guarantee.
 - **Breaking:** `TcpStream`, `UnixStream`, and `UdpSocket` are explicitly
   `!Send + !Sync` and no longer implement `RefUnwindSafe`. Keep each socket
   on its owner OS thread, and review borrowed socket captures at `catch_unwind`
-  boundaries before using `AssertUnwindSafe`. An idle socket can
-  move between FlowIO executors on that thread, but queued I/O stays bound to
-  its originating executor until FlowIO observes completion.
+  boundaries before using `AssertUnwindSafe`. An idle socket can move between
+  FlowIO executors on that thread, but once FlowIO queues I/O, its future stays
+  bound to the originating executor until it returns its result or is dropped.
 - **Breaking:** `UdpSocket::local_addr` returns `io::Result<SocketAddr>` and
   queries the live socket, including kernel-assigned ports and address changes
   after connect or reconnect. Callers must handle the result.
@@ -240,6 +240,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- Dropping a pending I/O future no longer risks memory corruption when the
+  finished task that last polled it owns, through its output, the `Executor`
+  that submitted the I/O, for example after `Executor::run` returned an error
+  or re-raised a task panic. That executor's shutdown now cancels the I/O
+  promptly instead of waiting up to one second and abandoning its buffer and
+  descriptor.
 - TCP and Unix `writev_all` and `writev_all_projected` wait for send-buffer
   space and continue one segment at a time instead of returning `WouldBlock`
   after part of the chain was sent, for example after the peer half-closes

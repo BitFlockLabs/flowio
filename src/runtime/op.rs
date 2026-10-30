@@ -65,14 +65,16 @@ use std::rc::Rc;
 /// `X` records poll-context rejection without changing ownership. Registry,
 /// owner, result, and retained-payload fields are orthogonal to this table.
 /// Several mutation sequences deliberately pass through shapes that are not
-/// stable handoff states: orphaning sets `O` before transferring the waiter;
-/// completion sets `C` before transferring the waiter or reclaiming `C|O` and
-/// `C|D`; cancel insertion sets `P` before publishing both links; cancel
-/// removal clears links before `P`; reset clears flags before registering the
-/// next waiter; shutdown and ring abandonment transfer waiters and cancel links
-/// before publishing `S` or `A`; and build-abort publication precedes retained
-/// payload destruction. No state may be inspected after task or payload
-/// release unless its liveness has been independently re-established.
+/// stable handoff states: orphaning sets `O` before transferring the waiter,
+/// and cancellation then queues `ASYNC_CANCEL` or links the retry entry before
+/// releasing that waiter; completion sets `C` before transferring the waiter or
+/// reclaiming `C|O` and `C|D`; cancel insertion sets `P` before publishing both
+/// links; cancel removal clears links before `P`; reset clears flags before
+/// registering the next waiter; shutdown and ring abandonment transfer waiters
+/// and cancel links before publishing `S` or `A`; and build-abort publication
+/// precedes retained payload destruction. No state may be inspected after task
+/// or payload release unless its liveness has been independently
+/// re-established.
 #[doc(hidden)]
 #[repr(C, align(64))]
 pub struct CompletionState {
@@ -83,9 +85,10 @@ pub struct CompletionState {
     /// Index in the owner's bounded live-operation registry.
     pub(crate) registry_index: u32,
     /// Task waiting on this operation, or null when no waiter is registered.
-    /// A non-null task pointer owns one task reference. After that reference is
-    /// released and `FLAG_CANCEL_PENDING` is set, this word stores the previous
-    /// completion state in the reactor's cancel-retry queue instead.
+    /// A non-null task pointer owns one task reference. After that reference
+    /// has been moved out of the state and `FLAG_CANCEL_PENDING` is set, this
+    /// word stores the previous completion state in the reactor's cancel-retry
+    /// queue instead.
     pub waiter: *mut TaskHeader,
     /// Next completion state in the reactor-owned cancel-retry queue.
     pub(crate) cancel_next: *mut CompletionState,
@@ -109,7 +112,8 @@ impl CompletionState {
     pub const FLAG_ORPHANED: u32 = 1 << 1;
     /// Operation has no waiting task and is reclaimed when its CQE retires.
     pub const FLAG_DETACHED: u32 = 1 << 2;
-    /// `ASYNC_CANCEL` submission failed and the reactor must retry it.
+    /// The state is on the reactor's cancel-retry queue awaiting an
+    /// `ASYNC_CANCEL` submission attempt.
     pub const FLAG_CANCEL_PENDING: u32 = 1 << 3;
     /// Executor shutdown owns cancellation and no task may be woken.
     pub const FLAG_RUNTIME_SHUTDOWN: u32 = 1 << 4;
@@ -202,8 +206,9 @@ impl CompletionState {
 
     /// Initializes this orphaned state's intrusive cancel-retry links.
     ///
-    /// The waiter reference must already have been released. While the state
-    /// remains queued, `waiter` is interpreted only as `cancel_prev`.
+    /// The waiter reference must already have been moved out of this state.
+    /// While the state remains queued, `waiter` is interpreted only as
+    /// `cancel_prev`.
     #[inline(always)]
     pub(crate) fn link_pending_cancel_after(&mut self, previous: *mut CompletionState) {
         debug_assert!(!self.is_cancel_pending());

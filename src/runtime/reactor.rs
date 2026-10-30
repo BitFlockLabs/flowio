@@ -210,11 +210,13 @@ fn retire_tracked_completion(runtime_state: &mut RuntimeState) -> io::Result<()>
     Ok(())
 }
 
-/// Owner-thread FIFO of operations awaiting another `ASYNC_CANCEL` attempt.
+/// Owner-thread FIFO of operations awaiting an `ASYNC_CANCEL` submission
+/// attempt.
 ///
 /// The queue is bounded by the reactor's live-operation cap and allocates no
-/// nodes. An orphaned state's released waiter word stores the previous link;
-/// `CompletionState::cancel_next` stores the next link.
+/// nodes. Once a state's waiter reference has been moved out, its waiter word
+/// stores the previous link; `CompletionState::cancel_next` stores the next
+/// link.
 struct PendingCancelQueue {
     head: *mut CompletionState,
     tail: *mut CompletionState,
@@ -245,7 +247,9 @@ impl PendingCancelQueue {
     /// # Safety
     ///
     /// `ptr` must identify a live completion state owned by this reactor. Its
-    /// waiter reference must have been released before this call.
+    /// waiter reference must already have been moved out of the state; a
+    /// caller that still holds that reference releases it only after this
+    /// call.
     unsafe fn push_back(&mut self, ptr: *mut CompletionState) {
         debug_assert!(
             !ptr.is_null(),
@@ -532,55 +536,39 @@ impl Drop for OpSlotReturnGuard {
     }
 }
 
-/// Ensures an orphaned operation remains reactor-owned if waiter destruction
-/// unwinds before cancellation can be submitted.
-struct PendingCancelEnqueueGuard {
-    pending_cancels: *mut PendingCancelQueue,
-    ptr: *mut CompletionState,
-    armed: bool,
-}
-
-impl PendingCancelEnqueueGuard {
-    #[inline(always)]
-    unsafe fn new(pending_cancels: *mut PendingCancelQueue, ptr: *mut CompletionState) -> Self {
-        Self {
-            pending_cancels,
-            ptr,
-            armed: true,
-        }
-    }
-
-    #[inline(always)]
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingCancelEnqueueGuard {
-    #[inline(always)]
-    fn drop(&mut self) {
-        if self.armed {
-            unsafe {
-                (*self.pending_cancels).push_back(self.ptr);
-            }
-        }
-    }
-}
-
+/// Orphans one submitted operation, publishes its cancellation, and releases
+/// the waiter reference moved out of the state as the final action.
+///
+/// `publish` queues `ASYNC_CANCEL` or links the cancel-retry entry while the
+/// reactor still owns the incomplete state; the waiter word is already empty,
+/// so a retry entry can reuse it as `cancel_prev`. The release can destroy the
+/// waiting task, whose output may drop the origin executor; that teardown can
+/// retire and recycle the slot or mark it ring-abandoned. Neither `ptr` nor
+/// its reactor is accessed after the release, and a release that unwinds
+/// propagates with cancellation already published.
+/// `runtime_dropped_read_publishes_cancel_before_final_waiter_release` and
+/// `task_cancel_publishes_retry_before_final_release_that_retires_target`,
+/// with its completion-drain and unwinding variants, cover this order.
+///
+/// # Safety
+///
+/// `ptr` must identify a live, submitted, incomplete completion state on its
+/// owner thread that is not ring-abandoned, shutdown-owned or queued for
+/// cancel retry.
+/// `publish` must queue or link cancellation for `ptr` without running user
+/// code, releasing task references, or freeing completion states.
 #[inline(always)]
-unsafe fn orphan_and_clear_waiter_with_cancel_fallback(
-    reactor: *mut Reactor,
+unsafe fn orphan_publish_cancel_then_release_waiter(
     ptr: *mut CompletionState,
-) -> PendingCancelEnqueueGuard {
+    publish: impl FnOnce(),
+) {
     unsafe {
         (*ptr).set_orphaned();
-        let pending_cancels = std::ptr::addr_of_mut!((*reactor).pending_cancels);
-        let enqueue = PendingCancelEnqueueGuard::new(pending_cancels, ptr);
         let waiter = CompletionState::take_waiter_unchecked(ptr);
+        publish();
         if !waiter.is_null() {
             release_task(waiter);
         }
-        enqueue
     }
 }
 
@@ -675,8 +663,7 @@ pub(crate) struct Reactor {
     deferred_closes: VecDeque<OwnedFd>,
     /// Explicit deferred-owner bound, independent of allocator capacity.
     max_deferred_closes: usize,
-    /// Bounded FIFO of orphaned operations whose `ASYNC_CANCEL` SQE could not
-    /// be submitted.
+    /// Bounded FIFO of operations awaiting an `ASYNC_CANCEL` submission attempt.
     pending_cancels: PendingCancelQueue,
     /// Pool of reusable completion-state records for in-flight operations.
     op_pool: ManuallyDrop<ProviderOwnedPool<CompletionState, BasicMemoryProvider>>,
@@ -1383,20 +1370,40 @@ impl Reactor {
         }
     }
 
-    /// Defers cancellation discovered from a destructor while the completion
-    /// view has the ring mutably borrowed.
+    /// Queues cancellation discovered from a destructor while a completion
+    /// drain may have a ring mutably borrowed.
+    ///
+    /// The cancel-retry entry is linked through the pending-cancel field
+    /// alone, so neither a ring nor the whole reactor is borrowed, and it is
+    /// linked before the waiter moved out of the state is released. That
+    /// release can reclaim operations through the registry, pools and
+    /// pending-cancel queue, defer descriptor closes, or shut down the origin
+    /// executor, so neither `ptr` nor `reactor` is accessed after it. Under
+    /// the completion-drain flag, the release reaches an existing ring only by
+    /// tearing down that ring's executor, and an executor's teardown never
+    /// starts while that executor's own completion view is live, so a live
+    /// view's ring borrow stays valid.
     ///
     /// # Safety
     ///
-    /// `reactor` must own the live submitted `ptr`; this must run on its owner
-    /// thread while the thread-wide completion-drain flag is active.
+    /// `reactor` must own `ptr`, a live, submitted, incomplete completion state
+    /// that is not ring-abandoned, shutdown-owned or queued for cancel retry.
+    /// This must run on the reactor's owner thread while the thread-wide
+    /// completion-drain flag is active. No Rust reference to the whole reactor
+    /// or to its pending-cancel queue may be live across this call.
+    /// When `ptr` has a waiter, no other Rust reference into the reactor may
+    /// be live across this call either, except a `ring` borrow held while no
+    /// teardown of the reactor's executor can start, such as its own live
+    /// completion view.
     pub(crate) unsafe fn defer_cancel_during_completion_drain(
         reactor: *mut Self,
         ptr: *mut CompletionState,
     ) {
         unsafe {
-            let enqueue = orphan_and_clear_waiter_with_cancel_fallback(reactor, ptr);
-            drop(enqueue);
+            let pending_cancels = std::ptr::addr_of_mut!((*reactor).pending_cancels);
+            orphan_publish_cancel_then_release_waiter(ptr, move || {
+                (*pending_cancels).push_back(ptr);
+            });
         }
     }
 
@@ -1409,18 +1416,27 @@ impl Reactor {
         unsafe { Self::cancel_op_unchecked(self, ptr) };
     }
 
-    /// Raw-pointer form of [`Self::cancel_op`] that remains sound when waiter
-    /// destruction synchronously re-enters reactor bookkeeping.
+    /// Raw-pointer form of [`Self::cancel_op`].
+    ///
+    /// Queues `ASYNC_CANCEL`, or links the cancel-retry entry when submission
+    /// fails, before releasing the waiter moved out of the state. That release
+    /// can drop the origin executor, so neither `ptr` nor `reactor` is accessed
+    /// after it.
     ///
     /// # Safety
     ///
-    /// `reactor` must own the live submitted `ptr` on its owner thread, with
-    /// exclusive logical access to its cancellation fields.
+    /// `reactor` must own `ptr`, a live, submitted, incomplete completion state
+    /// that is not ring-abandoned, shutdown-owned or queued for cancel retry, on
+    /// the reactor's owner thread, and no completion view may borrow its ring.
+    /// Publishing the cancellation reborrows the whole reactor mutably, so no
+    /// Rust reference into the reactor other than the one `reactor` was derived
+    /// from may be live across this call, and none at all when `ptr` has a
+    /// waiter, because the waiter release can re-enter the reactor.
     pub(crate) unsafe fn cancel_op_unchecked(reactor: *mut Self, ptr: *mut CompletionState) {
         unsafe {
-            let enqueue = orphan_and_clear_waiter_with_cancel_fallback(reactor, ptr);
-            enqueue.disarm();
-            (&mut *reactor).request_cancel(ptr);
+            orphan_publish_cancel_then_release_waiter(ptr, move || {
+                (&mut *reactor).request_cancel(ptr);
+            });
         }
     }
 
@@ -3187,7 +3203,8 @@ mod pending_cancel_tests {
     use super::completion_drain_probe::{CompletionDrainDescriptor, ReentrantOperationPayload};
     use super::*;
     use crate::runtime::executor::{
-        CloseSubmission, completion_drain_active, poll_ctx_from_waker, try_submit_close,
+        CloseSubmission, completion_drain_active, drop_op_ptr_unchecked, poll_ctx_from_waker,
+        stage_completed_task_output_for_benchmark, try_submit_close,
         with_ringless_poll_context_for_test,
     };
     #[cfg(not(miri))]
@@ -3857,7 +3874,7 @@ mod pending_cancel_tests {
     }
 
     #[test]
-    fn pending_cancel_prev_reuses_waiter_only_after_reference_release() {
+    fn pending_cancel_prev_reuses_waiter_word_only_after_reference_transfer() {
         let task = TaskHeader::new();
         let task_ptr = &task as *const TaskHeader as *mut TaskHeader;
         let mut states: Vec<_> = (0..2).map(|_| CompletionState::empty()).collect();
@@ -5364,6 +5381,322 @@ mod pending_cancel_tests {
         assert_eq!(heap_drops.get(), 2);
         assert_eq!(retained_pool.stats().heap_frees, 2);
         assert!(live_registry.is_empty());
+    }
+
+    /// Cancel entry selected by the thread-wide completion-drain flag.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CancelEntry {
+        TaskPoll,
+        CompletionDrain,
+    }
+
+    /// What the final waiter release does after recording its observation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FinalReleaseAction {
+        RetireTarget,
+        Panic,
+    }
+
+    #[derive(Debug)]
+    struct FinalReleasePanic;
+
+    /// Cancel-retry state visible to the destructor run by the final waiter
+    /// release.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FinalReleaseObservation {
+        queued_cancels: usize,
+        target_is_queue_head: bool,
+        target_flags: u32,
+        target_waiter_word_is_null: bool,
+    }
+
+    /// A ringless reactor cannot submit `ASYNC_CANCEL`, so published
+    /// cancellation is the target's cancel-retry entry.
+    const PUBLISHED_RETRY_AT_RELEASE: FinalReleaseObservation = FinalReleaseObservation {
+        queued_cancels: 1,
+        target_is_queue_head: true,
+        target_flags: CompletionState::FLAG_ORPHANED | CompletionState::FLAG_CANCEL_PENDING,
+        target_waiter_word_is_null: true,
+    };
+
+    /// Completed task output owned only through a pending operation's waiter.
+    ///
+    /// Once armed, its destructor records the cancel-retry state through field
+    /// places only, then either retires the target as origin shutdown would and
+    /// records the result, or panics without touching the slot. It never
+    /// asserts.
+    struct FinalReleaseProbe {
+        reactor: *mut Reactor,
+        target: *mut CompletionState,
+        runtime_state: *mut RuntimeState,
+        ready_queue: *mut crate::utils::list::intrusive::dlist::DList<TaskHeader>,
+        action: FinalReleaseAction,
+        armed: Rc<Cell<bool>>,
+        observed: Rc<Cell<Option<FinalReleaseObservation>>>,
+        retired: Rc<Cell<Option<bool>>>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for FinalReleaseProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if !self.armed.get() {
+                return;
+            }
+            let observation = unsafe {
+                let queue = &*std::ptr::addr_of!((*self.reactor).pending_cancels);
+                FinalReleaseObservation {
+                    queued_cancels: queue.len(),
+                    target_is_queue_head: queue.head == self.target,
+                    target_flags: (*self.target).state_flags,
+                    target_waiter_word_is_null: (*self.target).waiter.is_null(),
+                }
+            };
+            self.observed.set(Some(observation));
+            match self.action {
+                FinalReleaseAction::RetireTarget => {
+                    let retired = unsafe {
+                        Reactor::retire_completion_unchecked(
+                            self.reactor,
+                            (*self.reactor).owner,
+                            self.target,
+                            -libc::ECANCELED,
+                            self.runtime_state,
+                            self.ready_queue,
+                        )
+                    };
+                    self.retired.set(Some(retired.is_ok()));
+                }
+                FinalReleaseAction::Panic => std::panic::panic_any(FinalReleasePanic),
+            }
+        }
+    }
+
+    /// Values recorded around one modeled final waiter release.
+    struct FinalReleaseRun {
+        observed: Option<FinalReleaseObservation>,
+        probe_drops: usize,
+        retired_in_release: Option<bool>,
+        unwind: Option<PanicPayload>,
+        retired_after_unwind: Option<bool>,
+    }
+
+    /// Drops a future-owned completion pointer through the selected entry.
+    ///
+    /// # Safety
+    ///
+    /// `state` must satisfy [`drop_op_ptr_unchecked`].
+    unsafe fn drop_future_state(entry: CancelEntry, state: &mut *mut CompletionState) {
+        let _drain = (entry == CancelEntry::CompletionDrain).then(CompletionDrainGuard::enter);
+        unsafe { drop_op_ptr_unchecked(state) };
+    }
+
+    /// Drops the only operation of a fresh ringless owner while its waiter
+    /// holds the final reference to a completed task. The pool starts empty, so
+    /// a slot recycled during the release carries a null free-list link and
+    /// reads as zero flags. Values are recorded and the target is retired before
+    /// the publication assertions run. A failed check that leaves the target
+    /// registered, such as a setup check after a successful allocation, fails
+    /// the test normally: the target's owner reference, and after the waiter
+    /// transfer the staged task's, keep the ringless owner alive, so the owner
+    /// leaks instead of dropping the reactor.
+    fn with_final_release_model(
+        entry: CancelEntry,
+        action: FinalReleaseAction,
+        check: impl FnOnce(&mut FinalReleaseRun),
+    ) {
+        with_ringless_poll_context_for_test(1, |owner, _cx| {
+            let reactor = owner.reactor_ptr();
+            let target = unsafe { (&mut *reactor).alloc_op() };
+            assert!(!target.is_null(), "model operation allocation failed");
+            let mut runtime_state = runtime_state_with_shutdown_inflight(1);
+            let mut ready_queue =
+                crate::utils::list::intrusive::dlist::DList::<TaskHeader>::new_uninit();
+            ready_queue.init();
+            let armed = Rc::new(Cell::new(false));
+            let observed = Rc::new(Cell::new(None));
+            let retired = Rc::new(Cell::new(None));
+            let drops = Rc::new(Cell::new(0));
+            let staged = stage_completed_task_output_for_benchmark(FinalReleaseProbe {
+                reactor,
+                target,
+                runtime_state: std::ptr::addr_of_mut!(runtime_state),
+                ready_queue: std::ptr::addr_of_mut!(ready_queue),
+                action,
+                armed: Rc::clone(&armed),
+                observed: Rc::clone(&observed),
+                retired: Rc::clone(&retired),
+                drops: Rc::clone(&drops),
+            })
+            .expect("model task staging failed");
+            let _output = unsafe { staged.transfer_to_waiter(target) };
+            unsafe {
+                assert_eq!(
+                    (*reactor).live_registry,
+                    vec![target],
+                    "model target is not the only live operation"
+                );
+                assert!(
+                    (*reactor).pending_cancels.is_empty(),
+                    "model started with a queued cancel"
+                );
+                assert_eq!(
+                    (*target).state_flags,
+                    0,
+                    "model target is not a pending submitted operation"
+                );
+                assert!(!(*target).waiter.is_null(), "model target has no waiter");
+            }
+            armed.set(true);
+            // Under Miri, a live ring-field borrow across the drain entry and
+            // the reentrant release shows that both touch only disjoint
+            // reactor fields.
+            let ring = if entry == CancelEntry::CompletionDrain {
+                Some(unsafe { &mut *std::ptr::addr_of_mut!((*reactor).ring) })
+            } else {
+                None
+            };
+            let mut future_state = target;
+            let unwind = match action {
+                FinalReleaseAction::Panic => catch_unwind(AssertUnwindSafe(|| unsafe {
+                    drop_future_state(entry, &mut future_state);
+                }))
+                .err(),
+                FinalReleaseAction::RetireTarget => {
+                    unsafe { drop_future_state(entry, &mut future_state) };
+                    None
+                }
+            };
+            let ring_still_absent = ring.map(|ring| ring.is_none());
+            let future_pointer_cleared = future_state.is_null();
+            let drain_flag_clear = !completion_drain_active();
+            let retired_after_unwind = if action == FinalReleaseAction::Panic {
+                // The unwinding release left the target live behind its
+                // published retry entry; retire it as its target completion
+                // would.
+                Some(
+                    unsafe {
+                        Reactor::retire_completion_unchecked(
+                            reactor,
+                            (*reactor).owner,
+                            target,
+                            -libc::ECANCELED,
+                            std::ptr::addr_of_mut!(runtime_state),
+                            std::ptr::addr_of_mut!(ready_queue),
+                        )
+                    }
+                    .is_ok(),
+                )
+            } else {
+                None
+            };
+            let mut run = FinalReleaseRun {
+                observed: observed.get(),
+                probe_drops: drops.get(),
+                retired_in_release: retired.get(),
+                unwind,
+                retired_after_unwind,
+            };
+            check(&mut run);
+            if let Some(absent) = ring_still_absent {
+                assert!(absent, "ringless model unexpectedly acquired a ring");
+            }
+            assert!(
+                future_pointer_cleared,
+                "future drop kept its operation pointer"
+            );
+            assert!(drain_flag_clear, "model left the completion-drain flag set");
+            assert_eq!(
+                runtime_state.inflight_ops, 0,
+                "model target did not retire exactly once"
+            );
+            unsafe {
+                assert!(
+                    (*reactor).live_registry.is_empty(),
+                    "model left a live operation"
+                );
+                assert_queue_links(&(*reactor).pending_cancels, &[]);
+                assert!(
+                    next_allocation_reuses(&mut *reactor, target),
+                    "model target slot was not returned to the operation pool"
+                );
+            }
+        });
+    }
+
+    fn assert_published_before_final_release(run: &FinalReleaseRun) {
+        assert_eq!(
+            run.probe_drops, 1,
+            "final waiter release did not destroy the task output once"
+        );
+        assert_eq!(
+            run.observed,
+            Some(PUBLISHED_RETRY_AT_RELEASE),
+            "cancellation was not published before the final waiter release"
+        );
+    }
+
+    fn assert_retired_in_release(run: &mut FinalReleaseRun) {
+        assert!(run.unwind.is_none(), "final waiter release unwound");
+        assert_published_before_final_release(run);
+        assert_eq!(
+            run.retired_in_release,
+            Some(true),
+            "final waiter release did not retire the target"
+        );
+    }
+
+    fn assert_unwound_after_publication(run: &mut FinalReleaseRun) {
+        let payload = run
+            .unwind
+            .take()
+            .expect("final waiter release did not unwind");
+        assert!(
+            payload.is::<FinalReleasePanic>(),
+            "final waiter release resumed a different panic"
+        );
+        assert_published_before_final_release(run);
+        assert_eq!(
+            run.retired_after_unwind,
+            Some(true),
+            "post-unwind target retirement failed"
+        );
+    }
+
+    #[test]
+    fn task_cancel_publishes_retry_before_final_release_that_retires_target() {
+        with_final_release_model(
+            CancelEntry::TaskPoll,
+            FinalReleaseAction::RetireTarget,
+            assert_retired_in_release,
+        );
+    }
+
+    #[test]
+    fn drain_cancel_publishes_retry_before_final_release_that_retires_target() {
+        with_final_release_model(
+            CancelEntry::CompletionDrain,
+            FinalReleaseAction::RetireTarget,
+            assert_retired_in_release,
+        );
+    }
+
+    #[test]
+    fn task_cancel_publishes_retry_before_final_release_that_unwinds() {
+        with_final_release_model(
+            CancelEntry::TaskPoll,
+            FinalReleaseAction::Panic,
+            assert_unwound_after_publication,
+        );
+    }
+
+    #[test]
+    fn drain_cancel_publishes_retry_before_final_release_that_unwinds() {
+        with_final_release_model(
+            CancelEntry::CompletionDrain,
+            FinalReleaseAction::Panic,
+            assert_unwound_after_publication,
+        );
     }
 }
 
