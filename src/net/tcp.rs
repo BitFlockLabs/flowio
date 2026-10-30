@@ -714,8 +714,15 @@ impl TcpListener {
     }
 
     /// Binds a nonblocking listener with both `SO_REUSEADDR` and
-    /// `SO_REUSEPORT`, then starts listening.  Useful for multi-process
-    /// server patterns where multiple listeners share the same port.
+    /// `SO_REUSEPORT`, then starts listening.
+    ///
+    /// Every listener in one group must use this method with the same local
+    /// address, port, and effective user ID. The kernel distributes incoming
+    /// connections among the group members.
+    ///
+    /// The first member may use port zero. To share its automatically selected
+    /// port, subsequent members pass the address returned by [`Self::local_addr`].
+    /// [`Self::bind`] binds exclusively.
     pub fn bind_reuse_port(addr: SocketAddr, backlog: i32) -> io::Result<Self> {
         Self::bind_inner(addr, backlog, true)
     }

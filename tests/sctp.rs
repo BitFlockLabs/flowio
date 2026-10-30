@@ -6744,27 +6744,12 @@ fn runtime_sctp_reuse_port_listeners_share_and_distribute_associations() {
             let second_accepts = second_accepts
                 .await
                 .expect("second SCTP accept task cancelled");
-            assert_eq!(total.get(), CONNECTIONS);
-            assert_eq!(first_accepts.len() + second_accepts.len(), CONNECTIONS);
-            assert!(
-                !first_accepts.is_empty(),
-                "first listener accepted no association"
+            bind_setup_support::assert_reuse_port_group(
+                total.get(),
+                &client_addrs,
+                &first_accepts,
+                &second_accepts,
             );
-            assert!(
-                !second_accepts.is_empty(),
-                "second listener accepted no association"
-            );
-            for local in client_addrs {
-                assert_eq!(
-                    first_accepts
-                        .iter()
-                        .chain(&second_accepts)
-                        .filter(|(_, peer)| *peer == local)
-                        .count(),
-                    1,
-                    "every distinct client must be accepted exactly once",
-                );
-            }
             drop(clients);
         })
         .expect("SCTP reuse-port executor run failed");

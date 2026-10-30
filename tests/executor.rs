@@ -1741,6 +1741,115 @@ fn runtime_submitted_read_delays_foreign_context_error_until_cqe() {
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[test]
+fn runtime_submitted_read_exact_rejects_foreign_poll_after_partial_progress() {
+    for (label, reject_completed, reject_submitted, expected_kind, expected_bytes, receives) in [
+        (
+            "valid polls only",
+            false,
+            false,
+            io::ErrorKind::UnexpectedEof,
+            b"hijk".as_slice(),
+            3,
+        ),
+        (
+            "foreign poll after completion",
+            true,
+            false,
+            io::ErrorKind::NotConnected,
+            b"hi".as_slice(),
+            2,
+        ),
+        (
+            "foreign poll while submitted",
+            false,
+            true,
+            io::ErrorKind::NotConnected,
+            b"hi".as_slice(),
+            2,
+        ),
+    ] {
+        let mut foreign_executor = new_executor();
+        let foreign_waker = capture_flowio_waker(&mut foreign_executor);
+        let (mut reader, writer) = UnixStream::pair().expect("socketpair failed");
+        let drops = Rc::new(Cell::new(0));
+        let buffer = DropTrackedReadWrite::zeroed(6, &drops);
+        let address = buffer.bytes().as_ptr();
+        let mut executor = new_executor();
+
+        let (result, buffer, _reader, _writer, polls) =
+            common::run_test_output(&mut executor, async move {
+                let mut read = Box::pin(reader.read_exact(buffer, 6));
+                let mut polls = 0;
+                let (result, buffer) = poll_fn(|cx| {
+                    polls += 1;
+                    let polled = if reject_completed && polls == 3 {
+                        let mut foreign_cx = Context::from_waker(&foreign_waker);
+                        read.as_mut().poll(&mut foreign_cx)
+                    } else {
+                        read.as_mut().poll(cx)
+                    };
+                    match polls {
+                        1 => {
+                            assert!(polled.is_pending(), "{label}: initial receive completed");
+                            write_all_raw_fd(writer.as_raw_fd(), b"hi");
+                        }
+                        2 => {
+                            assert!(polled.is_pending(), "{label}: partial read completed");
+                            if reject_submitted {
+                                let mut foreign_cx = Context::from_waker(&foreign_waker);
+                                assert!(
+                                    read.as_mut().poll(&mut foreign_cx).is_pending(),
+                                    "{label}: foreign poll returned before the completion"
+                                );
+                                assert!(
+                                    read.as_mut().poll(cx).is_pending(),
+                                    "{label}: origin poll returned before the completion"
+                                );
+                            }
+                            write_all_raw_fd(writer.as_raw_fd(), b"jk");
+                            writer
+                                .shutdown(Shutdown::Write)
+                                .expect("writer shutdown failed");
+                        }
+                        _ => {}
+                    }
+                    polled
+                })
+                .await;
+                drop(read);
+                (result, buffer, reader, writer, polls)
+            });
+
+        assert_eq!(
+            result.map_err(|error| error.kind()),
+            Err(expected_kind),
+            "{label}"
+        );
+        assert_eq!(buffer.bytes(), expected_bytes, "{label}: published bytes");
+        assert_eq!(
+            buffer.bytes().as_ptr(),
+            address,
+            "{label}: buffer allocation"
+        );
+        assert_eq!(drops.get(), 0, "{label}: buffer dropped before return");
+        drop(buffer);
+        assert_eq!(drops.get(), 1, "{label}: returned buffer drop count");
+        runtime_longevity_support::assert_quiescent(executor.test_quiescence(), label);
+        #[cfg(debug_assertions)]
+        {
+            let stats = executor.last_stats();
+            assert_eq!(
+                (stats.sqe_submits, stats.cqe_completions),
+                (receives, receives),
+                "{label}: receive submissions and completions"
+            );
+        }
+        assert_eq!(polls, receives + 1, "{label}: completion poll count");
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
 fn runtime_submitted_read_foreign_waiter_routes_to_foreign_executor() {
     let drops = Rc::new(Cell::new(0));
     let read_drops = Rc::clone(&drops);

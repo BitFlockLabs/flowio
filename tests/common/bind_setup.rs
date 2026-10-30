@@ -213,6 +213,38 @@ pub(super) fn reserve_udp_reuse_port() -> StdUdpSocket {
     reservation
 }
 
+pub(super) fn assert_reuse_port_group<T>(
+    total: usize,
+    client_addrs: &[SocketAddr],
+    first_accepts: &[(T, SocketAddr)],
+    second_accepts: &[(T, SocketAddr)],
+) {
+    assert_eq!(total, client_addrs.len());
+    assert_eq!(
+        first_accepts.len() + second_accepts.len(),
+        client_addrs.len()
+    );
+    assert!(
+        !first_accepts.is_empty(),
+        "first listener accepted no connection"
+    );
+    assert!(
+        !second_accepts.is_empty(),
+        "second listener accepted no connection"
+    );
+    for local in client_addrs {
+        assert_eq!(
+            first_accepts
+                .iter()
+                .chain(second_accepts)
+                .filter(|(_, peer)| peer == local)
+                .count(),
+            1,
+            "every distinct client must be accepted exactly once",
+        );
+    }
+}
+
 pub(super) fn socket_option(fd: RawFd, name: libc::c_int) -> libc::c_int {
     let mut value: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

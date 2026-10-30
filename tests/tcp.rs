@@ -2481,14 +2481,108 @@ fn runtime_tcp_socket_options() {
     peer.finish();
 }
 
-/// TcpListener::bind_reuse_port sets SO_REUSEPORT.
+#[cfg(not(miri))]
 #[test]
-fn runtime_tcp_listener_reuse_port() {
-    let listener = TcpListener::bind_reuse_port(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128)
-        .expect("bind_reuse_port failed");
+fn runtime_tcp_reuse_port_listeners_share_and_distribute_connections() {
+    use flowio::runtime::timer::timeout_at;
+    use std::future::poll_fn;
+    use std::time::Instant;
 
-    let addr = listener.local_addr();
+    const CONNECTIONS: usize = 32;
+    let first = TcpListener::bind_reuse_port(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 128)
+        .expect("first TCP reuse-port bind failed");
+    let addr = first.local_addr();
     assert_ne!(addr.port(), 0);
+    let second =
+        TcpListener::bind_reuse_port(addr, 128).expect("second TCP reuse-port bind failed");
+    assert_eq!(second.local_addr(), addr);
+
+    for fd in [first.as_raw_fd(), second.as_raw_fd()] {
+        for option in [libc::SO_REUSEADDR, libc::SO_REUSEPORT, libc::SO_ACCEPTCONN] {
+            assert_eq!(bind_setup_support::socket_option(fd, option), 1);
+        }
+    }
+    let error = TcpListener::bind(addr, 128)
+        .err()
+        .expect("default bind must not join a reuse-port group");
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+
+    let mut executor = Executor::new().expect("TCP reuse-port executor");
+    executor
+        .run(async move {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut connector = TcpConnector::new();
+            let mut clients = Vec::with_capacity(CONNECTIONS);
+            let mut client_addrs = [addr; CONNECTIONS];
+            for index in 0..CONNECTIONS {
+                let connect = connector
+                    .connect(addr)
+                    .expect("TCP reuse-port connect setup");
+                let client = timeout_at(deadline, connect)
+                    .await
+                    .expect("TCP reuse-port connect deadline")
+                    .expect("TCP reuse-port connect failed");
+                let local = client.local_addr().expect("TCP client local address");
+                assert!(
+                    !client_addrs[..index].contains(&local),
+                    "reused live client address"
+                );
+                client_addrs[index] = local;
+                clients.push(client);
+            }
+
+            let total = Rc::new(Cell::new(0));
+            let first_accepted = Rc::new(RefCell::new(Vec::with_capacity(CONNECTIONS)));
+            let second_accepted = Rc::new(RefCell::new(Vec::with_capacity(CONNECTIONS)));
+            let accept_member =
+                |mut listener: TcpListener, accepted: Rc<RefCell<Vec<(TcpStream, SocketAddr)>>>| {
+                    let total = Rc::clone(&total);
+                    async move {
+                        while total.get() < CONNECTIONS {
+                            let (stream, peer) = listener
+                                .accept()
+                                .await
+                                .expect("TCP reuse-port accept failed");
+                            assert!(total.get() < CONNECTIONS, "extra TCP connection");
+                            accepted.borrow_mut().push((stream, peer));
+                            total.set(total.get() + 1);
+                        }
+                    }
+                };
+            {
+                let mut first_accepts =
+                    std::pin::pin!(accept_member(first, Rc::clone(&first_accepted)));
+                let mut second_accepts =
+                    std::pin::pin!(accept_member(second, Rc::clone(&second_accepted)));
+                timeout_at(
+                    deadline,
+                    poll_fn(|cx| {
+                        if total.get() < CONNECTIONS {
+                            let _ = first_accepts.as_mut().poll(cx);
+                        }
+                        if total.get() < CONNECTIONS {
+                            let _ = second_accepts.as_mut().poll(cx);
+                        }
+                        if total.get() == CONNECTIONS {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
+                )
+                .await
+                .expect("TCP reuse-port accept deadline");
+            }
+            bind_setup_support::assert_reuse_port_group(
+                total.get(),
+                &client_addrs,
+                &first_accepted.borrow(),
+                &second_accepted.borrow(),
+            );
+            drop(clients);
+        })
+        .expect("TCP reuse-port executor run failed");
 }
 
 #[cfg(not(miri))]

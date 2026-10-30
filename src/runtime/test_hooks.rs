@@ -54,22 +54,49 @@ pub(crate) fn fail_next_raw_sqe_submit() {
     FAIL_RAW_SQE_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn arm_ring_errno(count: &Cell<usize>, errno_cell: &Cell<i32>, errno: i32) -> bool {
+    let stored = errno_cell.get();
+    if count.get() > 0 && stored != errno {
+        return false;
+    }
+    count.set(count.get().saturating_add(1));
+    errno_cell.set(errno);
+    true
+}
+
 /// Makes the next raw `io_uring_enter` submit call on this thread fail with a
 /// specific OS errno.
+///
+/// # Panics
+///
+/// Panics if a failure with a different errno is still pending on this thread.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn fail_next_ring_submit_errno(errno: i32) {
-    FAIL_RING_SUBMITS.with(|fails| fails.set(fails.get().saturating_add(1)));
-    FAIL_RING_SUBMIT_ERRNO.with(|stored| stored.set(errno));
+    let armed = FAIL_RING_SUBMITS
+        .with(|count| FAIL_RING_SUBMIT_ERRNO.with(|stored| arm_ring_errno(count, stored, errno)));
+    assert!(
+        armed,
+        "ring submit failure already armed with a different errno"
+    );
 }
 
 /// Makes the next `io_uring_enter` wait call on this thread fail with a
 /// specific OS errno.
+///
+/// # Panics
+///
+/// Panics if a failure with a different errno is still pending on this thread.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn fail_next_ring_wait_errno(errno: i32) {
-    FAIL_RING_WAITS.with(|fails| fails.set(fails.get().saturating_add(1)));
-    FAIL_RING_WAIT_ERRNO.with(|stored| stored.set(errno));
+    let armed = FAIL_RING_WAITS
+        .with(|count| FAIL_RING_WAIT_ERRNO.with(|stored| arm_ring_errno(count, stored, errno)));
+    assert!(
+        armed,
+        "ring wait failure already armed with a different errno"
+    );
 }
 
 /// Makes the next `IoBuffPool` slab allocation on this thread fail.
@@ -91,9 +118,19 @@ pub(crate) fn fail_next_reactor_feature_probe(feature: RequiredRingFeature) {
 }
 
 /// Makes the next opcode-probe registration fail with the specified errno.
+///
+/// # Panics
+///
+/// Panics if a probe-registration failure is already pending on this thread.
 #[cfg(all(test, not(miri)))]
 pub(crate) fn fail_next_probe_registration_errno(errno: i32) {
-    FAIL_PROBE_REGISTRATION_ERRNO.with(|stored| stored.set(errno));
+    FAIL_PROBE_REGISTRATION_ERRNO.with(|stored| {
+        assert!(
+            stored.get() == 0,
+            "probe registration failure already armed"
+        );
+        stored.set(errno);
+    });
 }
 
 #[inline(always)]
@@ -427,5 +464,63 @@ pub(crate) mod bind_setup {
             *libc::__errno_location() = errno;
         }
         -1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::catch_unwind;
+
+    #[test]
+    fn ring_errno_hooks_reject_a_different_pending_errno() {
+        for (arm, take, remaining, expected) in [
+            (
+                fail_next_ring_submit_errno as fn(i32),
+                take_ring_submit_failure as fn() -> Option<io::Error>,
+                ring_submit_failures_remaining as fn() -> usize,
+                "ring submit failure already armed with a different errno",
+            ),
+            (
+                fail_next_ring_wait_errno as fn(i32),
+                take_ring_wait_failure as fn() -> Option<io::Error>,
+                ring_wait_failures_remaining as fn() -> usize,
+                "ring wait failure already armed with a different errno",
+            ),
+        ] {
+            arm(libc::EINTR);
+            arm(libc::EINTR);
+            let panic = catch_unwind(|| arm(libc::EIO))
+                .expect_err("a different pending errno was accepted");
+            assert_eq!(panic.downcast_ref::<&'static str>(), Some(&expected));
+            assert_eq!(remaining(), 2);
+            assert_eq!(take().unwrap().raw_os_error(), Some(libc::EINTR));
+            assert_eq!(take().unwrap().raw_os_error(), Some(libc::EINTR));
+            assert!(take().is_none());
+            catch_unwind(|| arm(libc::EIO)).expect("a consumed failure blocked a new errno");
+            assert_eq!(take().unwrap().raw_os_error(), Some(libc::EIO));
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn probe_registration_hook_rejects_a_second_pending_failure() {
+        fail_next_probe_registration_errno(libc::EIO);
+        let panic = catch_unwind(|| fail_next_probe_registration_errno(libc::EIO))
+            .expect_err("a second pending probe failure was accepted");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>(),
+            Some(&"probe registration failure already armed")
+        );
+        assert_eq!(
+            take_probe_registration_failure().unwrap().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(take_probe_registration_failure().is_none());
+        fail_next_probe_registration_errno(libc::EBUSY);
+        assert_eq!(
+            take_probe_registration_failure().unwrap().raw_os_error(),
+            Some(libc::EBUSY)
+        );
     }
 }
