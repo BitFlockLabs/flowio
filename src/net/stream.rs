@@ -1022,6 +1022,56 @@ struct RetainedProjectedWritevPayload<T> {
     skip: usize,
 }
 
+/// Borrows the retained window shared by complete vectored writes.
+trait RetainedWritevWindow: 'static {
+    fn writev_window(
+        &mut self,
+    ) -> (
+        &mut RetainedIovecScratch,
+        &mut MaybeUninit<libc::msghdr>,
+        &mut usize,
+        &mut usize,
+    );
+}
+
+impl<C: 'static> RetainedWritevWindow for RetainedWritevPayload<C> {
+    #[inline(always)]
+    fn writev_window(
+        &mut self,
+    ) -> (
+        &mut RetainedIovecScratch,
+        &mut MaybeUninit<libc::msghdr>,
+        &mut usize,
+        &mut usize,
+    ) {
+        (
+            &mut self.scratch,
+            &mut self.msg,
+            &mut self.written,
+            &mut self.skip,
+        )
+    }
+}
+
+impl<T: 'static> RetainedWritevWindow for RetainedProjectedWritevPayload<T> {
+    #[inline(always)]
+    fn writev_window(
+        &mut self,
+    ) -> (
+        &mut RetainedIovecScratch,
+        &mut MaybeUninit<libc::msghdr>,
+        &mut usize,
+        &mut usize,
+    ) {
+        (
+            &mut self.scratch,
+            &mut self.msg,
+            &mut self.written,
+            &mut self.skip,
+        )
+    }
+}
+
 /// Constructs a readv payload directly in its final retained allocation.
 ///
 /// The concrete internal buffer chain is transferred only after every
@@ -1262,18 +1312,16 @@ fn write_uses_message(iovecs: &[MaybeUninit<libc::iovec>], skip: usize, count: u
 }
 
 /// Switches once to scalar sends after a completed SENDMSG returns EAGAIN.
+/// Callers check the EAGAIN completion before calling this function.
 #[inline(always)]
 fn switch_writev_to_scalar(
     mode: &mut WritevSendMode,
-    result: i32,
-    iovecs: &[MaybeUninit<libc::iovec>],
+    scratch: &RetainedIovecScratch,
     skip: usize,
-    count: usize,
 ) -> bool {
-    if result == -libc::EAGAIN
-        && *mode == WritevSendMode::Vectored
-        && write_uses_message(iovecs, skip, count)
-    {
+    let iovecs = retained_iovecs(scratch);
+    let count = remaining_iovec_count(scratch, skip);
+    if *mode == WritevSendMode::Vectored && write_uses_message(iovecs, skip, count) {
         *mode = WritevSendMode::Scalar;
         return true;
     }
@@ -1317,6 +1365,115 @@ fn build_write_retry_entry(
             build_write_vectored_entry(fd, iovecs, skip, count, msg, user_data)
         }
     }
+}
+
+enum WritevAllStep {
+    Complete,
+    Failed(io::Error),
+    Resubmit,
+}
+
+/// Applies one completed write to its retained window without taking the owner.
+///
+/// # Safety
+///
+/// `state_ptr` must identify a non-null, exclusively accessible completed state
+/// owned by `pctx`'s reactor, with a retained payload of type `P` that no kernel
+/// operation accesses. The first `iov_count` scratch entries must be
+/// initialized, `iov_count` must not exceed the scratch length, and `total`
+/// must be the call's total byte count.
+#[inline(always)]
+unsafe fn apply_writev_all_cqe<P: RetainedWritevWindow>(
+    pctx: &PollCtx,
+    state_ptr: *mut CompletionState,
+    send_mode: &mut WritevSendMode,
+    iov_count: usize,
+    total: usize,
+) -> WritevAllStep {
+    #[cfg(not(any(debug_assertions, feature = "diagnostic-counters")))]
+    let _ = pctx;
+
+    let result = unsafe { (*state_ptr).result };
+    if result == -libc::EAGAIN {
+        let payload = unsafe { (*state_ptr).retained_payload_mut::<P>() };
+        let (scratch, _, _, skip) = payload.writev_window();
+        if switch_writev_to_scalar(send_mode, scratch, *skip) {
+            return WritevAllStep::Resubmit;
+        }
+    }
+    match classify_retry_cqe_result(result) {
+        RetryCqeResult::KernelError(errno) => {
+            WritevAllStep::Failed(io::Error::from_raw_os_error(errno))
+        }
+        RetryCqeResult::Zero => WritevAllStep::Failed(io::ErrorKind::WriteZero.into()),
+        RetryCqeResult::Bytes(n) => {
+            let payload = unsafe { (*state_ptr).retained_payload_mut::<P>() };
+            let (scratch, _, written, skip) = payload.writev_window();
+            debug_assert!(n <= total - *written);
+            *written += n;
+            if *written >= total {
+                return WritevAllStep::Complete;
+            }
+
+            let mut next_skip = *skip;
+            advance_iovecs_in_place(
+                unsafe { retained_iovecs_mut(scratch, iov_count) },
+                &mut next_skip,
+                n,
+            );
+            *skip = next_skip;
+            #[cfg(debug_assertions)]
+            unsafe {
+                let stats = &mut (*pctx.runtime_state()).stats;
+                stats.writev_partial_continuations =
+                    stats.writev_partial_continuations.saturating_add(1);
+            }
+            #[cfg(feature = "diagnostic-counters")]
+            unsafe {
+                Reactor::note_writev_partial_continuation(pctx.reactor());
+            }
+            WritevAllStep::Resubmit
+        }
+    }
+}
+
+/// Resets a completed write and submits its next retained window.
+///
+/// # Safety
+///
+/// `fd_state` must contain a non-null, exclusively accessible completed state
+/// owned by `pctx`'s reactor, with its CQE and waiter consumed and a valid
+/// retained payload of type `P`. No kernel operation may access that payload.
+/// The current window must contain initialized iovecs for its remaining bytes.
+/// The context's owner task must be live on the reactor's owner thread, and
+/// the original descriptor lease must still be attached to the state.
+#[inline(always)]
+unsafe fn resubmit_writev_window<P: RetainedWritevWindow>(
+    pctx: &PollCtx,
+    fd_state: &mut RuntimeFdOpState<'_>,
+    send_mode: WritevSendMode,
+) -> Result<(), (io::Error, P)> {
+    let state_ptr = fd_state.state_ptr();
+    unsafe { reset_existing_retry_state(&mut *state_ptr, pctx.owner_task()) };
+    let result = unsafe {
+        submit_resubmitted_fd_sqe(pctx, fd_state, |fd| {
+            let payload = (*state_ptr).retained_payload_mut::<P>();
+            let (scratch, msg, _, skip) = payload.writev_window();
+            Ok(build_write_retry_entry(
+                send_mode,
+                fd,
+                scratch,
+                *skip,
+                msg,
+                state_ptr as u64,
+            ))
+        })
+    };
+    if let Err(error) = result {
+        let payload = unsafe { take_retained_payload_and_free_state::<P>(pctx, fd_state) };
+        return Err((error, payload));
+    }
+    Ok(())
 }
 
 /// Advance past `bytes` consumed/filled bytes in an iovec array by mutating
@@ -3034,24 +3191,17 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             }
         }
 
-        let switched = !this.state_ptr.state_ptr().is_null()
-            && unsafe { (*this.state_ptr.state_ptr()).result == -libc::EAGAIN }
-            && unsafe {
-                let state = &mut *this.state_ptr.state_ptr();
-                let result = state.result;
-                let payload = state.retained_payload_mut::<RetainedWritevPayload<C>>();
-                switch_writev_to_scalar(
+        if !this.state_ptr.state_ptr().is_null() {
+            match unsafe {
+                apply_writev_all_cqe::<RetainedWritevPayload<C>>(
+                    &pctx,
+                    this.state_ptr.state_ptr(),
                     &mut this.send_mode,
-                    result,
-                    retained_iovecs(&payload.scratch),
-                    payload.skip,
-                    remaining_iovec_count(&payload.scratch, payload.skip),
+                    this.iov_count,
+                    this.total,
                 )
-            };
-        if !this.state_ptr.state_ptr().is_null() && !switched {
-            let state_ptr = this.state_ptr.state_ptr();
-            match classify_retry_cqe_result(unsafe { (*state_ptr).result }) {
-                RetryCqeResult::KernelError(errno) => {
+            } {
+                WritevAllStep::Complete => {
                     let completion = unsafe {
                         take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
                             &pctx,
@@ -3059,12 +3209,9 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                             |payload| take_writev_completion_from_retained(payload),
                         )
                     };
-                    return Poll::Ready((
-                        Err(io::Error::from_raw_os_error(errno)),
-                        completion.buffer,
-                    ));
+                    return Poll::Ready((Ok(completion.written), completion.buffer));
                 }
-                RetryCqeResult::Zero => {
+                WritevAllStep::Failed(error) => {
                     let completion = unsafe {
                         take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
                             &pctx,
@@ -3072,52 +3219,9 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
                             |payload| take_writev_completion_from_retained(payload),
                         )
                     };
-                    return Poll::Ready((
-                        Err(io::Error::from(io::ErrorKind::WriteZero)),
-                        completion.buffer,
-                    ));
+                    return Poll::Ready((Err(error), completion.buffer));
                 }
-                RetryCqeResult::Bytes(n) => {
-                    let completed = unsafe {
-                        let payload =
-                            (*state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
-                        debug_assert!(n <= this.total - payload.written);
-                        payload.written += n;
-                        payload.written >= this.total
-                    };
-                    if completed {
-                        let completion = unsafe {
-                            take_retained_payload_with_and_free_state::<RetainedWritevPayload<C>, _>(
-                                &pctx,
-                                &mut this.state_ptr,
-                                |payload| take_writev_completion_from_retained(payload),
-                            )
-                        };
-                        return Poll::Ready((Ok(completion.written), completion.buffer));
-                    }
-
-                    unsafe {
-                        let payload =
-                            (*state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
-                        let mut skip = payload.skip;
-                        advance_iovecs_in_place(
-                            retained_iovecs_mut(&mut payload.scratch, this.iov_count),
-                            &mut skip,
-                            n,
-                        );
-                        payload.skip = skip;
-                    }
-                    #[cfg(debug_assertions)]
-                    unsafe {
-                        let stats = &mut (*pctx.runtime_state()).stats;
-                        stats.writev_partial_continuations =
-                            stats.writev_partial_continuations.saturating_add(1);
-                    }
-                    #[cfg(feature = "diagnostic-counters")]
-                    unsafe {
-                        Reactor::note_writev_partial_continuation(pctx.reactor());
-                    }
-                }
+                WritevAllStep::Resubmit => {}
             }
         }
         if this.buffer.is_some() {
@@ -3186,27 +3290,14 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Future for WritevAllFuture<'_, C
             return Poll::Pending;
         }
 
-        let state_ptr = this.state_ptr.state_ptr();
-        unsafe { reset_existing_retry_state(&mut *state_ptr, pctx.owner_task()) };
-
-        unsafe {
-            if let Err(e) = submit_resubmitted_fd_sqe(&pctx, &this.state_ptr, |fd| {
-                let payload = (*state_ptr).retained_payload_mut::<RetainedWritevPayload<C>>();
-                Ok(build_write_retry_entry(
-                    this.send_mode,
-                    fd,
-                    &payload.scratch,
-                    payload.skip,
-                    &mut payload.msg,
-                    state_ptr as u64,
-                ))
-            }) {
-                let payload = take_retained_payload_and_free_state::<RetainedWritevPayload<C>>(
-                    &pctx,
-                    &mut this.state_ptr,
-                );
-                return Poll::Ready((Err(e), payload.buffer));
-            }
+        if let Err((error, payload)) = unsafe {
+            resubmit_writev_window::<RetainedWritevPayload<C>>(
+                &pctx,
+                &mut this.state_ptr,
+                this.send_mode,
+            )
+        } {
+            return Poll::Ready((Err(error), payload.buffer));
         }
 
         Poll::Pending
@@ -3424,85 +3515,35 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
             }
         };
 
-        let switched = !this.state_ptr.state_ptr().is_null()
-            && unsafe { (*this.state_ptr.state_ptr()).result == -libc::EAGAIN }
-            && unsafe {
-                let state = &mut *this.state_ptr.state_ptr();
-                let result = state.result;
-                let payload = state.retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                switch_writev_to_scalar(
+        if !this.state_ptr.state_ptr().is_null() {
+            match unsafe {
+                apply_writev_all_cqe::<RetainedProjectedWritevPayload<T>>(
+                    &pctx,
+                    this.state_ptr.state_ptr(),
                     &mut this.send_mode,
-                    result,
-                    retained_iovecs(&payload.scratch),
-                    payload.skip,
-                    remaining_iovec_count(&payload.scratch, payload.skip),
+                    this.iov_count,
+                    this.total,
                 )
-            };
-        if !this.state_ptr.state_ptr().is_null() && !switched {
-            let state_ptr = this.state_ptr.state_ptr();
-            match classify_retry_cqe_result(unsafe { (*state_ptr).result }) {
-                RetryCqeResult::KernelError(errno) => {
+            } {
+                WritevAllStep::Complete => {
                     let payload = unsafe {
                         take_retained_payload_and_free_state::<RetainedProjectedWritevPayload<T>>(
                             &pctx,
                             &mut this.state_ptr,
                         )
                     };
-                    return Poll::Ready((Err(io::Error::from_raw_os_error(errno)), payload.source));
+                    return Poll::Ready((Ok(payload.written), payload.source));
                 }
-                RetryCqeResult::Zero => {
+                WritevAllStep::Failed(error) => {
                     let payload = unsafe {
                         take_retained_payload_and_free_state::<RetainedProjectedWritevPayload<T>>(
                             &pctx,
                             &mut this.state_ptr,
                         )
                     };
-                    return Poll::Ready((
-                        Err(io::Error::from(io::ErrorKind::WriteZero)),
-                        payload.source,
-                    ));
+                    return Poll::Ready((Err(error), payload.source));
                 }
-                RetryCqeResult::Bytes(n) => {
-                    let completed = unsafe {
-                        let payload = (*state_ptr)
-                            .retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                        debug_assert!(n <= this.total - payload.written);
-                        payload.written += n;
-                        payload.written >= this.total
-                    };
-                    if completed {
-                        let payload = unsafe {
-                            take_retained_payload_and_free_state::<RetainedProjectedWritevPayload<T>>(
-                                &pctx,
-                                &mut this.state_ptr,
-                            )
-                        };
-                        let written = payload.written;
-                        return Poll::Ready((Ok(written), payload.source));
-                    }
-
-                    unsafe {
-                        let payload = (*state_ptr)
-                            .retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                        let mut skip = payload.skip;
-                        advance_iovecs_in_place(
-                            retained_iovecs_mut(&mut payload.scratch, this.iov_count),
-                            &mut skip,
-                            n,
-                        );
-                        payload.skip = skip;
-                    }
-                    #[cfg(debug_assertions)]
-                    unsafe {
-                        let stats = &mut (*pctx.runtime_state()).stats;
-                        stats.writev_partial_continuations =
-                            stats.writev_partial_continuations.saturating_add(1);
-                    }
-                    #[cfg(feature = "diagnostic-counters")]
-                    unsafe {
-                        Reactor::note_writev_partial_continuation(pctx.reactor());
-                    }
-                }
+                WritevAllStep::Resubmit => {}
             }
         }
 
@@ -3523,27 +3564,14 @@ impl<T: WritevProjection, S> Future for WritevAllProjectedFuture<'_, T, S> {
             !this.state_ptr.state_ptr().is_null(),
             "transferred projected writev source must retain its retry state"
         );
-        let state_ptr = this.state_ptr.state_ptr();
-        unsafe { reset_existing_retry_state(&mut *state_ptr, pctx.owner_task()) };
-
-        unsafe {
-            if let Err(e) = submit_resubmitted_fd_sqe(&pctx, &this.state_ptr, |fd| {
-                let payload =
-                    (*state_ptr).retained_payload_mut::<RetainedProjectedWritevPayload<T>>();
-                Ok(build_write_retry_entry(
-                    this.send_mode,
-                    fd,
-                    &payload.scratch,
-                    payload.skip,
-                    &mut payload.msg,
-                    state_ptr as u64,
-                ))
-            }) {
-                let payload = take_retained_payload_and_free_state::<
-                    RetainedProjectedWritevPayload<T>,
-                >(&pctx, &mut this.state_ptr);
-                return Poll::Ready((Err(e), payload.source));
-            }
+        if let Err((error, payload)) = unsafe {
+            resubmit_writev_window::<RetainedProjectedWritevPayload<T>>(
+                &pctx,
+                &mut this.state_ptr,
+                this.send_mode,
+            )
+        } {
+            return Poll::Ready((Err(error), payload.source));
         }
 
         Poll::Pending
