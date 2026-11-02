@@ -1269,6 +1269,15 @@ fn runtime_executor_drop_during_active_unwind_forgets_caught_task_panic_payload(
         return;
     }
 
+    // A panic raised while another panic unwinds makes the default hook print a
+    // symbolized backtrace, which takes seconds under AddressSanitizer. Writing
+    // each panic's location and message directly to stderr skips the backtrace
+    // and keeps the messages when a non-unwinding panic aborts the child.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write as _;
+        let _ = writeln!(io::stderr(), "{info}");
+    }));
+
     struct ShutdownPanicPayload(Arc<AtomicUsize>);
 
     impl Drop for ShutdownPanicPayload {
