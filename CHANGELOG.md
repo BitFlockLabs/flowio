@@ -240,6 +240,12 @@ Alpha prereleases carry no compatibility guarantee.
 
 ### Fixed
 
+- TCP and Unix `write_all`, `writev_all` and `writev_all_projected` submit the
+  unsent part again when the kernel interrupts a waiting send (`EINTR`), for
+  example when the process is stopped with `SIGSTOP` and continued, instead of
+  failing without reporting the bytes already sent. TLS reads, writes, flushes,
+  handshakes and shutdowns also continue instead of failing and making later
+  writes return `BrokenPipe`.
 - Dropping a pending I/O future no longer risks memory corruption when the
   finished task that last polled it owns, through its output, the `Executor`
   that submitted the I/O, for example after `Executor::run` returned an error

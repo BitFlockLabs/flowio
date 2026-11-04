@@ -19,7 +19,8 @@
 //! `CompletionState` is allocated from the reactor's pool for each active
 //! operation. A stream receive resubmits a no-progress EAGAIN completion with
 //! the same slot and payload. Exact/all futures also reuse their slot for
-//! partial progress; every resubmission follows the previous target CQE.
+//! partial progress, and complete writes reuse it after an interrupted send;
+//! every resubmission follows the previous target CQE.
 //!
 //! If a future is dropped while its SQE is still in flight, the state is
 //! marked orphaned and an `ASYNC_CANCEL` SQE is submitted; the CQE path then
@@ -252,15 +253,18 @@ macro_rules! impl_stream_rw {
             stream::WriteFuture::new(self.fd.op_state(), buffer)
         }
 
-        /// Writes the entire buffer, handling partial writes internally.
+        /// Writes the entire buffer, handling partial and interrupted writes
+        /// internally.
         ///
         /// Returns `(Ok(n), buffer)` where `n` equals `buffer.len()` on
         /// success. On error the buffer is returned with an unspecified
-        /// amount already written.
+        /// amount already written. If the kernel interrupts one of the call's
+        /// sends before that send transfers any bytes, the remaining bytes are
+        /// submitted again instead of returning [`io::ErrorKind::Interrupted`].
         ///
-        /// This complete-buffer API may resubmit after partial writes. Avoid
-        /// that retry bookkeeping when complete-buffer semantics are not
-        /// required; use [`Self::write`] and track progress in the caller.
+        /// This complete-buffer API may resubmit after partial or interrupted
+        /// writes. Avoid that retry bookkeeping when complete-buffer semantics
+        /// are not required; use [`Self::write`] and track progress in the caller.
         pub fn write_all<B: IoBuffReadOnly>(
             &mut self,
             buffer: B,
@@ -368,8 +372,8 @@ macro_rules! impl_stream_rw {
             stream::WritevProjectedFuture::new(self.fd.op_state(), source)
         }
 
-        /// Gather-write an entire owned vectored chain, handling partial
-        /// writes.
+        /// Gather-write an entire owned vectored chain, handling partial and
+        /// interrupted writes.
         ///
         /// Returns `(Ok(n), chain)` where `n` equals the total byte count on
         /// success. On error the chain is returned with an unspecified
@@ -379,11 +383,13 @@ macro_rules! impl_stream_rw {
         ///
         /// If the kernel reports `WouldBlock` for a multi-segment send, or for
         /// one segment of 4 GiB or more, the rest is sent one segment at a time
-        /// instead of returning that error.
+        /// instead of returning that error. If the kernel interrupts one of the
+        /// call's sends before that send transfers any bytes, the remaining bytes
+        /// are submitted again instead of returning [`io::ErrorKind::Interrupted`].
         ///
-        /// This complete-buffer vectored API may resubmit after partial writes.
-        /// Avoid that retry bookkeeping when the caller handles partial
-        /// progress; use [`Self::writev`] instead.
+        /// This complete-buffer vectored API may resubmit after partial or
+        /// interrupted writes. Avoid that retry bookkeeping when the caller
+        /// handles partial progress; use [`Self::writev`] instead.
         ///
         /// # Errors
         ///
@@ -396,8 +402,8 @@ macro_rules! impl_stream_rw {
             stream::WritevAllFuture::new(self.fd.op_state(), buffer)
         }
 
-        /// Gather-write all projected pieces from one compact owned
-        /// source.
+        /// Gather-write all projected pieces from one compact owned source,
+        /// handling partial and interrupted writes.
         ///
         /// Returns `(Ok(n), source)` where `n` equals the projected total
         /// byte count on success. On error the source is returned with an
@@ -406,13 +412,15 @@ macro_rules! impl_stream_rw {
         /// once for contract validation; valid empty projections complete with
         /// `Ok(0)` without submitting kernel I/O.
         ///
-        /// This complete-buffer API may resubmit after partial writes. Avoid
-        /// that retry bookkeeping when the caller can handle partial progress;
-        /// use [`Self::writev_projected`] instead.
+        /// This complete-buffer API may resubmit after partial or interrupted
+        /// writes. Avoid that retry bookkeeping when the caller can handle
+        /// partial progress; use [`Self::writev_projected`] instead.
         ///
         /// If the kernel reports `WouldBlock` for a multi-segment send, or for
         /// one segment of 4 GiB or more, the rest is sent one segment at a time
-        /// instead of returning that error.
+        /// instead of returning that error. If the kernel interrupts one of the
+        /// call's sends before that send transfers any bytes, the remaining bytes
+        /// are submitted again instead of returning [`io::ErrorKind::Interrupted`].
         pub fn writev_all_projected<T: WritevProjection>(
             &mut self,
             source: T,
@@ -1379,9 +1387,12 @@ enum WritevAllStep {
 ///
 /// `state_ptr` must identify a non-null, exclusively accessible completed state
 /// owned by `pctx`'s reactor, with a retained payload of type `P` that no kernel
-/// operation accesses. The first `iov_count` scratch entries must be
-/// initialized, `iov_count` must not exceed the scratch length, and `total`
-/// must be the call's total byte count.
+/// operation accesses. `iov_count` must equal the scratch length, every scratch
+/// entry must be initialized, and `total` must be the call's total byte count.
+/// While the payload's `written` count is below `total`, its `skip` must be below
+/// the scratch length. If the completion reports progress that does not finish
+/// the call, every scratch entry from `skip` to the end must point into the
+/// payload's unsent bytes.
 #[inline(always)]
 unsafe fn apply_writev_all_cqe<P: RetainedWritevWindow>(
     pctx: &PollCtx,
@@ -1402,6 +1413,10 @@ unsafe fn apply_writev_all_cqe<P: RetainedWritevWindow>(
         }
     }
     match classify_retry_cqe_result(result) {
+        // An interrupted send queued nothing, so resubmit the same window in
+        // the same send mode. Both callers validate context first; shutdown
+        // or a poll from another executor has already returned the owner.
+        RetryCqeResult::KernelError(libc::EINTR) => WritevAllStep::Resubmit,
         RetryCqeResult::KernelError(errno) => {
             WritevAllStep::Failed(io::Error::from_raw_os_error(errno))
         }
@@ -1437,14 +1452,16 @@ unsafe fn apply_writev_all_cqe<P: RetainedWritevWindow>(
     }
 }
 
-/// Resets a completed write and submits its next retained window.
+/// Resets a completed write and submits its remaining retained window.
 ///
 /// # Safety
 ///
 /// `fd_state` must contain a non-null, exclusively accessible completed state
 /// owned by `pctx`'s reactor, with its CQE and waiter consumed and a valid
 /// retained payload of type `P`. No kernel operation may access that payload.
-/// The current window must contain initialized iovecs for its remaining bytes.
+/// The payload's `skip` must be below the scratch length, and every scratch
+/// entry from `skip` to the end must be initialized and point into the payload's
+/// unsent bytes.
 /// The context's owner task must be live on the reactor's owner thread, and
 /// the original descriptor lease must still be attached to the state.
 #[inline(always)]
@@ -2246,7 +2263,7 @@ impl<B: IoBuffReadOnly, S> Drop for WriteFuture<'_, B, S> {
 // WriteAllFuture
 // ---------------------------------------------------------------------------
 
-/// Writes the entire buffer, re-submitting on partial writes.
+/// Writes the entire buffer, re-submitting on partial or interrupted writes.
 ///
 /// The buffer's base pointer is captured when the first write is submitted and
 /// reused for resubmissions, avoiding repeated `as_ptr()` calls. A poll that
@@ -2357,6 +2374,10 @@ impl<B: IoBuffReadOnly, S> Future for WriteAllFuture<'_, B, S> {
         // completion slot once the previous CQE has been fully consumed.
         if !this.state_ptr.state_ptr().is_null() {
             match classify_retry_cqe_result(unsafe { (*this.state_ptr.state_ptr()).result }) {
+                // An interrupted send queued nothing, so submit the unchanged
+                // remainder again. Context validation above has already returned
+                // the buffer during shutdown or a poll from another executor.
+                RetryCqeResult::KernelError(libc::EINTR) => {}
                 RetryCqeResult::KernelError(errno) => {
                     let payload = unsafe {
                         take_retained_payload_and_free_state::<RetainedWritePayload<B>>(
@@ -3089,7 +3110,8 @@ impl<C: WriteBufferChain<N>, const N: usize, S> Drop for WritevFuture<'_, C, N, 
 // WritevAllFuture
 // ---------------------------------------------------------------------------
 
-/// Gather-write an entire owned vectored chain, handling partial writes.
+/// Gather-write an entire owned vectored chain, handling partial and interrupted
+/// writes.
 pub struct WritevAllFuture<'a, C: WriteBufferChain<N>, const N: usize, S> {
     /// Completion state reused across sequential retry submissions.
     state_ptr: RuntimeFdOpState<'a>,
@@ -3423,7 +3445,8 @@ impl<T: WritevProjection, S> Drop for WritevProjectedFuture<'_, T, S> {
 // Projected WritevAllFuture
 // ---------------------------------------------------------------------------
 
-/// Gather-write all projected pieces from one compact owned source.
+/// Gather-write all projected pieces from one compact owned source, handling partial
+/// and interrupted writes.
 pub struct WritevAllProjectedFuture<'a, T: WritevProjection, S> {
     /// Completion state reused across projected retry submissions.
     state_ptr: RuntimeFdOpState<'a>,
@@ -3903,6 +3926,8 @@ impl<const N: usize, S> Drop for ReadvExactFuture<'_, N, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    use crate::net::send_sqe::test_support::SocketEntryCapture;
     use crate::net::send_sqe::test_support::sqe_prefix;
     use crate::runtime::buffer::IoBuffMut;
     use crate::runtime::executor::{CompletionDrainGuard, with_ringless_poll_context_for_test};
@@ -4075,12 +4100,122 @@ mod tests {
     }
 
     #[cfg(any(debug_assertions, feature = "test-support"))]
+    fn finish_completed_future<F, B>(
+        cx: &mut Context<'_>,
+        future: &mut F,
+        state: fn(&mut F) -> *mut CompletionState,
+        check: impl FnOnce(io::Result<usize>),
+    ) -> B
+    where
+        F: Future<Output = (io::Result<usize>, B)> + Unpin,
+    {
+        let capture = SocketEntryCapture::new();
+        let Poll::Ready((result, buffer)) = Pin::new(&mut *future).poll(cx) else {
+            panic!("terminal completion remained pending");
+        };
+        check(result);
+        capture.assert_empty();
+        assert!(state(future).is_null());
+        assert!(Pin::new(future).poll(cx).is_pending());
+        capture.assert_empty();
+        buffer
+    }
+
+    fn assert_pool_balanced(owner: &Rc<crate::runtime::executor::ExecutorOwner>) {
+        let stats = unsafe { (&*owner.reactor_ptr()).retained_payload_stats() };
+        assert_eq!(stats.pooled_allocs, stats.pooled_frees);
+    }
+
+    fn clean(owner: &Rc<crate::runtime::executor::ExecutorOwner>, fd: &RuntimeFd) {
+        assert_eq!(fd.strong_count_for_test(), 1);
+        assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
+        assert_eq!(owner.inflight_op_count_for_test(), 0);
+    }
+
+    #[cfg(not(miri))]
+    async fn wait_for_completion<F>(
+        future: &mut F,
+        state: fn(&mut F) -> *mut CompletionState,
+    ) -> *mut CompletionState {
+        std::future::poll_fn(|_| {
+            let state = state(future);
+            if unsafe { (*state).is_completed() } {
+                assert!(unsafe { (*state).waiter.is_null() });
+                Poll::Ready(state)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    #[cfg(all(not(miri), any(debug_assertions, feature = "test-support")))]
+    fn pending_poll<F, B>(
+        cx: &mut Context<'_>,
+        future: &mut F,
+        expected: Option<crate::net::send_sqe::test_support::ExpectedScalarEntry>,
+        operation: &str,
+    ) where
+        F: Future<Output = (io::Result<usize>, B)> + Unpin,
+    {
+        let capture = SocketEntryCapture::new();
+        #[cfg(debug_assertions)]
+        let state = poll_ctx_from_waker(cx)
+            .expect("context missing")
+            .runtime_state();
+        #[cfg(debug_assertions)]
+        let before = unsafe { (*state).stats.sqe_submits };
+        if let Poll::Ready((result, _)) = Pin::new(future).poll(cx) {
+            panic!("{operation} returned instead of waiting: {result:?}");
+        }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            unsafe { (*state).stats.sqe_submits },
+            before + usize::from(expected.is_some()),
+            "{operation} submitted an unexpected number of SQEs"
+        );
+        if let Some(e) = expected {
+            crate::net::send_sqe::test_support::assert_entry_fields(
+                &capture.take(),
+                e.opcode,
+                e.fd,
+                e.addr as u64,
+                e.len,
+                e.msg_flags,
+                e.user_data,
+            );
+        } else {
+            capture.assert_empty();
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn assert_peer_bytes(
+        peer: &mut std::os::unix::net::UnixStream,
+        progress: usize,
+        copies: usize,
+    ) {
+        use std::io::Read;
+
+        let mut received = [0; 12];
+        for _ in 0..copies {
+            peer.read_exact(&mut received[..12 - progress])
+                .expect("remaining bytes missing");
+            assert_eq!(&received[..12 - progress], &b"abcdefghijkl"[progress..]);
+        }
+        assert_eq!(
+            peer.read(&mut received)
+                .expect_err("extra bytes received")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
     mod writev_fallback_tests {
         use super::*;
-        #[cfg(not(miri))]
-        use crate::net::send_sqe::test_support::assert_entry_fields;
         use crate::net::send_sqe::test_support::{
-            ExpectedScalarEntry, SocketEntryCapture, assert_rejected_scalar_owner,
+            ExpectedScalarEntry, assert_rejected_scalar_owner,
         };
         use crate::runtime::executor::ExecutorOwner;
         use crate::runtime::op::completion_retirement_test_support::stage_payload;
@@ -4141,6 +4276,12 @@ mod tests {
             }
         }
         impl Subject {
+            fn send_mode(&mut self) -> &mut WritevSendMode {
+                match self {
+                    Self::Direct(future) => &mut future.send_mode,
+                    Self::Projected(future) => &mut future.send_mode,
+                }
+            }
             pub(super) fn state(&mut self) -> &mut RuntimeFdOpState<'static> {
                 match self {
                     Self::Direct(f) => &mut f.state_ptr,
@@ -4268,24 +4409,43 @@ mod tests {
                 user_data: subject.state().state_ptr() as u64,
             }
         }
-        fn terminal(cx: &mut Context<'_>, subject: &mut Subject, kind: io::ErrorKind) -> Source {
-            let capture = SocketEntryCapture::new();
-            let Poll::Ready((result, source)) = Pin::new(&mut *subject).poll(cx) else {
-                panic!("terminal completion remained pending")
-            };
-            assert_eq!(
-                result.expect_err("terminal completion succeeded").kind(),
-                kind
-            );
-            assert!(subject.state().state_ptr().is_null());
-            assert!(Pin::new(subject).poll(cx).is_pending());
-            capture.assert_empty();
-            source
+        pub(super) fn message_entry(subject: &mut Subject, entry: &mut ExpectedScalarEntry) {
+            entry.opcode = opcode::SendMsg::CODE;
+            entry.addr = unsafe { subject.fields().1.as_ptr().cast() };
+            entry.len = 1;
         }
-        pub(super) fn clean(owner: &Rc<ExecutorOwner>, fd: &RuntimeFd) {
-            assert_eq!(fd.strong_count_for_test(), 1);
-            assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
-            assert_eq!(owner.inflight_op_count_for_test(), 0);
+        fn finished(
+            cx: &mut Context<'_>,
+            subject: &mut Subject,
+            check: impl FnOnce(io::Result<usize>),
+        ) -> Source {
+            finish_completed_future(cx, subject, |subject| subject.state().state_ptr(), check)
+        }
+        fn terminal(cx: &mut Context<'_>, subject: &mut Subject, kind: io::ErrorKind) -> Source {
+            finished(cx, subject, |result| {
+                assert_eq!(
+                    result.expect_err("terminal completion succeeded").kind(),
+                    kind
+                );
+            })
+        }
+        fn interrupted_entry(
+            fd: &RuntimeFd,
+            subject: &mut Subject,
+            witness: &Witness,
+            prior: usize,
+        ) -> ExpectedScalarEntry {
+            let mode = *subject.send_mode();
+            let len = if mode == WritevSendMode::Scalar {
+                4 - prior % 4
+            } else {
+                12 - prior
+            };
+            let mut entry = expected(fd, subject, witness, prior, len as u32);
+            if mode == WritevSendMode::Vectored && prior < 8 {
+                message_entry(subject, &mut entry);
+            }
+            entry
         }
         #[test]
         fn writev_all_fallback_clamps_segments_above_u32_max() {
@@ -4321,6 +4481,167 @@ mod tests {
                 });
             }
         }
+        #[cfg(feature = "diagnostic-counters")]
+        fn assert_no_diagnostic_continuation(owner: &Rc<ExecutorOwner>) {
+            assert_eq!(
+                unsafe { (&mut *owner.reactor_ptr()).take_diagnostic_counters() }
+                    .writev_partial_continuations,
+                0
+            );
+        }
+        #[cfg(debug_assertions)]
+        fn partial_continuations(cx: &Context<'_>) -> usize {
+            let state = poll_ctx_from_waker(cx)
+                .expect("context missing")
+                .runtime_state();
+            unsafe { (*state).stats.writev_partial_continuations }
+        }
+        #[test]
+        fn writev_all_interrupted_send_resubmits_the_same_window() {
+            for projected in [false, true] {
+                for (mode, prior) in [
+                    (WritevSendMode::Vectored, 0),
+                    (WritevSendMode::Vectored, 1),
+                    (WritevSendMode::Vectored, 4),
+                    (WritevSendMode::Vectored, 8),
+                    (WritevSendMode::Vectored, 9),
+                    (WritevSendMode::Scalar, 1),
+                    (WritevSendMode::Scalar, 4),
+                ] {
+                    with_ringless_poll_context_for_test(1, |owner, cx| {
+                        let fd = RuntimeFd::from_fresh_raw_fd(-7);
+                        let (mut subject, witness) =
+                            staged(projected, owner, &fd, prior, -libc::EINTR, true);
+                        *subject.send_mode() = mode;
+                        let entry = interrupted_entry(&fd, &mut subject, &witness, prior);
+                        #[cfg(debug_assertions)]
+                        let before = partial_continuations(cx);
+                        #[cfg(feature = "diagnostic-counters")]
+                        assert_no_diagnostic_continuation(owner);
+                        let source = assert_rejected_scalar_owner(cx, &mut subject, &entry);
+                        assert!(*subject.send_mode() == mode);
+                        #[cfg(debug_assertions)]
+                        assert_eq!(
+                            partial_continuations(cx) - before,
+                            0,
+                            "interrupted send counted partial progress"
+                        );
+                        #[cfg(feature = "diagnostic-counters")]
+                        assert_no_diagnostic_continuation(owner);
+                        witness.returned(source, projected);
+                        clean(owner, &fd);
+                        assert_pool_balanced(owner);
+                    });
+                }
+            }
+        }
+        #[test]
+        fn writev_all_zero_byte_completion_returns_write_zero() {
+            for projected in [false, true] {
+                for prior in [0, 1] {
+                    with_ringless_poll_context_for_test(1, |owner, cx| {
+                        let fd = RuntimeFd::from_fresh_raw_fd(-7);
+                        let (mut subject, witness) = staged(projected, owner, &fd, prior, 0, true);
+                        let source = finished(cx, &mut subject, |result| {
+                            let error = result.expect_err("zero-byte completion succeeded");
+                            assert_eq!(
+                                error.kind(),
+                                io::ErrorKind::WriteZero,
+                                "zero-byte completion did not return WriteZero"
+                            );
+                            assert_eq!(error.raw_os_error(), None);
+                        });
+                        witness.returned(source, projected);
+                        clean(owner, &fd);
+                        assert_pool_balanced(owner);
+                    });
+                }
+            }
+        }
+        #[test]
+        fn writev_all_kernel_error_completion_returns_its_errno() {
+            for projected in [false, true] {
+                for (errno, kind) in [
+                    (libc::EPIPE, io::ErrorKind::BrokenPipe),
+                    (libc::ENOMEM, io::ErrorKind::OutOfMemory),
+                    (
+                        libc::ENOBUFS,
+                        io::Error::from_raw_os_error(libc::ENOBUFS).kind(),
+                    ),
+                ] {
+                    with_ringless_poll_context_for_test(1, |owner, cx| {
+                        let fd = RuntimeFd::from_fresh_raw_fd(-7);
+                        let (mut subject, witness) = staged(projected, owner, &fd, 1, -errno, true);
+                        let source = finished(cx, &mut subject, |result| {
+                            let error = result.expect_err("kernel error completion succeeded");
+                            assert_eq!(error.kind(), kind);
+                            assert_eq!(error.raw_os_error(), Some(errno));
+                        });
+                        witness.returned(source, projected);
+                        clean(owner, &fd);
+                        assert_pool_balanced(owner);
+                    });
+                }
+            }
+        }
+        #[test]
+        fn writev_all_final_completion_returns_the_total() {
+            for projected in [false, true] {
+                with_ringless_poll_context_for_test(1, |owner, cx| {
+                    let fd = RuntimeFd::from_fresh_raw_fd(-7);
+                    let (mut subject, witness) = staged(projected, owner, &fd, 1, 11, true);
+                    let source = finished(cx, &mut subject, |result| {
+                        assert_eq!(result.expect("final completion failed"), 12);
+                    });
+                    witness.returned(source, projected);
+                    clean(owner, &fd);
+                    assert_pool_balanced(owner);
+                });
+            }
+        }
+        #[test]
+        fn write_all_zero_byte_and_kernel_error_completions_are_terminal() {
+            for prior in [0u32, 4] {
+                for (result, kind, errno) in [
+                    (0, io::ErrorKind::WriteZero, None),
+                    (-libc::EPIPE, io::ErrorKind::BrokenPipe, Some(libc::EPIPE)),
+                    (-libc::EAGAIN, io::ErrorKind::WouldBlock, Some(libc::EAGAIN)),
+                    (
+                        -libc::ENOMEM,
+                        io::ErrorKind::OutOfMemory,
+                        Some(libc::ENOMEM),
+                    ),
+                    (
+                        -libc::ENOBUFS,
+                        io::Error::from_raw_os_error(libc::ENOBUFS).kind(),
+                        Some(libc::ENOBUFS),
+                    ),
+                ] {
+                    with_ringless_poll_context_for_test(1, |owner, cx| {
+                        let fd = RuntimeFd::from_fresh_raw_fd(-7);
+                        let mut future = staged_write_all(owner, &fd, prior, result, true);
+                        let original = future.base_ptr;
+                        let buffer = finish_completed_future(
+                            cx,
+                            &mut future,
+                            |future| future.state_ptr.state_ptr(),
+                            |result| {
+                                let error =
+                                    result.expect_err("terminal write completion succeeded");
+                                assert_eq!(error.kind(), kind);
+                                assert_eq!(error.raw_os_error(), errno);
+                            },
+                        );
+                        assert_eq!(buffer.as_ptr(), original);
+                        assert_eq!(buffer, b"abcdefghijkl");
+                        drop(buffer);
+                        clean(owner, &fd);
+                        assert_pool_balanced(owner);
+                    });
+                }
+            }
+        }
+
         #[test]
         fn writev_all_fallback_submission_failure_returns_owner() {
             for projected in [false, true] {
@@ -4360,47 +4681,11 @@ mod tests {
             subject: &mut Subject,
             expected: Option<ExpectedScalarEntry>,
         ) {
-            let capture = SocketEntryCapture::new();
-            #[cfg(debug_assertions)]
-            let state = poll_ctx_from_waker(cx)
-                .expect("context missing")
-                .runtime_state();
-            #[cfg(debug_assertions)]
-            let before = unsafe { (*state).stats.sqe_submits };
-            if let Poll::Ready((result, _)) = Pin::new(subject).poll(cx) {
-                panic!("fallback returned instead of waiting: {result:?}");
-            }
-            #[cfg(debug_assertions)]
-            assert_eq!(
-                unsafe { (*state).stats.sqe_submits },
-                before + usize::from(expected.is_some())
-            );
-            if let Some(e) = expected {
-                assert_entry_fields(
-                    &capture.take(),
-                    e.opcode,
-                    e.fd,
-                    e.addr as u64,
-                    e.len,
-                    e.msg_flags,
-                    e.user_data,
-                );
-            } else {
-                capture.assert_empty();
-            }
+            pending_poll(cx, subject, expected, "fallback");
         }
         #[cfg(not(miri))]
         async fn completed(subject: &mut Subject) -> *mut CompletionState {
-            std::future::poll_fn(|_| {
-                let state = subject.state().state_ptr();
-                if unsafe { (*state).is_completed() } {
-                    assert!(unsafe { (*state).waiter.is_null() });
-                    Poll::Ready(state)
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await
+            wait_for_completion(subject, |subject| subject.state().state_ptr()).await
         }
         #[cfg(not(miri))]
         fn socket_pair() -> (RuntimeFd, std::os::unix::net::UnixStream) {
@@ -4483,6 +4768,101 @@ mod tests {
             clean(&owner, &fd);
         }
         #[cfg(not(miri))]
+        fn assert_window(subject: &mut Subject, witness: &Witness, progress: usize) {
+            let expected_skip = progress / 4;
+            let (scratch, msg, written, skip) = unsafe { subject.fields() };
+            assert_eq!(*written, progress);
+            assert_eq!(*skip, expected_skip);
+            let iovecs = unsafe { retained_iovecs_mut(scratch, 3) };
+            assert_eq!(
+                iovecs[expected_skip].iov_base.cast_const().cast::<u8>(),
+                unsafe { witness.addr.add(progress) }
+            );
+            assert_eq!(iovecs[expected_skip].iov_len, 4 - progress % 4);
+            for (index, iovec) in iovecs.iter().enumerate().skip(expected_skip + 1) {
+                assert_eq!(iovec.iov_base.cast_const().cast::<u8>(), unsafe {
+                    witness.addr.add(4 * index)
+                });
+                assert_eq!(iovec.iov_len, 4);
+            }
+            if progress < 8 {
+                let header = unsafe { msg.assume_init_ref() };
+                assert_eq!(header.msg_iov, unsafe {
+                    iovecs.as_mut_ptr().add(expected_skip)
+                });
+                assert_eq!(header.msg_iovlen, 3 - expected_skip);
+                assert!(header.msg_name.is_null());
+                assert_eq!(header.msg_namelen, 0);
+                assert!(header.msg_control.is_null());
+                assert_eq!(header.msg_controllen, 0);
+                assert_eq!(header.msg_flags, 0);
+            } else {
+                assert_eq!(subject.snapshot(), (8, 2, [0xa5; 56]));
+            }
+        }
+        #[cfg(not(miri))]
+        fn interrupted_pending(
+            cx: &mut Context<'_>,
+            subject: &mut Subject,
+            witness: &Witness,
+            fd: &RuntimeFd,
+            state: *mut CompletionState,
+            prior: usize,
+        ) {
+            let entry = interrupted_entry(fd, subject, witness, prior);
+            #[cfg(debug_assertions)]
+            let before = partial_continuations(cx);
+            pending(cx, subject, Some(entry));
+            assert_eq!(subject.state().state_ptr(), state);
+            assert!(!unsafe { (*state).is_completed() });
+            assert!(*subject.send_mode() == WritevSendMode::Vectored);
+            assert_window(subject, witness, prior);
+            assert_eq!(fd.strong_count_for_test(), 2);
+            assert_eq!(witness.drops.get(), 0);
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                partial_continuations(cx) - before,
+                0,
+                "live interrupted send counted partial progress"
+            );
+            pending(cx, subject, None);
+        }
+        #[cfg(not(miri))]
+        #[test]
+        fn writev_all_interrupted_send_keeps_progress_and_completes() {
+            run(async {
+                for projected in [false, true] {
+                    for prior in [1, 8] {
+                        let (fd, mut peer) = socket_pair();
+                        let (owner, mut subject, witness, state) = std::future::poll_fn(|cx| {
+                            let pctx = poll_ctx_from_waker(cx).expect("context missing");
+                            let owner = unsafe { ExecutorOwner::clone_rc(pctx.owner_ptr()) };
+                            let (mut subject, witness) =
+                                staged(projected, &owner, &fd, prior, -libc::EINTR, true);
+                            let state = subject.state().state_ptr();
+                            interrupted_pending(cx, &mut subject, &witness, &fd, state, prior);
+                            Poll::Ready((owner, subject, witness, state))
+                        })
+                        .await;
+                        assert_eq!(completed(&mut subject).await, state);
+                        assert_eq!(unsafe { (*state).result }, (12 - prior) as i32);
+                        // The target completed; the planted interruption repeats its window.
+                        unsafe { (*state).result = -libc::EINTR };
+                        std::future::poll_fn(|cx| {
+                            interrupted_pending(cx, &mut subject, &witness, &fd, state, prior);
+                            Poll::Ready(())
+                        })
+                        .await;
+                        let (result, source) = subject.await;
+                        assert_eq!(result.expect("interrupted write failed"), 12);
+                        witness.returned(source, projected);
+                        assert_peer_bytes(&mut peer, prior, 2);
+                        clean(&owner, &fd);
+                    }
+                }
+            });
+        }
+        #[cfg(not(miri))]
         fn run(future: impl Future<Output = ()> + 'static) {
             Executor::new()
                 .expect("executor failed")
@@ -4517,8 +4897,6 @@ mod tests {
         #[cfg(not(miri))]
         #[test]
         fn writev_all_partial_progress_resubmits_remaining_segments_with_sendmsg() {
-            use std::io::Read;
-
             run(async {
                 for projected in [false, true] {
                     for progress in [1, 4, 5, 8] {
@@ -4530,63 +4908,19 @@ mod tests {
                                 staged(projected, &owner, &fd, 0, progress as i32, true);
                             let mut entry = expected(&fd, &mut subject, &witness, 8, 4);
                             if progress < 8 {
-                                entry.opcode = opcode::SendMsg::CODE;
-                                entry.addr = unsafe { subject.fields().1.as_ptr().cast() };
-                                entry.len = 1;
+                                message_entry(&mut subject, &mut entry);
                             }
                             pending(cx, &mut subject, Some(entry));
-                            let mode = match &subject {
-                                Subject::Direct(future) => future.send_mode,
-                                Subject::Projected(future) => future.send_mode,
-                            };
+                            let mode = *subject.send_mode();
                             assert!(mode == WritevSendMode::Vectored);
-                            let expected_skip = progress / 4;
-                            let (scratch, msg, written, skip) = unsafe { subject.fields() };
-                            assert_eq!(*written, progress);
-                            assert_eq!(*skip, expected_skip);
-                            let iovecs = unsafe { retained_iovecs_mut(scratch, 3) };
-                            assert_eq!(
-                                iovecs[expected_skip].iov_base.cast_const().cast::<u8>(),
-                                unsafe { witness.addr.add(progress) }
-                            );
-                            assert_eq!(iovecs[expected_skip].iov_len, 4 - progress % 4);
-                            for (index, iovec) in iovecs.iter().enumerate().skip(expected_skip + 1)
-                            {
-                                assert_eq!(iovec.iov_base.cast_const().cast::<u8>(), unsafe {
-                                    witness.addr.add(4 * index)
-                                });
-                                assert_eq!(iovec.iov_len, 4);
-                            }
-                            if progress < 8 {
-                                let header = unsafe { msg.assume_init_ref() };
-                                assert_eq!(header.msg_iov, unsafe {
-                                    iovecs.as_mut_ptr().add(expected_skip)
-                                });
-                                assert_eq!(header.msg_iovlen, 3 - expected_skip);
-                                assert!(header.msg_name.is_null());
-                                assert_eq!(header.msg_namelen, 0);
-                                assert!(header.msg_control.is_null());
-                                assert_eq!(header.msg_controllen, 0);
-                                assert_eq!(header.msg_flags, 0);
-                            } else {
-                                assert_eq!(subject.snapshot(), (8, 2, [0xa5; 56]));
-                            }
+                            assert_window(&mut subject, &witness, progress);
                             Poll::Ready((owner, subject, witness))
                         })
                         .await;
                         let (result, source) = subject.await;
                         assert_eq!(result.expect("partial write failed"), 12);
                         witness.returned(source, projected);
-                        let mut received = [0; 12];
-                        peer.read_exact(&mut received[..12 - progress])
-                            .expect("remaining bytes missing");
-                        assert_eq!(&received[..12 - progress], &b"abcdefghijkl"[progress..]);
-                        assert_eq!(
-                            peer.read(&mut received)
-                                .expect_err("extra bytes received")
-                                .kind(),
-                            io::ErrorKind::WouldBlock
-                        );
+                        assert_peer_bytes(&mut peer, progress, 1);
                         clean(&owner, &fd);
                     }
                 }
@@ -4596,7 +4930,7 @@ mod tests {
 
     #[cfg(any(debug_assertions, feature = "test-support"))]
     mod context_rejection_tests {
-        use super::writev_fallback_tests::{clean, expected, staged};
+        use super::writev_fallback_tests::{expected, message_entry, staged};
         use super::*;
         use crate::net::send_sqe::test_support::{
             ExpectedScalarEntry, SocketEntryCapture, assert_rejected_scalar_owner,
@@ -4628,6 +4962,71 @@ mod tests {
                 (*state).result = result;
                 (*state).set_completed();
             }
+        }
+
+        fn staged_read_exact(
+            owner: &Rc<ExecutorOwner>,
+            fd: &RuntimeFd,
+            prior: usize,
+            result: i32,
+            completed: bool,
+        ) -> (
+            ReadExactFuture<'static, ResetReadBuffer, ()>,
+            *const u8,
+            Rc<Cell<usize>>,
+            *mut u8,
+        ) {
+            let mut buffer = eagain_scalar_buffer();
+            buffer.bytes[..prior].copy_from_slice(&b"abcd"[..prior]);
+            let original = buffer.bytes.as_ptr();
+            let drops = Rc::clone(&buffer.drops);
+            let base = buffer.as_mut_ptr();
+            let mut future = ReadExactFuture::<_, ()>::new(fd.lease().into_op_state(), buffer, 4);
+            future.base_ptr = base;
+            future.filled = prior as u32;
+            let payload = RetainedReadPayload {
+                buffer: future.buffer.take().expect("read owner missing"),
+            };
+            unsafe {
+                stage_payload(owner, &mut future.state_ptr, payload, result, completed);
+            }
+            (future, original, drops, base)
+        }
+
+        fn staged_readv_exact(
+            owner: &Rc<ExecutorOwner>,
+            cx: &Context<'_>,
+            fd: &RuntimeFd,
+            prior: usize,
+            result: i32,
+            completed: bool,
+        ) -> (
+            ReadvExactFuture<'static, 2, ()>,
+            [*const u8; 2],
+            libc::iovec,
+        ) {
+            let chain = eagain_chain(2);
+            let original = chain_pointers(&chain);
+            let mut future = ReadvExactFuture::<2, ()>::new(fd.lease().into_op_state(), chain, 4);
+            let pctx = poll_ctx_from_waker(cx).expect("origin context missing");
+            let mut payload =
+                readv_payload(&pctx, future.buffer.take().expect("readv owner missing"));
+            unsafe {
+                future.window_iov_count =
+                    clamp_iovecs_to_read_limit(retained_iovecs_mut(&mut payload.scratch, 2), 0, 4);
+                write_vector_prefix(&mut payload, prior);
+                advance_iovecs_in_place(
+                    retained_iovecs_mut(&mut payload.scratch, 2),
+                    &mut future.skip,
+                    prior,
+                );
+            }
+            future.filled = prior;
+            let iovec = unsafe { retained_iovecs_mut(&mut payload.scratch, 2)[1] };
+            unsafe {
+                stage_payload(owner, &mut future.state_ptr, payload, result, completed);
+            }
+            (future, original, iovec)
         }
 
         fn control<F, B>(
@@ -4706,8 +5105,7 @@ mod tests {
                 returned(witness, buffer, scenario == Scenario::Control);
                 assert!(state(&mut future).is_null());
                 clean(owner, fd);
-                let stats = unsafe { (&*owner.reactor_ptr()).retained_payload_stats() };
-                assert_eq!(stats.pooled_allocs, stats.pooled_frees);
+                assert_pool_balanced(owner);
                 if let Some(capture) = capture {
                     capture.assert_empty();
                     assert!(Pin::new(&mut future).poll(cx).is_pending());
@@ -4740,49 +5138,42 @@ mod tests {
         fn retrying_stream_futures_reject_invalid_and_foreign_polls_without_resubmission() {
             let mut failures = Vec::new();
             for scenario in SCENARIOS {
-                for prior in [0, 4] {
-                    failures.extend(row(
-                        format!("WriteAll, result=2, prior={prior}"),
-                        2,
-                        scenario,
-                        |owner, _, fd, completed| {
-                            let buffer = b"abcdefghijkl".to_vec();
-                            let original = buffer.as_ptr();
-                            let mut future =
-                                WriteAllFuture::<_, ()>::new(fd.lease().into_op_state(), buffer);
-                            future.base_ptr = original;
-                            future.offset = prior;
-                            let payload = RetainedWritePayload {
-                                buffer: future.buffer.take().expect("write owner missing"),
-                            };
-                            let saved = unsafe {
-                                stage_payload(owner, &mut future.state_ptr, payload, 2, completed)
-                            };
-                            let entry = ExpectedScalarEntry {
-                                opcode: opcode::Send::CODE,
-                                fd: -7,
-                                addr: unsafe { original.add(prior as usize + 2) },
-                                owner_addr: original,
-                                len: 10 - prior,
-                                msg_flags: libc::MSG_NOSIGNAL as u32,
-                                user_data: saved.state as u64,
-                            };
-                            (future, original, Some(entry))
-                        },
-                        |future| future.state_ptr.state_ptr(),
-                        |original, buffer, _| {
-                            assert_eq!(buffer.as_ptr(), original);
-                            assert_eq!(buffer, b"abcdefghijkl");
-                        },
-                        |cx, future, entry| {
-                            assert_rejected_scalar_submission(
-                                cx,
-                                future,
-                                entry.expect("send entry missing"),
-                                b"abcdefghijkl",
-                            )
-                        },
-                    ));
+                for result in [2, -libc::EINTR] {
+                    for prior in [0, 4] {
+                        failures.extend(row(
+                            format!("WriteAll, result={result}, prior={prior}"),
+                            result,
+                            scenario,
+                            |owner, _, fd, completed| {
+                                let future = staged_write_all(owner, fd, prior, result, completed);
+                                let original = future.base_ptr;
+                                let progress = result.max(0) as u32;
+                                let entry = ExpectedScalarEntry {
+                                    opcode: opcode::Send::CODE,
+                                    fd: -7,
+                                    addr: unsafe { original.add((prior + progress) as usize) },
+                                    owner_addr: original,
+                                    len: 12 - prior - progress,
+                                    msg_flags: libc::MSG_NOSIGNAL as u32,
+                                    user_data: future.state_ptr.state_ptr() as u64,
+                                };
+                                (future, original, Some(entry))
+                            },
+                            |future| future.state_ptr.state_ptr(),
+                            |original, buffer, _| {
+                                assert_eq!(buffer.as_ptr(), original);
+                                assert_eq!(buffer, b"abcdefghijkl");
+                            },
+                            |cx, future, entry| {
+                                assert_rejected_scalar_submission(
+                                    cx,
+                                    future,
+                                    entry.expect("send entry missing"),
+                                    b"abcdefghijkl",
+                                )
+                            },
+                        ));
+                    }
                 }
                 for result in [-libc::EAGAIN, 1] {
                     for prior in [0, 1] {
@@ -4791,30 +5182,8 @@ mod tests {
                             result,
                             scenario,
                             |owner, _, fd, completed| {
-                                let mut buffer = eagain_scalar_buffer();
-                                buffer.bytes[..prior].copy_from_slice(&b"abcd"[..prior]);
-                                let original = buffer.bytes.as_ptr();
-                                let drops = Rc::clone(&buffer.drops);
-                                let base = buffer.as_mut_ptr();
-                                let mut future = ReadExactFuture::<_, ()>::new(
-                                    fd.lease().into_op_state(),
-                                    buffer,
-                                    4,
-                                );
-                                future.base_ptr = base;
-                                future.filled = prior as u32;
-                                let payload = RetainedReadPayload {
-                                    buffer: future.buffer.take().expect("read owner missing"),
-                                };
-                                let saved = unsafe {
-                                    stage_payload(
-                                        owner,
-                                        &mut future.state_ptr,
-                                        payload,
-                                        result,
-                                        completed,
-                                    )
-                                };
+                                let (future, original, drops, base) =
+                                    staged_read_exact(owner, fd, prior, result, completed);
                                 let filled = prior + result.max(0) as usize;
                                 let entry = ExpectedScalarEntry {
                                     opcode: opcode::Recv::CODE,
@@ -4823,7 +5192,7 @@ mod tests {
                                     owner_addr: original,
                                     len: (4 - filled) as u32,
                                     msg_flags: 0,
-                                    user_data: saved.state as u64,
+                                    user_data: future.state_ptr.state_ptr() as u64,
                                 };
                                 (future, (original, drops), Some(entry))
                             },
@@ -4847,7 +5216,7 @@ mod tests {
                     }
                 }
                 for projected in [false, true] {
-                    for result in [-libc::EAGAIN, 2] {
+                    for result in [-libc::EAGAIN, -libc::EINTR, 2] {
                         failures.extend(row(
                             format!("WritevAll, projected={projected}, result={result}, prior=1"),
                             result,
@@ -4856,10 +5225,8 @@ mod tests {
                                 let (mut future, witness) =
                                     staged(projected, owner, fd, 1, result, completed);
                                 let mut entry = expected(fd, &mut future, &witness, 1, 3);
-                                if result > 0 {
-                                    entry.opcode = opcode::SendMsg::CODE;
-                                    entry.addr = unsafe { future.fields().1.as_ptr().cast() };
-                                    entry.len = 1;
+                                if result != -libc::EAGAIN {
+                                    message_entry(&mut future, &mut entry);
                                 }
                                 (future, witness, Some(entry))
                             },
@@ -4876,35 +5243,9 @@ mod tests {
                             result,
                             scenario,
                             |owner, cx, fd, completed| {
-                                let chain = eagain_chain(2);
-                                let original = chain_pointers(&chain);
-                                let mut future = ReadvExactFuture::<2, ()>::new(
-                                    fd.lease().into_op_state(),
-                                    chain,
-                                    4,
-                                );
-                                let pctx = poll_ctx_from_waker(cx).expect("origin context missing");
-                                let mut payload = readv_payload(
-                                    &pctx,
-                                    future.buffer.take().expect("readv owner missing"),
-                                );
-                                unsafe {
-                                    future.window_iov_count = clamp_iovecs_to_read_limit(
-                                        retained_iovecs_mut(&mut payload.scratch, 2),
-                                        0,
-                                        4,
-                                    );
-                                    write_vector_prefix(&mut payload, prior);
-                                    advance_iovecs_in_place(
-                                        retained_iovecs_mut(&mut payload.scratch, 2),
-                                        &mut future.skip,
-                                        prior,
-                                    );
-                                }
-                                future.filled = prior;
+                                let (future, original, iovec) =
+                                    staged_readv_exact(owner, cx, fd, prior, result, completed);
                                 let entry = if prior == 2 {
-                                    let iovec =
-                                        unsafe { retained_iovecs_mut(&mut payload.scratch, 2)[1] };
                                     let progress = result.max(0) as usize;
                                     Some(ExpectedScalarEntry {
                                         opcode: opcode::Recv::CODE,
@@ -4913,24 +5254,11 @@ mod tests {
                                         owner_addr: original[1],
                                         len: (2 - progress) as u32,
                                         msg_flags: 0,
-                                        user_data: 0,
+                                        user_data: future.state_ptr.state_ptr() as u64,
                                     })
                                 } else {
                                     None
                                 };
-                                let saved = unsafe {
-                                    stage_payload(
-                                        owner,
-                                        &mut future.state_ptr,
-                                        payload,
-                                        result,
-                                        completed,
-                                    )
-                                };
-                                let entry = entry.map(|mut entry| {
-                                    entry.user_data = saved.state as u64;
-                                    entry
-                                });
                                 (future, original, entry)
                             },
                             |future| future.state_ptr.state_ptr(),
@@ -4951,6 +5279,91 @@ mod tests {
                 failures.is_empty(),
                 "context rejection rows failed: {failures:#?}"
             );
+        }
+
+        fn interrupted_completion<F, B>(
+            cx: &mut Context<'_>,
+            future: &mut F,
+            state: fn(&mut F) -> *mut CompletionState,
+            operation: &str,
+        ) -> B
+        where
+            F: Future<Output = (io::Result<usize>, B)> + Unpin,
+        {
+            finish_completed_future(cx, future, state, |result| {
+                let error = result.expect_err("interrupted completion succeeded");
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted,
+                    "{operation} completion error"
+                );
+                assert_eq!(error.raw_os_error(), Some(libc::EINTR));
+            })
+        }
+
+        #[test]
+        fn exact_reads_return_interrupted_completions_with_their_prefix() {
+            for prior in [0, 1] {
+                assert!(
+                    row(
+                        format!("ReadExact, result=-EINTR, prior={prior}"),
+                        -libc::EINTR,
+                        Scenario::Control,
+                        |owner, _, fd, completed| {
+                            let (future, original, drops, _) =
+                                staged_read_exact(owner, fd, prior, -libc::EINTR, completed);
+                            (future, (original, drops), None)
+                        },
+                        |future| future.state_ptr.state_ptr(),
+                        |(original, drops), buffer, _| {
+                            assert_eq!(buffer.bytes.as_ptr(), original);
+                            assert_eq!(
+                                buffer.bytes,
+                                if prior == 0 { &b"seed"[..] } else { &b"a"[..] }
+                            );
+                            assert_eq!(drops.get(), 0);
+                            drop(buffer);
+                            assert_eq!(drops.get(), 1);
+                        },
+                        |cx, future, _| {
+                            interrupted_completion(
+                                cx,
+                                future,
+                                |future| future.state_ptr.state_ptr(),
+                                "ReadExact",
+                            )
+                        },
+                    )
+                    .is_none()
+                );
+            }
+            for prior in [0, 2] {
+                assert!(
+                    row(
+                        format!("ReadvExact, result=-EINTR, prior={prior}"),
+                        -libc::EINTR,
+                        Scenario::Control,
+                        |owner, cx, fd, completed| {
+                            let (future, original, _) =
+                                staged_readv_exact(owner, cx, fd, prior, -libc::EINTR, completed);
+                            (future, original, None)
+                        },
+                        |future| future.state_ptr.state_ptr(),
+                        |original, chain, _| {
+                            assert_chain_prefix(&chain, original, 2, &b"abcd"[..prior]);
+                        },
+                        |cx, future, _| {
+                            interrupted_completion(
+                                cx,
+                                future,
+                                |future| future.state_ptr.state_ptr(),
+                                "ReadvExact",
+                            )
+                        },
+                    )
+                    .is_none()
+                );
+            }
         }
 
         #[test]
@@ -5421,6 +5834,103 @@ mod tests {
                     (*state).fd_lease_core_ptr().as_ptr().cast(),
                 )
             }
+        }
+
+        #[test]
+        fn write_all_interrupted_send_keeps_progress_and_completes() {
+            use crate::net::send_sqe::test_support::ExpectedScalarEntry;
+            use crate::runtime::executor::ExecutorOwner;
+
+            run(async {
+                for prior in [0u32, 4] {
+                    let (fd, mut peer) = socket_fixture();
+                    let bytes = b"abcdefghijkl";
+                    let buffer = bytes.to_vec();
+                    let original = buffer.as_ptr();
+                    let mut future =
+                        WriteAllFuture::<_, ()>::new(fd.lease().into_op_state(), buffer);
+                    let (owner, identity) = std::future::poll_fn(|cx| {
+                        let pctx = poll_ctx_from_waker(cx).expect("poll context missing");
+                        let payload = RetainedWritePayload {
+                            buffer: future.buffer.take().expect("write owner missing"),
+                        };
+                        future.base_ptr = payload.buffer.as_ptr();
+                        future.offset = prior;
+                        // SAFETY: the payload owns the source and no SQE refers
+                        // to this completed state before the next poll.
+                        unsafe {
+                            let retained = (&mut *pctx.reactor()).alloc_retained_payload(payload);
+                            publish_completed_result(
+                                &pctx,
+                                &mut future.state_ptr,
+                                retained,
+                                -libc::EINTR,
+                            );
+                            Poll::Ready((
+                                ExecutorOwner::clone_rc(pctx.owner_ptr()),
+                                retry_identity::<RetainedWritePayload<Vec<u8>>>(&future.state_ptr),
+                            ))
+                        }
+                    })
+                    .await;
+                    for interrupted_again in [true, false] {
+                        std::future::poll_fn(|cx| {
+                            let entry = ExpectedScalarEntry {
+                                opcode: opcode::Send::CODE,
+                                fd: fd.raw_fd(),
+                                addr: unsafe { original.add(prior as usize) },
+                                owner_addr: original,
+                                len: 12 - prior,
+                                msg_flags: libc::MSG_NOSIGNAL as u32,
+                                user_data: identity.0 as u64,
+                            };
+                            pending_poll(
+                                cx,
+                                &mut future,
+                                Some(entry),
+                                "interrupted complete write",
+                            );
+                            assert_eq!(
+                                unsafe {
+                                    retry_identity::<RetainedWritePayload<Vec<u8>>>(
+                                        &future.state_ptr,
+                                    )
+                                },
+                                identity
+                            );
+                            assert!(!unsafe { (*identity.0).is_completed() });
+                            assert_eq!(future.offset, prior);
+                            assert_eq!(fd.strong_count_for_test(), 2);
+                            pending_poll(cx, &mut future, None, "interrupted complete write");
+                            Poll::Ready(())
+                        })
+                        .await;
+                        let state =
+                            wait_for_completion(&mut future, |future| future.state_ptr.state_ptr())
+                                .await;
+                        assert_eq!(state, identity.0);
+                        assert_eq!(unsafe { (*state).result }, (12 - prior) as i32);
+                        if interrupted_again {
+                            // SAFETY: the real send has completed, so only the
+                            // result consumed by the next poll is replaced.
+                            unsafe { (*state).result = -libc::EINTR };
+                        }
+                    }
+                    let (result, buffer) = (&mut future).await;
+                    assert_eq!(
+                        result.expect("complete write after interruption failed"),
+                        12
+                    );
+                    assert_eq!(buffer.as_ptr(), original);
+                    assert_eq!(buffer, bytes);
+                    assert!(future.state_ptr.state_ptr().is_null());
+                    peer.set_nonblocking(true)
+                        .expect("set peer nonblocking failed");
+                    assert_peer_bytes(&mut peer, prior as usize, 2);
+                    clean(&owner, &fd);
+                    assert_pool_balanced(&owner);
+                }
+            });
         }
 
         #[test]
@@ -8957,6 +9467,66 @@ mod tests {
                 drop(returned);
                 assert_eq!(unsafe { (&*owner.reactor_ptr()).live_op_count() }, 0);
                 assert_eq!(owner.inflight_op_count_for_test(), 0);
+            });
+        }
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    fn staged_write_all(
+        owner: &Rc<crate::runtime::executor::ExecutorOwner>,
+        fd: &RuntimeFd,
+        prior: u32,
+        result: i32,
+        completed: bool,
+    ) -> WriteAllFuture<'static, Vec<u8>, ()> {
+        use crate::runtime::op::completion_retirement_test_support::stage_payload;
+
+        let buffer = b"abcdefghijkl".to_vec();
+        let original = buffer.as_ptr();
+        let mut future = WriteAllFuture::new(fd.lease().into_op_state(), buffer);
+        future.base_ptr = original;
+        future.offset = prior;
+        let payload = RetainedWritePayload {
+            buffer: future.buffer.take().expect("write owner missing"),
+        };
+        // SAFETY: the payload owns the complete source, prior progress is within
+        // it, and no SQE refers to this staged state before the next poll.
+        unsafe { stage_payload(owner, &mut future.state_ptr, payload, result, completed) };
+        future
+    }
+
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[test]
+    fn write_all_interrupted_send_resubmits_the_remaining_bytes() {
+        use crate::net::send_sqe::test_support::{
+            ExpectedScalarEntry, assert_rejected_scalar_submission,
+        };
+
+        for prior in [0u32, 4, 11] {
+            with_ringless_poll_context_for_test(1, |owner, cx| {
+                let fd = RuntimeFd::from_fresh_raw_fd(-7);
+                let mut future = staged_write_all(owner, &fd, prior, -libc::EINTR, true);
+                let original = future.base_ptr;
+                let state = future.state_ptr.state_ptr();
+                let returned = assert_rejected_scalar_submission(
+                    cx,
+                    &mut future,
+                    ExpectedScalarEntry {
+                        opcode: opcode::Send::CODE,
+                        fd: fd.raw_fd(),
+                        addr: unsafe { original.add(prior as usize) },
+                        owner_addr: original,
+                        len: 12 - prior,
+                        msg_flags: libc::MSG_NOSIGNAL as u32,
+                        user_data: state as u64,
+                    },
+                    b"abcdefghijkl",
+                );
+                assert_eq!((future.offset, future.total), (prior, 12));
+                assert!(future.state_ptr.state_ptr().is_null());
+                drop(returned);
+                clean(owner, &fd);
+                assert_pool_balanced(owner);
             });
         }
     }

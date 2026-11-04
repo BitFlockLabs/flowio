@@ -117,8 +117,10 @@
 //! consumed nothing and returns its owner unchanged; repeating it can return
 //! the same error until the condition clears, so apply bounded backoff.
 //! Complete-buffer writes (`write_all`, `writev_all` and
-//! `writev_all_projected`) do not report progress when they fail: after any
-//! error, including `WouldBlock`, part of the buffer may already have been
+//! `writev_all_projected`) submit a send again when the kernel interrupts it
+//! before it sends anything, instead of returning [`io::ErrorKind::Interrupted`].
+//! They do not report progress when they fail: after any error, including
+//! `WouldBlock`, part of the buffer may already have been
 //! sent, and repeating the call can send that part again.
 //! Socket send timeouts (`SO_SNDTIMEO`) do not bound FlowIO writes: a write
 //! can wait for send-buffer space without a time limit, and it can also end
